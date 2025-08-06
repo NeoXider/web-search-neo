@@ -7,6 +7,7 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from webdriver_manager.chrome import ChromeDriverManager
+import driver
 
 logging.basicConfig(
     level=logging.INFO,
@@ -15,23 +16,9 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-
 def get_driver() -> webdriver.Chrome:
     """Поднимаем headless Chrome через webdriver-manager."""
-    opts = Options()
-    opts.add_argument("--headless")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--disable-dev-shm-usage")
-    # Иногда помогает отключить признак автоматизации:
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    # Любой нормальный User-Agent — Google любит, когда это не «python-requests»
-    opts.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
-    )
-    service = Service(ChromeDriverManager().install())
-    return webdriver.Chrome(service=service, options=opts)
+    return driver.get_driver(log)
 
 
 def search_google(driver: webdriver.Chrome, query: str, num: int = 5) -> List[Dict[str, str]]:
