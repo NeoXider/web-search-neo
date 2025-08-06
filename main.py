@@ -75,17 +75,6 @@ def search_yandex(query: str, num: int = 5) -> List[Dict[str, str]]:
 def get_current_time_and_region() -> dict:
     """
     Return the current local date/time and a region string.
-
-    The result looks like:
-        {
-            "year": 2025,
-            "month": 8,
-            "day": 6,
-            "hour": 14,
-            "minute": 23,
-            "second": 47,
-            "region": "ЕКБ +5"
-        }
     """
     return msp_date_time.get_current_time_and_region()
 
