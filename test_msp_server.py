@@ -6,9 +6,8 @@ from typing import List, Dict
 from main import (
     fetch_url_text,
     fetch_page_links,
-    google_search_tool,
-    yandex_search_tool,
-    duckduckgo_search_tool,
+    search_duckduckgo,
+    search_yandex,
 )
 from selenium.common.exceptions import WebDriverException
 
@@ -43,29 +42,23 @@ class TestMspServer(unittest.TestCase):
                 for link in links:
                     self.assertIsInstance(link, str, f"Non-str item in links for {url}: {link!r}")
 
-    # ------------------------------------------------------------------
-    # 4. Тест google_search_tool
-    # ------------------------------------------------------------------
     def test_google_search_tool(self):
         query = "Python programming"
         try:
-            results = google_search_tool(query, num=3)
+            results = search_duckduckgo(query, num=3)
         except WebDriverException as e:
-            self.skipTest(f"Skipping Google search test due to WebDriver error: {e}")
-        self.assertIsInstance(results, list, "google_search_tool did not return a list")
+            self.skipTest(f"Skipping duckduckgo search test due to WebDriver error: {e}")
+        self.assertIsInstance(results, list, "search_duckduckgo did not return a list")
         if results:
             first: Dict[str, str] = results[0]
             for key in ("title", "url", "snippet"):
-                self.assertIn(key, first, f"Missing key '{key}' in first google_search_tool result")
+                self.assertIn(key, first, f"Missing key '{key}' in first search_duckduckgo result")
                 self.assertIsInstance(first[key], str, f"Expected string for '{key}', got {type(first[key])}")
 
-    # ------------------------------------------------------------------
-    # 5. Тест yandex_search_tool
-    # ------------------------------------------------------------------
     def test_yandex_search_tool(self):
         query = "Python programming"
         try:
-            results = yandex_search_tool(query, num=3)
+            results = search_yandex(query, num=3)
         except WebDriverException as e:
             self.skipTest(f"Skipping Yandex search test due to WebDriver error: {e}")
         self.assertIsInstance(results, list, "yandex_search_tool did not return a list")
@@ -73,22 +66,6 @@ class TestMspServer(unittest.TestCase):
             first: Dict[str, str] = results[0]
             for key in ("title", "url", "snippet"):
                 self.assertIn(key, first, f"Missing key '{key}' in first yandex_search_tool result")
-                self.assertIsInstance(first[key], str, f"Expected string for '{key}', got {type(first[key])}")
-
-    # ------------------------------------------------------------------
-    # 6. Тест duckduckgo_search_tool
-    # ------------------------------------------------------------------
-    def test_duckduckgo_search_tool(self):
-        query = "Python programming"
-        try:
-            results = duckduckgo_search_tool(query, num=3)
-        except WebDriverException as e:
-            self.skipTest(f"Skipping DuckDuckGo search test due to WebDriver error: {e}")
-        self.assertIsInstance(results, list, "duckduckgo_search_tool did not return a list")
-        if results:
-            first: Dict[str, str] = results[0]
-            for key in ("title", "url", "snippet"):
-                self.assertIn(key, first, f"Missing key '{key}' in first duckduckgo_search_tool result")
                 self.assertIsInstance(first[key], str, f"Expected string for '{key}', got {type(first[key])}")
 
 if __name__ == "__main__":

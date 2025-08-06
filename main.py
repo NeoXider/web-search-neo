@@ -16,7 +16,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # --- Add file handler for logs after basicConfig
-file_handler = logging.FileHandler('.logs/msp_server.log')
+file_handler = logging.FileHandler('msp_server.log')
 file_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
 log.addHandler(file_handler)
 

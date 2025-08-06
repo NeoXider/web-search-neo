@@ -3,7 +3,7 @@
     "web-search-neo": {
       "command": "python",
       "args": [
-        "C:/Git/PythonUrlFeatch/msp_server.py"
+        "C:/Git/PythonUrlFeatch/main.py"
       ]
     }
   }

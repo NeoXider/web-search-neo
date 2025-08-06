@@ -55,7 +55,7 @@ A sample configuration file `msp.json` can be used to customize the MCP server:
     "web-search-neo": {
       "command": "python",
       "args": [
-        "PATH/msp_server.py"
+        "PATH/main.py"
       ]
     }
   }
