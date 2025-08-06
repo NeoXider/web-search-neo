@@ -16,7 +16,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # --- Add file handler for logs after basicConfig
-file_handler = logging.FileHandler('msp_server.log')
+file_handler = logging.FileHandler('.logs/msp_server.log')
 file_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
 log.addHandler(file_handler)
 
@@ -55,6 +55,7 @@ def fetch_page_links(url: str) -> List[str]:
     )
     return links
 
+#TODO
 # @mcp.tool()
 # def search_google(query: str, num: int = 5) -> List[Dict[str, str]]:
 #     driver = msp_search.get_driver()

@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "web-search-neo": {
+      "command": "python",
+      "args": [
+        "C:/Git/PythonUrlFeatch/msp_server.py"
+      ]
+    }
+  }
+}
