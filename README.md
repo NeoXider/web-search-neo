@@ -16,7 +16,7 @@ pip install -r requirements.txt
 ## Running the MCP Server
 
 ```bash
-python msp_server.py
+python main.py
 ```
 
 The server exposes the following tools via the MCP protocol:
@@ -30,7 +30,7 @@ The server exposes the following tools via the MCP protocol:
 ## CLI Usage
 
 ```bash
-python msp_server.py --urls https://example.com https://another.org
+python main.py --urls https://example.com https://another.org
 ```
 
 Logs are written to `msp_server.log`.
