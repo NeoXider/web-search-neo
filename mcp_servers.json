@@ -4,7 +4,8 @@
       "command": "python",
       "args": [
         "C:/Git/PythonUrlFeatch/main.py"
-      ]
+      ],
+      "module": "main"
     }
   }
 }
