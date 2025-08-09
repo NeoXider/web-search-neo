@@ -1,4 +1,4 @@
-# PythonUrlFeatch
+# Web search Neo
 
 Python URL fetcher with MCP‑based tools for fetching URLs, extracting text, and web searching.
 
