@@ -1,11 +1,10 @@
 {
   "mcpServers": {
     "web-search-neo": {
-      "command": "py",
+      "command": "D:/Git/web-search-neo/.venv/Scripts/python.exe",
       "args": [
-        "C:/Git/PythonUrlFeatch/main.py"
-      ],
-      "module": "main"
+        "D:/Git/web-search-neo/main.py"
+      ]
     }
   }
 }
