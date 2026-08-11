@@ -75,7 +75,19 @@ Replace `cwd` with the directory you cloned. Use forward slashes in JSON on Wind
 
 The configuration deliberately uses `"command": "python"` instead of an absolute interpreter path. If LM Studio cannot find the virtual environment, either launch LM Studio with that environment on `PATH` or use the system Python where you installed `requirements.txt`.
 
-Toggle the MCP integration off and on, or restart LM Studio. The server should expose search, fetch, and browser tools under the name `web-search-neo`.
+Toggle the MCP integration off and on, or restart LM Studio. The server should expose exactly two tools under `web-search-neo`: `web_info` and `web_action`.
+
+If an older prompt or client still requires the previous individual tool names, set `WEB_SEARCH_NEO_LEGACY_TOOLS=1` for that server process. Compact mode remains the recommended default.
+
+### Optional Codex-compatible skill
+
+Copy the bundled skill to the local Codex skill directory and restart Codex:
+
+```powershell
+Copy-Item -Recurse -Force skills\web-search-neo "$env:USERPROFILE\.codex\skills\web-search-neo"
+```
+
+The skill can then be invoked as `$web-search-neo`. It keeps agent context small by discovering one action schema at a time through `web_info` and dispatching work through `web_action`.
 
 ## 5. Other MCP clients
 
@@ -106,14 +118,17 @@ Use `headless=false` with `profile_mode="temporary"`. A Chrome window opens and 
 
 Use `headless=false`, `profile_mode="persistent"`, and a stable `profile_id`. Log in once in that MCP-owned window; later sessions with the same profile ID reuse its cookies and local storage.
 
-```text
-browser_open_page(
-  url="https://example.com",
-  session_id="authorized-work",
-  headless=false,
-  profile_mode="persistent",
-  profile_id="authorized-work"
-)
+```json
+{
+  "actions": [{
+    "action": "open",
+    "url": "https://example.com",
+    "session_id": "authorized-work",
+    "headless": false,
+    "profile_mode": "persistent",
+    "profile_id": "authorized-work"
+  }]
+}
 ```
 
 ### Attach to an open authorized Chrome
@@ -126,14 +141,17 @@ powershell -ExecutionPolicy Bypass -File scripts\start_managed_chrome.ps1 -Profi
 
 Log in manually, leave that Chrome window open, and attach:
 
-```text
-browser_open_page(
-  url="https://example.com",
-  session_id="attached-work",
-  headless=false,
-  profile_mode="attach",
-  debugger_address="127.0.0.1:9222"
-)
+```json
+{
+  "actions": [{
+    "action": "open",
+    "url": "https://example.com",
+    "session_id": "attached-work",
+    "headless": false,
+    "profile_mode": "attach",
+    "debugger_address": "127.0.0.1:9222"
+  }]
+}
 ```
 
 MCP detaches without closing the managed Chrome. The next attach reuses the same browser state.
@@ -161,8 +179,11 @@ The tests use a local web server and do not rely on search-engine availability.
 
 Check providers from an MCP client with:
 
-```text
-get_search_engines_status(check_live=true)
+```json
+{
+  "topic": "search_status",
+  "params": {"check_live": true}
+}
 ```
 
 A provider may report a regional challenge while the overall service remains healthy through fallback.
@@ -196,11 +217,11 @@ Open `http://127.0.0.1:9222/json/version` locally. If it is unavailable, restart
 
 ### A canvas/WebGL game loads but cannot be controlled
 
-Run `browser_game_probe` first. If it reports a game iframe, reuse its selector as `frame_selector` in `browser_pointer` and `browser_press_keys`. Use `browser_screenshot` after input to verify the visible state change.
+Call `web_info(topic="game_probe")` first. If it reports a game iframe, reuse its selector as `frame_selector` in the `input` and `render` actions. Call `web_info(topic="screenshot")` after input to verify the visible state change.
 
-To slow a typical canvas/WebGL loop continuously, call `browser_render_control(mode="throttled", target_fps=10)`. To inspect exact input states frame by frame, use `mode="step"`; each pointer or keyboard batch advances one frame, and `browser_render_step(frames=N)` advances explicitly. Always restore `mode="normal"` when finished. Closing the MCP session also releases held input and restores normal rendering.
+To slow a typical canvas/WebGL loop continuously, send `{"action":"render","mode":"throttled","target_fps":10}` through `web_action`. For exact input states use `mode="step"`; each `input` action advances one frame, while the `step` action advances explicitly. Always restore `mode="normal"` when finished. Closing the MCP session also releases held input and restores normal rendering.
 
-Use `browser_input_batch` when different inputs must land in the same step-mode frame: each key entry has its own `tap`, `hold`, or `release` action, while pointer entries support `hover`, `move`, button actions, absolute coordinates, or `coordinate_mode="delta"` relative movement. Use `browser_release_inputs` as an emergency release for every held key and mouse button.
+Use one `input` action when different inputs must land in the same step-mode frame: each key entry has its own `tap`, `hold`, or `release`, while pointer entries support `hover`, `move`, button actions, absolute coordinates, or `coordinate_mode="delta"`. Send `release_inputs` as an emergency release for every held key and mouse button. If the contract is not in context, call `web_info(topic="action_schema", params={"action":"input"})` first.
 
 ### Search provider is challenged
 

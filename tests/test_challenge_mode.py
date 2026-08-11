@@ -82,7 +82,8 @@ def test_manual_challenge_returns_open_resolved_session(monkeypatch):
     assert response["engine_used"] == "duckduckgo"
     assert response["manual_challenge"]["session_open"] is True
     assert response["manual_challenge"]["timeout_seconds"] == 180
-    assert "browser_get_page_elements" in response["next_tools"]
+    assert response["next_tools"] == ["web_info", "web_action"]
+    assert response["next_calls"][0]["arguments"]["topic"] == "page_elements"
 
 
 def test_manual_challenge_timeout_closes_window_and_falls_back(monkeypatch):

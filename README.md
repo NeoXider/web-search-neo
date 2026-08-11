@@ -30,7 +30,7 @@ DuckDuckGo is the default route. Brave, Mojeek, Yahoo, Bing, and Startpage are a
 | Resilient fallback | Provider health, cooldowns, bounded retries, caching, and an overall deadline prevent one challenged engine from stalling the agent. |
 | Visible automation | Run Chrome with `headless=false` and watch every navigation, field fill, upload, click, and submit. |
 | Reusable authorization | Use a persistent MCP-owned profile or attach to a dedicated Chrome window where you are already signed in. |
-| Agent-friendly tools | Structured page elements, canvas/iframe probes, keyboard and pointer input, reusable CSS selectors, screenshots, status, and clear validation/error results. |
+| Two-tool MCP surface | Models see only `web_info` and `web_action`; detailed action schemas are discovered only when needed. |
 | Concurrent work | Search, HTTP fetches, and independent browser sessions run outside the MCP event loop; up to four browser sessions can work in parallel. |
 
 ## Quick start
@@ -69,21 +69,36 @@ Open LM Studio's MCP configuration and add:
 
 The Python executable is intentionally resolved through `PATH`, not pinned to a machine-specific absolute interpreter path. Restart or toggle the MCP server after changing the configuration. A ready-to-edit example is included in [mcp_servers.json](mcp_servers.json).
 
+## Optional agent skill
+
+The repository includes a concise [Web Search Neo skill](skills/web-search-neo/SKILL.md) that teaches Codex-compatible agents the two-tool workflow, browser profile selection, safe form handling, and atomic game input without loading every action schema.
+
+Install it locally by copying `skills/web-search-neo` into your Codex skills directory, then restart Codex:
+
+```powershell
+Copy-Item -Recurse -Force skills\web-search-neo "$env:USERPROFILE\.codex\skills\web-search-neo"
+```
+
+Invoke it explicitly as `$web-search-neo`, or let its task description trigger it for web search, visible Chrome automation, authorized attach sessions, form work, and browser-game testing.
+
 ## Search behavior
 
 The normal agent call is:
 
-```text
-search_web(
-  query="best local-first MCP tools",
-  num=5,
-  engine="duckduckgo",
-  fallback=true,
-  challenge_mode="fallback"
-)
+```json
+{
+  "actions": [{
+    "action": "search",
+    "query": "best local-first MCP tools",
+    "num": 5,
+    "engine": "duckduckgo",
+    "fallback": true,
+    "challenge_mode": "fallback"
+  }]
+}
 ```
 
-`get_search_engines_status(check_live=true)` reports configured engines, current live availability, latency, cooldown state, and detected challenges. Status checks are cached for five minutes; search results are cached for two minutes.
+Send that object to `web_action`. `web_info(topic="search_status", params={"check_live": true})` reports configured engines, current live availability, latency, cooldown state, and detected challenges. Status checks are cached for five minutes; search results are cached for two minutes.
 
 ### CAPTCHA and challenge modes
 
@@ -98,16 +113,19 @@ Yes — the agent can work in an open browser while you watch it.
 
 For a fresh visible session:
 
-```text
-browser_open_page(
-  url="https://example.com",
-  session_id="demo",
-  headless=false,
-  profile_mode="temporary"
-)
+```json
+{
+  "actions": [{
+    "action": "open",
+    "url": "https://example.com",
+    "session_id": "demo",
+    "headless": false,
+    "profile_mode": "temporary"
+  }]
+}
 ```
 
-The agent can then call `browser_get_page_elements`, `browser_fill_fields`, `browser_upload_file`, `browser_click`, `browser_submit_form`, and `browser_screenshot` using the same `session_id`.
+The agent can inspect with `web_info(topic="page_elements", params={"session_id": "demo"})`, then send ordered `fill`, `upload`, `click`, and `submit` actions through `web_action` using the same `session_id`. Screenshots are returned by the `screenshot` info topic.
 
 `headless` is an automatic three-state option:
 
@@ -131,14 +149,17 @@ powershell -ExecutionPolicy Bypass -File scripts\start_managed_chrome.ps1 -Profi
 
 Sign in to the sites you need in that window, keep it open, then let the agent attach:
 
-```text
-browser_open_page(
-  url="https://hh.ru/",
-  session_id="hh-authorized",
-  headless=false,
-  profile_mode="attach",
-  debugger_address="127.0.0.1:9222"
-)
+```json
+{
+  "actions": [{
+    "action": "open",
+    "url": "https://hh.ru/",
+    "session_id": "hh-authorized",
+    "headless": false,
+    "profile_mode": "attach",
+    "debugger_address": "127.0.0.1:9222"
+  }]
+}
 ```
 
 Chrome 136+ does not allow remote debugging against its normal default data directory. The included launcher therefore uses a separate durable profile. It feels like a normal visible Chrome window, keeps its logins, and remains open after MCP disconnects. See the [Chrome remote debugging security change](https://developer.chrome.com/blog/remote-debugging-port).
@@ -155,43 +176,43 @@ The `headless` argument cannot hide or reveal a Chrome process that is already r
 
 ## Testing canvas and WebGL games
 
-Browser automation is not limited to DOM forms. These tools cover common HTML5 game controls:
+Browser automation is not limited to DOM forms. The compact contract covers common HTML5 game controls:
 
-- `browser_game_probe` reports canvases, 2D/WebGL context, iframe surfaces, document focus, sampled animation FPS, loading time, and browser console warnings/errors;
-- `browser_pointer` clicks, double-clicks, hovers, moves, drags, or keeps a mouse button pressed across calls, using absolute coordinates or deltas from the current pointer position;
-- `browser_press_keys` sends keys such as `SPACE`, `ARROW_LEFT`, `W`, or combinations with `tap`, `hold`, and `release` actions;
-- `browser_input_batch` mixes different per-key actions and pointer actions into one input transaction;
-- `browser_release_inputs` safely releases every key and mouse button held by a session;
-- `browser_render_control` switches between normal rendering, continuous target-FPS throttling, and input-driven frame stepping;
-- `browser_render_step` releases an exact number of queued animation frames in step mode;
+- `web_info(topic="game_probe")` reports canvases, 2D/WebGL context, iframe surfaces, document focus, sampled animation FPS, loading time, console issues, and held input;
+- the `input` action mixes per-key `tap/hold/release` with pointer click, hover, move, drag, press, or release using absolute coordinates or deltas;
+- `render`, `step`, and `release_inputs` actions control animation and safely reset held input;
 - `frame_selector` targets a cross-origin game iframe such as the one used by Yandex Games.
 
 Example for a game hosted inside an iframe:
 
-```text
-browser_open_page(url="https://yandex.ru/games/app/geometry-dash-ufo-2d-371298",
-                  session_id="ufo", headless=false)
-browser_game_probe(session_id="ufo", frame_selector="iframe", sample_seconds=1)
-browser_render_control(mode="step", session_id="ufo", frame_selector="iframe")
-browser_input_batch(
-  key_actions=[
-    {"key": "W", "action": "hold"},
-    {"key": "S", "action": "release"},
-    {"key": "SPACE", "action": "tap"},
-    {"key": "E", "action": "tap"}
-  ],
-  pointer_actions=[
-    {"action": "hover", "x": 640, "y": 360},
-    {"action": "move", "x": 15, "y": -5, "coordinate_mode": "delta"}
-  ],
-  session_id="ufo",
-  frame_selector="iframe"
-)
-browser_render_step(frames=5, session_id="ufo")
-browser_release_inputs(session_id="ufo")
-browser_render_control(mode="normal", session_id="ufo", frame_selector="iframe")
-browser_screenshot(session_id="ufo")
+```json
+{
+  "actions": [
+    {"action": "open", "url": "https://yandex.ru/games/app/geometry-dash-ufo-2d-371298", "session_id": "ufo", "headless": false},
+    {"action": "render", "mode": "step", "session_id": "ufo", "frame_selector": "#game-frame"},
+    {
+      "action": "input",
+      "session_id": "ufo",
+      "frame_selector": "#game-frame",
+      "key_actions": [
+        {"key": "W", "action": "hold"},
+        {"key": "S", "action": "release"},
+        {"key": "SPACE", "action": "tap"},
+        {"key": "E", "action": "tap"}
+      ],
+      "pointer_actions": [
+        {"action": "hover", "x": 640, "y": 360},
+        {"action": "move", "x": 15, "y": -5, "coordinate_mode": "delta"}
+      ]
+    },
+    {"action": "step", "frames": 5, "session_id": "ufo"},
+    {"action": "release_inputs", "session_id": "ufo"},
+    {"action": "render", "mode": "normal", "session_id": "ufo"}
+  ]
+}
 ```
+
+Send the batch to `web_action`; use `web_info(topic="game_probe", params={"session_id": "ufo", "frame_selector": "#game-frame"})` or the `screenshot` topic to observe it.
 
 For a top-level canvas application such as `https://redoschool.ru/demo/?auto=true`, omit `frame_selector`. Pointer coordinates are relative to the selected top-level viewport or iframe.
 
@@ -201,9 +222,9 @@ For a top-level canvas application such as `https://redoschool.ru/demo/?auto=tru
 | --- | --- |
 | `normal` | Removes the render gate and returns to the page's normal `requestAnimationFrame` loop. |
 | `throttled` | Continuously releases animation callbacks at no more than `target_fps`, for example 10 FPS. |
-| `step` | Holds queued animation callbacks. `browser_render_step` releases frames explicitly; every keyboard or pointer batch also releases exactly one frame. |
+| `step` | Holds queued animation callbacks. The `step` action releases frames explicitly; every `input` action also releases exactly one frame. |
 
-`browser_press_keys(keys=["W", "SHIFT", "SPACE"], action="release")` releases the complete combination as one batch. For mixed actions, `browser_input_batch` can hold one key, release another, tap two more, hover, and move the pointer by a delta before releasing exactly one frame. In `step` mode the game never observes a partially applied intermediate input state. Outside step mode the actions are still serialized as one MCP call, but the page continues rendering normally.
+One `input` action can hold one key, release another, tap two more, hover, and move the pointer by a delta before releasing exactly one frame. In `step` mode the game never observes a partially applied intermediate input state. Outside step mode the actions are still serialized, but the page continues rendering normally.
 
 The render controller gates JavaScript `requestAnimationFrame`, which covers typical canvas/WebGL and Unity WebGL loops. It does not change video decoding, CSS compositor animations, the monitor refresh rate, or guarantee an exact GPU hardware frame rate on every engine.
 
@@ -216,18 +237,18 @@ Live MCP stdio smoke results on 2026-08-11:
 
 Live values depend on the machine and page version; the deterministic local suite verifies the control semantics independently of public-site availability.
 
-## MCP tools
+## Two-tool MCP contract
 
-| Group | Tools |
+| Tool | Responsibility |
 | --- | --- |
-| Search | `get_search_engines_status`, `search_web`, `search_duckduckgo`, `search_bing` |
-| Fast HTTP fetch | `fetch_url_text`, `fetch_page_links`, `fetch_urls_text` |
-| Open and inspect | `browser_open_page`, `browser_open_pages`, `browser_get_page_elements`, `browser_get_status` |
-| Wait and interact | `browser_wait_for`, `browser_wait_for_challenge`, `browser_fill_fields`, `browser_upload_file`, `browser_click`, `browser_submit_form` |
-| Game testing | `browser_game_probe`, `browser_pointer`, `browser_press_keys`, `browser_input_batch`, `browser_release_inputs`, `browser_render_control`, `browser_render_step` |
-| Observe and close | `browser_screenshot`, `browser_close`, `browser_close_all` |
+| `web_info` | Discover action groups and one action schema on demand; read search, browser, page, game, screenshot, or time state. |
+| `web_action` | Execute one or up to 32 ordered search, fetch, browser, form, input, render, and close actions. Supports fail-fast or `continue_on_error=true`. |
 
-Browser state is keyed by `session_id`. `browser_open_pages` can create up to four independent sessions concurrently. Non-full-page screenshots match the requested viewport dimensions exactly.
+Start with `web_info()` for a compact list. Request only the needed, generated JSON Schema with `web_info(topic="action_schema", params={"action": "input"})`, then invoke it through `web_action`. This follows the on-demand Tool Search principle used by [official Unreal MCP](https://dev.epicgames.com/documentation/unreal-engine/unreal-mcp-in-unreal-editor): keep the eager tool list small, disclose schemas only when needed, and dispatch actions through a meta-tool. Web Search Neo combines Unreal's list/describe discovery tools into one `web_info`, so only two tools are advertised. In the current build this reduces the eager model-facing tool schema from about 14.9k to 1.0k characters.
+
+Existing direct Python imports remain available. For temporary MCP-client migration only, set `WEB_SEARCH_NEO_LEGACY_TOOLS=1` before starting the server to advertise the former narrow tool list instead of the compact default.
+
+Browser state is keyed by `session_id`. The `open_many` action can create up to four independent sessions concurrently. Non-full-page screenshots match the requested viewport dimensions exactly.
 
 ## Optional configuration
 
@@ -250,7 +271,7 @@ python -m pytest
 python -m pytest --cov=. --cov-report=term-missing
 ```
 
-The deterministic suite uses a local test site and verifies search routing, fallback/cooldown/cache, HTTP fetches, a real MCP stdio handshake, multipart file upload, form inspection/fill/click/submission, native validation, exact PNG viewport size, canvas probing, sampled animation, normal/throttled/step rendering, atomic mixed per-key actions, absolute/delta pointer hover, persistent input, concurrent sessions, manual challenge resolution/timeout, persistent storage, and detach/reattach behavior.
+The deterministic suite verifies that MCP advertises exactly two tools, performs on-demand action discovery, runs ordered multi-action calls, and retains coverage of search routing, fallback/cooldown/cache, accurate Bing challenge detection, HTTP fetches, multipart upload, forms, validation, exact PNG viewport size, canvas probing, normal/throttled/step rendering, atomic mixed input, concurrent sessions, manual challenges, persistent storage, and a real managed-Chrome attach/detach that leaves Chrome running.
 
 Public search engines may rate-limit an IP or region, so live internet smoke checks are kept separate from deterministic tests.
 

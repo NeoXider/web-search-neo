@@ -87,6 +87,36 @@ def test_ddgs_provider_treats_blocked_no_results_as_challenge(monkeypatch):
     assert error.value.kind == "challenge"
 
 
+def test_bing_html_provider_parses_real_bing_markup(monkeypatch):
+    class Response:
+        text = """
+        <ol id="b_results"><li class="b_algo">
+          <h2><a href="https://example.test/result"> Example result </a></h2>
+          <div class="b_caption"><p> Useful snippet </p></div>
+        </li></ol>
+        """
+
+    monkeypatch.setattr(msp_search, "request", lambda *_args, **_kwargs: Response())
+    provider = msp_search.BingHtmlSearchProvider()
+    assert provider.search("query", 5, 2) == [
+        {
+            "title": "Example result",
+            "url": "https://example.test/result",
+            "snippet": "Useful snippet",
+        }
+    ]
+
+
+def test_bing_html_provider_reports_challenge_instead_of_false_availability(monkeypatch):
+    class Response:
+        text = '<div id="b_captcha">Please solve the challenge below</div>'
+
+    monkeypatch.setattr(msp_search, "request", lambda *_args, **_kwargs: Response())
+    with pytest.raises(msp_search.SearchProviderError) as error:
+        msp_search.BingHtmlSearchProvider().search("query", 1, 2)
+    assert error.value.kind == "challenge"
+
+
 def test_search_defaults_to_duckduckgo_and_falls_back(monkeypatch):
     calls = []
 
@@ -110,7 +140,9 @@ def test_search_defaults_to_duckduckgo_and_falls_back(monkeypatch):
     assert response["fallback_used"] is True
     assert response["results"] == RESULT
     assert response["errors"]["duckduckgo"]["kind"] == "challenge"
-    assert response["challenge_recoveries"][0]["suggested_arguments"]["headless"] is False
+    suggested = response["challenge_recoveries"][0]["suggested_arguments"]
+    assert suggested["actions"][0]["action"] == "open"
+    assert suggested["actions"][0]["headless"] is False
     assert calls == [("duckduckgo", "unity jobs", 20, 4.0), ("brave", "unity jobs", 20, 4.0)]
 
 

@@ -122,8 +122,9 @@ def local_site() -> LocalSite:
                       }), true);
                     }
                     window.frameCount = 0;
-                    function animate() { window.frameCount += 1; requestAnimationFrame(animate); }
-                    requestAnimationFrame(animate);
+                    const cachedRequestAnimationFrame = window.requestAnimationFrame;
+                    function animate() { window.frameCount += 1; cachedRequestAnimationFrame(animate); }
+                    cachedRequestAnimationFrame(animate);
                     </script></body></html>"""
                 )
                 return

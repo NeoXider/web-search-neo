@@ -14,7 +14,10 @@ import threading
 import time
 from urllib.parse import quote_plus
 
+from bs4 import BeautifulSoup
 from ddgs import DDGS
+
+from web_client import request
 
 
 DEFAULT_ENGINE = "duckduckgo"
@@ -142,6 +145,66 @@ class DdgsSearchProvider(SearchProvider):
         return self.url_template.format(query=quote_plus(query))
 
 
+@dataclass(frozen=True)
+class BingHtmlSearchProvider(SearchProvider):
+    """Use Bing's public HTML route without pretending another backend is Bing."""
+
+    name: str = "bing"
+
+    def search(
+        self, query: str, num: int, timeout_seconds: float
+    ) -> list[SearchResult]:
+        response = request(
+            "https://www.bing.com/search",
+            timeout_seconds=timeout_seconds,
+            max_response_bytes=2_000_000,
+            params={"q": query, "count": min(max(num, 1), 20)},
+        )
+        body = response.text
+        lower = body.lower()
+        if any(
+            marker in lower
+            for marker in (
+                "b_captcha",
+                "captcha challenge",
+                "please solve the challenge below",
+                "verify you are human",
+                "unusual traffic",
+            )
+        ):
+            raise SearchProviderError("Bing returned a human verification challenge", "challenge")
+        soup = BeautifulSoup(body, "html.parser")
+        results: list[SearchResult] = []
+        for item in soup.select("li.b_algo"):
+            anchor = item.select_one("h2 a[href]")
+            if anchor is None:
+                continue
+            url = str(anchor.get("href") or "").strip()
+            title = " ".join(anchor.get_text(" ", strip=True).split())
+            if not url.startswith(("http://", "https://")) or not title:
+                continue
+            snippet_node = item.select_one(".b_caption p") or item.select_one("p")
+            results.append(
+                {
+                    "title": title,
+                    "url": url,
+                    "snippet": " ".join(
+                        snippet_node.get_text(" ", strip=True).split()
+                        if snippet_node is not None
+                        else ""
+                    ),
+                }
+            )
+            if len(results) >= num:
+                break
+        if not results:
+            raise SearchProviderError("Bing returned no usable results", "empty_results")
+        return results
+
+    def browser_url(self, query: str) -> str:
+        return f"https://www.bing.com/search?q={quote_plus(query)}"
+
+
 SEARCH_PROVIDERS: dict[str, SearchProvider] = {}
 ENGINE_ORDER: list[str] = []
 _provider_locks: dict[str, threading.Lock] = {}
@@ -171,7 +234,7 @@ for _provider in (
     DdgsSearchProvider("brave", "brave", "https://search.brave.com/search?q={query}"),
     DdgsSearchProvider("mojeek", "mojeek", "https://www.mojeek.com/search?q={query}"),
     DdgsSearchProvider("yahoo", "yahoo", "https://search.yahoo.com/search?p={query}"),
-    DdgsSearchProvider("bing", "bing", "https://www.bing.com/search?q={query}"),
+    BingHtmlSearchProvider(),
     DdgsSearchProvider("startpage", "startpage", "https://www.startpage.com/do/search?q={query}"),
 ):
     register_search_provider(_provider)
@@ -223,15 +286,21 @@ def _call_provider(
 
 
 def _recovery(name: str, query: str) -> dict:
+    browser_url = SEARCH_PROVIDERS[name].browser_url(query)
     return {
         "provider": name,
         "challenge": True,
-        "browser_url": SEARCH_PROVIDERS[name].browser_url(query),
-        "next_tool": "browser_open_page",
+        "browser_url": browser_url,
+        "next_tool": "web_action",
         "suggested_arguments": {
-            "url": SEARCH_PROVIDERS[name].browser_url(query),
-            "session_id": f"search-{name}",
-            "headless": False,
+            "actions": [
+                {
+                    "action": "open",
+                    "url": browser_url,
+                    "session_id": f"search-{name}",
+                    "headless": False,
+                }
+            ]
         },
         "note": "Open visibly for manual challenge completion, or let fallback providers continue.",
     }

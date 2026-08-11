@@ -1,0 +1,4 @@
+interface:
+  display_name: "Web Search Neo"
+  short_description: "Search and automate Chrome with two MCP tools"
+  default_prompt: "Use $web-search-neo to search the web or automate a visible Chrome session."

@@ -1,4 +1,5 @@
-mcp>=1.29,<2
+mcp>=1.29,<1.30
+pydantic-settings>=2.14,<2.15
 ddgs>=9.14,<10
 requests>=2.32,<3
 beautifulsoup4>=4.13,<5

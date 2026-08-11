@@ -2,8 +2,15 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import json
+import os
+from pathlib import Path
+import shutil
+import socket
 import struct
+import subprocess
 import time
+from urllib.request import urlopen
 
 import pytest
 from selenium.common.exceptions import WebDriverException
@@ -17,6 +24,26 @@ def _open_or_skip(url: str, session_id: str, **kwargs):
         return browser_tools.open_page(url, session_id=session_id, **kwargs)
     except WebDriverException as exc:
         pytest.skip(f"Chrome/Selenium is unavailable: {exc}")
+
+
+def _chrome_binary() -> str | None:
+    candidates = [
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+    ]
+    if os.name == "nt":
+        candidates.extend(
+            str(Path(root) / "Google" / "Chrome" / "Application" / "chrome.exe")
+            for root in (
+                os.getenv("LOCALAPPDATA"),
+                os.getenv("PROGRAMFILES"),
+                os.getenv("PROGRAMFILES(X86)"),
+            )
+            if root
+        )
+    return next((str(path) for path in candidates if path and Path(path).is_file()), None)
 
 
 def test_browser_full_form_upload_click_submit_and_screenshot(local_site, tmp_path):
@@ -324,6 +351,66 @@ def test_profile_configuration_validates_attach_and_exclusive_profile(local_site
     )
 
 
+def test_attach_mode_reuses_managed_chrome_without_closing_it(local_site, tmp_path):
+    chrome = _chrome_binary()
+    if chrome is None:
+        pytest.skip("A Chrome/Chromium executable is unavailable")
+    with socket.socket() as reserved_port:
+        reserved_port.bind(("127.0.0.1", 0))
+        port = int(reserved_port.getsockname()[1])
+    profile = tmp_path / "attached-profile"
+    process = subprocess.Popen(
+        [
+            chrome,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={profile}",
+            "--headless=new",
+            "--window-size=800,600",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "about:blank",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    debugger_url = f"http://127.0.0.1:{port}/json/version"
+    try:
+        deadline = time.monotonic() + 15
+        version = None
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                break
+            try:
+                with urlopen(debugger_url, timeout=0.5) as response:
+                    version = json.loads(response.read())
+                break
+            except Exception:
+                time.sleep(0.1)
+        if version is None:
+            pytest.skip("Managed Chrome did not expose its DevTools endpoint")
+
+        opened = _open_or_skip(
+            f"{local_site.base_url}/form?session=attached",
+            "attached",
+            profile_mode="attach",
+            debugger_address=f"127.0.0.1:{port}",
+            headless=True,
+        )
+        assert opened["profile_mode"] == "attach"
+        assert opened["debugger_address"] == f"127.0.0.1:{port}"
+        assert browser_tools.close_session("attached")["closed"] is True
+        assert process.poll() is None
+        with urlopen(debugger_url, timeout=2) as response:
+            assert json.loads(response.read())["Browser"] == version["Browser"]
+    finally:
+        browser_tools.close_session("attached")
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
 def test_automatic_window_mode_defaults_attach_visible_and_owned_profiles_headless():
     assert browser_tools._resolve_headless("temporary", None) is True
     assert browser_tools._resolve_headless("persistent", None) is True

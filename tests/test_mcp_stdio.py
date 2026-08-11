@@ -12,7 +12,14 @@ from mcp.client.stdio import stdio_client
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_stdio_server_lists_tools_and_calls_status_tool():
+def test_stdio_server_exposes_compact_discovery_and_action_tools(local_site):
+    def unpack(result):
+        assert result.isError is False
+        # MCP SDK/Pydantic combinations differ in whether Any return values are
+        # omitted from structuredContent or wrapped under a synthetic "result".
+        # The protocol text block is stable across supported Python versions.
+        return json.loads(result.content[0].text)
+
     async def exercise_server() -> None:
         parameters = StdioServerParameters(
             command=sys.executable,
@@ -24,85 +31,54 @@ def test_stdio_server_lists_tools_and_calls_status_tool():
                 await session.initialize()
                 listed = await session.list_tools()
                 names = {tool.name for tool in listed.tools}
-                assert {
-                    "fetch_url_text",
-                    "fetch_page_links",
-                    "fetch_urls_text",
-                    "get_search_engines_status",
-                    "search_web",
-                    "browser_open_page",
-                    "browser_open_pages",
-                    "browser_get_page_elements",
-                    "browser_wait_for",
-                    "browser_wait_for_challenge",
-                    "browser_fill_fields",
-                    "browser_upload_file",
-                    "browser_click",
-                    "browser_press_keys",
-                    "browser_pointer",
-                    "browser_input_batch",
-                    "browser_game_probe",
-                    "browser_render_control",
-                    "browser_render_step",
-                    "browser_release_inputs",
-                    "browser_submit_form",
-                    "browser_screenshot",
-                    "browser_get_status",
-                    "browser_close",
-                    "browser_close_all",
-                } <= names
+                assert names == {"web_info", "web_action"}
                 schemas = {tool.name: tool.inputSchema for tool in listed.tools}
-                search_properties = schemas["search_web"]["properties"]
-                assert search_properties["challenge_mode"]["default"] == "fallback"
-                assert search_properties["challenge_mode"]["enum"] == ["fallback", "manual"]
-                assert search_properties["manual_timeout_seconds"]["default"] == 180.0
-                open_properties = schemas["browser_open_page"]["properties"]
-                assert open_properties["profile_mode"]["default"] == "temporary"
-                assert open_properties["profile_mode"]["enum"] == [
-                    "temporary",
-                    "persistent",
-                    "attach",
-                ]
-                assert "debugger_address" in open_properties
-                assert open_properties["headless"]["default"] is None
-                pointer_properties = schemas["browser_pointer"]["properties"]
-                assert pointer_properties["action"]["enum"] == [
-                    "click",
-                    "double_click",
-                    "move",
-                    "hover",
-                    "drag",
-                    "press",
-                    "release",
-                ]
-                assert pointer_properties["button"]["default"] == "left"
-                assert pointer_properties["coordinate_mode"]["default"] == "absolute"
-                assert pointer_properties["coordinate_mode"]["enum"] == [
-                    "absolute",
-                    "delta",
-                ]
-                key_properties = schemas["browser_press_keys"]["properties"]
-                assert key_properties["action"]["default"] == "tap"
-                assert key_properties["action"]["enum"] == ["tap", "hold", "release"]
-                batch_properties = schemas["browser_input_batch"]["properties"]
-                assert "key_actions" in batch_properties
-                assert "pointer_actions" in batch_properties
-                render_properties = schemas["browser_render_control"]["properties"]
-                assert render_properties["mode"]["enum"] == [
-                    "normal",
-                    "throttled",
-                    "step",
-                ]
-                assert render_properties["target_fps"]["default"] == 10.0
+                info_properties = schemas["web_info"]["properties"]
+                assert info_properties["topic"]["default"] == "capabilities"
+                assert "action_schema" in info_properties["topic"]["enum"]
+                assert schemas["web_action"]["required"] == ["actions"]
 
-                called = await session.call_tool(
-                    "get_search_engines_status", {"check_live": False}
+                capabilities = unpack(await session.call_tool("web_info", {}))
+                assert capabilities["public_tools"] == ["web_info", "web_action"]
+                assert capabilities["action_groups"]["game"] == [
+                    "input",
+                    "render",
+                    "step",
+                    "release_inputs",
+                ]
+                assert "action_types" not in capabilities
+
+                input_schema = unpack(
+                    await session.call_tool(
+                        "web_info",
+                        {"topic": "action_schema", "params": {"action": "input"}},
+                    )
                 )
-                assert called.isError is False
-                payload = called.structuredContent
-                if payload is None:
-                    payload = json.loads(called.content[0].text)
-                assert payload["default_engine"] == "duckduckgo"
-                assert "duckduckgo" in payload["configured"]
+                assert input_schema["action"] == "input"
+                assert input_schema["input_schema"]["properties"]["action"]["const"] == "input"
+                assert "key_actions" in input_schema["input_schema"]["properties"]
+                assert input_schema["notes"]["key_action"]["action"] == "tap|hold|release"
+
+                batch = unpack(
+                    await session.call_tool(
+                        "web_action",
+                        {
+                            "actions": [
+                                {
+                                    "action": "fetch_text",
+                                    "url": f"{local_site.base_url}/page",
+                                },
+                                {
+                                    "action": "fetch_links",
+                                    "url": f"{local_site.base_url}/page",
+                                },
+                            ]
+                        },
+                    )
+                )
+                assert batch["success"] is True
+                assert batch["completed_count"] == 2
+                assert "Local fixture" in batch["results"][0]["data"]
+                assert f"{local_site.base_url}/relative" in batch["results"][1]["data"]
 
     asyncio.run(exercise_server())

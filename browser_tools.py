@@ -46,6 +46,7 @@ class BrowserSession:
     render_mode: str = "normal"
     render_target_fps: float | None = None
     render_frame_selector: str | None = None
+    render_bootstrap_registered: bool = False
     lock: threading.RLock = field(default_factory=threading.RLock)
     last_used: float = field(default_factory=time.monotonic)
 
@@ -455,6 +456,7 @@ def open_page(
         with session.lock:
             _reset_session_runtime_state(session)
             _set_viewport(session.driver, width, height)
+            _register_render_bootstrap(session)
             session.driver.get(normalized)
             _wait_until_ready(session.driver, timeout_seconds)
         return {
@@ -1290,31 +1292,22 @@ def game_probe(
         }
 
 
-_RENDER_CONTROL_SCRIPT = r"""
-const mode = arguments[0];
-const targetFps = arguments[1];
+_RENDER_BOOTSTRAP_SCRIPT = r"""
+(() => {
 const stateKey = '__webSearchNeoRenderControl';
-let state = window[stateKey];
-if (mode === 'normal') {
-  if (state) {
-    state.restore();
-    delete window[stateKey];
-  }
-  return {mode: 'normal', target_fps: null, pending_callbacks: 0};
-}
-if (!state) {
-  state = {
-    mode,
-    targetFps,
-    interval: 1000 / targetFps,
+if (window[stateKey]) return;
+const state = {
+    mode: 'normal',
+    targetFps: null,
+    interval: 1000 / 60,
     lastFrame: performance.now(),
-    nextId: 1,
+    nextId: -1,
     pending: new Map(),
     timer: null,
     nativeRequest: window.requestAnimationFrame.bind(window),
     nativeCancel: window.cancelAnimationFrame.bind(window)
-  };
-  state.flush = timestamp => {
+};
+state.flush = timestamp => {
     state.lastFrame = timestamp;
     const batch = Array.from(state.pending.entries());
     state.pending.clear();
@@ -1323,47 +1316,67 @@ if (!state) {
     }
     state.schedule();
     return batch.length;
-  };
-  state.schedule = () => {
+};
+state.schedule = () => {
     if (state.mode !== 'throttled' || state.timer !== null || !state.pending.size) return;
     const delay = Math.max(0, state.interval - (performance.now() - state.lastFrame));
     state.timer = setTimeout(() => {
       state.timer = null;
       state.flush(performance.now());
     }, delay);
-  };
-  state.request = callback => {
-    const id = state.nextId++;
+};
+state.request = callback => {
+    if (state.mode === 'normal') return state.nativeRequest(callback);
+    const id = state.nextId--;
     state.pending.set(id, callback);
     state.schedule();
     return id;
-  };
-  state.cancel = id => {
+};
+state.cancel = id => {
     if (!state.pending.delete(id)) state.nativeCancel(id);
-  };
-  state.restore = () => {
+};
+state.setMode = (mode, targetFps) => {
     if (state.timer !== null) clearTimeout(state.timer);
-    const callbacks = Array.from(state.pending.values());
-    state.pending.clear();
-    window.requestAnimationFrame = state.nativeRequest;
-    window.cancelAnimationFrame = state.nativeCancel;
-    for (const callback of callbacks) state.nativeRequest(callback);
-  };
-  window[stateKey] = state;
-  window.requestAnimationFrame = state.request;
-  window.cancelAnimationFrame = state.cancel;
-} else {
-  if (state.timer !== null) {
-    clearTimeout(state.timer);
     state.timer = null;
-  }
-  state.mode = mode;
-  state.targetFps = targetFps;
-  state.interval = 1000 / targetFps;
-  state.schedule();
+    state.mode = mode;
+    state.targetFps = mode === 'throttled' ? targetFps : null;
+    state.interval = 1000 / targetFps;
+    if (mode === 'normal') {
+      const callbacks = Array.from(state.pending.values());
+      state.pending.clear();
+      for (const callback of callbacks) state.nativeRequest(callback);
+    } else {
+      state.schedule();
+    }
+};
+window[stateKey] = state;
+window.requestAnimationFrame = state.request;
+window.cancelAnimationFrame = state.cancel;
+})();
+"""
+
+
+_RENDER_CONTROL_SCRIPT = r"""
+const mode = arguments[0];
+const targetFps = arguments[1];
+const state = window.__webSearchNeoRenderControl;
+if (!state) {
+  return {error: 'Render bootstrap is unavailable in this document'};
 }
+state.setMode(mode, targetFps);
 return {mode: state.mode, target_fps: state.targetFps, pending_callbacks: state.pending.size};
 """
+
+
+def _register_render_bootstrap(session: BrowserSession) -> None:
+    """Install the frame gate before any script in future documents and frames."""
+    if session.render_bootstrap_registered:
+        return
+    session.driver.execute_cdp_cmd(
+        "Page.addScriptToEvaluateOnNewDocument",
+        {"source": _RENDER_BOOTSTRAP_SCRIPT},
+    )
+    session.render_bootstrap_registered = True
 
 
 _RENDER_STEP_SCRIPT = r"""
@@ -1426,9 +1439,12 @@ def set_render_control(
                 driver.switch_to.default_content()
         _select_frame(driver, selected_frame)
         try:
+            driver.execute_script(_RENDER_BOOTSTRAP_SCRIPT)
             state = driver.execute_script(_RENDER_CONTROL_SCRIPT, selected_mode, fps)
         finally:
             driver.switch_to.default_content()
+        if state.get("error"):
+            raise RuntimeError(state["error"])
         session.render_mode = selected_mode
         session.render_target_fps = fps if selected_mode == "throttled" else None
         session.render_frame_selector = selected_frame if selected_mode != "normal" else None
