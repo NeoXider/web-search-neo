@@ -330,7 +330,7 @@ async def browser_open_page(
     profile_id: str | None = None,
     debugger_address: str | None = None,
 ) -> dict[str, Any]:
-    """Open Chrome; automatic mode is headless for owned profiles and visible for attach."""
+    """Open visible Chrome by default; pass headless=true for background operation."""
     return await asyncio.to_thread(
         browser_tools.open_page,
         url,
@@ -352,9 +352,9 @@ async def browser_open_pages(
     width: int = 1440,
     height: int = 900,
     timeout_seconds: float = 20.0,
-    headless: bool = True,
+    headless: bool | None = None,
 ) -> dict[str, Any]:
-    """Open up to four pages concurrently, each in an independent browser session."""
+    """Open up to four visible pages concurrently; pass headless=true to hide them."""
     if not urls or len(urls) > browser_tools.MAX_SESSIONS:
         raise ValueError(f"Provide 1-{browser_tools.MAX_SESSIONS} URLs")
     ids = session_ids or [f"page-{index + 1}" for index in range(len(urls))]

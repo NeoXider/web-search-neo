@@ -16,6 +16,7 @@ def test_compact_web_action_runs_ordered_game_workflow(local_site):
                     "action": "open",
                     "url": f"{local_site.base_url}/game",
                     "session_id": "compact-game",
+                    "headless": True,
                 },
                 {
                     "action": "render",
@@ -126,6 +127,14 @@ def test_compact_web_info_discovers_one_action_at_a_time():
         "throttled",
         "step",
     ]
+
+    open_schema = asyncio.run(main.web_info("action_schema", {"action": "open"}))
+    assert open_schema["input_schema"]["properties"]["headless"]["default"] is None
+
+    open_many_schema = asyncio.run(
+        main.web_info("action_schema", {"action": "open_many"})
+    )
+    assert open_many_schema["input_schema"]["properties"]["headless"]["default"] is None
 
     with pytest.raises(ValueError, match="Unknown action schema"):
         asyncio.run(main.web_info("action_schema", {"action": "unknown"}))

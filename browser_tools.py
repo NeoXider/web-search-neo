@@ -115,12 +115,12 @@ def _profile_configuration(
 
 
 def _resolve_headless(profile_mode: str, headless: bool | None) -> bool:
-    """Resolve automatic window behavior without changing existing owned-browser defaults."""
+    """Default new browser sessions to a visible window unless explicitly hidden."""
     mode = profile_mode.strip().lower()
     if mode not in {"temporary", "persistent", "attach"}:
         raise ValueError("profile_mode must be 'temporary', 'persistent', or 'attach'")
     if headless is None:
-        return mode != "attach"
+        return False
     return bool(headless)
 
 
@@ -280,7 +280,7 @@ def _create_session(
         existing = _sessions.get(session_id)
         if existing is not None:
             if (
-                existing.headless != effective_headless
+                (headless is not None and existing.headless != effective_headless)
                 or existing.profile_mode != mode
                 or existing.profile_id != selected_profile
                 or existing.debugger_address != address

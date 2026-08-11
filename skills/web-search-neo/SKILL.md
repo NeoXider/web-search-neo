@@ -32,8 +32,8 @@ Use `fetch_text`, `fetch_links`, or `fetch_many` when exact URLs are already kno
 
 ## Choose a browser profile
 
-- Use `temporary` for clean disposable work. Set `headless=false` when the user should watch.
-- Use `persistent` with a stable `profile_id` for a separate MCP-owned profile that retains logins.
+- Use `temporary` for clean disposable work. It opens visibly by default; set `headless=true` only when background operation is explicitly wanted.
+- Use `persistent` with a stable `profile_id` for a separate MCP-owned profile that retains logins. It also opens visibly by default.
 - Use `attach` with `debugger_address="127.0.0.1:<port>"` for a dedicated Chrome launched with remote debugging. It defaults to visible and remains open after MCP detaches.
 
 Do not imply that an arbitrary normal Chrome window can be attached retroactively. Reuse one `session_id` for all operations on the same page and close owned sessions when finished.

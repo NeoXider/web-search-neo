@@ -20,6 +20,8 @@ import main
 
 
 def _open_or_skip(url: str, session_id: str, **kwargs):
+    # Keep the deterministic suite in the background while production defaults visible.
+    kwargs.setdefault("headless", True)
     try:
         return browser_tools.open_page(url, session_id=session_id, **kwargs)
     except WebDriverException as exc:
@@ -184,6 +186,7 @@ def test_async_bulk_open_creates_two_independent_named_sessions(local_site):
             session_ids=["bulk-one", "bulk-two"],
             width=700,
             height=500,
+            headless=True,
         )
     )
 
@@ -411,12 +414,14 @@ def test_attach_mode_reuses_managed_chrome_without_closing_it(local_site, tmp_pa
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
-def test_automatic_window_mode_defaults_attach_visible_and_owned_profiles_headless():
-    assert browser_tools._resolve_headless("temporary", None) is True
-    assert browser_tools._resolve_headless("persistent", None) is True
+def test_automatic_window_mode_defaults_every_profile_visible():
+    assert browser_tools._resolve_headless("temporary", None) is False
+    assert browser_tools._resolve_headless("persistent", None) is False
     assert browser_tools._resolve_headless("attach", None) is False
     assert browser_tools._resolve_headless("temporary", False) is False
     assert browser_tools._resolve_headless("persistent", False) is False
+    assert browser_tools._resolve_headless("temporary", True) is True
+    assert browser_tools._resolve_headless("persistent", True) is True
     assert browser_tools._resolve_headless("attach", True) is True
 
 

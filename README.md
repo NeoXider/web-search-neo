@@ -28,7 +28,7 @@ DuckDuckGo is the default route. Brave, Mojeek, Yahoo, Bing, and Startpage are a
 | --- | --- |
 | Free search | Uses public search routes through the maintained [DDGS](https://github.com/deedy5/ddgs) library; no paid search plan or API key. |
 | Resilient fallback | Provider health, cooldowns, bounded retries, caching, and an overall deadline prevent one challenged engine from stalling the agent. |
-| Visible automation | Run Chrome with `headless=false` and watch every navigation, field fill, upload, click, and submit. |
+| Visible automation | Chrome opens visibly by default, so you can watch every navigation, field fill, upload, click, and submit. |
 | Reusable authorization | Use a persistent MCP-owned profile or attach to a dedicated Chrome window where you are already signed in. |
 | Two-tool MCP surface | Models see only `web_info` and `web_action`; detailed action schemas are discovered only when needed. |
 | Concurrent work | Search, HTTP fetches, and independent browser sessions run outside the MCP event loop; up to four browser sessions can work in parallel. |
@@ -127,11 +127,11 @@ For a fresh visible session:
 
 The agent can inspect with `web_info(topic="page_elements", params={"session_id": "demo"})`, then send ordered `fill`, `upload`, `click`, and `submit` actions through `web_action` using the same `session_id`. Screenshots are returned by the `screenshot` info topic.
 
-`headless` is an automatic three-state option:
+`headless` is an explicit opt-out from the visible default:
 
-- omit it or send `null`: temporary/persistent sessions default to headless, while `attach` defaults to visible;
-- `headless=false`: open an owned temporary or persistent Chrome visibly;
-- `headless=true`: run an owned temporary or persistent Chrome without a visible window.
+- omit it, send `null`, or use `headless=false`: open new temporary and persistent sessions visibly;
+- `headless=true`: run a new temporary or persistent session without a visible window;
+- for `attach`, the launcher determines whether the already-running Chrome is visible or headless.
 
 ### Three Chrome profile modes
 

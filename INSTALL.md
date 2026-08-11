@@ -112,11 +112,11 @@ Some clients do not support a separate working-directory field. In that case kee
 
 ### Visible disposable browser
 
-Use `headless=false` with `profile_mode="temporary"`. A Chrome window opens and you can watch the agent. Cookies are discarded when the session closes.
+Use `profile_mode="temporary"`, which opens visibly by default. A Chrome window opens and you can watch the agent. Cookies are discarded when the session closes. Set `headless=true` only for background operation.
 
 ### Visible persistent browser
 
-Use `headless=false`, `profile_mode="persistent"`, and a stable `profile_id`. Log in once in that MCP-owned window; later sessions with the same profile ID reuse its cookies and local storage.
+Use `profile_mode="persistent"` and a stable `profile_id`. It opens visibly by default. Log in once in that MCP-owned window; later sessions with the same profile ID reuse its cookies and local storage.
 
 ```json
 {
@@ -162,7 +162,7 @@ Visible mode is the attach launcher default. To run the same managed profile wit
 powershell -ExecutionPolicy Bypass -File scripts\start_managed_chrome.ps1 -ProfileId automation -Port 9223 -WindowMode headless
 ```
 
-For MCP-owned `temporary` and `persistent` modes, set `headless=false` for a visible window or `headless=true` for background operation. If `headless` is omitted, owned profiles default to background operation and `attach` defaults to visible.
+All newly created MCP-owned `temporary` and `persistent` sessions are visible when `headless` is omitted. Set `headless=true` only for background operation. For `attach`, the launcher's `-WindowMode` controls the already-running Chrome; attach cannot change its visibility afterward.
 
 Chrome 136+ requires remote debugging to use a non-default data directory. You cannot safely retrofit attach mode onto an arbitrary normal Chrome window that was started without a DevTools port. The launcher handles both requirements with a separate durable profile.
 
