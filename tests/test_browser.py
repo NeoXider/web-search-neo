@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import struct
+import time
 
 import pytest
 from selenium.common.exceptions import WebDriverException
@@ -321,3 +322,320 @@ def test_profile_configuration_validates_attach_and_exclusive_profile(local_site
         "127.0.0.1:9222",
         "attach:127.0.0.1:9222",
     )
+
+
+def test_automatic_window_mode_defaults_attach_visible_and_owned_profiles_headless():
+    assert browser_tools._resolve_headless("temporary", None) is True
+    assert browser_tools._resolve_headless("persistent", None) is True
+    assert browser_tools._resolve_headless("attach", None) is False
+    assert browser_tools._resolve_headless("temporary", False) is False
+    assert browser_tools._resolve_headless("persistent", False) is False
+    assert browser_tools._resolve_headless("attach", True) is True
+
+
+def test_latest_cached_chromedriver_uses_highest_version(tmp_path, monkeypatch):
+    cache = tmp_path / "selenium"
+    executable = "chromedriver.exe" if browser_tools.os.name == "nt" else "chromedriver"
+    older = cache / "chromedriver" / "platform" / "150.0.1.1" / executable
+    newer = cache / "chromedriver" / "platform" / "151.0.2.3" / executable
+    older.parent.mkdir(parents=True)
+    newer.parent.mkdir(parents=True)
+    older.write_bytes(b"older")
+    newer.write_bytes(b"newer")
+    monkeypatch.setenv("SE_CACHE_PATH", str(cache))
+
+    assert browser_tools._latest_cached_chromedriver() == newer
+
+
+def test_canvas_game_probe_keyboard_pointer_and_drag(local_site):
+    opened = _open_or_skip(f"{local_site.base_url}/game", "canvas-game")
+    assert opened["headless"] is True
+    assert opened["window_mode"] == "headless"
+
+    probe = browser_tools.game_probe(
+        "canvas-game", sample_seconds=0.15, include_console=False
+    )
+    assert probe["success"] is True
+    assert probe["canvas_count"] == 1
+    assert probe["canvases"][0]["selector"] == "#game-canvas"
+    assert probe["canvases"][0]["context"] == "2d"
+    assert probe["animation"]["frames"] >= 1
+    assert probe["animation"]["fps"] > 0
+
+    rect = probe["canvases"][0]["rect"]
+    start_x = rect["x"] + 100
+    start_y = rect["y"] + 100
+    clicked = browser_tools.pointer_action(
+        "click", start_x, start_y, "canvas-game", wait_seconds=0
+    )
+    assert clicked["success"] is True
+    assert clicked["action"] == "click"
+
+    keys = browser_tools.press_keys(
+        ["SPACE"],
+        "canvas-game",
+        target_selector="#game-canvas",
+        hold_seconds=0.01,
+        repeat=2,
+        wait_seconds=0,
+    )
+    assert keys["success"] is True
+    assert keys["repeat"] == 2
+
+    dragged = browser_tools.pointer_action(
+        "drag",
+        start_x,
+        start_y,
+        "canvas-game",
+        end_x=start_x + 80,
+        end_y=start_y + 40,
+        duration_seconds=0.05,
+        wait_seconds=0,
+    )
+    assert dragged["success"] is True
+    assert dragged["action"] == "drag"
+
+    session = browser_tools._get_session("canvas-game")
+    events = session.driver.execute_script("return window.gameEvents")
+    event_types = [event["type"] for event in events]
+    assert event_types.count("pointerdown") >= 2
+    assert event_types.count("pointerup") >= 2
+    assert "pointermove" in event_types
+    assert sum(
+        event["type"] == "keydown" and event.get("code") == "Space"
+        for event in events
+    ) >= 2
+    assert sum(
+        event["type"] == "keyup" and event.get("code") == "Space"
+        for event in events
+    ) >= 2
+
+
+@pytest.mark.parametrize(
+    ("action", "kwargs", "message"),
+    [
+        ("unknown", {}, "action must be"),
+        ("click", {"button": "extra"}, "button must be"),
+        ("drag", {}, "drag requires"),
+    ],
+)
+def test_game_pointer_rejects_invalid_actions(local_site, action, kwargs, message):
+    _open_or_skip(f"{local_site.base_url}/game", "invalid-pointer")
+    with pytest.raises(ValueError, match=message):
+        browser_tools.pointer_action(
+            action, 20, 20, "invalid-pointer", wait_seconds=0, **kwargs
+        )
+
+
+def test_game_keyboard_rejects_unknown_named_key(local_site):
+    _open_or_skip(f"{local_site.base_url}/game", "invalid-key")
+    with pytest.raises(ValueError, match="Unsupported key"):
+        browser_tools.press_keys(["NOT_A_REAL_KEY"], "invalid-key")
+
+
+def test_step_render_batches_multiple_held_keys_into_one_frame(local_site):
+    _open_or_skip(f"{local_site.base_url}/game", "step-input")
+    session = browser_tools._get_session("step-input")
+
+    controlled = browser_tools.set_render_control("step", "step-input")
+    assert controlled["mode"] == "step"
+    assert controlled["input_advances_frame"] is True
+    time.sleep(0.1)
+    before = session.driver.execute_script("return window.frameCount")
+    time.sleep(0.15)
+    assert session.driver.execute_script("return window.frameCount") == before
+
+    held = browser_tools.press_keys(
+        ["W", "SHIFT", "SPACE"],
+        "step-input",
+        target_selector="#game-canvas",
+        wait_seconds=0,
+        action="hold",
+    )
+    assert held["held_keys"] == ["SHIFT", "SPACE", "W"]
+    after_hold = session.driver.execute_script("return window.frameCount")
+    assert after_hold == before + 1
+
+    events = session.driver.execute_script("return window.gameEvents")
+    key_down = [
+        event for event in events if event["type"] == "keydown" and event["code"] in {"KeyW", "ShiftLeft", "Space"}
+    ]
+    assert {event["code"] for event in key_down} == {"KeyW", "ShiftLeft", "Space"}
+    assert len({event["frame"] for event in key_down}) == 1
+    assert not any(
+        event["type"] == "keyup"
+        and event["code"] in {"KeyW", "ShiftLeft", "Space"}
+        for event in events
+    )
+
+    released = browser_tools.press_keys(
+        ["W", "SHIFT", "SPACE"],
+        "step-input",
+        wait_seconds=0,
+        action="release",
+    )
+    assert released["held_keys"] == []
+    assert session.driver.execute_script("return window.frameCount") == after_hold + 1
+    key_up = [
+        event
+        for event in session.driver.execute_script("return window.gameEvents")
+        if event["type"] == "keyup" and event["code"] in {"KeyW", "ShiftLeft", "Space"}
+    ]
+    assert {event["code"] for event in key_up} == {"KeyW", "ShiftLeft", "Space"}
+    assert len({event["frame"] for event in key_up}) == 1
+
+    stepped = browser_tools.render_step(3, "step-input")
+    assert stepped["frames"] == 3
+    assert session.driver.execute_script("return window.frameCount") == after_hold + 4
+
+    normal = browser_tools.set_render_control("normal", "step-input")
+    assert normal["mode"] == "normal"
+
+
+def test_mixed_key_and_pointer_batch_is_atomic_in_step_mode(local_site):
+    _open_or_skip(f"{local_site.base_url}/game", "mixed-input")
+    session = browser_tools._get_session("mixed-input")
+    browser_tools.set_render_control("step", "mixed-input")
+    browser_tools.press_keys(
+        ["S"],
+        "mixed-input",
+        target_selector="#game-canvas",
+        action="hold",
+        wait_seconds=0,
+    )
+    before = session.driver.execute_script(
+        "window.gameEvents = []; return window.frameCount;"
+    )
+
+    result = browser_tools.input_batch(
+        key_actions=[
+            {"key": "W", "action": "hold"},
+            {"key": "S", "action": "release"},
+            {"key": "SPACE", "action": "tap"},
+            {"key": "E", "action": "tap"},
+        ],
+        pointer_actions=[
+            {"action": "hover", "x": 200, "y": 150},
+            {
+                "action": "move",
+                "x": 10,
+                "y": -5,
+                "coordinate_mode": "delta",
+            },
+        ],
+        session_id="mixed-input",
+        wait_seconds=0,
+    )
+
+    assert result["frame_advanced"] is True
+    assert result["frames_advanced"] == 1
+    assert result["held_keys"] == ["W"]
+    assert result["pointer_actions"][0]["action"] == "hover"
+    assert result["pointer_actions"][0]["x"] == 200
+    assert result["pointer_actions"][0]["y"] == 150
+    assert result["pointer_actions"][1]["coordinate_mode"] == "delta"
+    assert result["pointer_actions"][1]["x"] == 210
+    assert result["pointer_actions"][1]["y"] == 145
+    assert session.driver.execute_script("return window.frameCount") == before + 1
+
+    events = session.driver.execute_script("return window.gameEvents")
+    relevant = [
+        event
+        for event in events
+        if event["type"] in {"keydown", "keyup", "pointermove"}
+    ]
+    assert relevant
+    assert {event["frame"] for event in relevant} == {before}
+    keyboard = {(event["type"], event["code"]) for event in relevant if "code" in event}
+    assert {
+        ("keydown", "KeyW"),
+        ("keyup", "KeyS"),
+        ("keydown", "Space"),
+        ("keyup", "Space"),
+        ("keydown", "KeyE"),
+        ("keyup", "KeyE"),
+    } <= keyboard
+
+
+def test_continuous_render_throttle_and_normal_restore(local_site):
+    _open_or_skip(f"{local_site.base_url}/game", "throttled-game")
+    session = browser_tools._get_session("throttled-game")
+    controlled = browser_tools.set_render_control(
+        "throttled", "throttled-game", target_fps=10
+    )
+    assert controlled["mode"] == "throttled"
+    assert controlled["target_fps"] == 10
+
+    start = session.driver.execute_script("return window.frameCount")
+    time.sleep(0.65)
+    throttled_delta = session.driver.execute_script("return window.frameCount") - start
+    assert 3 <= throttled_delta <= 10
+
+    browser_tools.set_render_control("normal", "throttled-game")
+    restored_start = session.driver.execute_script("return window.frameCount")
+    time.sleep(0.25)
+    restored_delta = session.driver.execute_script("return window.frameCount") - restored_start
+    assert restored_delta >= 5
+
+
+def test_pointer_button_can_be_held_moved_and_released(local_site):
+    _open_or_skip(f"{local_site.base_url}/game", "held-pointer")
+    browser_tools.pointer_action(
+        "press", 100, 100, "held-pointer", wait_seconds=0
+    )
+    assert browser_tools._get_session("held-pointer").held_buttons == {"left"}
+    moved = browser_tools.pointer_action(
+        "move", 180, 140, "held-pointer", wait_seconds=0
+    )
+    assert moved["held_buttons"] == ["left"]
+    released = browser_tools.pointer_action(
+        "release", 180, 140, "held-pointer", wait_seconds=0
+    )
+    assert released["held_buttons"] == []
+
+
+def test_release_inputs_clears_every_held_key_and_button(local_site):
+    _open_or_skip(f"{local_site.base_url}/game", "release-all")
+    browser_tools.press_keys(
+        ["A", "SHIFT"],
+        "release-all",
+        target_selector="#game-canvas",
+        action="hold",
+        wait_seconds=0,
+    )
+    browser_tools.pointer_action(
+        "press", 120, 120, "release-all", wait_seconds=0
+    )
+    result = browser_tools.release_inputs("release-all")
+    assert result["held_keys"] == []
+    assert result["held_buttons"] == []
+    session = browser_tools._get_session("release-all")
+    assert session.held_keys == {}
+    assert session.held_buttons == set()
+
+
+def test_navigation_resets_render_gate_and_held_inputs(local_site):
+    _open_or_skip(f"{local_site.base_url}/game", "navigation-reset")
+    browser_tools.set_render_control("step", "navigation-reset")
+    browser_tools.press_keys(
+        ["W", "SHIFT"],
+        "navigation-reset",
+        target_selector="#game-canvas",
+        action="hold",
+        wait_seconds=0,
+    )
+    browser_tools.pointer_action(
+        "press", 120, 120, "navigation-reset", wait_seconds=0
+    )
+
+    result = browser_tools.open_page(
+        f"{local_site.base_url}/form?session=navigation-reset",
+        "navigation-reset",
+    )
+
+    session = browser_tools._get_session("navigation-reset")
+    assert result["title"] == "Form navigation-reset"
+    assert session.render_mode == "normal"
+    assert session.render_frame_selector is None
+    assert session.held_keys == {}
+    assert session.held_buttons == set()

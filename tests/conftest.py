@@ -98,6 +98,35 @@ def local_site() -> LocalSite:
                     </form></body></html>"""
                 )
                 return
+            if parsed.path == "/game":
+                self._send_html(
+                    """<!doctype html>
+                    <html><head><title>Canvas game fixture</title></head><body>
+                    <canvas id="game-canvas" tabindex="0" width="640" height="360"
+                      style="display:block;width:640px;height:360px"></canvas>
+                    <script>
+                    const canvas = document.getElementById('game-canvas');
+                    const context = canvas.getContext('2d');
+                    context.fillStyle = '#0b1739'; context.fillRect(0, 0, 640, 360);
+                    window.gameEvents = [];
+                    for (const name of ['pointerdown', 'pointerup', 'pointermove']) {
+                      canvas.addEventListener(name, event => window.gameEvents.push({
+                        type: name, x: Math.round(event.offsetX), y: Math.round(event.offsetY),
+                        frame: window.frameCount
+                      }));
+                    }
+                    for (const name of ['keydown', 'keyup']) {
+                      document.addEventListener(name, event => window.gameEvents.push({
+                        type: name, key: event.key, code: event.code,
+                        frame: window.frameCount
+                      }), true);
+                    }
+                    window.frameCount = 0;
+                    function animate() { window.frameCount += 1; requestAnimationFrame(animate); }
+                    requestAnimationFrame(animate);
+                    </script></body></html>"""
+                )
+                return
             if parsed.path == "/slow":
                 delay = min(float(parse_qs(parsed.query).get("delay", ["0"])[0]), 1.0)
                 time.sleep(max(delay, 0.0))

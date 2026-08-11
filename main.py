@@ -36,6 +36,8 @@ mcp = FastMCP(
         "Free web search and browser automation without API keys. DuckDuckGo is the "
         "default search engine. Open a browser page before inspecting, filling, clicking, "
         "submitting, or capturing it; reuse the same session_id for subsequent actions. "
+        "For canvas/WebGL games use browser_game_probe, browser_pointer, "
+        "browser_press_keys, browser_input_batch, and browser_render_control. "
         "Search challenges fall back immediately unless challenge_mode is manual. Browser "
         "profiles are temporary by default; persistent and attach modes preserve explicit "
         "user-managed authorization without sending passwords through the model."
@@ -305,12 +307,12 @@ async def browser_open_page(
     width: int = 1440,
     height: int = 900,
     timeout_seconds: float = 20.0,
-    headless: bool = True,
+    headless: bool | None = None,
     profile_mode: Literal["temporary", "persistent", "attach"] = "temporary",
     profile_id: str | None = None,
     debugger_address: str | None = None,
 ) -> dict[str, Any]:
-    """Open a temporary, persistent, or locally attached Chrome session."""
+    """Open Chrome; automatic mode is headless for owned profiles and visible for attach."""
     return await asyncio.to_thread(
         browser_tools.open_page,
         url,
@@ -450,6 +452,134 @@ async def browser_click(
 ) -> dict[str, Any]:
     """Click one rendered page element using a CSS selector."""
     return await asyncio.to_thread(browser_tools.click, selector, session_id, wait_seconds)
+
+
+@mcp.tool()
+async def browser_press_keys(
+    keys: list[str],
+    session_id: str = "default",
+    target_selector: str | None = None,
+    frame_selector: str | None = None,
+    hold_seconds: float = 0.05,
+    repeat: int = 1,
+    wait_seconds: float = 0.2,
+    action: Literal["tap", "hold", "release"] = "tap",
+) -> dict[str, Any]:
+    """Tap, hold, or release one or more keys as a single input batch."""
+    return await asyncio.to_thread(
+        browser_tools.press_keys,
+        keys,
+        session_id,
+        target_selector,
+        frame_selector,
+        hold_seconds,
+        repeat,
+        wait_seconds,
+        action,
+    )
+
+
+@mcp.tool()
+async def browser_pointer(
+    action: Literal[
+        "click", "double_click", "move", "hover", "drag", "press", "release"
+    ],
+    x: float,
+    y: float,
+    session_id: str = "default",
+    end_x: float | None = None,
+    end_y: float | None = None,
+    button: Literal["left", "right", "middle"] = "left",
+    duration_seconds: float = 0.3,
+    frame_selector: str | None = None,
+    wait_seconds: float = 0.2,
+    coordinate_mode: Literal["absolute", "delta"] = "absolute",
+) -> dict[str, Any]:
+    """Click, hover, drag, press, or release using absolute or delta coordinates."""
+    return await asyncio.to_thread(
+        browser_tools.pointer_action,
+        action,
+        x,
+        y,
+        session_id,
+        end_x,
+        end_y,
+        button,
+        duration_seconds,
+        frame_selector,
+        wait_seconds,
+        coordinate_mode,
+    )
+
+
+@mcp.tool()
+async def browser_input_batch(
+    key_actions: list[dict[str, str]] | None = None,
+    pointer_actions: list[dict[str, Any]] | None = None,
+    session_id: str = "default",
+    target_selector: str | None = None,
+    frame_selector: str | None = None,
+    wait_seconds: float = 0.2,
+) -> dict[str, Any]:
+    """Mix per-key and pointer actions, then advance exactly one step-mode frame."""
+    return await asyncio.to_thread(
+        browser_tools.input_batch,
+        key_actions,
+        pointer_actions,
+        session_id,
+        target_selector,
+        frame_selector,
+        wait_seconds,
+    )
+
+
+@mcp.tool()
+async def browser_game_probe(
+    session_id: str = "default",
+    frame_selector: str | None = None,
+    sample_seconds: float = 1.0,
+    include_console: bool = True,
+) -> dict[str, Any]:
+    """Report canvas/WebGL readiness, sampled FPS, focus, frames, and console issues."""
+    return await asyncio.to_thread(
+        browser_tools.game_probe,
+        session_id,
+        frame_selector,
+        sample_seconds,
+        include_console,
+    )
+
+
+@mcp.tool()
+async def browser_render_control(
+    mode: Literal["normal", "throttled", "step"],
+    session_id: str = "default",
+    target_fps: float = 10.0,
+    frame_selector: str | None = None,
+) -> dict[str, Any]:
+    """Run normally, throttle requestAnimationFrame, or advance frames only on command/input."""
+    return await asyncio.to_thread(
+        browser_tools.set_render_control,
+        mode,
+        session_id,
+        target_fps,
+        frame_selector,
+    )
+
+
+@mcp.tool()
+async def browser_render_step(
+    frames: int = 1,
+    session_id: str = "default",
+) -> dict[str, Any]:
+    """Advance an active step-mode game by an exact bounded number of animation frames."""
+    return await asyncio.to_thread(browser_tools.render_step, frames, session_id)
+
+
+@mcp.tool()
+async def browser_release_inputs(session_id: str = "default") -> dict[str, Any]:
+    """Release every keyboard key and mouse button held by a browser session."""
+    return await asyncio.to_thread(browser_tools.release_inputs, session_id)
 
 
 @mcp.tool()

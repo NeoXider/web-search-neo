@@ -38,6 +38,13 @@ def test_stdio_server_lists_tools_and_calls_status_tool():
                     "browser_fill_fields",
                     "browser_upload_file",
                     "browser_click",
+                    "browser_press_keys",
+                    "browser_pointer",
+                    "browser_input_batch",
+                    "browser_game_probe",
+                    "browser_render_control",
+                    "browser_render_step",
+                    "browser_release_inputs",
                     "browser_submit_form",
                     "browser_screenshot",
                     "browser_get_status",
@@ -57,6 +64,36 @@ def test_stdio_server_lists_tools_and_calls_status_tool():
                     "attach",
                 ]
                 assert "debugger_address" in open_properties
+                assert open_properties["headless"]["default"] is None
+                pointer_properties = schemas["browser_pointer"]["properties"]
+                assert pointer_properties["action"]["enum"] == [
+                    "click",
+                    "double_click",
+                    "move",
+                    "hover",
+                    "drag",
+                    "press",
+                    "release",
+                ]
+                assert pointer_properties["button"]["default"] == "left"
+                assert pointer_properties["coordinate_mode"]["default"] == "absolute"
+                assert pointer_properties["coordinate_mode"]["enum"] == [
+                    "absolute",
+                    "delta",
+                ]
+                key_properties = schemas["browser_press_keys"]["properties"]
+                assert key_properties["action"]["default"] == "tap"
+                assert key_properties["action"]["enum"] == ["tap", "hold", "release"]
+                batch_properties = schemas["browser_input_batch"]["properties"]
+                assert "key_actions" in batch_properties
+                assert "pointer_actions" in batch_properties
+                render_properties = schemas["browser_render_control"]["properties"]
+                assert render_properties["mode"]["enum"] == [
+                    "normal",
+                    "throttled",
+                    "step",
+                ]
+                assert render_properties["target_fps"]["default"] == 10.0
 
                 called = await session.call_tool(
                     "get_search_engines_status", {"check_live": False}

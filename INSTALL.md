@@ -121,7 +121,7 @@ browser_open_page(
 On Windows, start the included managed Chrome launcher:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\start_managed_chrome.ps1 -ProfileId authorized -Port 9222
+powershell -ExecutionPolicy Bypass -File scripts\start_managed_chrome.ps1 -ProfileId authorized -Port 9222 -WindowMode visible
 ```
 
 Log in manually, leave that Chrome window open, and attach:
@@ -137,6 +137,14 @@ browser_open_page(
 ```
 
 MCP detaches without closing the managed Chrome. The next attach reuses the same browser state.
+
+Visible mode is the attach launcher default. To run the same managed profile without a visible window, use a different free port and `-WindowMode headless`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\start_managed_chrome.ps1 -ProfileId automation -Port 9223 -WindowMode headless
+```
+
+For MCP-owned `temporary` and `persistent` modes, set `headless=false` for a visible window or `headless=true` for background operation. If `headless` is omitted, owned profiles default to background operation and `attach` defaults to visible.
 
 Chrome 136+ requires remote debugging to use a non-default data directory. You cannot safely retrofit attach mode onto an arbitrary normal Chrome window that was started without a DevTools port. The launcher handles both requirements with a separate durable profile.
 
@@ -185,6 +193,14 @@ Confirm Google Chrome is installed and can launch normally. The first Selenium M
 ### Attach mode cannot connect
 
 Open `http://127.0.0.1:9222/json/version` locally. If it is unavailable, restart the managed Chrome launcher and make sure another process is not using the port.
+
+### A canvas/WebGL game loads but cannot be controlled
+
+Run `browser_game_probe` first. If it reports a game iframe, reuse its selector as `frame_selector` in `browser_pointer` and `browser_press_keys`. Use `browser_screenshot` after input to verify the visible state change.
+
+To slow a typical canvas/WebGL loop continuously, call `browser_render_control(mode="throttled", target_fps=10)`. To inspect exact input states frame by frame, use `mode="step"`; each pointer or keyboard batch advances one frame, and `browser_render_step(frames=N)` advances explicitly. Always restore `mode="normal"` when finished. Closing the MCP session also releases held input and restores normal rendering.
+
+Use `browser_input_batch` when different inputs must land in the same step-mode frame: each key entry has its own `tap`, `hold`, or `release` action, while pointer entries support `hover`, `move`, button actions, absolute coordinates, or `coordinate_mode="delta"` relative movement. Use `browser_release_inputs` as an emergency release for every held key and mouse button.
 
 ### Search provider is challenged
 
