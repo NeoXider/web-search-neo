@@ -23,6 +23,7 @@ SEARCH_CACHE_TTL_SECONDS = 120
 PROVIDER_COOLDOWN_SECONDS = 180
 CHALLENGE_COOLDOWN_SECONDS = 600
 MIN_PROVIDER_INTERVAL_SECONDS = 0.75
+MAX_PROVIDER_ATTEMPT_SECONDS = 4.0
 
 SearchResult = dict[str, str]
 
@@ -352,7 +353,16 @@ def search_web(
     errors: dict[str, dict] = {}
     recoveries: list[dict] = []
     started = time.perf_counter()
-    for candidate in candidates:
+    deadline = time.monotonic() + timeout
+    for attempt_index, candidate in enumerate(candidates):
+        budget = deadline - time.monotonic()
+        if attempt_index > 0 and budget < 1.0:
+            errors["overall_deadline"] = {
+                "kind": "timeout",
+                "message": f"Overall search deadline of {timeout:g} seconds was reached",
+                "cooldown_seconds": 0,
+            }
+            break
         remaining = _cooldown_remaining(candidate)
         if remaining:
             state = _provider_state.get(candidate, {})
@@ -365,7 +375,8 @@ def search_web(
                 recoveries.append(_recovery(candidate, query))
             continue
         try:
-            results = _call_provider(candidate, query, num, timeout)
+            attempt_timeout = max(1.0, min(MAX_PROVIDER_ATTEMPT_SECONDS, budget))
+            results = _call_provider(candidate, query, num, attempt_timeout)
             response = {
                 "success": True,
                 "query": query,

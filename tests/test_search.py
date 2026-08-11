@@ -96,7 +96,38 @@ def test_search_defaults_to_duckduckgo_and_falls_back(monkeypatch):
     assert response["results"] == RESULT
     assert response["errors"]["duckduckgo"]["kind"] == "challenge"
     assert response["challenge_recoveries"][0]["suggested_arguments"]["headless"] is False
-    assert calls == [("duckduckgo", "unity jobs", 20, 10.0), ("brave", "unity jobs", 20, 10.0)]
+    assert calls == [("duckduckgo", "unity jobs", 20, 4.0), ("brave", "unity jobs", 20, 4.0)]
+
+
+def test_search_uses_one_overall_deadline_for_fallback(monkeypatch):
+    calls = []
+
+    def slow_failure(_query, _num, timeout):
+        calls.append(("slow", timeout))
+        msp_search.time.sleep(1.05)
+        raise msp_search.SearchProviderError("timed out", "timeout")
+
+    def should_not_run(_query, _num, timeout):
+        calls.append(("fallback", timeout))
+        return RESULT
+
+    monkeypatch.setattr(msp_search, "ENGINE_ORDER", ["duckduckgo", "brave"])
+    monkeypatch.setitem(
+        msp_search.SEARCH_PROVIDERS,
+        "duckduckgo",
+        _provider("duckduckgo", slow_failure),
+    )
+    monkeypatch.setitem(
+        msp_search.SEARCH_PROVIDERS,
+        "brave",
+        _provider("brave", should_not_run),
+    )
+
+    response = msp_search.search_web("query", timeout_seconds=1.0)
+
+    assert calls == [("slow", pytest.approx(1.0, abs=0.05))]
+    assert response["success"] is False
+    assert response["errors"]["overall_deadline"]["kind"] == "timeout"
 
 
 def test_challenged_provider_is_skipped_during_cooldown(monkeypatch):

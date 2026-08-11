@@ -38,7 +38,7 @@ Use `python`, not an absolute interpreter path. `cwd` may be adapted to the clon
 ### Search and fetch
 
 - `get_search_engines_status(check_live=true, force_refresh=false)` — configured engines, live availability, latency, challenge/cooldown state. Live results are cached for five minutes.
-- `search_web(query, num=5, engine="duckduckgo", fallback=true, fresh=false)` — normalized results and structured per-provider errors. Repeated searches are cached for two minutes.
+- `search_web(query, num=5, engine="duckduckgo", fallback=true, fresh=false)` — normalized results and structured per-provider errors. Its timeout is one overall fallback deadline, with each provider attempt capped at four seconds. Repeated searches are cached for two minutes.
 - `search_duckduckgo(...)`, `search_bing(...)` — direct compatibility tools.
 - `fetch_url_text(...)`, `fetch_page_links(...)` — bounded HTTP fetch and absolute links.
 - `fetch_urls_text(urls)` — up to 16 URLs concurrently.
