@@ -28,11 +28,29 @@ def fetch_url_text(url: str) -> str:
     """Download the text from a URL."""
     log.info(f"fetch_url_text() started for {url}")
     try:
-        resp = requests.get(url, timeout=10)
+        resp = requests.get(url, timeout=60)
         resp.raise_for_status()
+    except requests.exceptions.Timeout:
+        msg = "TIMEOUT: запрос занял больше 60 секунд. Попробуйте другой запрос."
+        log.warning(f"fetch_url_text() timeout for {url}")
+        return msg
     except Exception as exc:
-        log.exception(f"HTTP error while fetching {url}: {exc}")
-        raise
+        if url.startswith("https://"):
+            http_url = "http://" + url[len("https://"):]
+            log.warning(f"HTTPS failed, retrying over HTTP: {http_url}")
+            try:
+                resp = requests.get(http_url, timeout=60)
+                resp.raise_for_status()
+            except requests.exceptions.Timeout:
+                msg = "TIMEOUT: запрос занял больше 60 секунд. Попробуйте другой запрос."
+                log.warning(f"fetch_url_text() timeout for {http_url}")
+                return msg
+            except Exception as exc_http:
+                log.exception(f"HTTP error while fetching {http_url}: {exc_http}")
+                raise
+        else:
+            log.exception(f"HTTP error while fetching {url}: {exc}")
+            raise
     soup = BeautifulSoup(resp.text, "html.parser")
     text = soup.get_text(separator="\n", strip=True)
     log.info(f"fetch_url_text() finished for {url} (size={len(text)} chars)")
@@ -43,11 +61,29 @@ def fetch_page_links(url: str) -> List[str]:
     """Return a list of all URLs found on the given page."""
     log.info(f"fetch_page_links() started for {url}")
     try:
-        resp = requests.get(url, timeout=10)
+        resp = requests.get(url, timeout=60)
         resp.raise_for_status()
+    except requests.exceptions.Timeout:
+        msg = "TIMEOUT: запрос занял больше 60 секунд. Попробуйте другой запрос."
+        log.warning(f"fetch_page_links() timeout for {url}")
+        return [msg]
     except Exception as exc:
-        log.exception(f"HTTP error while fetching {url}: {exc}")
-        raise
+        if url.startswith("https://"):
+            http_url = "http://" + url[len("https://"):]
+            log.warning(f"HTTPS failed, retrying over HTTP: {http_url}")
+            try:
+                resp = requests.get(http_url, timeout=60)
+                resp.raise_for_status()
+            except requests.exceptions.Timeout:
+                msg = "TIMEOUT: запрос занял больше 60 секунд. Попробуйте другой запрос."
+                log.warning(f"fetch_page_links() timeout for {http_url}")
+                return [msg]
+            except Exception as exc_http:
+                log.exception(f"HTTP error while fetching {http_url}: {exc_http}")
+                raise
+        else:
+            log.exception(f"HTTP error while fetching {url}: {exc}")
+            raise
     soup = BeautifulSoup(resp.text, "html.parser")
     links = [str(a["href"]) for a in soup.find_all("a", href=True)]
     log.info(

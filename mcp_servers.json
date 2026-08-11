@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "web-search-neo": {
-      "command": "py",
+      "command": "C:\Users\User\AppData\Local\Programs\Python\Python310\python.exe",
       "args": [
         "C:/Git/PythonUrlFeatch/main.py"
       ],
