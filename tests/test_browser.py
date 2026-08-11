@@ -233,3 +233,91 @@ def test_wait_for_dynamic_element(local_site):
     assert result["selector"] == "#dynamic-button"
     assert result["state"] == "clickable"
     assert result["tag"] == "button"
+
+
+def test_wait_for_manual_challenge_resolution(local_site):
+    _open_or_skip(f"{local_site.base_url}/form", "challenge-resolved")
+    session = browser_tools._get_session("challenge-resolved")
+    session.driver.execute_script(
+        "document.body.insertAdjacentHTML('afterbegin', "
+        "'<div id=challenge>Verify you are human</div>');"
+        "setTimeout(() => document.getElementById('challenge').remove(), 150);"
+    )
+
+    result = browser_tools.wait_for_challenge_resolution(
+        "challenge-resolved", timeout_seconds=2, poll_interval_seconds=0.05
+    )
+
+    assert result["success"] is True
+    assert result["challenge_seen"] is True
+    assert result["resolved"] is True
+    assert result["timed_out"] is False
+    assert result["session_open"] is True
+
+
+def test_wait_for_manual_challenge_timeout_keeps_session_open(local_site):
+    _open_or_skip(f"{local_site.base_url}/form", "challenge-timeout")
+    session = browser_tools._get_session("challenge-timeout")
+    session.driver.execute_script(
+        "document.body.insertAdjacentHTML('afterbegin', "
+        "'<div id=challenge>Verify you are human</div>');"
+    )
+
+    result = browser_tools.wait_for_challenge_resolution(
+        "challenge-timeout", timeout_seconds=0.15, poll_interval_seconds=0.05
+    )
+
+    assert result["success"] is False
+    assert result["resolved"] is False
+    assert result["timed_out"] is True
+    assert result["session_open"] is True
+
+
+def test_persistent_profile_reuses_browser_storage(local_site, tmp_path, monkeypatch):
+    monkeypatch.setenv("WEB_SEARCH_NEO_PROFILE_ROOT", str(tmp_path / "profiles"))
+    first = _open_or_skip(
+        f"{local_site.base_url}/form",
+        "persistent-one",
+        profile_mode="persistent",
+        profile_id="hh",
+    )
+    assert first["profile_mode"] == "persistent"
+    assert first["profile_id"] == "hh"
+    session = browser_tools._get_session("persistent-one")
+    session.driver.execute_script("localStorage.setItem('authorization-proof', 'saved')")
+    browser_tools.close_session("persistent-one")
+
+    second = _open_or_skip(
+        f"{local_site.base_url}/form",
+        "persistent-two",
+        profile_mode="persistent",
+        profile_id="hh",
+    )
+    session = browser_tools._get_session("persistent-two")
+    assert second["profile_mode"] == "persistent"
+    assert session.driver.execute_script(
+        "return localStorage.getItem('authorization-proof')"
+    ) == "saved"
+    with pytest.raises(RuntimeError, match="already in use"):
+        browser_tools.open_page(
+            f"{local_site.base_url}/form",
+            "persistent-three",
+            profile_mode="persistent",
+            profile_id="hh",
+        )
+
+
+def test_profile_configuration_validates_attach_and_exclusive_profile(local_site):
+    with pytest.raises(ValueError, match="local address"):
+        browser_tools._profile_configuration(
+            "attach", "attach", None, "192.168.1.10:9222"
+        )
+    mode, profile_id, address, key = browser_tools._profile_configuration(
+        "attach", "attach", None, "127.0.0.1:9222"
+    )
+    assert (mode, profile_id, address, key) == (
+        "attach",
+        None,
+        "127.0.0.1:9222",
+        "attach:127.0.0.1:9222",
+    )

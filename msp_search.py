@@ -96,7 +96,18 @@ class DdgsSearchProvider(SearchProvider):
         except Exception as exc:
             message = str(exc)
             lower = message.lower()
-            if any(token in lower for token in ("captcha", "ratelimit", "rate limit", "202", "403", "429")):
+            if any(
+                token in lower
+                for token in (
+                    "captcha",
+                    "ratelimit",
+                    "rate limit",
+                    "no results found",
+                    "202",
+                    "403",
+                    "429",
+                )
+            ):
                 kind = "challenge"
             elif "timeout" in lower or "timed out" in lower:
                 kind = "timeout"

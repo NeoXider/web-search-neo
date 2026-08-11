@@ -4,7 +4,7 @@ import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
@@ -35,7 +35,10 @@ mcp = FastMCP(
     instructions=(
         "Free web search and browser automation without API keys. DuckDuckGo is the "
         "default search engine. Open a browser page before inspecting, filling, clicking, "
-        "submitting, or capturing it; reuse the same session_id for subsequent actions."
+        "submitting, or capturing it; reuse the same session_id for subsequent actions. "
+        "Search challenges fall back immediately unless challenge_mode is manual. Browser "
+        "profiles are temporary by default; persistent and attach modes preserve explicit "
+        "user-managed authorization without sending passwords through the model."
     ),
 )
 
@@ -144,11 +147,139 @@ async def search_web(
     fallback: bool = True,
     timeout_seconds: float = 10.0,
     fresh: bool = False,
+    challenge_mode: Literal["fallback", "manual"] = "fallback",
+    manual_timeout_seconds: float = 180.0,
 ) -> dict:
-    """Search the web without an API key; DuckDuckGo is the default engine."""
-    return await asyncio.to_thread(
-        msp_search.search_web, query, num, engine, fallback, timeout_seconds, fresh
+    """Search with immediate fallback, or allow a three-minute manual challenge handoff."""
+    if challenge_mode not in {"fallback", "manual"}:
+        raise ValueError("challenge_mode must be 'fallback' or 'manual'")
+    if challenge_mode == "fallback":
+        response = await asyncio.to_thread(
+            msp_search.search_web,
+            query,
+            num,
+            engine,
+            fallback,
+            timeout_seconds,
+            fresh,
+        )
+        return {**response, "challenge_mode": "fallback"}
+
+    manual_timeout = max(10.0, min(float(manual_timeout_seconds), 300.0))
+    initial = await asyncio.to_thread(
+        msp_search.search_web,
+        query,
+        num,
+        engine,
+        False,
+        timeout_seconds,
+        fresh,
     )
+    if initial.get("success"):
+        return {**initial, "challenge_mode": "manual", "manual_challenge": None}
+
+    recoveries = initial.get("challenge_recoveries") or []
+    if not recoveries:
+        if not fallback:
+            return {**initial, "challenge_mode": "manual", "manual_challenge": None}
+        response = await asyncio.to_thread(
+            msp_search.search_web,
+            query,
+            num,
+            engine,
+            True,
+            timeout_seconds,
+            True,
+        )
+        return {**response, "challenge_mode": "manual", "manual_challenge": None}
+
+    recovery = recoveries[0]
+    arguments = recovery["suggested_arguments"]
+    session_id = arguments["session_id"]
+    manual: dict[str, Any] = {
+        "provider": recovery["provider"],
+        "session_id": session_id,
+        "browser_url": recovery["browser_url"],
+        "timeout_seconds": manual_timeout,
+        "opened": False,
+        "resolved": False,
+        "timed_out": False,
+        "session_open": False,
+        "fallback_continued": False,
+    }
+    try:
+        await asyncio.to_thread(
+            browser_tools.open_page,
+            recovery["browser_url"],
+            session_id,
+            1440,
+            900,
+            min(timeout_seconds, 20.0),
+            False,
+        )
+        manual["opened"] = True
+        waited = await asyncio.to_thread(
+            browser_tools.wait_for_challenge_resolution,
+            session_id,
+            manual_timeout,
+        )
+        manual.update(
+            resolved=bool(waited["resolved"]),
+            timed_out=bool(waited["timed_out"]),
+            challenge_seen=bool(waited["challenge_seen"]),
+            waited_seconds=waited["waited_seconds"],
+            session_open=True,
+            url=waited["url"],
+            title=waited["title"],
+        )
+    except Exception as exc:
+        manual["error"] = f"{type(exc).__name__}: {exc}"
+
+    if manual["resolved"]:
+        return {
+            **initial,
+            "success": True,
+            "engine_used": recovery["provider"],
+            "challenge_mode": "manual",
+            "outcome": "manual_browser_ready",
+            "result_source": "browser_session",
+            "browser_session_ready": True,
+            "manual_challenge": manual,
+            "next_tools": [
+                "browser_get_page_elements",
+                "browser_screenshot",
+                "browser_click",
+            ],
+        }
+
+    if manual["opened"]:
+        closed = await asyncio.to_thread(browser_tools.close_session, session_id)
+        manual["session_open"] = False
+        manual["closed"] = bool(closed["closed"])
+    if not fallback:
+        return {
+            **initial,
+            "challenge_mode": "manual",
+            "outcome": "manual_challenge_failed",
+            "manual_challenge": manual,
+        }
+
+    response = await asyncio.to_thread(
+        msp_search.search_web,
+        query,
+        num,
+        engine,
+        True,
+        timeout_seconds,
+        True,
+    )
+    manual["fallback_continued"] = True
+    return {
+        **response,
+        "challenge_mode": "manual",
+        "outcome": "fallback_after_manual_timeout",
+        "manual_challenge": manual,
+    }
 
 
 @mcp.tool()
@@ -175,8 +306,11 @@ async def browser_open_page(
     height: int = 900,
     timeout_seconds: float = 20.0,
     headless: bool = True,
+    profile_mode: Literal["temporary", "persistent", "attach"] = "temporary",
+    profile_id: str | None = None,
+    debugger_address: str | None = None,
 ) -> dict[str, Any]:
-    """Open a rendered page; set headless=false for manual challenge handoff."""
+    """Open a temporary, persistent, or locally attached Chrome session."""
     return await asyncio.to_thread(
         browser_tools.open_page,
         url,
@@ -185,6 +319,9 @@ async def browser_open_page(
         height,
         timeout_seconds,
         headless,
+        profile_mode,
+        profile_id,
+        debugger_address,
     )
 
 
@@ -266,6 +403,19 @@ async def browser_wait_for(
         selector,
         session_id,
         state,
+        timeout_seconds,
+    )
+
+
+@mcp.tool()
+async def browser_wait_for_challenge(
+    session_id: str = "default",
+    timeout_seconds: float = 180.0,
+) -> dict[str, Any]:
+    """Wait up to three minutes for a human to clear a visible browser challenge."""
+    return await asyncio.to_thread(
+        browser_tools.wait_for_challenge_resolution,
+        session_id,
         timeout_seconds,
     )
 

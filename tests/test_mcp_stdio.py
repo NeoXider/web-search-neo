@@ -34,6 +34,7 @@ def test_stdio_server_lists_tools_and_calls_status_tool():
                     "browser_open_pages",
                     "browser_get_page_elements",
                     "browser_wait_for",
+                    "browser_wait_for_challenge",
                     "browser_fill_fields",
                     "browser_upload_file",
                     "browser_click",
@@ -43,6 +44,19 @@ def test_stdio_server_lists_tools_and_calls_status_tool():
                     "browser_close",
                     "browser_close_all",
                 } <= names
+                schemas = {tool.name: tool.inputSchema for tool in listed.tools}
+                search_properties = schemas["search_web"]["properties"]
+                assert search_properties["challenge_mode"]["default"] == "fallback"
+                assert search_properties["challenge_mode"]["enum"] == ["fallback", "manual"]
+                assert search_properties["manual_timeout_seconds"]["default"] == 180.0
+                open_properties = schemas["browser_open_page"]["properties"]
+                assert open_properties["profile_mode"]["default"] == "temporary"
+                assert open_properties["profile_mode"]["enum"] == [
+                    "temporary",
+                    "persistent",
+                    "attach",
+                ]
+                assert "debugger_address" in open_properties
 
                 called = await session.call_tool(
                     "get_search_engines_status", {"check_live": False}

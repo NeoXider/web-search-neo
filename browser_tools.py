@@ -30,6 +30,10 @@ _SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 class BrowserSession:
     driver: webdriver.Chrome
     headless: bool
+    profile_mode: str = "temporary"
+    profile_id: str | None = None
+    debugger_address: str | None = None
+    owns_browser: bool = True
     lock: threading.RLock = field(default_factory=threading.RLock)
     last_used: float = field(default_factory=time.monotonic)
 
@@ -38,6 +42,7 @@ _sessions: dict[str, BrowserSession] = {}
 _sessions_lock = threading.RLock()
 _sessions_condition = threading.Condition(_sessions_lock)
 _pending_sessions: set[str] = set()
+_pending_browser_keys: set[str] = set()
 _browser_available: bool | None = None
 _browser_error: str | None = None
 
@@ -54,42 +59,100 @@ def _bounded_size(width: int, height: int) -> tuple[int, int]:
     return max(320, min(int(width), 3840)), max(240, min(int(height), 2160))
 
 
+def _validate_debugger_address(debugger_address: str | None) -> str:
+    value = (debugger_address or os.getenv("WEB_SEARCH_NEO_DEBUGGER_ADDRESS") or "").strip()
+    match = re.fullmatch(r"(localhost|127\.0\.0\.1):([0-9]{1,5})", value)
+    if not match or not 1 <= int(match.group(2)) <= 65535:
+        raise ValueError(
+            "debugger_address must be a local address such as 127.0.0.1:9222"
+        )
+    return value
+
+
+def _persistent_profile_dir(profile_id: str) -> Path:
+    _validate_session_id(profile_id)
+    configured_root = os.getenv("WEB_SEARCH_NEO_PROFILE_ROOT")
+    if configured_root:
+        root = Path(configured_root).expanduser()
+    elif os.getenv("LOCALAPPDATA"):
+        root = Path(os.environ["LOCALAPPDATA"]) / "WebSearchNeo" / "profiles"
+    else:
+        root = Path.home() / ".web-search-neo" / "profiles"
+    path = (root / profile_id).resolve()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _profile_configuration(
+    session_id: str,
+    profile_mode: str,
+    profile_id: str | None,
+    debugger_address: str | None,
+) -> tuple[str, str | None, str | None, str | None]:
+    mode = profile_mode.strip().lower()
+    if mode not in {"temporary", "persistent", "attach"}:
+        raise ValueError("profile_mode must be 'temporary', 'persistent', or 'attach'")
+    if mode == "temporary":
+        return mode, None, None, None
+    if mode == "persistent":
+        selected_profile = _validate_session_id(profile_id or session_id)
+        return mode, selected_profile, None, f"persistent:{selected_profile}"
+    address = _validate_debugger_address(debugger_address)
+    return mode, None, address, f"attach:{address}"
+
+
 def create_driver(
-    width: int = 1440, height: int = 900, headless: bool = True
+    width: int = 1440,
+    height: int = 900,
+    headless: bool = True,
+    profile_mode: str = "temporary",
+    profile_id: str | None = None,
+    debugger_address: str | None = None,
 ) -> webdriver.Chrome:
     """Create Chrome through Selenium Manager, optionally visible for human handoff."""
     global _browser_available, _browser_error
     width, height = _bounded_size(width, height)
-    options = Options()
-    if headless:
-        options.add_argument("--headless=new")
-    options.add_argument(f"--window-size={width},{height}")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--no-first-run")
-    options.add_argument("--no-default-browser-check")
-    browser_user_agent = os.getenv("WEB_SEARCH_NEO_BROWSER_USER_AGENT")
-    if browser_user_agent:
-        options.add_argument(f"--user-agent={browser_user_agent}")
-    proxy = os.getenv("WEB_SEARCH_NEO_PROXY")
-    if proxy:
-        options.add_argument(f"--proxy-server={proxy}")
-    options.page_load_strategy = "eager"
-    options.add_experimental_option(
-        "prefs",
-        {
-            "download.prompt_for_download": False,
-            "profile.default_content_setting_values.notifications": 2,
-        },
+    mode, selected_profile, address, _browser_key = _profile_configuration(
+        "driver", profile_mode, profile_id, debugger_address
     )
+    options = Options()
+    browser_user_agent = None
+    if mode == "attach":
+        options.debugger_address = address
+    else:
+        if headless:
+            options.add_argument("--headless=new")
+        options.add_argument(f"--window-size={width},{height}")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-extensions")
+        options.add_argument("--no-first-run")
+        options.add_argument("--no-default-browser-check")
+        if mode == "persistent" and selected_profile:
+            options.add_argument(
+                f"--user-data-dir={_persistent_profile_dir(selected_profile)}"
+            )
+        browser_user_agent = os.getenv("WEB_SEARCH_NEO_BROWSER_USER_AGENT")
+        if browser_user_agent:
+            options.add_argument(f"--user-agent={browser_user_agent}")
+        proxy = os.getenv("WEB_SEARCH_NEO_PROXY")
+        if proxy:
+            options.add_argument(f"--proxy-server={proxy}")
+        options.page_load_strategy = "eager"
+        options.add_experimental_option(
+            "prefs",
+            {
+                "download.prompt_for_download": False,
+                "profile.default_content_setting_values.notifications": 2,
+            },
+        )
     try:
         driver = webdriver.Chrome(options=options)
     except Exception as exc:
         _browser_available = False
         _browser_error = f"{type(exc).__name__}: {exc}"
         raise
-    if headless and not browser_user_agent:
+    if mode != "attach" and headless and not browser_user_agent:
         try:
             native_user_agent = str(
                 driver.execute_script("return navigator.userAgent") or ""
@@ -110,29 +173,75 @@ def create_driver(
 
 
 def _create_session(
-    session_id: str, width: int, height: int, headless: bool
+    session_id: str,
+    width: int,
+    height: int,
+    headless: bool,
+    profile_mode: str = "temporary",
+    profile_id: str | None = None,
+    debugger_address: str | None = None,
 ) -> BrowserSession:
+    mode, selected_profile, address, browser_key = _profile_configuration(
+        session_id, profile_mode, profile_id, debugger_address
+    )
+    effective_headless = False if mode == "attach" else headless
     with _sessions_condition:
         while session_id in _pending_sessions:
             _sessions_condition.wait(timeout=30)
         existing = _sessions.get(session_id)
         if existing is not None:
-            if existing.headless != headless:
+            if (
+                existing.headless != effective_headless
+                or existing.profile_mode != mode
+                or existing.profile_id != selected_profile
+                or existing.debugger_address != address
+            ):
                 raise ValueError(
-                    "Session already exists with a different headless mode; close it first"
+                    "Session already exists with different browser/profile options; close it first"
                 )
             return existing
         if len(_sessions) + len(_pending_sessions) >= MAX_SESSIONS:
             raise RuntimeError(
                 f"Maximum of {MAX_SESSIONS} browser sessions reached; close one first"
             )
+        if browser_key:
+            active_keys = {
+                (
+                    f"persistent:{item.profile_id}"
+                    if item.profile_mode == "persistent"
+                    else f"attach:{item.debugger_address}"
+                )
+                for item in _sessions.values()
+                if item.profile_mode in {"persistent", "attach"}
+            }
+            if browser_key in active_keys or browser_key in _pending_browser_keys:
+                raise RuntimeError(
+                    "This persistent profile or debugger address is already in use"
+                )
+            _pending_browser_keys.add(browser_key)
         _pending_sessions.add(session_id)
     try:
-        driver = create_driver(width, height, headless)
-        session = BrowserSession(driver=driver, headless=headless)
+        driver = create_driver(
+            width,
+            height,
+            effective_headless,
+            mode,
+            selected_profile,
+            address,
+        )
+        session = BrowserSession(
+            driver=driver,
+            headless=effective_headless,
+            profile_mode=mode,
+            profile_id=selected_profile,
+            debugger_address=address,
+            owns_browser=mode != "attach",
+        )
     finally:
         with _sessions_condition:
             _pending_sessions.discard(session_id)
+            if browser_key:
+                _pending_browser_keys.discard(browser_key)
             _sessions_condition.notify_all()
     with _sessions_lock:
         _sessions[session_id] = session
@@ -185,8 +294,19 @@ def _challenge_status(driver: webdriver.Chrome) -> dict[str, Any]:
         body = ""
     markers = {
         "captcha": ("captcha", "smartcaptcha", "recaptcha"),
-        "human_verification": ("verify you are human", "checking your browser"),
-        "access_challenge": ("unusual traffic", "access denied", "are you a robot"),
+        "human_verification": (
+            "verify you are human",
+            "checking your browser",
+            "подтвердите, что вы человек",
+            "подтвердите, что вы не робот",
+            "я не робот",
+        ),
+        "access_challenge": (
+            "unusual traffic",
+            "access denied",
+            "are you a robot",
+            "необычный трафик",
+        ),
     }
     haystacks = (url, title, body)
     for challenge_type, phrases in markers.items():
@@ -226,18 +346,34 @@ def open_page(
     height: int = 900,
     timeout_seconds: float = 20.0,
     headless: bool = True,
+    profile_mode: str = "temporary",
+    profile_id: str | None = None,
+    debugger_address: str | None = None,
 ) -> dict[str, Any]:
     """Open a URL in a reusable rendered browser session."""
     normalized = validate_http_url(url)
     session_id = _validate_session_id(session_id)
     width, height = _bounded_size(width, height)
-    session = _create_session(session_id, width, height, headless)
+    session = _create_session(
+        session_id,
+        width,
+        height,
+        headless,
+        profile_mode,
+        profile_id,
+        debugger_address,
+    )
     try:
         with session.lock:
             _set_viewport(session.driver, width, height)
             session.driver.get(normalized)
             _wait_until_ready(session.driver, timeout_seconds)
-            return _page_summary(session.driver, session_id)
+        return {
+            **_page_summary(session.driver, session_id),
+            "profile_mode": session.profile_mode,
+            "profile_id": session.profile_id,
+            "debugger_address": session.debugger_address,
+        }
     except WebDriverException:
         close_session(session_id)
         raise
@@ -372,6 +508,45 @@ def wait_for_element(
             "state": state,
             "tag": element.tag_name,
         }
+
+
+def wait_for_challenge_resolution(
+    session_id: str = "default",
+    timeout_seconds: float = 180.0,
+    poll_interval_seconds: float = 0.5,
+) -> dict[str, Any]:
+    """Wait for a human to clear a visible challenge while keeping the session open."""
+    timeout = max(0.1, min(float(timeout_seconds), 300.0))
+    poll_interval = max(0.05, min(float(poll_interval_seconds), 2.0))
+    session = _get_session(session_id)
+    started = time.monotonic()
+    challenge_seen = False
+    with session.lock:
+        while True:
+            challenge = _challenge_status(session.driver)
+            challenge_seen = challenge_seen or bool(challenge["challenge_detected"])
+            if not challenge["challenge_detected"]:
+                return {
+                    **_page_summary(session.driver, session_id),
+                    "success": True,
+                    "resolved": True,
+                    "timed_out": False,
+                    "challenge_seen": challenge_seen,
+                    "waited_seconds": round(time.monotonic() - started, 2),
+                    "session_open": True,
+                }
+            elapsed = time.monotonic() - started
+            if elapsed >= timeout:
+                return {
+                    **_page_summary(session.driver, session_id),
+                    "success": False,
+                    "resolved": False,
+                    "timed_out": True,
+                    "challenge_seen": challenge_seen,
+                    "waited_seconds": round(elapsed, 2),
+                    "session_open": True,
+                }
+            time.sleep(min(poll_interval, timeout - elapsed))
 
 
 def _desired_checked(value: Any) -> bool:
@@ -611,6 +786,9 @@ def get_status(session_id: str = "default") -> dict[str, Any]:
             "session_open": True,
             "active_sessions": active_ids,
             "engine": "Chrome via Selenium Manager",
+            "profile_mode": session.profile_mode,
+            "profile_id": session.profile_id,
+            "debugger_address": session.debugger_address,
             **_page_summary(session.driver, session_id),
         }
 
@@ -654,7 +832,10 @@ def close_session(session_id: str = "default") -> dict[str, Any]:
     if session is not None:
         with session.lock:
             try:
-                session.driver.quit()
+                if session.owns_browser:
+                    session.driver.quit()
+                else:
+                    session.driver.service.stop()
             except Exception:
                 pass
     return {"session_id": session_id, "closed": closed, "active_sessions": remaining}
@@ -667,7 +848,10 @@ def close_all_sessions() -> None:
     for session in sessions:
         with session.lock:
             try:
-                session.driver.quit()
+                if session.owns_browser:
+                    session.driver.quit()
+                else:
+                    session.driver.service.stop()
             except Exception:
                 pass
 

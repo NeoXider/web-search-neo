@@ -72,6 +72,21 @@ def test_ddgs_provider_classifies_captcha(monkeypatch):
     assert error.value.kind == "challenge"
 
 
+def test_ddgs_provider_treats_blocked_no_results_as_challenge(monkeypatch):
+    class FakeDDGS:
+        def __init__(self, **_kwargs):
+            pass
+
+        def text(self, *_args, **_kwargs):
+            raise RuntimeError("No results found.")
+
+    monkeypatch.setattr(msp_search, "DDGS", FakeDDGS)
+    provider = msp_search.DdgsSearchProvider("test", "test", "https://x/?q={query}")
+    with pytest.raises(msp_search.SearchProviderError) as error:
+        provider.search("common query", 1, 2)
+    assert error.value.kind == "challenge"
+
+
 def test_search_defaults_to_duckduckgo_and_falls_back(monkeypatch):
     calls = []
 
