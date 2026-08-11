@@ -1,0 +1,201 @@
+from __future__ import annotations
+
+import threading
+from types import SimpleNamespace
+
+import pytest
+
+import msp_search
+
+
+RESULT = [{"title": "Result", "url": "https://example.test", "snippet": "ok"}]
+
+
+@pytest.fixture(autouse=True)
+def reset_search_runtime(monkeypatch):
+    monkeypatch.setattr(msp_search, "_status_cache", None)
+    monkeypatch.setattr(msp_search, "_search_cache", msp_search.OrderedDict())
+    monkeypatch.setattr(
+        msp_search,
+        "_provider_state",
+        {name: {} for name in msp_search.ENGINE_ORDER},
+    )
+    monkeypatch.setattr(
+        msp_search,
+        "_provider_last_request",
+        {},
+    )
+    monkeypatch.setattr(msp_search, "MIN_PROVIDER_INTERVAL_SECONDS", 0)
+
+
+def _provider(name, fn):
+    return msp_search.FunctionSearchProvider(
+        name, fn, f"https://{name}.example/search?q={{query}}"
+    )
+
+
+def test_ddgs_provider_normalizes_results_and_passes_backend(monkeypatch):
+    calls = []
+
+    class FakeDDGS:
+        def __init__(self, **kwargs):
+            calls.append(("init", kwargs))
+
+        def text(self, query, **kwargs):
+            calls.append((query, kwargs))
+            return [{"title": "  Unity   job ", "href": "https://jobs.test/1", "body": " Great\nrole "}]
+
+    monkeypatch.setattr(msp_search, "DDGS", FakeDDGS)
+    provider = msp_search.DdgsSearchProvider(
+        "test", "test-backend", "https://search.test/?q={query}"
+    )
+
+    assert provider.search("unity", 3, 4.2) == [
+        {"title": "Unity job", "url": "https://jobs.test/1", "snippet": "Great role"}
+    ]
+    assert calls[1][1]["backend"] == "test-backend"
+    assert calls[1][1]["max_results"] == 3
+
+
+def test_ddgs_provider_classifies_captcha(monkeypatch):
+    class FakeDDGS:
+        def __init__(self, **_kwargs):
+            pass
+
+        def text(self, *_args, **_kwargs):
+            raise RuntimeError("HTTP 429 CAPTCHA required")
+
+    monkeypatch.setattr(msp_search, "DDGS", FakeDDGS)
+    provider = msp_search.DdgsSearchProvider("test", "test", "https://x/?q={query}")
+    with pytest.raises(msp_search.SearchProviderError) as error:
+        provider.search("query", 1, 2)
+    assert error.value.kind == "challenge"
+
+
+def test_search_defaults_to_duckduckgo_and_falls_back(monkeypatch):
+    calls = []
+
+    def blocked(query, num, timeout):
+        calls.append(("duckduckgo", query, num, timeout))
+        raise msp_search.SearchProviderError("CAPTCHA", "challenge")
+
+    def works(query, num, timeout):
+        calls.append(("brave", query, num, timeout))
+        return RESULT
+
+    monkeypatch.setitem(msp_search.SEARCH_PROVIDERS, "duckduckgo", _provider("duckduckgo", blocked))
+    monkeypatch.setitem(msp_search.SEARCH_PROVIDERS, "brave", _provider("brave", works))
+    monkeypatch.setattr(msp_search, "ENGINE_ORDER", ["duckduckgo", "brave"])
+
+    response = msp_search.search_web("  unity jobs  ", num=99)
+
+    assert response["success"] is True
+    assert response["requested_engine"] == "duckduckgo"
+    assert response["engine_used"] == "brave"
+    assert response["fallback_used"] is True
+    assert response["results"] == RESULT
+    assert response["errors"]["duckduckgo"]["kind"] == "challenge"
+    assert response["challenge_recoveries"][0]["suggested_arguments"]["headless"] is False
+    assert calls == [("duckduckgo", "unity jobs", 20, 10.0), ("brave", "unity jobs", 20, 10.0)]
+
+
+def test_challenged_provider_is_skipped_during_cooldown(monkeypatch):
+    calls = []
+    monkeypatch.setattr(msp_search, "ENGINE_ORDER", ["duckduckgo", "brave"])
+    monkeypatch.setitem(
+        msp_search.SEARCH_PROVIDERS,
+        "duckduckgo",
+        _provider("duckduckgo", lambda *_args: calls.append("duckduckgo") or RESULT),
+    )
+    monkeypatch.setitem(
+        msp_search.SEARCH_PROVIDERS,
+        "brave",
+        _provider("brave", lambda *_args: calls.append("brave") or RESULT),
+    )
+    msp_search._provider_state["duckduckgo"] = {
+        "cooldown_until": msp_search.time.monotonic() + 60,
+        "error_kind": "challenge",
+        "last_error": "CAPTCHA",
+    }
+
+    response = msp_search.search_web("query")
+    assert calls == ["brave"]
+    assert response["engine_used"] == "brave"
+    assert response["errors"]["duckduckgo"]["cooldown_seconds"] > 0
+
+
+def test_search_result_cache_avoids_second_provider_request(monkeypatch):
+    calls = []
+    monkeypatch.setattr(msp_search, "ENGINE_ORDER", ["duckduckgo"])
+    monkeypatch.setitem(
+        msp_search.SEARCH_PROVIDERS,
+        "duckduckgo",
+        _provider("duckduckgo", lambda *_args: calls.append(1) or RESULT),
+    )
+    first = msp_search.search_web("query", fallback=False)
+    second = msp_search.search_web("query", fallback=False)
+    assert first["cached"] is False
+    assert second["cached"] is True
+    assert calls == [1]
+
+
+def test_search_without_fallback_returns_structured_error(monkeypatch):
+    def fails(*_args):
+        raise RuntimeError("offline")
+
+    monkeypatch.setattr(msp_search, "ENGINE_ORDER", ["duckduckgo"])
+    monkeypatch.setitem(msp_search.SEARCH_PROVIDERS, "duckduckgo", _provider("duckduckgo", fails))
+    response = msp_search.search_web("query", fallback=False)
+    assert response["success"] is False
+    assert response["engine_used"] is None
+    assert response["errors"]["duckduckgo"]["kind"] == "provider_error"
+
+
+def test_search_validates_query_and_engine():
+    with pytest.raises(ValueError, match="query must not be empty"):
+        msp_search.search_web("  ")
+    with pytest.raises(ValueError, match="Unknown engine"):
+        msp_search.search_web("query", engine="missing")
+
+
+def test_status_without_live_check_lists_provider_registry():
+    status = msp_search.get_search_engines_status(check_live=False)
+    assert status["default_engine"] == "duckduckgo"
+    assert status["configured"] == list(msp_search.ENGINE_ORDER)
+    assert all(item["state"] == "configured" for item in status["engines"])
+
+
+def test_live_status_probes_providers_concurrently_and_caches(monkeypatch):
+    names = ["duckduckgo", "brave", "mojeek"]
+    barrier = threading.Barrier(len(names))
+    calls = []
+    monkeypatch.setattr(msp_search, "ENGINE_ORDER", names)
+    monkeypatch.setattr(msp_search, "_provider_locks", {name: threading.Lock() for name in names})
+
+    for name in names:
+        def run(_q, _n, _t, current=name):
+            calls.append(current)
+            barrier.wait(timeout=2)
+            if current == "brave":
+                raise RuntimeError("offline")
+            return RESULT
+        monkeypatch.setitem(msp_search.SEARCH_PROVIDERS, name, _provider(name, run))
+
+    first = msp_search.get_search_engines_status(force_refresh=True)
+    second = msp_search.get_search_engines_status()
+    assert first["available"] == ["duckduckgo", "mojeek"]
+    assert second["cached"] is True
+    assert sorted(calls) == sorted(names)
+
+
+def test_new_provider_registration_updates_dispatch_and_invalidates_status(monkeypatch):
+    monkeypatch.setattr(msp_search, "SEARCH_PROVIDERS", dict(msp_search.SEARCH_PROVIDERS))
+    monkeypatch.setattr(msp_search, "ENGINE_ORDER", list(msp_search.ENGINE_ORDER))
+    monkeypatch.setattr(msp_search, "_provider_locks", dict(msp_search._provider_locks))
+    monkeypatch.setattr(msp_search, "_provider_state", dict(msp_search._provider_state))
+    monkeypatch.setattr(msp_search, "_status_cache", (0, {"stale": True}))
+    msp_search.register_search_provider(_provider("local_test", lambda *_args: RESULT))
+    response = msp_search.search_web("query", engine="local_test", fallback=False)
+    assert msp_search.ENGINE_ORDER[-1] == "local_test"
+    assert response["engine_used"] == "local_test"
+    assert msp_search._status_cache is None
