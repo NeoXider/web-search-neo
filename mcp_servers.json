@@ -3,9 +3,8 @@
     "web-search-neo": {
       "command": "C:\Users\User\AppData\Local\Programs\Python\Python310\python.exe",
       "args": [
-        "C:/Git/PythonUrlFeatch/main.py"
-      ],
-      "module": "main"
+        "D:/Git/web-search-neo/main.py"
+      ]
     }
   }
 }
