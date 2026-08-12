@@ -40,6 +40,11 @@ from bridge_daemon import (
 from key_table import MODIFIER_BITS, resolve_key
 
 
+# The tab group the agent's pages land in. It carries the project's mascot so a
+# user glancing at a crowded window can tell at once which tabs are not theirs.
+DEFAULT_TAB_GROUP = "🟢 AI"
+
+
 class ChromeBridgeError(RuntimeError):
     """Raised when the companion extension isn't connected or rejects a command."""
 
@@ -51,6 +56,12 @@ DAEMON_ENTRY = PROJECT_DIR / "main.py"
 # Two daemons of the wrong version in a row means another checkout is fighting us
 # over the port, and replacing each other forever would be worse than saying so.
 MAX_DAEMON_REPLACEMENTS = 2
+
+# Long enough for a capture of a window nothing is looking at, which measured
+# between 70 ms and half a minute depending on whether Chrome was painting it,
+# and short enough that a capture which will never arrive still ends in an
+# answer rather than in whatever timeout the caller above us happens to have.
+SCREENSHOT_TIMEOUT = 45.0
 
 __all__ = [
     "CHROME_EXTENSION_ID",
@@ -179,6 +190,10 @@ class ChromeBridge:
         self._daemon: Any = None
         self._daemon_version = ""
         self._daemon_pid: int | None = None
+        # tab id -> the browser run it was granted under. Kept so that a link
+        # rebuilt after a drop can ask for the same tabs again: the daemon ties a
+        # claim to the connection that made it, and connections do not last.
+        self._claimed: dict[int, str | None] = {}
         self._browser_info: dict[str, Any] = {}
         self._connected = threading.Event()
         self._attempted = threading.Event()
@@ -421,22 +436,35 @@ class ChromeBridge:
             )
         close_quietly(connection, 1000, "Replaced by a newer server")
 
-    def _refresh_state(self, connection: Any) -> None:
-        """Ask the fresh link what the browser is doing before anyone calls status."""
+    def _control_inline(
+        self,
+        connection: Any,
+        method: str,
+        fields: dict[str, Any] | None = None,
+        timeout: float = 5.0,
+    ) -> Any:
+        """Ask one control question on a link whose reader thread has not started.
+
+        Between the handshake and ``_read_until_closed`` nobody is draining the
+        socket, so a question asked here has to read its own answer - and hand
+        every other frame to the ordinary dispatcher on the way, because the
+        daemon pushes state whenever it likes and those frames arrive first.
+        """
         request_id = uuid.uuid4().hex
         pending = _PendingRequest(event=threading.Event(), connection=connection)
         with self._state_lock:
             self._pending[request_id] = pending
-            self._daemon = connection
         try:
             connection.send(
-                json.dumps({"type": "control", "id": request_id, "method": "status"})
+                json.dumps(
+                    {"type": "control", "id": request_id, "method": method, **(fields or {})}
+                )
             )
-            deadline = time.monotonic() + 5.0
+            deadline = time.monotonic() + timeout
             while not pending.event.is_set():
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError("The bridge daemon did not report the companion state")
+                    raise TimeoutError(f"The bridge daemon did not answer '{method}'")
                 frame = json.loads(connection.recv(timeout=remaining))
                 if isinstance(frame, dict):
                     self._dispatch(frame)
@@ -445,7 +473,52 @@ class ChromeBridge:
                 self._pending.pop(request_id, None)
         if pending.error:
             raise ChromeBridgeError(str(pending.error))
-        self._apply_state(pending.result or {})
+        return pending.result
+
+    def _refresh_state(self, connection: Any) -> None:
+        """Ask the fresh link what the browser is doing before anyone calls status."""
+        with self._state_lock:
+            self._daemon = connection
+        self._apply_state(self._control_inline(connection, "status") or {})
+        self._reassert_claims(connection)
+
+    def _reassert_claims(self, connection: Any) -> None:
+        """Ask again for the tabs we already hold, on a link that is new.
+
+        A claim belongs to a connection: a daemon we have just reconnected to -
+        or one that restarted under us - knows nothing about ours. Saying nothing
+        would let the guard evaporate silently at the moment it is most likely to
+        matter, since a daemon restart is exactly when another agent is starting
+        up too. Anything a newcomer took while we were away is dropped from our
+        own book and said out loud, so that a caller reading
+        :attr:`claimed_tabs` is never told it owns a tab that it does not.
+        """
+        with self._state_lock:
+            remembered = list(self._claimed)
+        for tab_id in remembered:
+            try:
+                answer = self._control_inline(connection, "claim_tab", {"tab_id": tab_id})
+            except Exception as exc:
+                # A daemon that cannot answer at all is either too old to know
+                # about claims or already gone; the next link will try again, and
+                # forgetting our claims here would only make the next agent's
+                # question easier to answer wrongly.
+                LOGGER.warning(
+                    "Could not re-claim tab %s on the new bridge link: %s: %s",
+                    tab_id,
+                    type(exc).__name__,
+                    exc,
+                )
+                return
+            if isinstance(answer, dict) and answer.get("granted"):
+                continue
+            with self._state_lock:
+                self._claimed.pop(tab_id, None)
+            LOGGER.warning(
+                "Tab %s was taken over while this server was not linked to the bridge: %s",
+                tab_id,
+                (answer or {}).get("reason") if isinstance(answer, dict) else answer,
+            )
 
     def _read_until_closed(self, connection: Any) -> None:
         try:
@@ -532,8 +605,44 @@ class ChromeBridge:
 
     @property
     def browser_info(self) -> dict[str, Any]:
+        """What the connected companion says about its browser.
+
+        The daemon keeps this dictionary and hands it to us twice over: in the
+        ``status`` control answer this client asks for the moment a link is
+        established - which is what makes it correct when we attach to a daemon
+        that has been linked to a companion for hours - and in the ``extension``
+        state pushed to every client whenever the companion connects or drops.
+        Both paths land in ``_apply_state``, so there is one shape to read:
+
+            {"name": "Chrome",              # what the companion calls itself
+             "extension_version": "1.3.2",  # its manifest version
+             "browser_run": "9f3c...b1"}    # str | None, see below
+
+        ``browser_run`` is a 32-character hex string minted by the companion once
+        per browser run: identical across service worker restarts within one run,
+        different after Chrome is closed and reopened. It is the only thing that
+        can tell a caller that a tab id it stored earlier now belongs to a
+        different browser, because ids restart with the browser and the daemon
+        does not. Compare the value recorded when a session was created with the
+        value here; if they differ, the tab id in that session names some other
+        tab, quite possibly one of the user's.
+
+        Two values need care:
+
+        * ``None`` means the companion is older than 1.3.2 and mints no identity.
+          Nothing can be concluded from it, in either direction.
+        * The whole dictionary is empty (so ``.get("browser_run")`` is ``None``)
+          while no companion is connected. Check ``connected`` first; a session
+          cannot be checked against a browser that is not there.
+        """
         with self._state_lock:
             return dict(self._browser_info)
+
+    @property
+    def browser_run(self) -> str | None:
+        """Shorthand for ``browser_info.get("browser_run")``; see there."""
+        with self._state_lock:
+            return self._browser_info.get(bridge_daemon.BROWSER_RUN_KEY)
 
     def request(
         self,
@@ -590,6 +699,7 @@ class ChromeBridge:
                 self._pending.pop(request_id, None)
 
     def status(self, wait_seconds: float = 0.0) -> dict[str, Any]:
+        """The bridge as a caller sees it; ``browser`` is :attr:`browser_info`."""
         connected = self.wait_connected(wait_seconds)
         with self._state_lock:
             daemon = {
@@ -604,6 +714,140 @@ class ChromeBridge:
             "startup_error": self._startup_error,
             "browser": self.browser_info,
             "daemon": daemon,
+        }
+
+    def _control(
+        self, method: str, fields: dict[str, Any] | None = None, timeout: float = 5.0
+    ) -> Any:
+        """Ask the daemon something about itself, rather than asking the browser."""
+        self.start()
+        with self._state_lock:
+            connection = self._daemon
+            if connection is None:
+                raise ChromeBridgeError(
+                    f"No bridge daemon is linked, so '{method}' could not be asked"
+                )
+            request_id = uuid.uuid4().hex
+            pending = _PendingRequest(event=threading.Event(), connection=connection)
+            self._pending[request_id] = pending
+        try:
+            payload = json.dumps(
+                {"type": "control", "id": request_id, "method": method, **(fields or {})}
+            )
+            try:
+                with self._send_lock:
+                    connection.send(payload)
+            except Exception as exc:
+                raise ChromeBridgeError(
+                    f"The bridge daemon link dropped while asking '{method}': {exc}"
+                ) from exc
+            if not pending.event.wait(max(0.1, timeout)):
+                raise TimeoutError(f"The bridge daemon did not answer '{method}'")
+            if pending.error:
+                raise ChromeBridgeError(str(pending.error))
+            return pending.result
+        finally:
+            with self._state_lock:
+                self._pending.pop(request_id, None)
+
+    def claim_tab(self, tab_id: int, timeout: float = 5.0) -> dict[str, Any]:
+        """Ask the daemon for exclusive use of one Chrome tab.
+
+        Several MCP servers can now drive one browser, and the guard that keeps
+        two of them off one tab cannot live in either process. The daemon holds
+        it, and this is how to ask. The answer is always a dictionary with a
+        ``status`` of exactly one of three words, because the three mean
+        different things and only one of them is a "no":
+
+        ``granted``
+            The tab is yours until you release it or this client's link to the
+            daemon ends, whichever comes first. ``browser_run`` is the run the
+            claim is tied to; record it with the session and the claim is void
+            once the browser behind the bridge changes.
+        ``refused``
+            Somebody else is driving that tab. ``reason`` is a sentence written
+            to be shown to a person, and ``holder`` describes the other client.
+            Do not start the session.
+        ``unavailable``
+            There was nobody to ask - no daemon, an older daemon that does not
+            know about claims, or a link that dropped mid-question. ``reason``
+            says which. This is not a refusal and must not be treated as one:
+            proceed as before, with whatever in-process guard you already have.
+            ``granted`` is ``True`` for exactly this reason, so a caller that
+            only looks at ``granted`` fails open rather than locking itself out
+            of a browser it could have used.
+
+        Only ``profile_mode: "current"`` has a browser to share; the Selenium
+        modes drive a Chrome of their own, where a claim is meaningless and this
+        call is simply not needed.
+        """
+        try:
+            answer = self._control("claim_tab", {"tab_id": int(tab_id)}, timeout=timeout)
+        except Exception as exc:
+            # A refusal is a well-formed answer. Anything else - no daemon, an
+            # unknown-method error from a daemon that predates claims, a dropped
+            # link - means the question was never put, which is a different fact.
+            return {
+                "status": "unavailable",
+                "granted": True,
+                "tab_id": int(tab_id),
+                "reason": f"The bridge daemon could not be asked about tab {tab_id}: {exc}",
+            }
+        if not isinstance(answer, dict):
+            return {
+                "status": "unavailable",
+                "granted": True,
+                "tab_id": int(tab_id),
+                "reason": f"The bridge daemon answered a tab claim with {answer!r}",
+            }
+        granted = bool(answer.get("granted"))
+        with self._state_lock:
+            if granted:
+                self._claimed[int(tab_id)] = answer.get("browser_run")
+            else:
+                self._claimed.pop(int(tab_id), None)
+        return {
+            "status": "granted" if granted else "refused",
+            "granted": granted,
+            "tab_id": int(tab_id),
+            "browser_run": answer.get("browser_run"),
+            "reason": answer.get("reason"),
+            "holder": answer.get("holder"),
+        }
+
+    @property
+    def claimed_tabs(self) -> tuple[int, ...]:
+        """The tabs this client holds, as far as it knows.
+
+        A tab leaves this list when it is released, and also when a reconnect
+        finds that somebody else took it in the meantime, so it is safe to read
+        as "may I still drive this?" - as long as the answer is understood to be
+        this process's view of a fact the daemon owns.
+        """
+        with self._state_lock:
+            return tuple(sorted(self._claimed))
+
+    def release_tab(self, tab_id: int, timeout: float = 5.0) -> dict[str, Any]:
+        """Give a claimed tab back. Never raises: letting go must always work.
+
+        Returns ``{"released": bool, "tab_id": int, "reason": str | None}``.
+        ``released`` is ``False`` when the daemon could not be reached or the tab
+        was not ours, neither of which a caller can do anything about - and both
+        of which are handled anyway, because a client's claims are dropped when
+        its link to the daemon ends.
+        """
+        with self._state_lock:
+            self._claimed.pop(int(tab_id), None)
+        try:
+            answer = self._control("release_tab", {"tab_id": int(tab_id)}, timeout=timeout)
+        except Exception as exc:
+            return {"released": False, "tab_id": int(tab_id), "reason": str(exc)}
+        if not isinstance(answer, dict):
+            return {"released": False, "tab_id": int(tab_id), "reason": "unreadable answer"}
+        return {
+            "released": bool(answer.get("released")),
+            "tab_id": int(tab_id),
+            "reason": answer.get("reason"),
         }
 
     def stop_daemon(self, reason: str = "requested") -> bool:
@@ -774,7 +1018,21 @@ class _BridgeSwitchTo:
 
 
 class ChromeBridgeDriver:
-    """WebDriver-shaped adapter that controls an already-open Chrome via extension."""
+    """WebDriver-shaped adapter that controls an already-open Chrome via extension.
+
+    ``foreground`` decides whether this driver is allowed to take the screen. It
+    is false by default, which is the point of the mode: the browser belongs to
+    the user and they are usually still working in it, so the tab opens in the
+    background, navigations leave their view alone, and claiming a tab does not
+    raise it. Passing ``foreground=True`` restores the old behaviour exactly - a
+    tab that opens in front, stays in front through every navigation and is
+    raised when it is claimed - for a caller who is watching the agent work.
+
+    Nothing else changes: input, screenshots and scripts all go through the
+    debugger, which addresses the tab's renderer and does not care which tab is
+    on screen. :meth:`activate_tab` is the explicit "show me this" in either
+    mode, for a caller who wants to hand the tab back to the user.
+    """
 
     is_extension_bridge = True
 
@@ -782,25 +1040,68 @@ class ChromeBridgeDriver:
         self,
         bridge: ChromeBridge | None = None,
         tab_id: int | None = None,
-        tab_group: str = "AI",
+        tab_group: str = DEFAULT_TAB_GROUP,
+        *,
+        foreground: bool = False,
     ) -> None:
         self.bridge = bridge or get_chrome_bridge()
-        self.tab_group = tab_group.strip() or "AI"
+        self.tab_group = tab_group.strip() or DEFAULT_TAB_GROUP
+        self.foreground = bool(foreground)
         self._script_timeout = 15.0
         self._page_load_timeout = 30.0
         self._frame_session_id: str | None = None
         self._same_origin_frame_selector: str | None = None
         self.service = _BridgeService()
         self._modifier_mask = 0
+        # Whether this tab is recording network traffic right now. It belongs to
+        # the tab rather than to whoever reads the events, because the extension
+        # keeps one capture per tab and a reader cannot tell from a payload
+        # whether an empty result means "quiet page" or "nothing was recorded".
+        self.events_subscribed = False
         if tab_id is None:
             tab = self.bridge.request(
-                "tabs.create", {"url": "about:blank", "group": self.tab_group}, timeout=10.0
+                "tabs.create",
+                {"url": "about:blank", "group": self.tab_group, "active": self.foreground},
+                timeout=10.0,
             )
         else:
+            # Claiming a tab the user pointed at can be a "show me" moment, but
+            # only when someone is watching: a background session that raised the
+            # claimed tab would interrupt exactly the work it was told not to.
             tab = self.bridge.request("tabs.get", {"tabId": int(tab_id)}, timeout=10.0)
-            tab = self.bridge.request("tabs.activate", {"tabId": int(tab_id)}, timeout=10.0)
+            if self.foreground:
+                tab = self.bridge.request(
+                    "tabs.activate", {"tabId": int(tab_id)}, timeout=10.0
+                )
         self.tab_id = int(tab["id"])
         self.actual_tab_group = tab.get("group")
+        self._start_capture()
+
+    def _start_capture(self) -> None:
+        """Record console and network from this tab's first navigation onwards.
+
+        Capture has to be armed before the page it is meant to explain. The
+        extension only records a request while ``Network.enable`` is on, so a
+        subscription made when someone first asks for the network topic answers
+        the question "why did this page misbehave" with "no requests were made" -
+        a false premise, and the worst possible answer. The tab exists and is
+        still blank here, which is the last moment before it can request
+        anything; a tab claimed with ``tab_id`` starts recording from the claim,
+        since traffic it made before that was never recorded by anyone.
+
+        A failure to subscribe is not fatal: the tab is still usable without
+        capture, and the network topic subscribes again when it is first read, so
+        a bridge hiccup here costs history rather than the whole session.
+        """
+        try:
+            self.subscribe_events(["console", "network"])
+        except Exception as exc:
+            LOGGER.warning(
+                "Capturing events on tab %s failed: %s: %s",
+                self.tab_id,
+                type(exc).__name__,
+                exc,
+            )
 
     @property
     def switch_to(self) -> _BridgeSwitchTo:
@@ -820,11 +1121,20 @@ class ChromeBridgeDriver:
     def set_script_timeout(self, seconds: float) -> None:
         self._script_timeout = max(1.0, float(seconds))
 
+    def activate_tab(self) -> dict[str, Any]:
+        """Put this tab in front and raise its window - the only call that may.
+
+        Nothing in the driver calls this on its own any more. It is here so that
+        a caller with a reason to interrupt the user ("here is the page you asked
+        to see") can say so out loud, in one place that is easy to audit.
+        """
+        return self.bridge.request("tabs.activate", {"tabId": self.tab_id}, timeout=10.0)
+
     def get(self, url: str) -> None:
         self.switch_to.default_content()
         self.bridge.request(
             "tabs.navigate",
-            {"tabId": self.tab_id, "url": url},
+            {"tabId": self.tab_id, "url": url, "active": self.foreground},
             timeout=self._page_load_timeout,
         )
 
@@ -907,16 +1217,40 @@ class ChromeBridgeDriver:
         return result.get("value")
 
     def execute_cdp_cmd(self, command: str, params: dict[str, Any]) -> Any:
-        return self.bridge.request(
-            "cdp.send",
-            {
-                "tabId": self.tab_id,
-                "sessionId": self._frame_session_id,
-                "method": command,
-                "params": params,
-            },
-            timeout=self._script_timeout,
+        # A screenshot of a tab that is not on screen is the one command whose
+        # cost is set by the window manager rather than by the page. Measured on
+        # this Chrome: about 70 ms while the browser window is being composited,
+        # but tens of seconds - 25 s, 33 s, and once no answer at all - whenever
+        # another window covers it, which is the normal state of affairs while
+        # the user works elsewhere. The script timeout is far too short for that
+        # and turns a slow picture into a failed call.
+        timeout = SCREENSHOT_TIMEOUT if command == "Page.captureScreenshot" else (
+            self._script_timeout
         )
+        try:
+            return self.bridge.request(
+                "cdp.send",
+                {
+                    "tabId": self.tab_id,
+                    "sessionId": self._frame_session_id,
+                    "method": command,
+                    "params": params,
+                },
+                timeout=timeout,
+            )
+        except TimeoutError as exc:
+            if command != "Page.captureScreenshot":
+                raise
+            # Same exception type, because callers above catch it by type; what
+            # changes is that the message names the cause and a way out.
+            raise TimeoutError(
+                f"Chrome did not return a screenshot within {timeout:.0f}s. This is what "
+                "an obscured browser window looks like: Chrome stops painting a window "
+                "nothing can see, and a capture then waits for a frame that is not being "
+                "produced. The page itself is fine - reading the DOM, clicking and typing "
+                "do not need the window. Ask for the screenshot again, or bring the tab to "
+                "the front first if a picture is what matters."
+            ) from exc
 
     def find_element(self, by: str, value: str) -> ChromeBridgeElement:
         if by not in {"css selector", "css"}:
@@ -1006,7 +1340,11 @@ class ChromeBridgeDriver:
         }
         if limits:
             params["limits"] = {str(key): int(value) for key, value in limits.items()}
-        return dict(self.bridge.request("events.subscribe", params, timeout=timeout) or {})
+        result = dict(self.bridge.request("events.subscribe", params, timeout=timeout) or {})
+        # The extension answers with every domain the tab is capturing, not just
+        # the ones this call asked for, so the flag follows the tab's real state.
+        self.events_subscribed = "network" in (result.get("domains") or params["domains"])
+        return result
 
     def get_events(
         self,
@@ -1060,7 +1398,9 @@ class ChromeBridgeDriver:
         params: dict[str, Any] = {"tabId": self.tab_id}
         if domains:
             params["domains"] = [str(domain).lower() for domain in domains]
-        return dict(self.bridge.request("events.unsubscribe", params, timeout=timeout) or {})
+        result = dict(self.bridge.request("events.unsubscribe", params, timeout=timeout) or {})
+        self.events_subscribed = "network" in (result.get("domains") or [])
+        return result
 
     def get_network_body(self, request_id: str, *, timeout: float = 15.0) -> dict[str, Any]:
         """Fetch one response body; binary payloads come back as metadata only."""

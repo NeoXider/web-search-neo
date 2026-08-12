@@ -53,6 +53,13 @@ const RECONNECT_ALARM = "bridge-reconnect";
 const RELOAD_GRACE_MS = 250;
 const BACKOFF_KEY = "bridge_backoff";
 const BACKOFF_STREAK_LIMIT = 32;
+// A tab id is unique only inside one browser run: close Chrome and the next run
+// hands the same numbers out again, starting with the tabs it restores. The
+// bridge daemon now outlives the browser, so a client still holding tab 100 from
+// before the restart cannot tell that 100 belongs to someone else now, and
+// typing into it reports success. This id is what makes that change visible: it
+// is minted once per browser run and rides along in every hello.
+const RUN_KEY = "browser_run";
 const KEEPALIVE_MS = 20000;
 const DEBUGGER_VERSION = "1.3";
 const STATE_KEY = "bridge_state";
@@ -74,6 +81,10 @@ let reconnectTimer = null;
 let keepaliveTimer = null;
 let lastAttemptAt = 0;
 let backoff = {transport: 0, auth: 0, nextAttemptAt: 0};
+// The read-or-mint of the run id, shared by every caller, and the value this
+// particular worker minted (null in a worker that only ever read one).
+let runPromise = null;
+let mintedRun = null;
 const attachedTabs = new Set();
 // `${tabId}:${url}` -> {tabId, url, sessionId, targetId}
 const childSessions = new Map();
@@ -115,6 +126,33 @@ async function waitForTab(tabId, timeoutMs = 20000) {
     await new Promise(resolve => setTimeout(resolve, 100));
   }
   return chrome.tabs.get(tabId);
+}
+
+// Which window a new tab should open in. A tab meant to be seen goes where the
+// user is looking; a background tab does not, because the focused window is the
+// one they are working in and every tab we add there moves their tab strip under
+// their hands. In order of preference it joins the window that already holds our
+// own group - agent tabs then cluster in one place the user can ignore or close
+// as a unit - then any window that is not focused, and only then the focused one.
+// Opening a window of our own is never the answer: on Windows a new window
+// raises itself and lands in the taskbar, which is the very interruption
+// background mode exists to avoid.
+async function windowForNewTab(group, active) {
+  const windows = await chrome.windows.getAll({windowTypes: ["normal"]});
+  if (!windows.length) return null;
+  const focused = windows.find(window => window.focused) || windows[0];
+  if (active) return focused.id;
+  if (group) {
+    const groups = await chrome.tabGroups.query({});
+    const ours = groups.find(
+      item => item.title === group && windows.some(window => window.id === item.windowId),
+    );
+    if (ours) return ours.windowId;
+  }
+  // A minimized window is the last place to put work someone may want to look
+  // at later, so it is only taken when there is nothing else.
+  const spare = windows.filter(window => !window.focused);
+  return (spare.find(window => window.state !== "minimized") || spare[0] || focused).id;
 }
 
 async function ensureGroupUnlocked(tabId, title) {
@@ -246,6 +284,21 @@ async function ensureDebugger(tabId) {
     waitForDebuggerOnStart: false,
     flatten: true,
   });
+  // Without this a tab that was never in front is barely controllable, which
+  // measurement rather than theory established: Input.dispatchKeyEvent and
+  // dispatchMouseEvent return success and are then dropped on the floor, no
+  // event reaches the page at all; requestAnimationFrame never fires; and
+  // setTimeout is clamped to one second, then to sixty after a minute or so
+  // hidden. With focus emulation on, the same hidden tab measured 49 fps and
+  // 4.5 ms timers - foreground numbers - and input arrives.
+  //
+  // The cost is that the page is told it is focused and visible when it is
+  // not, so a script watching visibilitychange sees a tab that never hides.
+  // For a page an agent is driving that is closer to the truth than the
+  // alternative: something is looking at it, and it should behave as if. The
+  // setting belongs to this debugger session and dies with it, so the tab goes
+  // back to ordinary background behaviour the moment the session detaches.
+  await sendSafe(tabId, "Emulation.setFocusEmulationEnabled", {enabled: true});
   persistState();
 }
 
@@ -311,28 +364,38 @@ const commands = {
     return serializeTab(await chrome.tabs.get(Number(tabId)), await groupMap());
   },
 
-  async "tabs.create"({url = "about:blank", group = "AI"}) {
-    const windows = await chrome.windows.getAll({windowTypes: ["normal"]});
-    const focused = windows.find(window => window.focused) || windows[0];
+  // `active` is Chrome's own word and keeps its meaning: false leaves the tab
+  // in the background, where an agent's tab belongs unless someone asked to
+  // watch it. It defaults to false because the browser is the user's and they
+  // are usually still in it; a caller that wants the old behaviour - a tab that
+  // opens in front and stays there - sends active: true.
+  async "tabs.create"({url = "about:blank", group = "AI", active = false}) {
+    const wanted = Boolean(active);
+    const windowId = await windowForNewTab(group, wanted);
     const tab = await chrome.tabs.create({
       url,
-      active: true,
-      ...(focused ? {windowId: focused.id} : {}),
+      active: wanted,
+      ...(windowId === null ? {} : {windowId}),
     });
     await ensureGroup(tab.id, group);
     return serializeTab(await waitForTab(tab.id, 10000), await groupMap());
   },
 
-  async "tabs.navigate"({tabId, url}) {
+  // Navigating says nothing about who should be looking at the tab, so it no
+  // longer decides: without `active` the tab keeps whatever place it had, and a
+  // foreground session passes active: true to keep its tab in front.
+  async "tabs.navigate"({tabId, url, active = false}) {
     const numericId = Number(tabId);
     for (const [key, entry] of childSessions) {
       if (entry.tabId === numericId) childSessions.delete(key);
     }
     persistState();
-    await chrome.tabs.update(numericId, {url, active: true});
+    await chrome.tabs.update(numericId, {url, ...(active ? {active: true} : {})});
     return serializeTab(await waitForTab(numericId), await groupMap());
   },
 
+  // Unchanged, and the only command that may take the screen: it means "show me
+  // this tab", so it raises the window too. Nothing calls it on its own.
   async "tabs.activate"({tabId}) {
     const tab = await chrome.tabs.update(Number(tabId), {active: true});
     await chrome.windows.update(tab.windowId, {focused: true});
@@ -784,6 +847,65 @@ async function resumeConnect() {
   startConnect();
 }
 
+// "Once per browser run" is the whole difficulty here, because a worker is not a
+// run: Chrome evicts this file after about thirty seconds of idleness and starts
+// it again on the next event, so an id minted at module scope would change
+// several times an hour and every change would read as a browser restart. That
+// is the same bug pointing the other way - sessions thrown away while their tab
+// is exactly where they left it - so the value has to live somewhere the worker
+// does not.
+//
+// chrome.storage.session is that shelf, and it is already trusted for the
+// reconnect backoff above for the same two reasons: it survives eviction, and
+// Chrome empties it when the browser shuts down. Reading it first and minting
+// only on a miss gives a value that is stable across worker restarts and new
+// after a browser restart, which is exactly the dimension a stale tab id needs
+// to be caught in.
+function browserRun() {
+  if (!runPromise) runPromise = resolveBrowserRun();
+  return runPromise;
+}
+
+async function resolveBrowserRun() {
+  try {
+    const stored = (await chrome.storage.session.get(RUN_KEY))?.[RUN_KEY];
+    if (typeof stored === "string" && stored) return stored;
+  } catch (error) {
+    console.warn("bridge: could not read the browser run id", error);
+  }
+  return mintBrowserRun();
+}
+
+async function mintBrowserRun() {
+  const value = bytesToHex(crypto.getRandomValues(new Uint8Array(16)));
+  mintedRun = value;
+  try {
+    await chrome.storage.session.set({[RUN_KEY]: value});
+  } catch (error) {
+    // An id that could not be stored still holds for as long as this worker
+    // lives, and refusing to connect over it would cost far more than the
+    // session it might one day fail to invalidate.
+    console.warn("bridge: could not store the browser run id", error);
+  }
+  return value;
+}
+
+// The braces to that belt. A browser start is the one moment a stored id must be
+// doubted: if the session store was not emptied - a crash restore, a profile
+// that kept running after its last window closed - the value on the shelf is the
+// previous run's and would hide the very restart it exists to report. Anything
+// this worker minted itself belongs to this run and is kept, which is what stops
+// the check from re-minting over a healthy id and inventing a restart of its own.
+async function startBrowserRun() {
+  const current = await browserRun();
+  if (mintedRun !== null && current === mintedRun) return;
+  runPromise = mintBrowserRun();
+  await runPromise;
+  // A hello carrying the stale id is already on the daemon's side of the wire,
+  // and only a fresh handshake replaces it.
+  if (socket) socket.close();
+}
+
 function bytesToHex(bytes) {
   return [...new Uint8Array(bytes)].map(byte => byte.toString(16).padStart(2, "0")).join("");
 }
@@ -838,10 +960,13 @@ export async function connect() {
   let token = null;
   let nonce = null;
   let expectedProof = null;
+  let run = null;
   try {
     token = await loadBridgeToken();
     nonce = bytesToHex(crypto.getRandomValues(new Uint8Array(16)));
     expectedProof = await hmacSha256(token, nonce);
+    // Read last, and before the socket exists, because onopen cannot await.
+    run = await browserRun();
   } catch (error) {
     // Chrome logs the failed read of bridge-token.js on its own; what it cannot
     // say is what to do about it. Once per streak is enough, because the retry
@@ -867,7 +992,11 @@ export async function connect() {
       protocol: PROTOCOL_VERSION,
       token,
       nonce,
-      browser: {name: "Chrome", extension_version: chrome.runtime.getManifest().version},
+      browser: {
+        name: "Chrome",
+        extension_version: chrome.runtime.getManifest().version,
+        browser_run: run,
+      },
     }));
   };
   socket.onmessage = event => {
@@ -947,7 +1076,14 @@ function completeHandshake(connection, message, expectedProof) {
 }
 
 chrome.runtime.onInstalled.addListener(connectNow);
-chrome.runtime.onStartup.addListener(connectNow);
+// The run check runs first so the hello that follows carries this run's id, and
+// connecting is not made conditional on it: a browser that is up is worth
+// reaching even if the session store refused to answer.
+chrome.runtime.onStartup.addListener(() => {
+  startBrowserRun()
+    .catch(error => console.warn("bridge: could not start a browser run", error))
+    .then(connectNow);
+});
 chrome.action.onClicked.addListener(connectNow);
 // The alarm carries no urgency of its own; it exists to bring the worker back
 // for a wait that outlasts it, so it lands on the ordinary attempt path.

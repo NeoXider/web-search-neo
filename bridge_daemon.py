@@ -9,10 +9,13 @@ started server had to wait out the extension's reconnect backoff.
 
 Inverting the direction would fix all three, but MV3 gives an extension no way to
 listen for connections, so the listener moved out of the MCP process instead. It
-runs here, alone, and the MCP servers connect to it as clients. It does two
-things: it holds the single connection to the Chrome companion, and it relays
+runs here, alone, and the MCP servers connect to it as clients. It does three
+things: it holds the single connection to the Chrome companion; it relays
 commands from any number of local clients to that companion, returning each
-answer to the client that asked for it.
+answer to the client that asked for it; and it keeps the register of which
+client owns which tab, because letting several servers share one browser also
+means they can reach for the same tab, and this process is the only one that can
+see them all.
 
 The frames exchanged with the extension are byte-for-byte what they were, because
 the extension is not being changed. A local client speaks the same authenticated
@@ -43,6 +46,14 @@ DEFAULT_PORT = 8765
 PROTOCOL = 1
 TOKEN_MISMATCH_REASON = "Companion token mismatch; reload the extension on chrome://extensions"
 MAX_FRAME_BYTES = 64 * 1024 * 1024
+# The companion mints one of these per browser run and sends it in its hello.
+# Because this process now outlives Chrome, it is the only thing that tells a
+# client the browser behind the bridge is no longer the one it was talking to -
+# tab ids alone cannot, since a new run reissues the same numbers.
+BROWSER_RUN_KEY = "browser_run"
+# Long enough for any identity worth minting, short enough that a peer cannot
+# park a novel in the state every client is pushed on every connect.
+MAX_BROWSER_RUN_CHARS = 256
 
 # Nobody is served by a process that has had neither a browser nor an agent for a
 # quarter of an hour: Chrome is closed or the companion is gone, and the price of
@@ -68,6 +79,29 @@ def idle_shutdown_seconds() -> float:
         return max(0.0, float(os.getenv("WEB_SEARCH_NEO_BRIDGE_IDLE_SECONDS", "")))
     except ValueError:
         return IDLE_SHUTDOWN_SECONDS
+
+
+def browser_state(hello: dict[str, Any]) -> dict[str, Any]:
+    """Describe the browser a companion hello came from, run identity included.
+
+    ``browser_run`` is always present so that a client never has to tell "the
+    companion did not say" apart from "the daemon forgot to relay it". It is
+    ``None`` for a companion older than 1.3.2, which sends no identity at all;
+    requiring one would take ``profile_mode: "current"`` away from anyone whose
+    extension has not updated yet, and the update needs a working connection.
+    """
+    browser = dict(hello.get("browser") or {})
+    # Nested is where the companion puts it, next to the browser name it
+    # describes; the top level is accepted too so that the daemon does not have
+    # to be released in lockstep with a companion that moves it.
+    for candidate in (browser.get(BROWSER_RUN_KEY), hello.get(BROWSER_RUN_KEY)):
+        if isinstance(candidate, str) and 1 <= len(candidate) <= MAX_BROWSER_RUN_CHARS:
+            browser[BROWSER_RUN_KEY] = candidate
+            return browser
+    # Anything else - a number, an object, an empty string - is not an identity,
+    # and passing junk on would let it be compared against a later, real one.
+    browser[BROWSER_RUN_KEY] = None
+    return browser
 
 
 def close_quietly(connection: Any, code: int, reason: str) -> None:
@@ -115,6 +149,25 @@ class _Route:
     extension: Any
 
 
+@dataclass
+class _Claim:
+    """One tab, and the client that is currently driving it.
+
+    The guard against two agents steering one tab used to live in the MCP
+    server's own module globals, which worked for exactly as long as there was
+    one MCP server. This daemon is the only thing that sees every client, so the
+    guard has to live here or it does not exist at all.
+    """
+
+    client: _Client
+    tab_id: int
+    browser_run: str | None
+    claimed_at: float
+
+    def held_seconds(self) -> float:
+        return max(0.0, time.monotonic() - self.claimed_at)
+
+
 class BridgeDaemon:
     """Owns the companion port and relays between the extension and local clients."""
 
@@ -142,6 +195,13 @@ class BridgeDaemon:
         self._extension: Any = None
         self._extension_send_lock = threading.Lock()
         self._browser_info: dict[str, Any] = {}
+        # The run the claims below belong to. It is kept apart from
+        # ``_browser_info`` because that is emptied whenever the companion's
+        # socket drops, and a companion that merely reconnects is still the same
+        # browser holding the same tabs; only a genuinely different run may
+        # invalidate anyone's claim.
+        self._browser_run: str | None = None
+        self._claims: dict[int, _Claim] = {}
         self._clients: set[_Client] = set()
         self._routes: dict[str, _Route] = {}
         self._started = threading.Event()
@@ -293,7 +353,19 @@ class BridgeDaemon:
     # -- state -------------------------------------------------------------
 
     def status(self) -> dict[str, Any]:
-        """What a client needs to answer for the browser without asking Chrome."""
+        """What a client needs to answer for the browser without asking Chrome.
+
+        ``browser`` is whatever the companion said about itself, with
+        ``browser_run`` (see :func:`browser_state`) added: a string that is the
+        same for every hello of one browser run and different after Chrome
+        restarts, or ``None`` from a companion too old to mint one. While no
+        companion is connected ``browser`` is empty, so the key is absent
+        entirely - "no browser" rather than "an unnamed browser".
+
+        This is the answer to the ``status`` control call and, with a ``type`` of
+        ``extension``, the state pushed to every client whenever the companion
+        connects or drops.
+        """
         with self._lock:
             return {
                 "connected": self._extension is not None,
@@ -320,6 +392,119 @@ class BridgeDaemon:
     def client_count(self) -> int:
         with self._lock:
             return len(self._clients)
+
+    @property
+    def claimed_tabs(self) -> dict[int, str]:
+        """Which tabs are spoken for, and by whom - for diagnostics and tests."""
+        with self._lock:
+            return {tab_id: claim.client.label for tab_id, claim in self._claims.items()}
+
+    # -- tab ownership -----------------------------------------------------
+
+    def _adopt_browser_run(self, run: str | None) -> None:
+        """Note the run a fresh companion reports, dropping claims of an older one.
+
+        Caller holds the lock. Tab ids are only unique inside one browser run, so
+        a claim on tab 100 made against the browser that has just been replaced
+        says nothing about tab 100 of the browser that replaced it - keeping it
+        would lock a live tab out of the pool for as long as the daemon runs.
+
+        A companion that reloads itself (which is how it updates) also comes back
+        with a new run id, and that clears the claims too. That is the right
+        outcome for a different reason: the reload drops every ``chrome.debugger``
+        attachment, so the sessions behind those claims are already broken.
+
+        ``None`` means a companion too old to say, and unchanged means the same
+        browser: neither is a reason to take a tab away from whoever is using it.
+        """
+        if run is None or run == self._browser_run:
+            return
+        self._browser_run = run
+        if self._claims:
+            LOGGER.info(
+                "A different browser run is on the bridge; dropping %d tab claim(s)",
+                len(self._claims),
+            )
+            self._claims.clear()
+
+    def _claim_tab(self, client: _Client, raw_tab_id: Any) -> dict[str, Any]:
+        """Hand one tab to one client, or say who already has it."""
+        try:
+            tab_id = int(raw_tab_id)
+        except (TypeError, ValueError):
+            return {
+                "granted": False,
+                "tab_id": raw_tab_id,
+                "reason": "A tab claim needs a numeric tab id",
+            }
+        with self._lock:
+            run = self._browser_run
+            held = self._claims.get(tab_id)
+            # Re-claiming a tab you already hold is how a caller renews its grip
+            # after a reconnect, and must never be mistaken for a conflict.
+            if held is not None and held.client is not client:
+                held_for = held.held_seconds()
+                LOGGER.info(
+                    "Refused %s the tab %s that %s has held for %.0f s",
+                    client.label,
+                    tab_id,
+                    held.client.label,
+                    held_for,
+                )
+                return {
+                    "granted": False,
+                    "tab_id": tab_id,
+                    "browser_run": run,
+                    # Written to be shown to a person: it has to say what has the
+                    # tab, since "the tab is busy" invites them to try again
+                    # forever against an agent that is not going to let go.
+                    "reason": (
+                        f"Chrome tab {tab_id} is already being driven by another agent on "
+                        f"this machine ({held.client.label}, for {held_for:.0f}s). Two "
+                        "sessions on one tab fight over it, so this one was not started. "
+                        "Use a different tab, or stop that agent first."
+                    ),
+                    "holder": {
+                        "label": held.client.label,
+                        "version": held.client.version,
+                        "held_seconds": round(held_for, 1),
+                    },
+                }
+            self._claims[tab_id] = _Claim(
+                client=client, tab_id=tab_id, browser_run=run, claimed_at=time.monotonic()
+            )
+        LOGGER.info("Bridge client %s claimed tab %s", client.label, tab_id)
+        return {"granted": True, "tab_id": tab_id, "browser_run": run}
+
+    def _release_tab(self, client: _Client, raw_tab_id: Any) -> dict[str, Any]:
+        try:
+            tab_id = int(raw_tab_id)
+        except (TypeError, ValueError):
+            return {
+                "released": False,
+                "tab_id": raw_tab_id,
+                "reason": "A tab release needs a numeric tab id",
+            }
+        with self._lock:
+            held = self._claims.get(tab_id)
+            if held is None:
+                return {"released": False, "tab_id": tab_id, "reason": "Nobody holds that tab"}
+            if held.client is not client:
+                return {
+                    "released": False,
+                    "tab_id": tab_id,
+                    "reason": f"Tab {tab_id} is held by {held.client.label}, not by you",
+                }
+            self._claims.pop(tab_id, None)
+        LOGGER.info("Bridge client %s released tab %s", client.label, tab_id)
+        return {"released": True, "tab_id": tab_id}
+
+    def _drop_claims_of(self, client: _Client) -> list[int]:
+        """Free everything one client held. Caller holds the lock."""
+        dropped = [tab_id for tab_id, claim in self._claims.items() if claim.client is client]
+        for tab_id in dropped:
+            self._claims.pop(tab_id, None)
+        return dropped
 
     def _broadcast_state(self) -> None:
         state = self.status()
@@ -389,7 +574,8 @@ class BridgeDaemon:
             with self._lock:
                 previous = self._extension
                 self._extension = websocket
-                self._browser_info = dict(hello.get("browser") or {})
+                self._browser_info = browser_state(hello)
+                self._adopt_browser_run(self._browser_info.get(BROWSER_RUN_KEY))
                 self._idle_since = None
             if previous is not None and previous is not websocket:
                 # The newest authenticated companion wins: a stale socket that
@@ -509,12 +695,25 @@ class BridgeDaemon:
                 "Bridge client %s detached: %s: %s", label, type(exc).__name__, exc
             )
         finally:
+            # Every exit from the loop above lands here - a clean goodbye, a
+            # dropped socket, an exception inside a handler - and a tab whose
+            # owner is gone has to come back to the pool on all of them. A claim
+            # that outlives its client cannot be undone by anyone: the process
+            # that would release it no longer exists, and the tab would stay
+            # unusable until the daemon itself is restarted.
             with self._lock:
                 self._clients.discard(client)
                 stale = [key for key, route in self._routes.items() if route.client is client]
                 for key in stale:
                     self._routes.pop(key, None)
+                released = self._drop_claims_of(client)
             self._refresh_idle()
+            if released:
+                LOGGER.info(
+                    "Released tab(s) %s held by the departing client %s",
+                    ", ".join(str(tab_id) for tab_id in released),
+                    label,
+                )
             LOGGER.info("Bridge client %s is gone", label)
 
     def _relay_command(self, client: _Client, message: dict[str, Any]) -> None:
@@ -571,6 +770,24 @@ class BridgeDaemon:
         if method == "status":
             client.send_quietly(
                 {"type": "control_result", "id": message.get("id"), "result": self.status()}
+            )
+            return
+        if method == "claim_tab":
+            client.send_quietly(
+                {
+                    "type": "control_result",
+                    "id": message.get("id"),
+                    "result": self._claim_tab(client, message.get("tab_id")),
+                }
+            )
+            return
+        if method == "release_tab":
+            client.send_quietly(
+                {
+                    "type": "control_result",
+                    "id": message.get("id"),
+                    "result": self._release_tab(client, message.get("tab_id")),
+                }
             )
             return
         if method == "shutdown":

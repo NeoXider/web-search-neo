@@ -16,6 +16,7 @@ from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect
 
 import bridge_auth
+import bridge_daemon
 import browser_tools
 import chrome_bridge
 import main
@@ -206,6 +207,11 @@ def _node_worker_eval(body: str, prelude: str = ""):
     return json.loads(completed.stdout)
 
 
+def answer_error(answer: dict) -> str | None:
+    """The error out of a companion result frame, so a failure says what it was."""
+    return answer.get("error")
+
+
 def _free_port() -> int:
     with socket.socket() as candidate:
         candidate.bind(("127.0.0.1", 0))
@@ -219,10 +225,19 @@ def _companion_socket(port: int):
     )
 
 
-def _hello(token: str | None, nonce: str = "0f" * 16, role: str | None = None) -> str:
+def _hello(
+    token: str | None,
+    nonce: str = "0f" * 16,
+    role: str | None = None,
+    run: str | None = None,
+) -> str:
     message: dict = {"type": "hello", "protocol": 1, "browser": {"name": "Test Chrome"}}
     if role is not None:
         message["role"] = role
+    # Left out entirely by default, because that is what a companion older than
+    # 1.3.2 sends and the daemon has to keep serving it.
+    if run is not None:
+        message["browser"]["browser_run"] = run
     if token is not None:
         message["token"] = token
         message["nonce"] = nonce
@@ -256,9 +271,9 @@ def _attached_client(daemon: BridgeDaemon, **kwargs):
 class _FakeCompanion:
     """The extension's half of the protocol, driven by a test instead of Chrome."""
 
-    def __init__(self, port: int, nonce: str = "0f" * 16) -> None:
+    def __init__(self, port: int, nonce: str = "0f" * 16, run: str | None = None) -> None:
         self.socket = _companion_socket(port)
-        self.socket.send(_hello(TEST_TOKEN, nonce))
+        self.socket.send(_hello(TEST_TOKEN, nonce, run=run))
         acknowledgement = json.loads(self.socket.recv(timeout=5.0))
         assert acknowledgement["type"] == "hello_ack"
         # The ack proves the daemon knows the same secret, not just the port.
@@ -755,6 +770,668 @@ def test_the_reload_command_answers_before_it_takes_the_worker_down() -> None:
     assert outcome["stored"] == {"transport": 0, "auth": 0, "nextAttemptAt": 0}
 
 
+# A worker restart and a browser restart look almost the same from inside the
+# extension - the module starts over either way - and the run id has to tell them
+# apart, so both are spelled out here rather than argued about. Importing the
+# module again under a different query string is a real second module instance
+# with its own module scope, which is exactly what Chrome hands a worker it
+# evicted; what carries over is the session store, exactly as in a browser that
+# never closed.
+_WORKER_RESTART = (
+    "const restarted = await import("
+    + json.dumps(SERVICE_WORKER_MODULE + "?worker-restart=1")
+    + ");\n"
+)
+# Chrome empties chrome.storage.session when the browser shuts down. Nothing else
+# about a browser restart is visible to the extension, so this is what one is.
+_BROWSER_RESTART = (
+    "const store = globalThis.__session();\n"
+    "for (const key of Object.keys(store)) delete store[key];\n"
+    "const restarted = await import("
+    + json.dumps(SERVICE_WORKER_MODULE + "?browser-restart=1")
+    + ");\n"
+)
+# A module that has just started is already connecting on its own, so this waits
+# for a socket that did not exist before rather than taking the newest one: taking
+# the newest one reads the hello of whichever instance got there first, which is
+# how the first draft of these tests managed to pass while proving nothing.
+_HELLO_ONCE = """
+const helloFrom = async instance => {
+  const before = globalThis.__sockets.length;
+  await instance.connect();
+  await globalThis.__waitFor(
+    () => globalThis.__sockets.length > before, "a socket from this instance");
+  const socket = globalThis.__sockets[globalThis.__sockets.length - 1];
+  socket.onopen();
+  return JSON.parse(socket.sent[socket.sent.length - 1]);
+};
+"""
+
+
+@requires_node
+def test_the_browser_run_id_holds_across_a_worker_restart() -> None:
+    """MV3 evicts the worker constantly; an id that changed with it would be noise."""
+    outcome = _node_worker_eval(
+        _WORKER_READY
+        + _HELLO_ONCE
+        + """
+        const first = await helloFrom(worker);
+        """
+        + _WORKER_RESTART
+        + """
+        const second = await helloFrom(restarted);
+        return {
+          first: first.browser,
+          second: second.browser,
+          stored: globalThis.__session().browser_run,
+        };
+        """
+    )
+    run = outcome["first"]["browser_run"]
+    assert isinstance(run, str) and len(run) == 32 and int(run, 16) >= 0
+    assert outcome["second"]["browser_run"] == run, "an evicted worker is not a new browser"
+    assert outcome["stored"] == run
+    assert outcome["first"]["name"] == "Chrome"
+
+
+@requires_node
+def test_the_browser_run_id_changes_when_the_browser_restarts() -> None:
+    """The whole point: the id is what says the tab ids started over."""
+    outcome = _node_worker_eval(
+        _WORKER_READY
+        + _HELLO_ONCE
+        + """
+        const first = await helloFrom(worker);
+        """
+        + _BROWSER_RESTART
+        + """
+        const second = await helloFrom(restarted);
+        return {first: first.browser.browser_run, second: second.browser.browser_run};
+        """
+    )
+    assert outcome["first"] and outcome["second"]
+    assert outcome["first"] != outcome["second"]
+
+
+@requires_node
+def test_a_browser_start_replaces_an_id_that_outlived_its_browser() -> None:
+    """If the session store was not emptied, onStartup is what still catches it."""
+    outcome = _node_worker_eval(
+        _WORKER_READY
+        + _HELLO_ONCE
+        + """
+        const first = await helloFrom(worker);
+        const socket = globalThis.__sockets[globalThis.__sockets.length - 1];
+        globalThis.__fire("startup");
+        await globalThis.__waitFor(
+          () => globalThis.__session().browser_run !== first.browser.browser_run,
+          "the browser start to mint a new run id",
+        );
+        const closed = socket.readyState === 3;
+        const second = await helloFrom(worker);
+        return {first: first.browser.browser_run, second: second.browser.browser_run, closed};
+        """,
+        prelude='globalThis.__seedSession({browser_run: "0123456789abcdef0123456789abcdef"});',
+    )
+    assert outcome["first"] == "0123456789abcdef0123456789abcdef"
+    assert outcome["second"] != outcome["first"], "a browser start must not inherit an id"
+    assert outcome["closed"], "the daemon still holds the stale id until we say hello again"
+
+
+@requires_node
+def test_a_browser_start_keeps_the_id_this_worker_just_minted() -> None:
+    """Re-minting here would invalidate healthy sessions - the same bug, mirrored."""
+    outcome = _node_worker_eval(
+        _WORKER_READY
+        + _HELLO_ONCE
+        + """
+        const first = await helloFrom(worker);
+        const socket = globalThis.__sockets[globalThis.__sockets.length - 1];
+        globalThis.__fire("startup");
+        await globalThis.__sleep(120);
+        return {
+          first: first.browser.browser_run,
+          stored: globalThis.__session().browser_run,
+          open: socket.readyState === 1,
+        };
+        """
+    )
+    assert outcome["stored"] == outcome["first"]
+    assert outcome["open"], "the live connection was dropped over an id that never changed"
+
+
+def test_the_run_id_reaches_a_client_when_the_browser_arrives() -> None:
+    """The fresh-connect path: a client that was already waiting is pushed the state."""
+    with _running_daemon() as daemon:
+        with _attached_client(daemon) as client:
+            assert client.browser_info == {}
+            companion = _FakeCompanion(daemon.port, run="run-of-the-first-browser")
+            try:
+                assert client.wait_connected(2.0)
+                assert client.browser_info["browser_run"] == "run-of-the-first-browser"
+                assert client.browser_run == "run-of-the-first-browser"
+                assert client.status()["browser"]["browser_run"] == "run-of-the-first-browser"
+                assert daemon.browser_info["browser_run"] == "run-of-the-first-browser"
+            finally:
+                companion.close()
+
+
+def test_a_client_attaching_to_a_linked_daemon_learns_the_run_id() -> None:
+    """The daemon outlives every client, so this is the common path, not the rare one."""
+    with _running_daemon() as daemon:
+        companion = _FakeCompanion(daemon.port, run="run-of-the-second-browser")
+        try:
+            # No client was listening when the companion said hello, so nothing was
+            # pushed; the status call the client makes on connect is all it gets.
+            with _attached_client(daemon) as client:
+                assert client.wait_connected(2.0)
+                assert client.browser_run == "run-of-the-second-browser"
+        finally:
+            companion.close()
+
+
+def test_a_restarted_browser_reaches_a_client_that_never_disconnected() -> None:
+    """The defect end to end: the daemon stays up across the restart, so it must tell."""
+    with _running_daemon() as daemon:
+        first = _FakeCompanion(daemon.port, run="before-the-restart")
+        try:
+            with _attached_client(daemon) as client:
+                assert client.wait_connected(2.0)
+                assert client.browser_run == "before-the-restart"
+                # Chrome closed and opened again; the companion of the new run
+                # dials the same daemon and takes the connection over.
+                second = _FakeCompanion(daemon.port, nonce="1a" * 16, run="after-the-restart")
+                try:
+                    deadline = time.monotonic() + 5.0
+                    while time.monotonic() < deadline:
+                        if client.browser_run == "after-the-restart":
+                            break
+                        time.sleep(0.05)
+                    assert client.browser_run == "after-the-restart", (
+                        "a client holding tab ids from the old run was never told"
+                    )
+                finally:
+                    second.close()
+        finally:
+            first.close()
+
+
+def test_two_agents_cannot_drive_the_same_tab() -> None:
+    """The guard used to live in one process's globals, which two processes ignore."""
+    with _running_daemon() as daemon:
+        companion = _FakeCompanion(daemon.port, run="one-browser")
+        try:
+            with _attached_client(daemon) as first, _attached_client(daemon) as second:
+                assert first.wait_connected(2.0) and second.wait_connected(2.0)
+                granted = first.claim_tab(41)
+                assert granted["status"] == "granted" and granted["granted"] is True
+                assert granted["browser_run"] == "one-browser"
+
+                refused = second.claim_tab(41)
+                assert refused["status"] == "refused" and refused["granted"] is False
+                # The message is shown to a person, so it has to name the holder
+                # rather than only saying no.
+                assert "41" in refused["reason"] and "another agent" in refused["reason"]
+                assert refused["holder"]["label"] == daemon.claimed_tabs[41]
+                assert refused["holder"]["held_seconds"] >= 0
+
+                # A different tab is nobody's business but the asker's.
+                assert second.claim_tab(42)["granted"] is True
+                # And renewing your own grip is not a conflict with yourself.
+                assert first.claim_tab(41)["granted"] is True
+
+                assert first.release_tab(41) == {"released": True, "tab_id": 41, "reason": None}
+                assert second.claim_tab(41)["granted"] is True
+                # Releasing what is now someone else's must not take it from them.
+                assert first.release_tab(41)["released"] is False
+                assert 41 in daemon.claimed_tabs, "the tab lost its owner"
+        finally:
+            companion.close()
+
+
+def test_a_tab_claim_dies_with_the_client_that_made_it() -> None:
+    """A claim nobody can release would take the tab out of use until a restart."""
+    with _running_daemon() as daemon:
+        companion = _FakeCompanion(daemon.port, run="one-browser")
+        try:
+            # A raw socket, so the drop is abrupt: no release, no goodbye, exactly
+            # what an MCP server that is killed mid-session leaves behind.
+            doomed = connect(f"ws://127.0.0.1:{daemon.port}")
+            doomed.send(_hello(TEST_TOKEN, nonce="2b" * 16, role="client"))
+            assert json.loads(doomed.recv(timeout=5.0))["type"] == "hello_ack"
+            doomed.send(
+                json.dumps({"type": "control", "id": "c1", "method": "claim_tab", "tab_id": 41})
+            )
+            assert json.loads(doomed.recv(timeout=5.0))["result"]["granted"] is True
+            assert 41 in daemon.claimed_tabs
+
+            doomed.close()
+            deadline = time.monotonic() + 5.0
+            while daemon.claimed_tabs and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert daemon.claimed_tabs == {}, "the tab is stranded until the daemon restarts"
+
+            with _attached_client(daemon) as survivor:
+                assert survivor.wait_connected(2.0)
+                assert survivor.claim_tab(41)["granted"] is True
+        finally:
+            companion.close()
+
+
+def test_claims_are_dropped_when_the_browser_behind_them_changes() -> None:
+    """Tab 41 of the new browser has nothing to do with tab 41 of the old one."""
+    with _running_daemon() as daemon:
+        first_browser = _FakeCompanion(daemon.port, run="before-the-restart")
+        try:
+            with _attached_client(daemon) as client:
+                assert client.wait_connected(2.0)
+                assert client.claim_tab(41)["granted"] is True
+                assert 41 in daemon.claimed_tabs
+
+                second_browser = _FakeCompanion(
+                    daemon.port, nonce="3c" * 16, run="after-the-restart"
+                )
+                try:
+                    deadline = time.monotonic() + 5.0
+                    while daemon.claimed_tabs and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                    assert daemon.claimed_tabs == {}
+                    with _attached_client(daemon) as newcomer:
+                        assert newcomer.wait_connected(2.0)
+                        fresh = newcomer.claim_tab(41)
+                        assert fresh["granted"] is True
+                        assert fresh["browser_run"] == "after-the-restart"
+                finally:
+                    second_browser.close()
+        finally:
+            first_browser.close()
+
+
+def test_a_companion_reconnecting_does_not_cost_anyone_their_tab() -> None:
+    """Only a different browser invalidates a claim; a dropped socket does not."""
+    with _running_daemon() as daemon:
+        companion = _FakeCompanion(daemon.port, run="one-browser")
+        with _attached_client(daemon) as client:
+            assert client.wait_connected(2.0)
+            assert client.claim_tab(41)["granted"] is True
+            companion.close()
+            deadline = time.monotonic() + 5.0
+            while daemon.connected and time.monotonic() < deadline:
+                time.sleep(0.05)
+            again = _FakeCompanion(daemon.port, nonce="4d" * 16, run="one-browser")
+            try:
+                assert client.wait_connected(2.0)
+                assert set(daemon.claimed_tabs) == {41}
+                with _attached_client(daemon) as other:
+                    assert other.wait_connected(2.0)
+                    assert other.claim_tab(41)["granted"] is False
+            finally:
+                again.close()
+
+
+def _settled(check, label: str, seconds: float = 10.0) -> None:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if check():
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"timed out waiting for {label}")
+
+
+def test_a_client_asks_for_its_tabs_again_on_a_link_it_had_to_rebuild() -> None:
+    """A claim belongs to a connection, and connections do not last.
+
+    Dropping the link and letting it form again is what a daemon restart looks
+    like from this side, and a daemon restart is precisely when another agent is
+    starting up too - so a guard that quietly forgot itself here would be missing
+    at the one moment it is needed.
+    """
+    port = _free_port()
+    client = ChromeBridge(port=port, token=TEST_TOKEN, spawn=False)
+    try:
+        with _running_daemon(port=port) as daemon:
+            client.start()
+            assert client.claim_tab(41)["granted"] is True
+            assert client.claimed_tabs == (41,)
+
+            client.shutdown()
+            _settled(lambda: daemon.claimed_tabs == {}, "the daemon to free the orphaned tab")
+
+            client.start()
+            _settled(lambda: set(daemon.claimed_tabs) == {41}, "the client to ask again")
+            assert client.claimed_tabs == (41,)
+            with _attached_client(daemon) as newcomer:
+                assert newcomer.claim_tab(41)["granted"] is False
+    finally:
+        client.shutdown()
+
+
+def test_a_tab_lost_while_the_link_was_down_stops_being_ours() -> None:
+    """Telling a caller it still owns a tab that it does not is the worse failure."""
+    port = _free_port()
+    client = ChromeBridge(port=port, token=TEST_TOKEN, spawn=False)
+    try:
+        with _running_daemon(port=port) as daemon:
+            client.start()
+            assert client.claim_tab(41)["granted"] is True
+            client.shutdown()
+            _settled(lambda: daemon.claimed_tabs == {}, "the daemon to free the orphaned tab")
+
+            with _attached_client(daemon) as squatter:
+                # Somebody else got there first while the link was down.
+                assert squatter.claim_tab(41)["granted"] is True
+                client.start()
+                _settled(lambda: client.claimed_tabs == (), "the client to give the tab up")
+                # And the tab stayed with whoever actually holds it.
+                assert 41 in daemon.claimed_tabs
+                assert squatter.claimed_tabs == (41,)
+    finally:
+        client.shutdown()
+
+
+def test_a_claim_with_nobody_to_ask_is_not_a_refusal() -> None:
+    """'Nobody answered' and 'someone else has it' must not look the same."""
+    lonely = ChromeBridge(port=_free_port(), token=TEST_TOKEN, spawn=False, start_timeout=0.2)
+    try:
+        answer = lonely.claim_tab(41)
+        assert answer["status"] == "unavailable"
+        # Failing open: a browser nobody is guarding is still usable, and the
+        # caller's own in-process guard still covers the single-server case.
+        assert answer["granted"] is True
+        assert "could not be asked" in answer["reason"]
+        assert lonely.release_tab(41)["released"] is False
+    finally:
+        lonely.shutdown()
+
+
+def test_a_daemon_that_never_heard_of_claims_reads_as_unavailable() -> None:
+    """An older daemon answers with an error, which is not a "no" either."""
+
+    class _DaemonWithoutClaims(BridgeDaemon):
+        def _answer_control(self, client, message) -> None:
+            if message.get("method") in {"claim_tab", "release_tab"}:
+                client.send_quietly(
+                    {
+                        "type": "control_result",
+                        "id": message.get("id"),
+                        "error": f"Unknown bridge control method {message.get('method')!r}",
+                    }
+                )
+                return
+            super()._answer_control(client, message)
+
+    daemon = _DaemonWithoutClaims(port=_free_port(), token=TEST_TOKEN)
+    daemon.start()
+    assert daemon.startup_error is None, daemon.startup_error
+    try:
+        with _attached_client(daemon) as client:
+            answer = client.claim_tab(41)
+            assert answer["status"] == "unavailable" and answer["granted"] is True
+            assert "Unknown bridge control method" in answer["reason"]
+    finally:
+        daemon.shutdown()
+
+
+def test_a_tab_id_that_is_not_a_number_is_refused_rather_than_stored() -> None:
+    with _running_daemon() as daemon:
+        with _attached_client(daemon) as client:
+            answer = client._control("claim_tab", {"tab_id": None})
+            assert answer["granted"] is False and "numeric" in answer["reason"]
+            assert daemon.claimed_tabs == {}
+
+
+def test_a_companion_too_old_to_mint_a_run_id_is_still_served() -> None:
+    """Requiring the id would take the browser away from anyone mid-update."""
+    with _running_daemon() as daemon:
+        companion = _FakeCompanion(daemon.port)
+        try:
+            with _attached_client(daemon) as client:
+                assert client.wait_connected(2.0)
+                # Present and empty, not missing: a caller reading it never has to
+                # tell "the companion said nothing" from "the daemon dropped it".
+                assert client.browser_info["browser_run"] is None
+                assert client.browser_run is None
+                answers: list = []
+                caller = threading.Thread(
+                    target=lambda: answers.append(client.request("tabs.list", timeout=10.0))
+                )
+                caller.start()
+                command = companion.take_command()
+                companion.answer(command, [])
+                caller.join(timeout=5.0)
+                assert answers == [[]], "an old companion must still be able to work"
+        finally:
+            companion.close()
+
+
+@pytest.mark.parametrize("junk", [17, "", {"id": "x"}, ["x"], "x" * 257])
+def test_a_run_id_that_is_not_an_identity_is_reported_as_none(junk) -> None:
+    """Passing junk on would let it be compared against a later, real id."""
+    hello = {
+        "type": "hello",
+        "protocol": 1,
+        "browser": {"name": "Test Chrome", "browser_run": junk},
+    }
+    assert bridge_daemon.browser_state(hello)["browser_run"] is None
+    assert bridge_daemon.browser_state(hello)["name"] == "Test Chrome"
+
+
+def test_a_run_id_at_the_top_level_of_the_hello_is_accepted_too() -> None:
+    """So the daemon need not ship in lockstep with a companion that moves it."""
+    state = bridge_daemon.browser_state(
+        {"type": "hello", "protocol": 1, "browser_run": "top-level"}
+    )
+    assert state["browser_run"] == "top-level"
+
+
+# Enough of a browser for the tab commands: windows the user may be looking at,
+# tab groups that may already be ours, and a record of every call the worker
+# makes, since what these tests are about is exactly which flags it passes.
+_TAB_WORLD = """
+const world = {windows: [], groups: [], created: null, updated: [], raised: []};
+globalThis.__world = world;
+chrome.windows.getAll = async () => world.windows.map(item => ({...item}));
+chrome.windows.update = async (windowId, patch) => {
+  world.raised.push({windowId, ...patch});
+  return {id: windowId};
+};
+chrome.tabGroups.query = async (filter = {}) => world.groups
+  .filter(item => filter.windowId === undefined || item.windowId === filter.windowId)
+  .map(item => ({...item}));
+chrome.tabGroups.update = async (groupId, patch) => ({id: groupId, ...patch});
+chrome.tabs.create = async info => {
+  world.created = {...info};
+  return {id: 7, windowId: info.windowId ?? 1, active: Boolean(info.active),
+          status: "complete", url: info.url, title: ""};
+};
+chrome.tabs.get = async tabId => ({
+  id: tabId, windowId: world.created?.windowId ?? 1, active: false,
+  status: "complete", url: "about:blank", title: ""});
+chrome.tabs.update = async (tabId, patch) => {
+  world.updated.push({tabId, ...patch});
+  return {id: tabId, windowId: 1, active: Boolean(patch.active),
+          status: "complete", url: patch.url || "about:blank", title: ""};
+};
+chrome.tabs.group = async ({groupId}) => groupId ?? 99;
+"""
+
+# A command is only answered on the socket it arrived on, and only after the
+# handshake, so a test that wants to call one has to earn a verified socket.
+_VERIFIED_SOCKET = """
+const openSocket = async () => {
+  await worker.connect();
+  const socket = globalThis.__sockets[globalThis.__sockets.length - 1];
+  socket.onopen();
+  const hello = JSON.parse(socket.sent[0]);
+  socket.onmessage({data: JSON.stringify({
+    type: "hello_ack",
+    protocol: hello.protocol,
+    proof: await globalThis.__hmac(hello.token, hello.nonce),
+  })});
+  return socket;
+};
+const ask = async (socket, method, params) => {
+  const before = socket.sent.length;
+  socket.onmessage({data: JSON.stringify({type: "command", id: method, method, params})});
+  await globalThis.__waitFor(
+    () => socket.sent.length > before, "the answer to " + method);
+  return JSON.parse(socket.sent[socket.sent.length - 1]);
+};
+"""
+
+
+@requires_node
+def test_a_new_tab_opens_behind_the_window_the_user_is_working_in() -> None:
+    """The default has to be the polite one: the browser is not ours."""
+    outcome = _node_worker_eval(
+        _WORKER_READY
+        + _TAB_WORLD
+        + _VERIFIED_SOCKET
+        + """
+        globalThis.__world.windows = [
+          {id: 1, focused: true, state: "normal"},
+          {id: 2, focused: false, state: "minimized"},
+          {id: 3, focused: false, state: "normal"}];
+        const socket = await openSocket();
+        const answer = await ask(socket, "tabs.create", {url: "about:blank", group: "AI"});
+        return {answer, created: globalThis.__world.created, raised: globalThis.__world.raised};
+        """
+    )
+    assert answer_error(outcome["answer"]) is None
+    assert outcome["created"]["active"] is False
+    # Not window 1, which the user is in, and not the minimized window 2, which
+    # is the last place to leave work someone may want to look at.
+    assert outcome["created"]["windowId"] == 3
+    assert outcome["raised"] == [], "nothing may raise a window on its own"
+
+
+@requires_node
+def test_a_new_tab_joins_the_window_that_already_holds_the_agents_group() -> None:
+    """Agent tabs cluster where the agent already works, not where the user does."""
+    outcome = _node_worker_eval(
+        _WORKER_READY
+        + _TAB_WORLD
+        + _VERIFIED_SOCKET
+        + """
+        globalThis.__world.windows = [
+          {id: 1, focused: true}, {id: 2, focused: false}, {id: 3, focused: false}];
+        globalThis.__world.groups = [
+          {id: 10, title: "Other", windowId: 2}, {id: 11, title: "AI", windowId: 3}];
+        const socket = await openSocket();
+        await ask(socket, "tabs.create", {url: "about:blank", group: "AI"});
+        return globalThis.__world.created;
+        """
+    )
+    assert outcome["windowId"] == 3
+    assert outcome["active"] is False
+
+
+@requires_node
+def test_a_tab_asked_for_in_front_opens_where_the_user_is_looking() -> None:
+    """Opting in has to give the old behaviour back, or it is not an escape hatch."""
+    outcome = _node_worker_eval(
+        _WORKER_READY
+        + _TAB_WORLD
+        + _VERIFIED_SOCKET
+        + """
+        globalThis.__world.windows = [{id: 1, focused: false}, {id: 2, focused: true}];
+        globalThis.__world.groups = [{id: 11, title: "AI", windowId: 1}];
+        const socket = await openSocket();
+        await ask(socket, "tabs.create", {url: "about:blank", group: "AI", active: true});
+        return globalThis.__world.created;
+        """
+    )
+    assert outcome["active"] is True
+    assert outcome["windowId"] == 2, "a tab to be watched belongs in the window in front"
+
+
+@requires_node
+def test_a_lone_window_gets_the_background_tab_rather_than_a_new_window() -> None:
+    """A window of our own would raise itself, which is the interruption we avoid."""
+    outcome = _node_worker_eval(
+        _WORKER_READY
+        + _TAB_WORLD
+        + _VERIFIED_SOCKET
+        + """
+        globalThis.__world.windows = [{id: 5, focused: true}];
+        const socket = await openSocket();
+        const answer = await ask(socket, "tabs.create", {url: "about:blank", group: ""});
+        return {answer, created: globalThis.__world.created};
+        """
+    )
+    # chrome.windows.create is not stubbed at all, so reaching for one would have
+    # come back as an error rather than as a passing test.
+    assert answer_error(outcome["answer"]) is None
+    assert outcome["created"] == {"url": "about:blank", "active": False, "windowId": 5}
+
+
+@requires_node
+def test_navigating_does_not_pull_the_screen_to_the_agents_tab() -> None:
+    outcome = _node_worker_eval(
+        _WORKER_READY
+        + _TAB_WORLD
+        + _VERIFIED_SOCKET
+        + """
+        globalThis.__world.windows = [{id: 1, focused: true}];
+        const socket = await openSocket();
+        await ask(socket, "tabs.navigate", {tabId: 7, url: "https://example.test/"});
+        await ask(socket, "tabs.navigate", {tabId: 7, url: "https://example.test/2", active: true});
+        return globalThis.__world.updated;
+        """
+    )
+    assert outcome[0] == {"tabId": 7, "url": "https://example.test/"}
+    assert "active" not in outcome[0], "the tab keeps whatever place the user gave it"
+    assert outcome[1] == {"tabId": 7, "url": "https://example.test/2", "active": True}
+
+
+@requires_node
+def test_attaching_the_debugger_makes_a_hidden_tab_controllable() -> None:
+    """Measured, not assumed: without this a background tab drops every keystroke."""
+    outcome = _node_worker_eval(
+        _WORKER_READY
+        + _TAB_WORLD
+        + _VERIFIED_SOCKET
+        + """
+        const sent = [];
+        chrome.debugger.sendCommand = async (target, method, params) => {
+          sent.push({tabId: target.tabId, method, params: params || null});
+          return {};
+        };
+        const socket = await openSocket();
+        const answer = await ask(socket, "cdp.send",
+          {tabId: 7, method: "Runtime.evaluate", params: {expression: "1"}});
+        return {answer, sent};
+        """
+    )
+    assert answer_error(outcome["answer"]) is None
+    focus = [item for item in outcome["sent"]
+             if item["method"] == "Emulation.setFocusEmulationEnabled"]
+    assert focus == [{"tabId": 7, "method": "Emulation.setFocusEmulationEnabled",
+                      "params": {"enabled": True}}]
+    # It has to be in place before the first command the caller actually wanted,
+    # or that command is the one that gets dropped.
+    methods = [item["method"] for item in outcome["sent"]]
+    assert methods.index("Emulation.setFocusEmulationEnabled") < methods.index("Runtime.evaluate")
+
+
+@requires_node
+def test_activating_a_tab_still_raises_its_window() -> None:
+    """The one command that means "show me": it must keep working, and stay alone."""
+    outcome = _node_worker_eval(
+        _WORKER_READY
+        + _TAB_WORLD
+        + _VERIFIED_SOCKET
+        + """
+        globalThis.__world.windows = [{id: 1, focused: true}];
+        const socket = await openSocket();
+        await ask(socket, "tabs.activate", {tabId: 7});
+        return {updated: globalThis.__world.updated, raised: globalThis.__world.raised};
+        """
+    )
+    assert outcome["updated"] == [{"tabId": 7, "active": True}]
+    assert outcome["raised"] == [{"windowId": 1, "focused": True}]
+
+
 def test_a_first_frame_that_is_not_an_object_is_refused_with_a_reason() -> None:
     with _running_daemon() as daemon:
         for frame in ("not json at all", "123", "[1, 2]", "null"):
@@ -1061,7 +1738,7 @@ class _FakeBridge:
         raise AssertionError(method)
 
 
-def test_driver_opens_new_tabs_in_ai_group() -> None:
+def test_driver_opens_new_tabs_in_ai_group_without_taking_the_screen() -> None:
     bridge = _FakeBridge()
     driver = ChromeBridgeDriver(bridge=bridge, tab_group="AI")
     driver.get("https://example.test/")
@@ -1069,20 +1746,71 @@ def test_driver_opens_new_tabs_in_ai_group() -> None:
     assert driver.actual_tab_group == "AI"
     assert bridge.calls[0] == (
         "tabs.create",
-        {"url": "about:blank", "group": "AI"},
+        {"url": "about:blank", "group": "AI", "active": False},
     )
-    assert any(
-        method == "tabs.navigate" and params["url"] == "https://example.test/"
-        for method, params in bridge.calls
-    )
+    navigations = [params for method, params in bridge.calls if method == "tabs.navigate"]
+    assert navigations and navigations[0]["url"] == "https://example.test/"
+    # The user's view is theirs: an agent navigating its own tab must not pull
+    # the screen away from whatever they are reading in another one.
+    assert all(params["active"] is False for params in navigations)
+    assert all(method != "tabs.activate" for method, _ in bridge.calls)
 
 
-def test_driver_claims_and_activates_existing_tab_without_regrouping() -> None:
+def test_driver_claims_an_existing_tab_without_raising_it() -> None:
     bridge = _FakeBridge()
     driver = ChromeBridgeDriver(bridge=bridge, tab_id=41, tab_group="AI")
     assert driver.actual_tab_group == "Existing"
-    assert [method for method, _ in bridge.calls[:2]] == ["tabs.get", "tabs.activate"]
+    assert [method for method, _ in bridge.calls] == ["tabs.get", "events.subscribe"]
     assert all(method != "tabs.create" for method, _ in bridge.calls)
+
+
+def test_a_foreground_driver_still_opens_claims_and_navigates_in_front() -> None:
+    """The old behaviour is one flag away for whoever is watching the agent work."""
+    bridge = _FakeBridge()
+    driver = ChromeBridgeDriver(bridge=bridge, tab_group="AI", foreground=True)
+    driver.get("https://example.test/")
+    assert bridge.calls[0] == (
+        "tabs.create",
+        {"url": "about:blank", "group": "AI", "active": True},
+    )
+    assert any(
+        method == "tabs.navigate" and params["active"] is True
+        for method, params in bridge.calls
+    )
+
+    claimed = _FakeBridge()
+    ChromeBridgeDriver(bridge=claimed, tab_id=41, tab_group="AI", foreground=True)
+    assert [method for method, _ in claimed.calls[:2]] == ["tabs.get", "tabs.activate"]
+
+
+def test_a_screenshot_waits_longer_than_a_script_and_says_why_when_it_cannot() -> None:
+    """A capture of a window nothing is painting takes seconds, not milliseconds."""
+
+    class _SlowScreenshots(_FakeBridge):
+        def request(self, method: str, params: dict | None = None, timeout: float = 20.0):
+            params = params or {}
+            if method == "cdp.send" and params["method"] == "Page.captureScreenshot":
+                self.calls.append((params["method"], {"timeout": timeout}))
+                raise TimeoutError("Chrome bridge command 'cdp.send' timed out")
+            return super().request(method, params, timeout)
+
+    bridge = _SlowScreenshots()
+    driver = ChromeBridgeDriver(bridge=bridge, tab_group="AI")
+    driver.set_script_timeout(15.0)
+    with pytest.raises(TimeoutError) as failure:
+        driver.get_screenshot_as_png()
+    waited = dict(bridge.calls)["Page.captureScreenshot"]["timeout"]
+    assert waited == chrome_bridge.SCREENSHOT_TIMEOUT > 15.0
+    # The agent can act on this; "cdp.send timed out" only tells it to give up.
+    assert "obscured" in str(failure.value) and "front" in str(failure.value)
+
+
+def test_a_background_driver_can_still_be_told_to_show_the_tab() -> None:
+    """Background mode is a default, not a cage: "show me" stays one call away."""
+    bridge = _FakeBridge()
+    driver = ChromeBridgeDriver(bridge=bridge, tab_group="AI")
+    driver.activate_tab()
+    assert ("tabs.activate", {"tabId": 41}) in bridge.calls
 
 
 def test_driver_keeps_held_modifier_across_atomic_key_actions() -> None:
