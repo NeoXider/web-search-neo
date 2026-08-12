@@ -19,12 +19,90 @@ from chrome_bridge import CHROME_EXTENSION_ID, ChromeBridge, ChromeBridgeDriver
 TEST_TOKEN = "a1" * 32
 OTHER_TOKEN = "b2" * 32
 NODE = shutil.which("node")
-EVENTS_MODULE = (
-    Path(__file__).resolve().parents[1] / "chrome-extension" / "events.js"
-).as_uri()
+EXTENSION_DIR = Path(__file__).resolve().parents[1] / "chrome-extension"
+EVENTS_MODULE = (EXTENSION_DIR / "events.js").as_uri()
+SERVICE_WORKER_MODULE = (EXTENSION_DIR / "service-worker.js").as_uri()
 requires_node = pytest.mark.skipif(
     NODE is None, reason="node is required to exercise the extension helpers"
 )
+
+# Enough of Chrome for service-worker.js to load and connect outside a browser:
+# a socket that records what it was told to send, and a token file the test owns.
+_WORKER_STUBS = """
+import * as fs from "node:fs";
+
+const sockets = [];
+let tokenSource = null;
+let fetchCalls = 0;
+const noop = () => {};
+const listener = {addListener: noop};
+
+globalThis.__sockets = sockets;
+globalThis.__setToken = source => { tokenSource = source; };
+globalThis.__fetchCalls = () => fetchCalls;
+globalThis.__sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+globalThis.__waitFor = async (check, label) => {
+  for (let attempt = 0; attempt < 300; attempt += 1) {
+    if (check()) return;
+    await globalThis.__sleep(10);
+  }
+  throw new Error("timed out waiting for " + label);
+};
+globalThis.__hmac = async (token, message) => {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", encoder.encode(token),
+    {name: "HMAC", hash: "SHA-256"}, false, ["sign"]);
+  const signed = await crypto.subtle.sign("HMAC", key, encoder.encode(message));
+  return [...new Uint8Array(signed)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+};
+
+globalThis.fetch = async () => {
+  fetchCalls += 1;
+  if (tokenSource === null) throw new TypeError("bridge-token.js is missing");
+  return {ok: true, status: 200, text: async () => tokenSource};
+};
+
+class FakeSocket {
+  static CONNECTING = 0;
+  static OPEN = 1;
+  static CLOSED = 3;
+  constructor(url) {
+    this.url = url;
+    this.readyState = FakeSocket.OPEN;
+    this.sent = [];
+    sockets.push(this);
+  }
+  send(data) { this.sent.push(data); }
+  close() { this.readyState = FakeSocket.CLOSED; }
+}
+globalThis.WebSocket = FakeSocket;
+
+globalThis.chrome = {
+  runtime: {
+    getURL: path => "chrome-extension://stub/" + path,
+    getManifest: () => ({version: "0.0.0-test"}),
+    onInstalled: listener,
+    onStartup: listener,
+  },
+  action: {setBadgeBackgroundColor: noop, setBadgeText: noop, onClicked: listener},
+  storage: {session: {get: async () => ({}), set: async () => ({})}},
+  debugger: {
+    onEvent: listener,
+    onDetach: listener,
+    attach: async () => {},
+    detach: async () => {},
+    sendCommand: async () => ({}),
+  },
+  tabs: {
+    onRemoved: listener,
+    query: async () => [],
+    get: async () => ({}),
+    update: async () => ({}),
+  },
+  tabGroups: {query: async () => []},
+  windows: {getAll: async () => [], update: async () => ({})},
+};
+"""
 
 
 def _node_eval(body: str):
@@ -33,6 +111,27 @@ def _node_eval(body: str):
         f"import * as events from {json.dumps(EVENTS_MODULE)};\n"
         f"const result = await (async () => {{\n{body}\n}})();\n"
         "process.stdout.write(JSON.stringify(result ?? null));\n"
+    )
+    completed = subprocess.run(
+        [NODE, "--input-type=module", "-e", module],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout)
+
+
+def _node_worker_eval(body: str):
+    """Run one snippet against service-worker.js with Chrome stubbed out."""
+    module = (
+        _WORKER_STUBS
+        + f"const worker = await import({json.dumps(SERVICE_WORKER_MODULE)});\n"
+        + f"const result = await (async () => {{\n{body}\n}})();\n"
+        + "fs.writeSync(1, JSON.stringify(result ?? null));\n"
+        # Keepalive and reconnect timers keep the loop alive; the answer is written.
+        + "process.exit(0);\n"
     )
     completed = subprocess.run(
         [NODE, "--input-type=module", "-e", module],
@@ -214,6 +313,100 @@ def test_web_crypto_hmac_matches_the_python_signature() -> None:
         """
     )
     assert digest == bridge_auth.sign(token, nonce)
+
+
+@requires_node
+def test_a_command_answers_only_the_socket_it_arrived_on() -> None:
+    """A slow command must not spill its result into a replacement socket."""
+    outcome = _node_worker_eval(
+        f"""
+        const token = {json.dumps(TEST_TOKEN)};
+        await globalThis.__waitFor(() => globalThis.__fetchCalls() >= 1, "the first token read");
+        await globalThis.__sleep(20);
+        globalThis.__setToken('export const BRIDGE_TOKEN = "' + token + '";');
+
+        await worker.connect();
+        const first = globalThis.__sockets[0];
+        first.onopen();
+        const hello = JSON.parse(first.sent[0]);
+        first.onmessage({{data: JSON.stringify({{
+          type: "hello_ack",
+          protocol: hello.protocol,
+          proof: await globalThis.__hmac(token, hello.nonce),
+        }})}});
+
+        first.onmessage({{data: JSON.stringify({{type: "command", id: "fast", method: "tabs.list"}})}});
+        await globalThis.__waitFor(() => first.sent.length > 1, "the answer to the fast command");
+
+        let release = null;
+        chrome.tabs.query = () => new Promise(resolve => {{ release = resolve; }});
+        first.onmessage({{data: JSON.stringify({{type: "command", id: "slow", method: "tabs.list"}})}});
+        await globalThis.__waitFor(() => release !== null, "the slow command to start");
+
+        first.onclose({{code: 1006, reason: "dropped"}});
+        await worker.connect();
+        const second = globalThis.__sockets[1];
+        second.onopen();
+        release([]);
+        await globalThis.__sleep(60);
+
+        return {{
+          fast: JSON.parse(first.sent[1]),
+          first_after: first.sent.slice(2).map(item => JSON.parse(item)),
+          second_frames: second.sent.map(item => JSON.parse(item).type),
+        }};
+        """
+    )
+    assert outcome["fast"] == {"type": "result", "id": "fast", "result": []}
+    assert outcome["first_after"] == [], "the answer went to a socket that is already gone"
+    # The replacement has only said hello; it has not been verified, so a result
+    # landing there would be page data handed to an unproven peer.
+    assert outcome["second_frames"] == ["hello"]
+
+
+@requires_node
+def test_the_token_is_re_read_after_it_was_missing() -> None:
+    """A token written after the extension loaded must be picked up without a reload."""
+    outcome = _node_worker_eval(
+        f"""
+        const token = {json.dumps(TEST_TOKEN)};
+        let failure = null;
+        try {{
+          await worker.loadBridgeToken();
+        }} catch (error) {{
+          failure = String((error && error.message) || error);
+        }}
+        globalThis.__setToken('export const BRIDGE_TOKEN = "' + token + '";\\n');
+        const recovered = await worker.loadBridgeToken();
+        let junk = null;
+        try {{
+          worker.parseBridgeToken('export const BRIDGE_TOKEN = "nope";');
+        }} catch (error) {{
+          junk = String(error.message);
+        }}
+        return {{failure, recovered, junk}};
+        """
+    )
+    assert outcome["failure"], "the first read should fail while the token file is absent"
+    assert outcome["recovered"] == TEST_TOKEN
+    assert "no usable token" in outcome["junk"]
+
+
+def test_a_first_frame_that_is_not_an_object_is_refused_with_a_reason() -> None:
+    bridge = ChromeBridge(port=_free_port(), token=TEST_TOKEN)
+    bridge.start()
+    try:
+        for frame in ("not json at all", "123", "[1, 2]", "null"):
+            with _companion_socket(bridge.port) as websocket:
+                websocket.send(frame)
+                with pytest.raises(ConnectionClosed) as rejection:
+                    websocket.recv(timeout=5.0)
+            closed = rejection.value.rcvd
+            assert closed.code == 1008, frame
+            assert "JSON object" in closed.reason, frame
+        assert bridge.wait_connected(0.2) is False
+    finally:
+        bridge.shutdown()
 
 
 class _FakeBridge:

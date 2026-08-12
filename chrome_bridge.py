@@ -132,7 +132,16 @@ class ChromeBridge:
 
     def _handle_connection(self, websocket: Any) -> None:
         try:
-            first = json.loads(websocket.recv(timeout=5.0))
+            try:
+                first = json.loads(websocket.recv(timeout=5.0))
+            except (TypeError, ValueError):
+                first = None
+            if not isinstance(first, dict):
+                # Without this the AttributeError below lands in the catch-all and
+                # the peer only ever sees a bare 1000, with no hint of what broke.
+                LOGGER.warning("Rejected a bridge client whose first frame was not a JSON object")
+                websocket.close(code=1008, reason="Companion hello must be a JSON object")
+                return
             if first.get("type") != "hello" or first.get("protocol") != 1:
                 websocket.close(code=1008, reason="Expected Web Search Neo protocol hello")
                 return
@@ -257,7 +266,7 @@ class ChromeBridge:
                 f"'current' cannot be used{detail}. Either retry with "
                 '{"action": "open", "url": "...", "profile_mode": "temporary"}, '
                 'which needs no extension, or send {"action": '
-                '"setup_current_chrome"} and follow the confirmation it returns.'
+                '"setup_current_chrome"}, which returns the steps to install it.'
             )
         request_id = uuid.uuid4().hex
         with self._connection_lock:

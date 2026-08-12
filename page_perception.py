@@ -15,9 +15,21 @@ import re
 from typing import Any
 
 
-# ``ref:<epoch>:<N>`` is the current handle; ``ref:N`` is still accepted because
-# older transcripts and callers carry it, but it can only ever mean "this document".
+# ``ref:<epoch>:<N>`` is the only handle that resolves; ``ref:N`` still parses so
+# that an old transcript gets a real explanation instead of a CSS syntax error.
+# The epoch is minted as lowercase hex, so a handle is lowercased before it is
+# compared - an uppercase copy would otherwise never match and silently miss.
 REF_PATTERN = re.compile(r"^ref:(?:([0-9a-fA-F]{8,64}):)?(\d+)$")
+_LEGACY_REF_HINT = (
+    "Element handle '{handle}' carries no document epoch. Ref numbers restart at 1 "
+    "in every document, so a bare 'ref:N' could name a different element than the "
+    "one you read. Read the page again with web_info(topic='page_outline') and use "
+    "the 'ref:<epoch>:N' handle it reports."
+)
+_EMPTY_SEGMENT_HINT = (
+    "Piercing path '{selector}' has an empty segment. Write it as 'host >>> inner', "
+    "with a selector on both sides of every ' >>> '."
+)
 _PIERCING_SEPARATOR = " >>> "
 _MAX_OUTLINE_NODES = 1000
 _MAX_FIND_MATCHES = 25
@@ -67,10 +79,16 @@ REF_REGISTRY_SCRIPT = r"""
 """
 
 
-def parse_ref(ref_id: int | str) -> tuple[str | None, int]:
-    """Split a ``ref:<epoch>:<N>`` handle - or a legacy ``ref:N`` - into its parts."""
+def parse_ref(ref_id: int | str) -> tuple[str, int]:
+    """Split a ``ref:<epoch>:<N>`` handle into its epoch and its number.
+
+    A handle without an epoch - the legacy ``ref:N``, or a bare number - is
+    rejected rather than answered from the current document: it would resolve to
+    whichever element happens to hold that number now, which is exactly the
+    wrong-element bug the epoch exists to prevent.
+    """
     if isinstance(ref_id, bool):
-        raise ValueError("ref_id must be an integer or a 'ref:<epoch>:N' string")
+        raise ValueError("ref_id must be a 'ref:<epoch>:N' string")
     if isinstance(ref_id, str):
         match = REF_PATTERN.match(ref_id.strip())
         if match:
@@ -81,7 +99,9 @@ def parse_ref(ref_id: int | str) -> tuple[str | None, int]:
         epoch, number = None, int(ref_id)
     if number < 1:
         raise ValueError("ref_id must be a positive integer")
-    return epoch, number
+    if not epoch:
+        raise ValueError(_LEGACY_REF_HINT.format(handle=str(ref_id).strip()))
+    return epoch.lower(), number
 
 
 def ref_expression(ref_id: int | str) -> str:
@@ -90,21 +110,15 @@ def ref_expression(ref_id: int | str) -> str:
     Ref numbers restart at 1 in every document, so the epoch carried by the handle
     is compared with the live registry before the lookup: a handle minted on a page
     that has since been replaced resolves to ``null`` instead of to whatever element
-    now happens to hold that number. A legacy handle without an epoch carries no
-    document identity at all, so it is only ever answered from the current registry
-    and only while its node is still attached.
+    now happens to hold that number.
     """
     epoch, number = parse_ref(ref_id)
-    epoch_guard = (
-        f"if (registry.epoch !== {json.dumps(epoch, ensure_ascii=True)}) return null;"
-        if epoch
-        else ""
-    )
     return (
         "(() => {"
         "const registry = window.__wsnRefs;"
         "if (!registry || !registry.nodes) return null;"
-        f"{epoch_guard}"
+        f"if (String(registry.epoch).toLowerCase() !== {json.dumps(epoch, ensure_ascii=True)})"
+        " return null;"
         f"const node = registry.nodes.get({number});"
         # A ref outlives its element; a detached node would accept actions that no
         # user could ever perform on the page they are looking at.
@@ -1012,10 +1026,15 @@ function wsnTextWalk(el, budget) {
   // slotted light-DOM nodes are reached through <slot>. Walking both roots emits
   // every slotted node twice.
   const source = el.shadowRoot ? el.shadowRoot : el;
+  // Light-DOM text arrives through the slot with no whitespace of its own, so
+  // without a boundary it glues onto whatever the shadow tree emitted before it.
+  const slotted = tag === 'SLOT';
+  if (slotted) chunks.push(' ');
   for (const child of wsnChildNodes(source)) {
     if (child.nodeType === 3) wsnEmitText(child, el);
     else if (child.nodeType === 1) wsnTextWalk(child, budget);
   }
+  if (slotted) chunks.push(' ');
   if (includeLinks && tag === 'A' && el.getAttribute('href')) {
     const label = wsnClean(chunks.slice(linkStart).join(' '), WSN_VALUE_LIMIT);
     const index = links.length + 1;
@@ -1412,7 +1431,8 @@ def split_piercing_path(selector: str) -> list[str] | None:
 
     ``div[data-op='a >>> b']`` is a perfectly valid CSS selector, so the scan has to
     ignore the separator inside quotes and inside attribute brackets. Returns
-    ``None`` when the string is not a piercing path at all.
+    ``None`` when the string is not a piercing path at all, and raises when it is
+    one but a segment is missing.
     """
     parts: list[str] = []
     current: list[str] = []
@@ -1455,7 +1475,10 @@ def split_piercing_path(selector: str) -> list[str] | None:
         # at face value rather than swallowing the whole locator into one part.
         parts = selector.split(_PIERCING_SEPARATOR)
     parts = [part.strip() for part in parts]
-    parts = [part for part in parts if part]
+    if len(parts) > 1 and not all(parts):
+        # Dropping the empty part would leave a single segment that then travels
+        # on as plain CSS and fails deep inside the driver with nothing to act on.
+        raise ValueError(_EMPTY_SEGMENT_HINT.format(selector=selector))
     return parts if len(parts) > 1 else None
 
 
@@ -1463,9 +1486,10 @@ def resolve_locator_expression(locator: str) -> str | None:
     """Translate a ref handle or a ``a >>> b`` piercing path into a JS expression.
 
     Returns ``None`` for plain CSS selectors so the caller keeps its existing
-    ``find_element`` path. ``ref:12`` is not valid CSS, and `` ' >>> ' `` is only
-    treated as a separator outside quotes and brackets, so neither form can steal a
-    selector that already works today.
+    ``find_element`` path, and raises for a locator that is meant as a ref or a
+    piercing path but cannot address anything. `` ' >>> ' `` is only treated as a
+    separator outside quotes and brackets, so neither form can steal a selector
+    that already works today.
     """
     if not isinstance(locator, str):
         return None
@@ -1474,6 +1498,10 @@ def resolve_locator_expression(locator: str) -> str | None:
         return None
     if REF_PATTERN.match(candidate):
         return ref_expression(candidate)
+    if candidate.startswith(">>>") or candidate.endswith(">>>"):
+        # Stripping already ate the space that made this a separator, and no CSS
+        # selector begins or ends with a bare '>>>'.
+        raise ValueError(_EMPTY_SEGMENT_HINT.format(selector=candidate))
     if _PIERCING_SEPARATOR not in candidate:
         return None
     parts = split_piercing_path(candidate)

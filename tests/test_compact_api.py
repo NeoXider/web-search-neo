@@ -283,7 +283,7 @@ def test_compact_web_info_discovers_one_action_at_a_time():
     setup_schema = asyncio.run(
         main.web_info("action_schema", {"action": "setup_current_chrome"})
     )
-    assert setup_schema["input_schema"]["properties"]["confirm_install"]["default"] is False
+    assert setup_schema["input_schema"]["properties"]["wait_seconds"]["default"] == 1.0
 
     with pytest.raises(ValueError, match="Unknown action schema"):
         asyncio.run(main.web_info("action_schema", {"action": "unknown"}))

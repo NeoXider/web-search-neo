@@ -234,35 +234,36 @@ limits, and worked examples. `web_info(topic="action_schema", params={"action":
 The default browser mode is `current`. It fails with a clear setup error when the
 companion isn't connected; it does not silently open a different browser.
 
-An agent can prepare the bundled companion through the compact MCP contract. If
-it is not already connected, the first call changes no Chrome setting and returns
-the exact requested browser change:
+An agent prepares the bundled companion through the compact MCP contract:
 
 ```json
 {"actions":[{"action":"setup_current_chrome"}]}
 ```
 
-After the user explicitly approves installing the extension, repeat the call with
-`"confirm_install": true`:
+That call changes nothing in any browser. It writes the shared secret into
+`chrome-extension/bridge-token.js`, checks the bundled build against whatever is
+connected, and returns `manual_steps` — the clicks that are left, with the
+absolute path of the folder to pick — plus `token_ready` and `token_file`.
 
-```json
-{"actions":[{"action":"setup_current_chrome","confirm_install":true}]}
-```
+Chrome does not let a program add an unpacked extension to a browser that is
+already open: the installed set is signed inside `Secure Preferences`, policy
+installs need a packed CRX behind an update URL, and a Chrome started without a
+DevTools port cannot be given one later. So three steps stay with the user:
 
-On Windows this publishes the shared secret into the extension folder, opens
-`chrome://extensions`, enables Developer mode, loads this repository's fixed
-`chrome-extension` folder — reloading the card if one is already there, so a
-stale service worker picks up the current secret — and waits for the loopback
-connection. Chrome deliberately shows the extension and its permissions; this
-isn't a silent extension install. Both calls report `token_ready` and the
-`token_file` they used.
-
-Manual installation remains available:
-
-1. Start or restart the MCP server so its loopback bridge is listening on `127.0.0.1:8765`. Starting the server also writes the shared secret the companion needs.
-2. Open `chrome://extensions`, enable **Developer mode**, and choose **Load unpacked**.
+1. Open `chrome://extensions`.
+2. Switch on **Developer mode**, then choose **Load unpacked**.
 3. Select this repository's `chrome-extension` folder.
-4. Keep **Web Search Neo Companion** enabled. Its toolbar badge reads `ON` while the MCP is connected and authenticated.
+
+Keep **Web Search Neo Companion** enabled. Its toolbar badge reads `ON` while the
+MCP is connected and authenticated. Nobody has to create or copy a token: the
+server writes it on every start and on every `setup_current_chrome` call.
+
+Earlier revisions tried to perform those clicks through Windows UI Automation.
+That code is gone: it depended on the interface language, on which window had
+focus, and on a folder picker the automation backend does not enumerate. There
+is no automatic substitute. If you would rather not install an extension at all,
+`profile_mode="temporary"` and `profile_mode="persistent"` drive a Selenium
+browser that needs no companion.
 
 The bundled companion is version 1.3.0. Chrome does not refresh an unpacked
 extension by itself, so after pulling a new revision press **Reload** on the
@@ -378,7 +379,7 @@ self-opened tab behind. The MCP doesn't read cookies or passwords; the page
 simply continues using the authorization already present in Chrome.
 
 If the companion isn't ready, read `web_info(topic="browser_status")` and run the
-confirmation-gated `setup_current_chrome` action. Use `profile_mode="auto"` only
+`setup_current_chrome` action for the exact steps. Use `profile_mode="auto"` only
 when opening a separate visible Selenium window is an acceptable fallback.
 
 ### Chrome profile modes
@@ -465,7 +466,7 @@ Ref handles carry the document they were read from:
 
 - element numbers restart at 1 in every document, so the earlier `ref:N` form silently resolved to an unrelated element after a navigation — a `ref:1` saved from a search page addressed whatever happened to be the first node of the next page;
 - a handle whose epoch no longer matches now resolves to nothing, and the action fails with an explicit "read the page again with `page_outline`" message. So does a handle whose element has been detached from the DOM;
-- the bare `ref:N` form is still accepted for compatibility, but it carries no document identity, so it is only ever answered from the current document and only while its node is still attached.
+- a bare `ref:N` without an epoch is refused outright, with an error that says to read `page_outline` again: it carries no document identity, and answering it from whatever document happens to be loaded is the very mistake the epoch exists to prevent.
 
 Ref handles and piercing paths are accepted by `fill` (both its field and its file keys),
 `upload`, `click`, `wait`, and the `form_selector` of `submit`. `click` and `wait` took
@@ -713,7 +714,7 @@ python -m pytest
 python -m pytest --cov=. --cov-report=term-missing
 ```
 
-The deterministic suite is 231 tests, grouped by what they protect:
+The deterministic suite is 250 tests, grouped by what they protect:
 
 | Area | Covered |
 | --- | --- |
@@ -748,7 +749,7 @@ It reports the eager tool-schema size and the median and p95 latency of both MCP
 - The loopback bridge is authenticated in both directions. The extension proves it holds the machine-local token before the server accepts a command, and the server proves the same by returning `HMAC-SHA256(token, nonce)` before the extension executes one. Until 1.3.0 the port accepted any local client that spoke the protocol, and the extension trusted whatever answered on it.
 - That secret is a file readable by the user account that owns it, so it does not defend against a malicious process already running as you: such a process can read the token and impersonate either side. It removes the race in which any local program that binds `127.0.0.1:8765` before the server inherits DevTools access to every signed-in tab. Chrome Native Messaging, which needs no listening port at all, is the actual fix and is tracked in [TODO.md](TODO.md).
 - Authentication is not authorization. An authenticated peer may call `cdp.send` with any DevTools method on any tab the session drives; there is no method allowlist yet.
-- `setup_current_chrome` requires explicit user approval before it changes Chrome's extension state.
+- `setup_current_chrome` changes no browser state at all. It publishes the shared secret and returns the steps; installing the companion stays a deliberate user action in Chrome's own UI.
 - Plain `http://` to public hosts is refused unless `WEB_SEARCH_NEO_ALLOW_PLAIN_HTTP=1` is set; loopback and private-network addresses are always reachable.
 - File upload tools can upload local paths supplied to the tool. Review agent actions and scope filesystem access appropriately.
 - Browser automation may be restricted by a site's terms of service. Use it only where you are authorized.

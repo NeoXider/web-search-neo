@@ -755,16 +755,16 @@ def _companion_status() -> dict[str, Any]:
     )
     if not status["connected"]:
         status["next"] = (
-            'Not connected. Send {"action": "setup_current_chrome"} to see the exact '
-            "change it would make, then repeat it with confirm_install=true once the "
-            "user approves. Selenium modes (profile_mode temporary/persistent) need "
-            "no extension."
+            'Not connected. Send {"action": "setup_current_chrome"} for the exact '
+            "steps the user has to perform; nothing can install the extension for "
+            "them. Selenium modes (profile_mode temporary/persistent) need no "
+            "extension."
         )
     elif status["outdated"]:
         status["next"] = (
             f"The connected companion is {running} but this server ships {expected}. "
-            "Reload it on chrome://extensions, or run setup_current_chrome with "
-            "confirm_install=true."
+            "Press Reload on its card at chrome://extensions; run "
+            "setup_current_chrome for the exact steps."
         )
     else:
         status["next"] = None
@@ -776,13 +776,9 @@ def get_current_tabs(wait_seconds: float = 1.0) -> dict[str, Any]:
     return list_current_chrome_tabs(max(0.0, min(float(wait_seconds), 5.0)))
 
 
-def setup_current_chrome_companion(
-    confirm_install: bool = False,
-    timeout_seconds: float = 30.0,
-    window_title: str | None = None,
-) -> dict[str, Any]:
-    """Install or enable the current-Chrome companion after explicit consent."""
-    return setup_current_chrome(confirm_install, timeout_seconds, window_title)
+def setup_current_chrome_companion(wait_seconds: float = 1.0) -> dict[str, Any]:
+    """Publish the bridge secret and return the manual steps Chrome still requires."""
+    return setup_current_chrome(wait_seconds)
 
 
 def attach_current_tab(

@@ -13,7 +13,6 @@ dependencies = [
     "beautifulsoup4>=4.13,<5",
     "selenium>=4.34,<5",
     "websockets>=15,<18",
-    "pywinauto>=0.6.9,<0.7; platform_system == 'Windows'",
 ]
 
 [project.urls]

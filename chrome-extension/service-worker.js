@@ -22,9 +22,10 @@ import {
 const BRIDGE_URL = "ws://127.0.0.1:8765";
 const PROTOCOL_VERSION = 1;
 const RECONNECT_MS = 2000;
-// A rejected handshake means the operator has to reload this extension, so
-// retrying is nearly pointless; the delay stays under the worker idle timeout
-// so the badge keeps updating instead of the worker dying unrecoverably.
+// A refused handshake usually waits on the operator, so this retry is slow on
+// purpose. It is still a real retry: the token is re-read from disk on every
+// attempt, so a secret written after the extension was loaded is picked up
+// without a reload.
 const AUTH_RETRY_MS = 10000;
 const KEEPALIVE_MS = 20000;
 const DEBUGGER_VERSION = "1.3";
@@ -570,22 +571,47 @@ chrome.debugger.onDetach.addListener(source => {
 
 chrome.tabs.onRemoved.addListener(tabId => forgetTab(tabId));
 
-async function handleCommand(message) {
+// A command runs for as long as attaching a debugger or loading a page takes,
+// and the socket can be replaced meanwhile. Answering into whatever socket is
+// current by then would hand page contents to a peer that has not proved it
+// knows the companion token yet.
+export function isLiveConnection(connection) {
+  return Boolean(connection)
+    && connection === socket
+    && verified
+    && connection.readyState === WebSocket.OPEN;
+}
+
+function sendResult(connection, id, payload) {
+  if (!isLiveConnection(connection)) {
+    console.warn(`bridge: dropped the result for ${id}; its connection is gone`);
+    return false;
+  }
+  try {
+    connection.send(JSON.stringify({type: "result", id, ...payload}));
+  } catch (error) {
+    // The socket can die between the check and the write; nobody is awaiting
+    // this call, so a throw here would only surface as an unhandled rejection.
+    console.warn(`bridge: could not answer ${id}`, error);
+    return false;
+  }
+  return true;
+}
+
+export async function handleCommand(connection, message) {
   const {id, method} = message;
   const params = message.params && typeof message.params === "object" ? message.params : {};
+  if (!isLiveConnection(connection)) return;
+  let payload;
   try {
     await restoreState();
     const handler = commands[method];
     if (!handler) throw new Error(`Unknown bridge method: ${method}`);
-    const result = await handler(params);
-    socket?.send(JSON.stringify({type: "result", id, result}));
+    payload = {result: await handler(params)};
   } catch (error) {
-    socket?.send(JSON.stringify({
-      type: "result",
-      id,
-      error: `${error?.name || "Error"}: ${error?.message || error}`,
-    }));
+    payload = {error: `${error?.name || "Error"}: ${error?.message || error}`};
   }
+  sendResult(connection, id, payload);
 }
 
 function setBadge(online) {
@@ -628,14 +654,20 @@ function timingSafeEqual(left, right) {
   return difference === 0;
 }
 
+export function parseBridgeToken(source) {
+  const match = /BRIDGE_TOKEN\s*=\s*["']([0-9a-f]{64})["']/.exec(String(source ?? ""));
+  if (!match) throw new Error("bridge-token.js holds no usable token");
+  return match[1];
+}
+
 // bridge-token.js is written by the Python side and is absent in a fresh clone.
-// The module graph caches this import, so a rotated token is only picked up
-// after the extension is reloaded — which is exactly what setup does.
-async function loadBridgeToken() {
-  const module = await import("./bridge-token.js");
-  const token = String(module?.BRIDGE_TOKEN || "");
-  if (!/^[0-9a-f]{64}$/.test(token)) throw new Error("bridge-token.js holds no usable token");
-  return token;
+// It is read rather than imported on purpose: the worker's module map caches a
+// failed import for the life of the worker, so a token file that appears after
+// the first attempt would never be seen without a manual reload.
+export async function loadBridgeToken() {
+  const response = await fetch(chrome.runtime.getURL("bridge-token.js"), {cache: "no-store"});
+  if (!response.ok) throw new Error(`bridge-token.js is unreadable (HTTP ${response.status})`);
+  return parseBridgeToken(await response.text());
 }
 
 async function hmacSha256(token, message) {
@@ -650,7 +682,7 @@ async function hmacSha256(token, message) {
   return new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(message)));
 }
 
-async function connect() {
+export async function connect() {
   if (connecting) return;
   if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
   connecting = true;
@@ -708,10 +740,10 @@ async function connect() {
     const {id, method} = message;
     if (typeof id !== "string" && typeof id !== "number") return;
     if (typeof method !== "string") {
-      active.send(JSON.stringify({type: "result", id, error: "Error: method must be a string"}));
+      sendResult(active, id, {error: "Error: method must be a string"});
       return;
     }
-    handleCommand(message);
+    handleCommand(active, message);
   };
   socket.onclose = event => {
     const rejected = handshakeStarted && !verified;

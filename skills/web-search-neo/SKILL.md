@@ -61,9 +61,9 @@ stay reachable, so local services work unchanged.
   New tabs enter group `AI`; `attach_tab` claims an existing `tab_id` without moving it.
   `close` removes a tab the agent opened and leaves a claimed tab open; `close_all` follows
   the same rule for every session at once.
-- If the companion is disconnected, read `browser_status` and call `setup_current_chrome`
-  without confirmation. Only after the user explicitly approves may you repeat it with
-  `confirm_install=true`.
+- If the companion is disconnected, read `browser_status` and call `setup_current_chrome`.
+  It changes no browser: show the `manual_steps` it returns to the user word for word, and
+  wait for them. Nothing can install the extension on their behalf.
 - `auto` falls back to a visible temporary window; `temporary` and `persistent` are
   MCP-owned and visible unless `headless=true`; `attach` uses a Chrome you started with a
   DevTools port and stays open afterwards.

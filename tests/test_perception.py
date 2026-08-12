@@ -213,20 +213,20 @@ def test_closed_shadow_roots_are_counted_when_the_registry_boots_early(local_sit
 
 
 def test_resolve_locator_expression_handles_the_three_locator_forms():
-    legacy = page_perception.resolve_locator_expression("ref:12")
-    assert "nodes.get(12)" in legacy
-    assert "isConnected" in legacy  # a bare ref may only answer for a live node
-    assert "registry.epoch !==" not in legacy
-    assert page_perception.ref_expression(7) == page_perception.ref_expression("ref:7")
-
     scoped = page_perception.resolve_locator_expression("ref:a1b2c3d4e5f60718:12")
-    assert 'registry.epoch !== "a1b2c3d4e5f60718"' in scoped
+    assert '!== "a1b2c3d4e5f60718"' in scoped
     assert "nodes.get(12)" in scoped
+    assert "isConnected" in scoped  # a ref may only answer for a live node
     assert page_perception.parse_ref("ref:a1b2c3d4e5f60718:12") == (
         "a1b2c3d4e5f60718",
         12,
     )
-    assert page_perception.parse_ref("ref:12") == (None, 12)
+    # The epoch is minted lowercase, so a shouted copy has to be folded, not missed.
+    assert page_perception.parse_ref("ref:A1B2C3D4E5F60718:12") == (
+        "a1b2c3d4e5f60718",
+        12,
+    )
+    assert page_perception.ref_expression("ref:A1B2C3D4E5F60718:12") == scoped
 
     piercing = page_perception.resolve_locator_expression("my-app >>> #inner >>> button")
     assert piercing is not None
@@ -237,6 +237,26 @@ def test_resolve_locator_expression_handles_the_three_locator_forms():
     assert page_perception.resolve_locator_expression("input[name='q']") is None
     assert page_perception.resolve_locator_expression("") is None
     assert page_perception.resolve_locator_expression("ref:abc") is None
+
+
+@pytest.mark.parametrize("handle", ["ref:12", "ref:1", 7])
+def test_a_ref_without_an_epoch_is_refused_instead_of_guessed(handle):
+    """`ref:N` names a number, and every document numbers its elements from 1."""
+    with pytest.raises(ValueError, match="page_outline"):
+        page_perception.parse_ref(handle)
+    with pytest.raises(ValueError, match="page_outline"):
+        page_perception.ref_expression(handle)
+    if isinstance(handle, str):
+        with pytest.raises(ValueError, match="page_outline"):
+            page_perception.resolve_locator_expression(handle)
+
+
+@pytest.mark.parametrize("selector", ["a >>> ", " >>> a", "a >>>  >>> b", " >>> "])
+def test_a_piercing_path_with_an_empty_segment_is_refused(selector):
+    with pytest.raises(ValueError, match="empty segment"):
+        page_perception.split_piercing_path(selector)
+    with pytest.raises(ValueError, match="empty segment"):
+        page_perception.resolve_locator_expression(selector)
 
 
 def test_locator_parsing_never_splices_raw_input_into_javascript():
@@ -303,6 +323,13 @@ def test_a_ref_from_another_document_never_resolves(local_site):
 
         with pytest.raises(ValueError, match="stale"):
             browser_tools._resolve_element(driver, button["ref"])
+
+        # The same number written the legacy way used to resolve happily - to
+        # whichever element of the new page happens to hold it.
+        number = button["ref"].rsplit(":", 1)[1]
+        assert any(node["ref"].endswith(f":{number}") for node in _nodes(second))
+        with pytest.raises(ValueError, match="page_outline"):
+            browser_tools._resolve_element(driver, f"ref:{number}")
     finally:
         browser_tools.close_session("perception-epoch")
 
@@ -438,10 +465,13 @@ def test_page_text_does_not_repeat_slotted_content(local_site):
             "host.innerHTML = '<span>SLOTTED-MARKER-ONCE</span>';"
             "document.body.appendChild(host);"
             "host.attachShadow({mode: 'open'}).innerHTML ="
-            "  '<section><slot></slot></section>';"
+            "  '<section>SHADOWLEAD<slot></slot></section>';"
         )
         text = page_perception.page_text(driver, mode="full")["text"]
         assert text.count("SLOTTED-MARKER-ONCE") == 1, text
+        # Slotted light-DOM text carries no whitespace of its own, so the shadow
+        # tree's last word would otherwise run straight into it.
+        assert "SHADOWLEAD SLOTTED-MARKER-ONCE" in text, text
     finally:
         browser_tools.close_session("perception-slot")
 

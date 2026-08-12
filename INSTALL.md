@@ -11,9 +11,8 @@ the 1.3.0 handshake — see [Updating](#updating) if an older one is already ins
 - Python 3.10, 3.11, 3.12, or 3.13 available as `python` on `PATH`.
 - Git.
 - Google Chrome 116+ for rendered browser automation. Search and plain HTTP fetch tools do not require Chrome.
-- Windows, Linux, or macOS supported by Selenium Manager. Automatic companion
-  setup uses Windows UI Automation; manual unpacked installation works anywhere
-  Chrome supports extensions.
+- Windows, Linux, or macOS supported by Selenium Manager. The companion is installed by
+  three clicks in your own Chrome, which works anywhere Chrome supports extensions.
 
 Check the commands before continuing:
 
@@ -132,33 +131,26 @@ Start/restart the MCP first, then ask it for setup state:
 }
 ```
 
-If the companion is not already connected, that first call changes no Chrome
-setting and returns `confirmation_required=true`. After the user explicitly
-approves installing the extension, send:
+That call changes nothing in any browser. It writes the shared bridge secret into
+`chrome-extension/bridge-token.js`, compares the bundled build with whatever is connected,
+and returns `manual_steps`: the clicks that are left, with the absolute path of the folder
+to pick. The result also carries `token_ready` and the `token_file` it wrote.
 
-```json
-{
-  "actions": [{
-    "action": "setup_current_chrome",
-    "confirm_install": true,
-    "timeout_seconds": 30
-  }]
-}
-```
+Chrome does not let any program add an unpacked extension to a browser you already have
+open. The installed set is signed inside `Secure Preferences`, policy installs need a packed
+CRX behind an update URL, and a Chrome that started without a DevTools port cannot be given
+one afterwards. So these three steps are yours:
 
-On Windows the action first writes the shared bridge secret into the extension folder, then
-opens `chrome://extensions`, enables Developer mode, loads the repository's
-`chrome-extension` folder — reloading the card when one is already present — and waits for
-the companion. Chrome still displays the unpacked extension and its permissions. The result
-carries `token_ready` and the `token_file` that was used. If UI Automation isn't available,
-install manually:
+1. Open `chrome://extensions`.
+2. Switch on **Developer mode** (top-right of that page).
+3. Choose **Load unpacked** and select the repository's `chrome-extension` folder.
 
-1. Start the MCP server at least once from the clone, so it writes
-   `chrome-extension/bridge-token.js`.
-2. Open `chrome://extensions`.
-3. Enable **Developer mode**.
-4. Choose **Load unpacked** and select the repository's `chrome-extension` folder.
-5. Leave **Web Search Neo Companion** enabled and restart/toggle the MCP server.
+Leave **Web Search Neo Companion** enabled; its toolbar badge reads `ON` once it reaches the
+server. You never create or copy a token by hand — the server writes it on every start.
+
+Earlier revisions tried to perform those clicks for you through Windows UI Automation. That
+code is gone. It depended on the interface language, on which window happened to have focus,
+and on a folder picker that the automation backend does not even enumerate.
 
 The bundled companion is version 1.3.0 and declares four permissions: `debugger`, `storage`,
 `tabs`, and `tabGroups`. There are no content scripts and no `host_permissions`; page access
@@ -169,6 +161,10 @@ If the companion was already installed from an earlier revision, Chrome keeps ru
 old service worker until you press **Reload** on its card at `chrome://extensions`. Do that
 after every `git pull`. From 1.3.0 onwards it is not optional: an older worker knows nothing
 about the handshake below, so the bridge rejects it and the badge never turns `ON`.
+
+There is no automatic alternative to those three steps, on any platform. If you do not want
+an extension at all, use the Selenium modes in section 7 — `profile_mode="temporary"` and
+`profile_mode="persistent"` drive their own browser and need no companion.
 
 Verify it with `web_info(topic="browser_status")`; `current_chrome.connected`
 should be `true`. List tabs with `web_info(topic="browser_tabs")`, then claim an
@@ -197,9 +193,9 @@ work; it is documented because the file exists on your disk.
 - The token is machine-local and per-user. Never copy it to another machine or into a
   repository; if it leaks, delete the file, restart the MCP server, and reload the
   companion, which mints and publishes a new one.
-- The server writes a copy into `chrome-extension/bridge-token.js` whenever it starts and
-  before `setup_current_chrome` touches Chrome. That file is in `.gitignore`; a fresh clone
-  does not contain it, and the companion simply retries until the server has written it.
+- The server writes a copy into `chrome-extension/bridge-token.js` whenever it starts and on
+  every `setup_current_chrome` call. That file is in `.gitignore`; a fresh clone does not
+  contain it, and the companion simply retries until the server has written it.
 - The companion sends the token with a nonce; the server answers with
   `HMAC-SHA256(token, nonce)`; each side stops if the other cannot prove it holds the same
   secret.

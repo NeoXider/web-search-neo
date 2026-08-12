@@ -422,17 +422,10 @@ async def browser_list_tabs(wait_seconds: float = 1.0) -> dict[str, Any]:
 
 
 @mcp.tool()
-async def browser_setup_current_chrome(
-    confirm_install: bool = False,
-    timeout_seconds: float = 30.0,
-    window_title: str | None = None,
-) -> dict[str, Any]:
-    """Install/enable the companion in current Chrome; requires explicit consent."""
+async def browser_setup_current_chrome(wait_seconds: float = 1.0) -> dict[str, Any]:
+    """Publish the bridge secret and return the manual steps Chrome still requires."""
     return await asyncio.to_thread(
-        browser_tools.setup_current_chrome_companion,
-        confirm_install,
-        timeout_seconds,
-        window_title,
+        browser_tools.setup_current_chrome_companion, wait_seconds
     )
 
 
@@ -1018,7 +1011,7 @@ _ACTIONS: dict[str, ActionSpec] = {
             "setup_current_chrome",
             browser_setup_current_chrome,
             "session",
-            "Connect the companion extension; changing Chrome needs explicit user approval.",
+            "Publish the bridge secret and return the manual steps Chrome still requires.",
         ),
         _action("wait", browser_wait_for, "page", "Wait until an element is present, visible, or clickable."),
         _action(
@@ -1219,6 +1212,17 @@ _ACTION_NOTES = {
     },
     "step": {
         "speed": _HOT_PATH_SPEED,
+    },
+    "setup_current_chrome": {
+        "changes_nothing": (
+            "It publishes the shared secret and reads state. Show manual_steps to the "
+            "user verbatim; they contain the absolute folder to pick."
+        ),
+        "why": (
+            "No program can add an unpacked extension to a Chrome that is already "
+            "open, so the three clicks belong to the user."
+        ),
+        "wait_seconds": "Raise it right after the user pressed Load unpacked.",
     },
     "open": {
         "profile_mode": {
