@@ -86,6 +86,11 @@ class BrowserSession:
     console_cursor: int = 0
     browser_log: list[dict[str, Any]] = field(default_factory=list)
     browser_log_cursor: int = 0
+    # game_probe reads the same two sources as the console topic, but reports
+    # what is new to *it*, so it carries its own place in both of them.
+    probe_console_cursor: int = 0
+    probe_log_cursor: int = 0
+    probe_console_seen: list[dict[str, Any]] = field(default_factory=list)
     network_pending: dict[str, dict[str, Any]] = field(default_factory=dict)
     network_rows: list[dict[str, Any]] = field(default_factory=list)
     network_subscribed: bool = False
@@ -1324,7 +1329,11 @@ def press_keys(
             driver.switch_to.default_content()
         if _advance_frame and not (selected_action == "tap" and stepping):
             _auto_advance_render_after_input(session)
-            frames_advanced += 1
+            # Only step mode releases frames by hand. In normal and throttled mode
+            # the page draws on its own schedule and this call held nothing back,
+            # so counting a frame here would invent one the caller never got.
+            if stepping:
+                frames_advanced += 1
         _wait_after_action(driver, wait_seconds)
         return {
             **_action_summary(driver, session_id, include_summary),
@@ -1489,7 +1498,49 @@ def _drain_browser_log(session: BrowserSession) -> list[dict[str, Any]]:
     if overflow > 0:
         del session.browser_log[:overflow]
         session.browser_log_cursor = max(0, session.browser_log_cursor - overflow)
+        session.probe_log_cursor = max(0, session.probe_log_cursor - overflow)
     return session.browser_log
+
+
+def _console_since(
+    session: BrowserSession, console_seq: int, log_cursor: int, clear: bool = False
+) -> dict[str, Any]:
+    """Collect the console output recorded after one reader's own two cursors.
+
+    A reader carries two of them because the sources are counted in different
+    units and neither may be consumed on another reader's behalf: the in-page
+    hook numbers the entries it keeps, while Chrome's browser log is destroyed by
+    reading it, so it is drained into a session buffer that readers index into.
+    The companion backend buffers both inside the extension, where one sequence
+    number covers everything.
+
+    ``clear`` throws the buffered entries away after they have been collected,
+    which leaves every cursor pointing at an empty buffer.
+    """
+    driver = session.driver
+    if hasattr(driver, "get_events"):
+        payload = driver.get_events(kinds=["console"], since_seq=console_seq, limit=500)
+        entries = list(payload.get("entries") or [])
+        next_seq = int(payload.get("next_seq") or console_seq)
+        next_log = log_cursor
+        if clear:
+            driver.clear_events(kinds=["console"])
+    else:
+        payload = diagnostics.read_page_console(driver, console_seq, clear)
+        entries = list(payload.get("entries") or [])
+        next_seq = int(payload.get("next_seq") or console_seq)
+        buffered = _drain_browser_log(session)
+        entries.extend(buffered[min(max(0, log_cursor), len(buffered)) :])
+        next_log = len(buffered)
+        if clear:
+            session.browser_log.clear()
+    entries.sort(key=lambda item: (item.get("ts") or 0, item.get("seq") or 0))
+    return {
+        "entries": diagnostics.dedupe_console(entries),
+        "next_seq": 0 if clear else next_seq,
+        "next_log_cursor": 0 if clear else next_log,
+        "dropped": payload.get("dropped"),
+    }
 
 
 def get_console(
@@ -1508,41 +1559,30 @@ def get_console(
     """
     session = _get_session(session_id)
     with session.lock:
-        driver = session.driver
-        entries: list[dict[str, Any]] = []
-        if hasattr(driver, "get_events"):
-            payload = driver.get_events(
-                kinds=["console"], since_seq=since_seq or session.console_cursor, limit=500
-            )
-            entries = list(payload.get("entries") or [])
-            session.console_cursor = int(payload.get("next_seq") or session.console_cursor)
-            dropped = payload.get("dropped")
-            if clear:
-                driver.clear_events(kinds=["console"])
-                session.console_cursor = 0
-        else:
-            payload = diagnostics.read_page_console(
-                driver, since_seq or session.console_cursor, clear
-            )
-            entries = list(payload.get("entries") or [])
-            session.console_cursor = int(payload.get("next_seq") or session.console_cursor)
-            buffered = _drain_browser_log(session)
-            entries.extend(buffered[session.browser_log_cursor :])
-            session.browser_log_cursor = len(buffered)
-            if clear:
-                session.browser_log.clear()
-                session.browser_log_cursor = 0
-            dropped = payload.get("dropped")
-        entries.sort(key=lambda item: (item.get("ts") or 0, item.get("seq") or 0))
-        entries = diagnostics.dedupe_console(entries)
-        selected = diagnostics.filter_console(entries, levels, contains, kinds, limit)
+        payload = _console_since(
+            session,
+            since_seq or session.console_cursor,
+            session.browser_log_cursor,
+            clear,
+        )
+        session.console_cursor = payload["next_seq"]
+        session.browser_log_cursor = payload["next_log_cursor"]
+        if clear:
+            # The buffers everyone reads are gone, so no reader may keep a place
+            # in them: a stale index would skip whatever arrives next.
+            session.probe_console_cursor = 0
+            session.probe_log_cursor = 0
+            session.probe_console_seen.clear()
+        selected = diagnostics.filter_console(
+            payload["entries"], levels, contains, kinds, limit
+        )
         return {
             "success": True,
             "session_id": session_id,
             "entries": selected,
             "returned": len(selected),
             "next_seq": session.console_cursor,
-            "dropped": dropped,
+            "dropped": payload["dropped"],
             "levels": levels or list(diagnostics.LEVELS),
             "note": (
                 "The buffer starts when the session connects; reload the page to "
@@ -2368,13 +2408,39 @@ return {
 """
 
 
+def _unreported_console(
+    session: BrowserSession, entries: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Drop the copies of messages an earlier probe already reported.
+
+    Chrome writes its own browser-log copy of a ``console.error`` a moment after
+    the in-page hook has handed the message over, so the two copies can arrive in
+    different probes, where the dedupe inside a single read cannot see them
+    together. Remembering the last hooked messages is what keeps one error
+    reported once rather than once per channel.
+    """
+    remembered = session.probe_console_seen
+    fresh = diagnostics.dedupe_console(remembered + entries)[len(remembered) :]
+    session.probe_console_seen = (
+        remembered + [item for item in fresh if item.get("kind") != "browser"]
+    )[-50:]
+    return fresh
+
+
 def game_probe(
     session_id: str = "default",
     frame_selector: str | None = None,
     sample_seconds: float = 1.0,
     include_console: bool = True,
 ) -> dict[str, Any]:
-    """Inspect canvas/WebGL readiness, animation FPS, frames, focus, and console issues."""
+    """Inspect canvas/WebGL readiness, animation FPS, frames, focus, and console issues.
+
+    ``console_messages`` carries only what appeared since this session's previous
+    probe, each message once, so that polling in a loop reports a problem when it
+    happens instead of re-reporting everything the session has ever logged. The
+    console topic keeps its own place in the same buffers, so reading either one
+    leaves the other's entries where they are.
+    """
     duration = max(0.1, min(float(sample_seconds), 3.0))
     session = _get_session(session_id)
     with session.lock:
@@ -2439,13 +2505,18 @@ def game_probe(
         console_error: str | None = None
         if include_console:
             try:
+                payload = _console_since(
+                    session, session.probe_console_cursor, session.probe_log_cursor
+                )
+                session.probe_console_cursor = payload["next_seq"]
+                session.probe_log_cursor = payload["next_log_cursor"]
                 console_messages = [
                     {
                         "level": item.get("level"),
                         "message": str(item.get("text", ""))[:2000],
                         "timestamp": item.get("ts"),
                     }
-                    for item in _drain_browser_log(session)[-100:]
+                    for item in _unreported_console(session, payload["entries"])[-100:]
                     if item.get("level") in {"warn", "error"}
                 ]
             except Exception as exc:
@@ -2457,6 +2528,7 @@ def game_probe(
             **probe,
             "animation": animation,
             "console_messages": console_messages,
+            "console_scope": "new since the previous game_probe call",
             "console_error": console_error,
             "render_control": {
                 "mode": session.render_mode,
@@ -2547,6 +2619,10 @@ state.wrapTimer = (callback, delay, args, interval) => {
       state.timers.set(id, {
         callback: callback, args: args, interval: interval, due: state.now() + wait
       });
+      // A queued timer is work that only a released frame can run, so it has to
+      // be able to start the pump on its own; in step mode this does nothing and
+      // the agent stays the only source of frames.
+      state.schedule();
       return id;
     }
     const fire = interval === null
@@ -2678,8 +2754,17 @@ state.flush = () => {
     return batch.length;
 };
 
+// Keep the throttled pump running for as long as anything is waiting on a
+// frame - a queued frame callback or a gated timer. Waiting only on frame
+// callbacks deadlocks a page whose loop boots from a timer: that timer runs on
+// the frame it was itself going to ask for. With nothing queued no timer is
+// armed at all, so an idle page costs nothing and the pump restarts from
+// `request` and `wrapTimer` the moment work appears.
+state.pumpWanted = () =>
+    state.pending.size > 0 || (state.gateTimers && state.timers.size > 0);
+
 state.schedule = () => {
-    if (state.mode !== 'throttled' || state.timer !== null || !state.pending.size) return;
+    if (state.mode !== 'throttled' || state.timer !== null || !state.pumpWanted()) return;
     const elapsed = nativePerformanceNow() - state.lastRealFlush;
     const delay = Math.max(0, state.interval - elapsed);
     state.timer = nativeSetTimeout(() => {

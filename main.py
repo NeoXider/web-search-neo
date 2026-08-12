@@ -20,7 +20,7 @@ import msp_search
 from web_client import request
 
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 PROJECT_DIR = Path(__file__).resolve().parent
 log = logging.getLogger("web_search_neo")
@@ -423,7 +423,7 @@ async def browser_list_tabs(wait_seconds: float = 1.0) -> dict[str, Any]:
 
 @mcp.tool()
 async def browser_setup_current_chrome(wait_seconds: float = 1.0) -> dict[str, Any]:
-    """Publish the bridge secret and return the manual steps Chrome still requires."""
+    """Publish the bridge secret, update a stale companion, and return what is left."""
     return await asyncio.to_thread(
         browser_tools.setup_current_chrome_companion, wait_seconds
     )
@@ -1214,13 +1214,16 @@ _ACTION_NOTES = {
         "speed": _HOT_PATH_SPEED,
     },
     "setup_current_chrome": {
-        "changes_nothing": (
-            "It publishes the shared secret and reads state. Show manual_steps to the "
-            "user verbatim; they contain the absolute folder to pick."
+        "opens_no_page": (
+            "It publishes the shared secret and reads state. Its one browser effect "
+            "is reloading a stale companion; self_update reports done, unsupported "
+            "or timeout. Show manual_steps to the user verbatim when they are "
+            "present; they contain the absolute folder to pick."
         ),
         "why": (
             "No program can add an unpacked extension to a Chrome that is already "
-            "open, so the three clicks belong to the user."
+            "open, so the first install belongs to the user. Updates after that do "
+            "not: the companion re-reads its own folder when asked."
         ),
         "wait_seconds": "Raise it right after the user pressed Load unpacked.",
     },
@@ -1319,6 +1322,16 @@ _EXAMPLES = {
 }
 
 
+# Requirements no Python signature can carry: these parameters have a default,
+# so the schema calls them optional, yet the handler refuses the call without
+# them. Left unsaid, the most-used action ("input") looks like it takes nothing
+# and a small model learns the real contract only from a runtime error.
+_RUNTIME_REQUIREMENTS = {
+    "input": "at least one of key_actions=[{key,action}] or pointer_actions=[{action,x,y}]",
+    "touch": "points=[{x,y}], swipe adds end_x/end_y; only release and cancel need none",
+}
+
+
 def _action_index() -> dict[str, dict[str, Any]]:
     """Summaries plus required parameter names, which is what a caller must guess.
 
@@ -1331,6 +1344,8 @@ def _action_index() -> dict[str, dict[str, Any]]:
         entry: dict[str, Any] = {"summary": spec.summary}
         if required:
             entry["required"] = required
+        if name in _RUNTIME_REQUIREMENTS:
+            entry["also_required"] = _RUNTIME_REQUIREMENTS[name]
         index[name] = entry
     return index
 
@@ -1343,6 +1358,8 @@ def _action_documentation() -> dict[str, dict[str, Any]]:
         entry: dict[str, Any] = {"summary": spec.summary}
         if required:
             entry["required"] = required
+        if name in _RUNTIME_REQUIREMENTS:
+            entry["also_required"] = _RUNTIME_REQUIREMENTS[name]
         if optional:
             entry["optional"] = optional
         entry.update(_ACTION_NOTES.get(name, {}))
@@ -1414,8 +1431,10 @@ def _capabilities(action_name: str | None = None) -> dict[str, Any]:
             "params_example": {"action": "input"},
             "note": "Describe only the action you need, then call it through web_action.",
             "parameters": (
-                "actions[name].required is the full list of parameters you must send; "
-                "optional names, types, and defaults exist only in action_schema."
+                "actions[name].required lists parameters you must always send; "
+                "also_required is a condition a list cannot express and is just as "
+                "mandatory. Optional names, types, and defaults exist only in "
+                "action_schema."
             ),
         },
     }

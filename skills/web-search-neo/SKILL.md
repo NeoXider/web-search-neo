@@ -62,8 +62,10 @@ stay reachable, so local services work unchanged.
   `close` removes a tab the agent opened and leaves a claimed tab open; `close_all` follows
   the same rule for every session at once.
 - If the companion is disconnected, read `browser_status` and call `setup_current_chrome`.
-  It changes no browser: show the `manual_steps` it returns to the user word for word, and
-  wait for them. Nothing can install the extension on their behalf.
+  It opens no page and touches no browsing data; a connected companion older than the
+  bundled build is reloaded automatically, reported as `self_update`. When it does return
+  `manual_steps`, show them to the user word for word and wait: nothing can install the
+  extension, or reload a build older than 1.3.1, on their behalf.
 - `auto` falls back to a visible temporary window; `temporary` and `persistent` are
   MCP-owned and visible unless `headless=true`; `attach` uses a Chrome you started with a
   DevTools port and stays open afterwards.
@@ -133,7 +135,8 @@ released frame, which is what engines that poll key state per frame need.
 Always `release_inputs` after holding input and restore `render` to `normal` before handoff
 or close. Take a screenshot or read `game_probe` between batches; in step mode a screenshot
 taken before the first frame still shows the old frame, and `game_probe` reports
-`animation_suspended` with `fps: null` instead of measuring a gate you are driving by hand.
+`animation.animation_suspended` with `animation.fps: null` instead of measuring a gate you
+are driving by hand.
 
 ## Batch results
 

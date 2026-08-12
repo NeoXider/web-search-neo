@@ -373,6 +373,149 @@ def test_game_probe_leaves_the_browser_log_for_the_console_topic(local_site):
         browser_tools.close_session("probe-console")
 
 
+def _probe_console_until(session_id: str, marker: str, timeout: float = 8.0) -> list[str]:
+    """Poll ``game_probe`` the way an agent does, collecting everything it reports.
+
+    Chrome writes its own browser log entry a moment after the event, so a marker
+    can miss the first probe; what matters is how often it is reported in total
+    once it has arrived.
+    """
+    collected: list[str] = []
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        probe = browser_tools.game_probe(session_id, sample_seconds=0.1)
+        collected.extend(item["message"] for item in probe["console_messages"])
+        if any(marker in message for message in collected):
+            break
+        time.sleep(0.1)
+    return collected
+
+
+def test_game_probe_reports_a_console_issue_once_and_not_on_every_later_probe(local_site):
+    session = _open_fixture(local_site, PLATFORMER, "probe-repeat")
+    driver = session.driver
+    try:
+        browser_tools.game_probe("probe-repeat", sample_seconds=0.1)  # past the load noise
+        driver.execute_script("console.error('probe-repeat-marker-one');")
+
+        reported = _probe_console_until("probe-repeat", "probe-repeat-marker-one")
+        assert sum("probe-repeat-marker-one" in item for item in reported) == 1, reported
+
+        # An agent polling in a loop reads a message handed to it again as a
+        # message about something that is going wrong again, right now.
+        for _ in range(3):
+            again = browser_tools.game_probe("probe-repeat", sample_seconds=0.1)
+            assert not any(
+                "probe-repeat-marker-one" in item["message"]
+                for item in again["console_messages"]
+            ), again["console_messages"]
+
+        driver.execute_script("console.error('probe-repeat-marker-two');")
+        later = _probe_console_until("probe-repeat", "probe-repeat-marker-two")
+        assert sum("probe-repeat-marker-two" in item for item in later) == 1, later
+        assert not any("probe-repeat-marker-one" in item for item in later)
+    finally:
+        browser_tools.close_session("probe-repeat")
+
+
+def test_game_probe_and_the_console_topic_each_keep_their_own_place(local_site):
+    session = _open_fixture(local_site, PLATFORMER, "probe-cursors")
+    driver = session.driver
+    try:
+        browser_tools.game_probe("probe-cursors", sample_seconds=0.1)
+        browser_tools.get_console("probe-cursors", limit=200)
+        driver.execute_script("console.error('probe-shared-marker');")
+
+        # Neither reader may consume the message for the other: both are asked
+        # after the error, and both have to see it exactly once.
+        reported = _probe_console_until("probe-cursors", "probe-shared-marker")
+        assert sum("probe-shared-marker" in item for item in reported) == 1, reported
+
+        texts = [
+            str(item.get("text") or "")
+            for item in browser_tools.get_console("probe-cursors", limit=200)["entries"]
+        ]
+        assert sum("probe-shared-marker" in item for item in texts) == 1, texts
+    finally:
+        browser_tools.close_session("probe-cursors")
+
+
+def _start_throttled_on_an_idle_page(local_site, session_id: str):
+    """Open a page that draws nothing and throttle it with an empty frame queue.
+
+    This is the state a game is in before it boots or between levels, and it is
+    the state in which the pump has nothing to restart it.
+    """
+    _open_or_skip(f"{local_site.base_url}/page", session_id)
+    control = browser_tools.set_render_control("throttled", session_id, target_fps=20)
+    assert control["mode"] == "throttled"
+    assert control["pending_callbacks"] == 0
+    return browser_tools._get_session(session_id).driver
+
+
+def _wait_for_ticks(driver, wanted: int = 3, timeout: float = 5.0) -> int:
+    deadline = time.monotonic() + timeout
+    ticks = 0
+    while time.monotonic() < deadline:
+        ticks = driver.execute_script("return window.__ticks;")
+        if ticks >= wanted:
+            break
+        time.sleep(0.1)
+    return ticks
+
+
+def test_throttled_mode_pumps_a_loop_that_boots_from_a_gated_timer(local_site):
+    driver = _start_throttled_on_an_idle_page(local_site, "throttled-timer-boot")
+    try:
+        # The timer is gated, so it only runs when a frame is released, and the
+        # frame it is waiting for is the one it was going to ask for itself.
+        driver.execute_script(
+            "window.__ticks = 0;"
+            "setTimeout(function () {"
+            "  requestAnimationFrame(function loop() {"
+            "    window.__ticks += 1; requestAnimationFrame(loop);"
+            "  });"
+            "}, 10);"
+        )
+        ticks = _wait_for_ticks(driver)
+        assert ticks >= 3, f"the gated timer never got the frame it needs: {ticks}"
+    finally:
+        browser_tools.set_render_control("normal", "throttled-timer-boot")
+        browser_tools.close_session("throttled-timer-boot")
+
+
+def test_throttled_mode_keeps_running_a_loop_that_never_asks_for_a_frame(local_site):
+    driver = _start_throttled_on_an_idle_page(local_site, "throttled-timer-loop")
+    try:
+        # A loop built out of timers alone never queues a frame callback, and the
+        # gated clock it is scheduled against only moves when a frame is released.
+        driver.execute_script(
+            "window.__ticks = 0;"
+            "setInterval(function () { window.__ticks += 1; }, 16);"
+        )
+        ticks = _wait_for_ticks(driver)
+        assert ticks >= 3, f"the gated interval was frozen for the whole wait: {ticks}"
+    finally:
+        browser_tools.set_render_control("normal", "throttled-timer-loop")
+        browser_tools.close_session("throttled-timer-loop")
+
+
+def test_throttled_mode_pumps_a_frame_callback_registered_after_the_switch(local_site):
+    driver = _start_throttled_on_an_idle_page(local_site, "throttled-raf-boot")
+    try:
+        driver.execute_script(
+            "window.__ticks = 0;"
+            "requestAnimationFrame(function loop() {"
+            "  window.__ticks += 1; requestAnimationFrame(loop);"
+            "});"
+        )
+        ticks = _wait_for_ticks(driver)
+        assert ticks >= 3, f"a callback registered after the switch never ran: {ticks}"
+    finally:
+        browser_tools.set_render_control("normal", "throttled-raf-boot")
+        browser_tools.close_session("throttled-raf-boot")
+
+
 def test_tapped_key_is_still_held_while_the_frame_runs(local_site):
     session = _open_fixture(local_site, PLATFORMER, "tap-jump")
     try:

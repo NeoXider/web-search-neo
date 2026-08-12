@@ -2,7 +2,7 @@
 
 This guide installs the MCP server from source and connects it to LM Studio or another stdio-compatible MCP client.
 
-It describes version 1.3.0. The Python package, the server, and the bundled Chrome
+It describes version 1.3.1. The Python package, the server, and the bundled Chrome
 companion carry that same version, and the bridge only accepts a companion able to complete
 the 1.3.0 handshake — see [Updating](#updating) if an older one is already installed.
 
@@ -131,10 +131,13 @@ Start/restart the MCP first, then ask it for setup state:
 }
 ```
 
-That call changes nothing in any browser. It writes the shared bridge secret into
-`chrome-extension/bridge-token.js`, compares the bundled build with whatever is connected,
-and returns `manual_steps`: the clicks that are left, with the absolute path of the folder
-to pick. The result also carries `token_ready` and the `token_file` it wrote.
+That call opens no page and touches no browsing data. It writes the shared bridge secret
+into `chrome-extension/bridge-token.js`, compares the bundled build with whatever is
+connected, and returns `manual_steps`: the clicks that are left, with the absolute path of
+the folder to pick. The result also carries `token_ready` and the `token_file` it wrote.
+The one thing it can change is the companion itself: when the connected build is older than
+the bundled one it asks that companion to reload itself, and reports the outcome as
+`self_update` (`done`, `unsupported`, or `timeout`) with the `replaced_version` it evicted.
 
 Chrome does not let any program add an unpacked extension to a browser you already have
 open. The installed set is signed inside `Secure Preferences`, policy installs need a packed
@@ -152,15 +155,20 @@ Earlier revisions tried to perform those clicks for you through Windows UI Autom
 code is gone. It depended on the interface language, on which window happened to have focus,
 and on a folder picker that the automation backend does not even enumerate.
 
-The bundled companion is version 1.3.0 and declares four permissions: `debugger`, `storage`,
-`tabs`, and `tabGroups`. There are no content scripts and no `host_permissions`; page access
-comes from `debugger`, which attaches the Chrome DevTools Protocol to the tabs the agent
-drives.
+The bundled companion is version 1.3.1 and declares five permissions: `alarms`, `debugger`,
+`storage`, `tabs`, and `tabGroups`. There are no content scripts and no `host_permissions`;
+page access comes from `debugger`, which attaches the Chrome DevTools Protocol to the tabs
+the agent drives. `alarms` exists because Chrome suspends an idle MV3 service worker after
+about thirty seconds: the longer waits in the reconnect backoff have to be handed to
+`chrome.alarms` or they would die with the worker and leave the bridge offline until
+someone clicked the toolbar icon. Chrome shows no additional user-facing warning for it.
 
 If the companion was already installed from an earlier revision, Chrome keeps running the
-old service worker until you press **Reload** on its card at `chrome://extensions`. Do that
-after every `git pull`. From 1.3.0 onwards it is not optional: an older worker knows nothing
-about the handshake below, so the bridge rejects it and the badge never turns `ON`.
+old service worker until it is reloaded. From 1.3.1 the server does that for you: a
+`setup_current_chrome` call that finds an older connected build asks it to re-read its own
+folder from disk. The one upgrade that still costs a click is the one *onto* 1.3.1, because
+the build being replaced is the build that has to understand the command — see
+[Updating](#updating).
 
 There is no automatic alternative to those three steps, on any platform. If you do not want
 an extension at all, use the Selenium modes in section 7 — `profile_mode="temporary"` and
@@ -300,13 +308,26 @@ git pull --ff-only
 python -m pip install -r requirements.txt
 ```
 
-Restart or toggle the MCP server after updating. If you use the companion extension, you
-must then open `chrome://extensions` and press **Reload** on **Web Search Neo Companion**.
-Chrome keeps running the service worker it loaded earlier, and a worker older than 1.3.0
-does not authenticate against the bridge, so without the reload the companion stays
-disconnected — the badge shows `OFF` and every `current`-mode action fails with a setup
-error. Reloading also makes the worker re-read `chrome-extension/bridge-token.js`, which is
-how a rotated secret reaches it.
+Restart or toggle the MCP server after updating. Chrome never refreshes an unpacked
+extension by itself, but from 1.3.1 the server no longer needs you to: a
+`setup_current_chrome` call that finds a connected companion older than the bundled one
+sends it a `runtime.reload` command, waits for the worker to come back, and reports
+`self_update: "done"` with the `replaced_version`. Reloading is also what makes the worker
+re-read `chrome-extension/bridge-token.js`, which is how a rotated secret reaches it.
+
+Two cases still need the human:
+
+- **Upgrading from 1.3.0 or older.** The build being replaced is the one that has to
+  understand the command, and it does not. From 1.3.0 the server sees the stale companion,
+  answers `self_update: "unsupported"`, and returns the Reload steps as `manual_steps`. From
+  1.2.0 or older it sees nothing at all — that worker never completes the handshake, so the
+  badge stays `OFF`, every `current`-mode action fails with a setup error, and the setup
+  call reports the companion as simply not connected. Either way it is the same single fix:
+  open `chrome://extensions` and press **Reload** on **Web Search Neo Companion** once.
+  Every update after that one applies by itself.
+- **A first install.** Nothing has changed there: no program can add an unpacked extension
+  to a Chrome that is already open, so the three **Load unpacked** steps in section 6 remain
+  yours.
 
 Confirm with `web_info(topic="browser_status")` that `current_chrome.connected` is `true`
 before continuing.
@@ -359,10 +380,28 @@ toolbar badge shows `ON`. If port 8765 is occupied, stop the other process or se
 the same free `WEB_SEARCH_NEO_BRIDGE_PORT` for the MCP and extension source before
 loading it.
 
+A badge that reads `OFF` while no MCP server is running is not a fault: there is nothing to
+connect to. The worker retries with an exponential backoff — about 1.5 seconds after the
+first failure, doubling to a ceiling of one minute, and resetting to the floor as soon as a
+handshake verifies. Starting the browser, reloading the extension, and clicking its toolbar
+icon each reset that schedule and retry at once, which is how you say "the server is up now"
+without waiting out the current delay.
+
+### The companion card shows a red “Errors” button
+
+Expected on an idle machine, and harmless. Chrome records every refused connection attempt
+to `127.0.0.1:8765` as an extension runtime error, so with no server listening the card
+collects identical `ERR_CONNECTION_REFUSED` lines. Before 1.3.1 the worker retried every two
+seconds and could bury the page under hundreds of them; the backoff above turns that into
+roughly one line a minute. An extension cannot suppress the entries — Chrome writes them
+itself — so clear them with **Clear all** if they are in your way, and judge the connection
+by the badge and by `web_info(topic="browser_status")` instead.
+
 ### The companion stopped connecting after an update
 
-This is the expected symptom of an unreloaded extension, and it is the first thing to check
-after any `git pull` that crosses 1.3.0.
+This is the expected symptom of an unreloaded extension. From 1.3.1 the server reloads a
+stale companion itself, so the check matters for a `git pull` that crosses 1.3.0 or 1.3.1,
+or when `setup_current_chrome` answered `self_update: "unsupported"` or `"timeout"`.
 
 1. Open `chrome://extensions` and press **Reload** on **Web Search Neo Companion**. The
    badge should turn `ON` within a few seconds.
@@ -373,14 +412,15 @@ after any `git pull` that crosses 1.3.0.
    the file holds a different secret than the running server — the usual cause is two
    clones, or a copied checkout, so start the server from the same directory Chrome loaded
    and reload the extension again.
-3. Check the card's version. It must read 1.3.0; anything older cannot authenticate at all,
-   and Chrome only picks up the new manifest on reload.
+3. Check the card's version. It must read 1.3.1; anything older than 1.3.0 cannot
+   authenticate at all, and Chrome only picks up the new manifest on reload.
 4. `msp_server.log` records the server's side: `Rejected a bridge client that did not
    present the companion token` confirms that something did reach the port but could not
    prove the secret.
 
-The companion retries roughly every ten seconds after a refused handshake, so once the
-cause is fixed it reconnects on its own.
+The companion keeps retrying a refused handshake on its own — starting at about ten seconds
+and slowing to at most two minutes — so once the cause is fixed it reconnects without help.
+Clicking the toolbar icon resets that schedule and retries immediately.
 
 ### A canvas/WebGL game loads but cannot be controlled
 

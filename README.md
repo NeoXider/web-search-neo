@@ -240,10 +240,13 @@ An agent prepares the bundled companion through the compact MCP contract:
 {"actions":[{"action":"setup_current_chrome"}]}
 ```
 
-That call changes nothing in any browser. It writes the shared secret into
-`chrome-extension/bridge-token.js`, checks the bundled build against whatever is
-connected, and returns `manual_steps` — the clicks that are left, with the
-absolute path of the folder to pick — plus `token_ready` and `token_file`.
+That call opens no page and touches no browsing data. It writes the shared secret
+into `chrome-extension/bridge-token.js`, checks the bundled build against
+whatever is connected, and returns `manual_steps` — the clicks that are left,
+with the absolute path of the folder to pick — plus `token_ready` and
+`token_file`. The one thing it can change is the companion itself: a connected
+build older than the bundled one is asked to reload itself, reported as
+`self_update` (`done`, `unsupported`, or `timeout`) with `replaced_version`.
 
 Chrome does not let a program add an unpacked extension to a browser that is
 already open: the installed set is signed inside `Secure Preferences`, policy
@@ -265,17 +268,26 @@ is no automatic substitute. If you would rather not install an extension at all,
 `profile_mode="temporary"` and `profile_mode="persistent"` drive a Selenium
 browser that needs no companion.
 
-The bundled companion is version 1.3.0. Chrome does not refresh an unpacked
-extension by itself, so after pulling a new revision press **Reload** on the
-companion card at `chrome://extensions`. Since 1.3.0 this is mandatory rather
-than merely advisable:
+The bundled companion is version 1.3.1. Chrome does not refresh an unpacked
+extension by itself, but from 1.3.1 the server does it instead: the worker
+understands a `runtime.reload` command, and `setup_current_chrome` sends it
+whenever the connected build is older than the bundled one. Upgrading *onto*
+1.3.1 is the last one that costs a click, because the build being replaced is the
+build that has to understand the command; the very first install still needs the
+three steps above, which no program can perform.
+
+So press **Reload** on the companion card at `chrome://extensions` once, after the
+pull that crosses 1.3.1. Skipping it on a 1.2.0-or-older install is the loudest
+case, because that build cannot even authenticate:
 
 - a service worker from 1.2.0 or older sends no token, so the bridge closes it with code 1008 and the reason `Companion token mismatch; reload the extension on chrome://extensions`;
-- the badge then stays `OFF` and the worker retries about every ten seconds;
+- the badge then stays `OFF` and the worker retries on a slow ladder, from about ten seconds up to two minutes;
 - the server records the rejection in `msp_server.log`;
 - a 1.3.0 worker also prints the close code and reason in its own service-worker console; an older one does not, so on a stale install the badge and the server log are the signal.
 
-The bridge accepts only the fixed bundled extension ID, binds only to loopback, and never reads Chrome profile files, cookies, or saved passwords directly. The extension uses Chrome's standard [tabs](https://developer.chrome.com/docs/extensions/reference/api/tabs), [tab groups](https://developer.chrome.com/docs/extensions/reference/api/tabGroups), and [debugger](https://developer.chrome.com/docs/extensions/reference/api/debugger) APIs, plus `storage` for its own session state, with the permissions shown by Chrome.
+The bridge accepts only the fixed bundled extension ID, binds only to loopback, and never reads Chrome profile files, cookies, or saved passwords directly. The extension uses Chrome's standard [tabs](https://developer.chrome.com/docs/extensions/reference/api/tabs), [tab groups](https://developer.chrome.com/docs/extensions/reference/api/tabGroups), and [debugger](https://developer.chrome.com/docs/extensions/reference/api/debugger) APIs, plus `storage` for its own session state and [alarms](https://developer.chrome.com/docs/extensions/reference/api/alarms) for the long waits in its reconnect backoff, with the permissions shown by Chrome.
+
+A badge reading `OFF` while no server is running is the normal idle state, not a fault. The worker retries with an exponential backoff — about 1.5 seconds after the first failure, doubling to a ceiling of one minute, and dropping back to the floor the moment a handshake verifies. Chrome suspends an idle service worker after roughly thirty seconds, which is why the longer waits are `chrome.alarms` rather than timers: a timer that long would die with the worker. Chrome also logs every refused attempt as an extension error of ours and an extension cannot suppress that, so a red **Errors** button on the card of an idle machine is expected; before 1.3.1 the worker retried every two seconds and could fill that page with hundreds of identical `ERR_CONNECTION_REFUSED` lines. Starting the browser, reloading the extension, or clicking its toolbar icon resets the schedule and retries immediately.
 
 Keep the companion enabled in one Chrome profile at a time. The bridge holds exactly one companion connection and the most recent authenticated one wins, so a second profile with the companion enabled quietly takes the agent's tabs with it.
 
@@ -499,8 +511,11 @@ The page's own console and HTTP traffic are readable without leaving the MCP con
 One line per request, for example a form post the server rejected:
 
 ```text
-POST 501 Document       4ms 0.5KB http://127.0.0.1:58394/submit
+POST 422 Document       4ms 0.5KB https://example.com/submit
 ```
+
+`only_errors=true` keeps exactly these — failed requests and everything from 400 up — so a
+post the server accepted is filtered out and an empty list is itself an answer.
 
 Use `output="json"` on the `network` topic when you need the per-request `id` that `network_body` expects; the default text lines omit it.
 
@@ -540,7 +555,7 @@ Browser automation is not limited to DOM forms. The compact contract covers comm
 
 | Call | What it does |
 | --- | --- |
-| `web_info(topic="game_probe")` | Reports canvases, 2D/WebGL context, iframe surfaces, document focus, sampled animation FPS, loading time, console issues, and held input. |
+| `web_info(topic="game_probe")` | Reports canvases, 2D/WebGL context, iframe surfaces, document focus, sampled FPS under `animation`, loading time, console issues, and held input. |
 | `input` | Mixes per-key `tap`/`hold`/`release` with pointer `click`, `double_click`, `hover`, `move`, `drag`, `press`, `release`, and `wheel`, using absolute coordinates, deltas, or unbounded relative motion, up to 16 entries of each kind. |
 | `press_keys` | Keyboard-only shortcut: `keys` plus `key_action` (`tap`, `hold`, `release`), `repeat`, `hold_seconds`, `focus_mode` (`focus`, `click`, `none`), and `hold_frames`, which keeps a tap down across N released frames in `step` mode. |
 | `touch`, `touch_emulation` | `tap`, `press`, `move`, `release`, `swipe`, or `cancel` with up to ten simultaneous points; the emulation makes the page report `navigator.maxTouchPoints` and `ontouchstart` so a game's mobile code path actually runs. |
@@ -621,10 +636,12 @@ The render controller gates JavaScript `requestAnimationFrame`, which covers typ
 
 While a gate is engaged, `game_probe` does not try to sample FPS. Frames are released by
 hand, so the measurement could only expire against its own script timeout and then report
-a fabricated zero; the probe returns immediately with `fps: null`,
-`animation_suspended: true`, and a `reason` naming the active render mode and the gated
-frame. The probe also no longer consumes Chrome's browser log — `get_log` hands it out
-exactly once, so reading it destroyed the diagnostics that the `console` topic was
+a fabricated zero; the probe returns immediately with an `animation` object holding
+`fps: null`, `animation_suspended: true`, and a `reason` naming the active render mode and
+the gated frame. Every frame-rate field lives in that nested object — `animation.fps`,
+`animation.frames`, `animation.elapsed_ms`, `animation.available` — never at the top level
+of the result. The probe also no longer consumes Chrome's browser log — `get_log` hands it
+out exactly once, so reading it destroyed the diagnostics that the `console` topic was
 supposed to report. Both readers now draw from one bounded session buffer.
 
 ### Input latency
@@ -656,13 +673,13 @@ cheapest of the four. Absolute numbers depend on the machine; the ratios do not.
 
 Start with `web_info()`. With no arguments it returns `actions` with each action's required and optional parameters, `action_groups`, `info_topics`, `recipes`, `pitfalls`, `limits`, and worked `examples`. Request only the needed, generated JSON Schema with `web_info(topic="action_schema", params={"action": "input"})`, then invoke it through `web_action`. This follows the on-demand Tool Search principle used by [official Unreal MCP](https://dev.epicgames.com/documentation/unreal-engine/unreal-mcp-in-unreal-editor): keep the eager tool list small, disclose schemas only when needed, and dispatch actions through a meta-tool. Web Search Neo combines Unreal's list/describe discovery tools into one `web_info`, so only two tools are advertised.
 
-Measured on the current build, summing each advertised tool's `name`, `description`, and serialized `inputSchema`: the compact surface is 1,091 characters across two tools, against 22,310 characters across the 40 tools of legacy mode. The self-describing contract behind `web_info()` is 7,120 characters, and it is fetched only when an agent asks for it. Each action in it now lists its required parameter names; optional names, types, and defaults stay in `action_schema`, where they cost nothing until needed.
+Measured on the current build, summing each advertised tool's `name`, `description`, and serialized `inputSchema`: the compact surface is 1,091 characters across two tools, against 22,110 characters across the 40 tools of legacy mode. The self-describing contract behind `web_info()` is 7,379 characters, and it is fetched only when an agent asks for it. Each action in it now lists its required parameter names; optional names, types, and defaults stay in `action_schema`, where they cost nothing until needed.
 
 Every action is declared once in a single registry that also generates its published schema, and arguments are validated against that same model before the handler runs. An unknown or malformed field returns the offending names and the list of allowed parameters instead of an internal `TypeError`:
 
 ```text
 ValueError: action 'input': unknown parameter(s) ['frames']. Allowed: ['key_actions', 'pointer_actions',
-'session_id', 'target_selector', 'frame_selector', 'wait_seconds']. Call
+'session_id', 'target_selector', 'frame_selector', 'wait_seconds', 'include_summary']. Call
 web_info(topic='action_schema', params={'action': '<name>'}) for the full schema.
 ```
 
@@ -714,7 +731,7 @@ python -m pytest
 python -m pytest --cov=. --cov-report=term-missing
 ```
 
-The deterministic suite is 250 tests, grouped by what they protect:
+The deterministic suite is 269 tests, grouped by what they protect:
 
 | Area | Covered |
 | --- | --- |
@@ -745,11 +762,11 @@ It reports the eager tool-schema size and the median and p95 latency of both MCP
 ## Safety notes
 
 - Visible or attached sessions may contain authenticated accounts. The MCP client can act with the permissions of those accounts.
-- The companion declares four permissions: `debugger`, `storage`, `tabs`, and `tabGroups`. It ships no content scripts and asks for no `host_permissions`, but `debugger` is the broad one: it lets the extension attach the Chrome DevTools Protocol to a tab and from there read and modify that page, its console, and its network traffic. Chrome shows a "started debugging this browser" banner whenever it is attached. Install the companion only from this repository.
+- The companion declares five permissions: `alarms`, `debugger`, `storage`, `tabs`, and `tabGroups`. It ships no content scripts and asks for no `host_permissions`, but `debugger` is the broad one: it lets the extension attach the Chrome DevTools Protocol to a tab and from there read and modify that page, its console, and its network traffic. Chrome shows a "started debugging this browser" banner whenever it is attached. `alarms` is the narrow one — it only wakes a suspended service worker to retry the bridge, and Chrome shows no extra warning for it. Install the companion only from this repository.
 - The loopback bridge is authenticated in both directions. The extension proves it holds the machine-local token before the server accepts a command, and the server proves the same by returning `HMAC-SHA256(token, nonce)` before the extension executes one. Until 1.3.0 the port accepted any local client that spoke the protocol, and the extension trusted whatever answered on it.
 - That secret is a file readable by the user account that owns it, so it does not defend against a malicious process already running as you: such a process can read the token and impersonate either side. It removes the race in which any local program that binds `127.0.0.1:8765` before the server inherits DevTools access to every signed-in tab. Chrome Native Messaging, which needs no listening port at all, is the actual fix and is tracked in [TODO.md](TODO.md).
 - Authentication is not authorization. An authenticated peer may call `cdp.send` with any DevTools method on any tab the session drives; there is no method allowlist yet.
-- `setup_current_chrome` changes no browser state at all. It publishes the shared secret and returns the steps; installing the companion stays a deliberate user action in Chrome's own UI.
+- `setup_current_chrome` opens no page, navigates nothing, and reads no browsing data. It publishes the shared secret and returns the steps. The single exception, since 1.3.1, is that it may tell an already-installed companion older than the bundled build to reload itself; *installing* the companion stays a deliberate user action in Chrome's own UI.
 - Plain `http://` to public hosts is refused unless `WEB_SEARCH_NEO_ALLOW_PLAIN_HTTP=1` is set; loopback and private-network addresses are always reachable.
 - File upload tools can upload local paths supplied to the tool. Review agent actions and scope filesystem access appropriately.
 - Browser automation may be restricted by a site's terms of service. Use it only where you are authorized.

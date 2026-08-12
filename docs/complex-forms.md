@@ -424,16 +424,19 @@ hidden flag for it. A provider-supported, legal integration is tracked in
 A form that "did nothing" almost always said why, in the console or on the wire.
 
 ```json
-{"topic":"network","params":{"session_id":"apply","only_errors":true,"limit":20}}
+{"topic":"network","params":{"session_id":"apply","url_pattern":"submit","limit":20}}
 ```
 
 ```text
-POST 501 Document       4ms 0.5KB http://127.0.0.1:58394/submit
+POST 200 Document       4ms 0.5KB http://127.0.0.1:58394/submit
 ```
 
-The line order is `method status type ms size url`. `only_errors=true` keeps
-failed requests and everything from 400 up. Narrow further with `url_pattern` (a
-case-insensitive regex), `types`, or `status_min`/`status_max`.
+The line order is `method status type ms size url`, and `url_pattern` is a
+case-insensitive regex. The fixture answers the post with 200, which is the
+point: an HTTP success is not a business success, and the body below is what
+tells you which one you got. `only_errors=true` narrows the same list to failed
+requests and everything from 400 up, so against this fixture it comes back
+empty; `types` and `status_min`/`status_max` narrow it other ways.
 
 To read what the server actually answered, ask for the row `id` first — the text
 lines do not carry it:

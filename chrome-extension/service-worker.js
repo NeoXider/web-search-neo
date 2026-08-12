@@ -21,12 +21,38 @@ import {
 
 const BRIDGE_URL = "ws://127.0.0.1:8765";
 const PROTOCOL_VERSION = 1;
-const RECONNECT_MS = 2000;
+// The bridge only listens while the MCP server runs, which on a desktop is a
+// small slice of the day. Chrome logs every refused attempt as a runtime error
+// of ours, so a flat retry buries chrome://extensions under hundreds of
+// identical lines and the extension reads as broken while it is merely idle.
+// Backing off turns thirty lines a minute into roughly one; the explicit
+// triggers further down buy back the promptness it costs.
+const RECONNECT_BASE_MS = 1500;
+const RECONNECT_MAX_MS = 60000;
+const RECONNECT_FACTOR = 2;
+// Jitter only ever shortens a wait, so the cap above stays a real ceiling while
+// attempts stop landing in lockstep with a server that restarts on its own
+// rhythm.
+const RECONNECT_JITTER = 0.25;
 // A refused handshake usually waits on the operator, so this retry is slow on
-// purpose. It is still a real retry: the token is re-read from disk on every
-// attempt, so a secret written after the extension was loaded is picked up
-// without a reload.
+// purpose and grows slower still. It is a real retry: the token is re-read from
+// disk on every attempt, so a secret written after the extension was loaded is
+// picked up without a reload.
 const AUTH_RETRY_MS = 10000;
+const AUTH_RETRY_MAX_MS = 120000;
+// Chrome stops an idle worker after about thirty seconds and pending timers die
+// with it, so a longer wait has to be an alarm, the only thing that can start
+// the worker back up. Without the "alarms" permission we keep every wait inside
+// that window instead: worse than the cap above, still far quieter than a flat
+// two seconds.
+const WORKER_IDLE_MS = 30000;
+const TIMER_SAFE_MS = 25000;
+const RECONNECT_ALARM = "bridge-reconnect";
+// Long enough for the answer to a reload request to reach the socket before the
+// worker that wrote it disappears.
+const RELOAD_GRACE_MS = 250;
+const BACKOFF_KEY = "bridge_backoff";
+const BACKOFF_STREAK_LIMIT = 32;
 const KEEPALIVE_MS = 20000;
 const DEBUGGER_VERSION = "1.3";
 const STATE_KEY = "bridge_state";
@@ -37,11 +63,17 @@ const NETWORK_BUFFER_LIMITS = {
   maxPostDataSize: 65536,
 };
 
+// The permission is the user's to grant in the manifest, so the worker has to
+// work either way and simply retries more coarsely when alarms are missing.
+const alarmsAvailable = Boolean(chrome.alarms?.onAlarm);
+
 let socket = null;
 let verified = false;
 let connecting = false;
 let reconnectTimer = null;
 let keepaliveTimer = null;
+let lastAttemptAt = 0;
+let backoff = {transport: 0, auth: 0, nextAttemptAt: 0};
 const attachedTabs = new Set();
 // `${tabId}:${url}` -> {tabId, url, sessionId, targetId}
 const childSessions = new Map();
@@ -450,6 +482,31 @@ const commands = {
     forgetTab(numericId);
     return {detached: true};
   },
+
+  // Nothing outside Chrome can press "Reload" on an unpacked extension card, so
+  // a companion left behind by a server update sits stale until the user thinks
+  // to click. From in here it is one call, but it takes this worker and its
+  // socket down with it, so the answer has to be on the wire first: handleCommand
+  // writes it the moment this returns, and the grace period below is the gap that
+  // write needs. An alarm would be the suspension-proof way to wait, except no
+  // alarm fires sooner than half a minute — and suspension cannot happen here
+  // anyway, since handling this very command is the activity that keeps the
+  // worker alive.
+  async "runtime.reload"() {
+    const {version} = chrome.runtime.getManifest();
+    // The worker that comes back reads the stored schedule on startup, so a
+    // pending wait left behind would make new code sit out a backoff it never
+    // earned.
+    clearReconnect();
+    await resetBackoff();
+    setTimeout(() => chrome.runtime.reload(), RELOAD_GRACE_MS);
+    return {
+      reloading: true,
+      version,
+      extension_id: chrome.runtime.id,
+      in_ms: RELOAD_GRACE_MS,
+    };
+  },
 };
 
 function cdpTimestamp(value) {
@@ -619,20 +676,112 @@ function setBadge(online) {
   chrome.action.setBadgeText({text: online ? "ON" : "OFF"});
 }
 
-function scheduleReconnect(delayMs = RECONNECT_MS) {
+// Two schedules, because the two failures mean different things: nobody is
+// listening yet (common, noisy, cheap to retry) versus a peer that answered and
+// turned us away (rare, and nothing we do sooner will change its mind).
+export function backoffDelay(kind, streak) {
+  const base = kind === "auth" ? AUTH_RETRY_MS : RECONNECT_BASE_MS;
+  const cap = kind === "auth" ? AUTH_RETRY_MAX_MS : RECONNECT_MAX_MS;
+  const step = Math.min(base * RECONNECT_FACTOR ** streak, cap);
+  return Math.round(step - step * RECONNECT_JITTER * Math.random());
+}
+
+function persistBackoff() {
+  return Promise.resolve(chrome.storage.session.set({[BACKOFF_KEY]: backoff})).catch(() => {});
+}
+
+function clearReconnect() {
   clearTimeout(reconnectTimer);
-  reconnectTimer = setTimeout(startConnect, delayMs);
+  reconnectTimer = null;
+  if (alarmsAvailable) Promise.resolve(chrome.alarms.clear(RECONNECT_ALARM)).catch(() => {});
+}
+
+function scheduleReconnect(delayMs) {
+  clearReconnect();
+  const wait = Math.max(0, Math.round(delayMs));
+  backoff.nextAttemptAt = Date.now() + wait;
+  persistBackoff();
+  if (alarmsAvailable && wait >= WORKER_IDLE_MS) {
+    chrome.alarms.create(RECONNECT_ALARM, {delayInMinutes: wait / 60000});
+    return;
+  }
+  // A timer we would not live to see is worse than a shorter one: it would
+  // leave the extension offline until the user thinks to click it.
+  reconnectTimer = setTimeout(startConnect, alarmsAvailable ? wait : Math.min(wait, TIMER_SAFE_MS));
+}
+
+function retryAfterFailure(kind) {
+  const delay = backoffDelay(kind, backoff[kind]);
+  backoff[kind] = Math.min(backoff[kind] + 1, BACKOFF_STREAK_LIMIT);
+  scheduleReconnect(delay);
+}
+
+function resetBackoff() {
+  backoff = {transport: 0, auth: 0, nextAttemptAt: 0};
+  return persistBackoff();
 }
 
 // connect() is async, so every entry point funnels through here to keep a
 // rejected promise from silently stopping the reconnect chain.
 function startConnect() {
+  lastAttemptAt = Date.now();
+  clearReconnect();
   connect().catch(error => {
     connecting = false;
+    // Nothing else records this one: the rejection is caught here, so Chrome
+    // never sees it, and it means our own code broke rather than the port
+    // being closed.
     console.warn("bridge: connect attempt failed", error);
     setBadge(false);
-    scheduleReconnect(AUTH_RETRY_MS);
+    retryAfterFailure("auth");
   });
+}
+
+// Nothing arrives over a socket that was never established, so the extension
+// cannot notice a server that has just started. These signals are the
+// substitute: the browser starting, this extension being installed or reloaded,
+// and a click on the toolbar icon, which is how someone who just launched the
+// MCP server says "try now". Each clears the streak, so the floor below is what
+// stops a signal that repeats, or two arriving together, from turning back into
+// a fixed short loop: inside the floor the pending retry is only pulled forward.
+function connectNow() {
+  resetBackoff();
+  const sinceLast = Date.now() - lastAttemptAt;
+  if (sinceLast < RECONNECT_BASE_MS) {
+    scheduleReconnect(RECONNECT_BASE_MS - sinceLast);
+    return;
+  }
+  startConnect();
+}
+
+// Chrome evicts an idle worker and this file starts over whenever a listener
+// wakes it, so the backoff has to outlive the worker; otherwise every closed tab
+// would spend a fresh attempt and the flood would return through the side door.
+// chrome.storage.session is the right shelf: it survives eviction and is empty
+// again after a browser restart, which is exactly when an immediate attempt is
+// warranted.
+async function resumeConnect() {
+  try {
+    const stored = (await chrome.storage.session.get(BACKOFF_KEY))?.[BACKOFF_KEY];
+    if (stored) {
+      backoff = {
+        transport: Number(stored.transport) || 0,
+        auth: Number(stored.auth) || 0,
+        nextAttemptAt: Number(stored.nextAttemptAt) || 0,
+      };
+    }
+  } catch (error) {
+    console.warn("bridge: could not read the stored reconnect backoff", error);
+  }
+  // The cap is what a clock the user moved forward, or a value written by an
+  // older build, cannot get past: the longest this ever parks the bridge is one
+  // ordinary wait.
+  const remaining = Math.min(backoff.nextAttemptAt - Date.now(), RECONNECT_MAX_MS);
+  if (remaining > 0) {
+    scheduleReconnect(remaining);
+    return;
+  }
+  startConnect();
 }
 
 function bytesToHex(bytes) {
@@ -694,10 +843,15 @@ export async function connect() {
     nonce = bytesToHex(crypto.getRandomValues(new Uint8Array(16)));
     expectedProof = await hmacSha256(token, nonce);
   } catch (error) {
-    console.warn("bridge: no companion token yet, run setup_current_chrome", error);
+    // Chrome logs the failed read of bridge-token.js on its own; what it cannot
+    // say is what to do about it. Once per streak is enough, because the retry
+    // repeats but the advice does not change.
+    if (!backoff.auth) {
+      console.warn("bridge: no companion token yet, run setup_current_chrome", error);
+    }
     connecting = false;
     setBadge(false);
-    scheduleReconnect(AUTH_RETRY_MS);
+    retryAfterFailure("auth");
     return;
   }
 
@@ -747,6 +901,8 @@ export async function connect() {
   };
   socket.onclose = event => {
     const rejected = handshakeStarted && !verified;
+    // A closed port is Chrome's own error line and needs nothing from us, but a
+    // peer that answered and then turned us away is worth the code and reason.
     if (rejected) console.warn(`bridge: handshake refused (${event.code}) ${event.reason || ""}`);
     // A socket the module already replaced must not clear the live one's state.
     if (socket !== active) return;
@@ -754,7 +910,7 @@ export async function connect() {
     clearInterval(keepaliveTimer);
     verified = false;
     socket = null;
-    scheduleReconnect(rejected ? AUTH_RETRY_MS : RECONNECT_MS);
+    retryAfterFailure(rejected ? "auth" : "transport");
   };
   socket.onerror = () => active.close();
 }
@@ -777,6 +933,10 @@ function completeHandshake(connection, message, expectedProof) {
   }
   if (connection !== socket || connection.readyState !== WebSocket.OPEN) return;
   verified = true;
+  // A verified peer proves the wait is over, so the next outage starts counting
+  // from the floor again rather than from wherever the last one left off.
+  clearReconnect();
+  resetBackoff();
   setBadge(true);
   clearInterval(keepaliveTimer);
   keepaliveTimer = setInterval(() => {
@@ -786,8 +946,15 @@ function completeHandshake(connection, message, expectedProof) {
   }, KEEPALIVE_MS);
 }
 
-chrome.runtime.onInstalled.addListener(startConnect);
-chrome.runtime.onStartup.addListener(startConnect);
-chrome.action.onClicked.addListener(startConnect);
+chrome.runtime.onInstalled.addListener(connectNow);
+chrome.runtime.onStartup.addListener(connectNow);
+chrome.action.onClicked.addListener(connectNow);
+// The alarm carries no urgency of its own; it exists to bring the worker back
+// for a wait that outlasts it, so it lands on the ordinary attempt path.
+if (alarmsAvailable) {
+  chrome.alarms.onAlarm.addListener(alarm => {
+    if (alarm.name === RECONNECT_ALARM) startConnect();
+  });
+}
 restoreState();
-startConnect();
+resumeConnect();

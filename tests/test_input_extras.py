@@ -352,6 +352,47 @@ def test_pointer_lock_accumulates_unclamped_relative_movement(local_site):
         browser_tools.close_session("lock-input")
 
 
+def test_frames_advanced_counts_only_the_frames_the_gate_really_released(local_site):
+    _open_pointer_fixture(local_site, "frame-count")
+    try:
+        # Nothing is gated in normal mode, so the page draws on its own schedule
+        # and the call released no frame at all.
+        loose = browser_tools.press_keys(
+            ["W"], "frame-count", action="tap", wait_seconds=0
+        )
+        assert loose["render_mode"] == "normal"
+        assert loose["frames_advanced"] == 0
+
+        batched = browser_tools.input_batch(
+            key_actions=[{"key": "W", "action": "tap"}],
+            session_id="frame-count",
+            wait_seconds=0,
+        )
+        assert batched["frame_advanced"] is False
+        assert batched["frames_advanced"] == 0
+
+        browser_tools.set_render_control("throttled", "frame-count", target_fps=20)
+        throttled = browser_tools.press_keys(
+            ["W"], "frame-count", action="tap", wait_seconds=0
+        )
+        assert throttled["render_mode"] == "throttled"
+        assert throttled["frames_advanced"] == 0
+
+        browser_tools.set_render_control("step", "frame-count")
+        stepped = browser_tools.press_keys(
+            ["W"], "frame-count", action="tap", hold_frames=2, wait_seconds=0
+        )
+        assert stepped["frames_advanced"] == 2
+        held = browser_tools.press_keys(
+            ["W"], "frame-count", action="hold", wait_seconds=0
+        )
+        assert held["frames_advanced"] == 1
+        browser_tools.press_keys(["W"], "frame-count", action="release", wait_seconds=0)
+    finally:
+        browser_tools.set_render_control("normal", "frame-count")
+        browser_tools.close_session("frame-count")
+
+
 @pytest.mark.parametrize(
     ("name", "expected"),
     [

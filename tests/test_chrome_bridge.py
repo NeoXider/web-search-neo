@@ -27,7 +27,8 @@ requires_node = pytest.mark.skipif(
 )
 
 # Enough of Chrome for service-worker.js to load and connect outside a browser:
-# a socket that records what it was told to send, and a token file the test owns.
+# a socket that records what it was told to send, a token file the test owns,
+# and a session store, alarm shelf and timer log the reconnect schedule lands in.
 _WORKER_STUBS = """
 import * as fs from "node:fs";
 
@@ -35,12 +36,43 @@ const sockets = [];
 let tokenSource = null;
 let fetchCalls = 0;
 const noop = () => {};
-const listener = {addListener: noop};
+const listeners = {};
+const listener = name => ({
+  addListener: handler => { (listeners[name] = listeners[name] || []).push(handler); },
+});
+const sessionStore = {};
+const alarms = [];
+const timers = [];
+let reloads = 0;
+const realSetTimeout = globalThis.setTimeout;
+const realClearTimeout = globalThis.clearTimeout;
+
+globalThis.setTimeout = (handler, ms, ...rest) => {
+  const id = realSetTimeout(handler, ms, ...rest);
+  timers.push({ms, id});
+  return id;
+};
 
 globalThis.__sockets = sockets;
 globalThis.__setToken = source => { tokenSource = source; };
 globalThis.__fetchCalls = () => fetchCalls;
-globalThis.__sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+globalThis.__fire = (name, detail) => (listeners[name] || []).forEach(handler => handler(detail));
+globalThis.__seedSession = items => Object.assign(sessionStore, items);
+globalThis.__session = () => sessionStore;
+globalThis.__alarms = () => alarms.slice();
+globalThis.__reloads = () => reloads;
+// Forget (and cancel) whatever was already pending so the next assertion reads
+// exactly one scheduling decision.
+globalThis.__resetSchedule = () => {
+  for (const timer of timers) realClearTimeout(timer.id);
+  timers.length = 0;
+  alarms.length = 0;
+};
+globalThis.__scheduledWait = () => {
+  if (alarms.length) return Math.round(alarms[alarms.length - 1].delayInMinutes * 60000);
+  return timers.length ? timers[timers.length - 1].ms : null;
+};
+globalThis.__sleep = ms => new Promise(resolve => realSetTimeout(resolve, ms));
 globalThis.__waitFor = async (check, label) => {
   for (let attempt = 0; attempt < 300; attempt += 1) {
     if (check()) return;
@@ -79,22 +111,38 @@ globalThis.WebSocket = FakeSocket;
 
 globalThis.chrome = {
   runtime: {
+    id: "stub-extension-id",
     getURL: path => "chrome-extension://stub/" + path,
     getManifest: () => ({version: "0.0.0-test"}),
-    onInstalled: listener,
-    onStartup: listener,
+    reload: () => { reloads += 1; },
+    onInstalled: listener("installed"),
+    onStartup: listener("startup"),
   },
-  action: {setBadgeBackgroundColor: noop, setBadgeText: noop, onClicked: listener},
-  storage: {session: {get: async () => ({}), set: async () => ({})}},
+  action: {
+    setBadgeBackgroundColor: noop,
+    setBadgeText: noop,
+    onClicked: listener("clicked"),
+  },
+  alarms: {
+    create: (name, info) => { alarms.push({name, ...info}); },
+    clear: async () => true,
+    onAlarm: listener("alarm"),
+  },
+  storage: {
+    session: {
+      get: async key => (key in sessionStore ? {[key]: sessionStore[key]} : {}),
+      set: async items => { Object.assign(sessionStore, items); },
+    },
+  },
   debugger: {
-    onEvent: listener,
-    onDetach: listener,
+    onEvent: listener("debuggerEvent"),
+    onDetach: listener("debuggerDetach"),
     attach: async () => {},
     detach: async () => {},
     sendCommand: async () => ({}),
   },
   tabs: {
-    onRemoved: listener,
+    onRemoved: listener("tabRemoved"),
     query: async () => [],
     get: async () => ({}),
     update: async () => ({}),
@@ -123,10 +171,16 @@ def _node_eval(body: str):
     return json.loads(completed.stdout)
 
 
-def _node_worker_eval(body: str):
-    """Run one snippet against service-worker.js with Chrome stubbed out."""
+def _node_worker_eval(body: str, prelude: str = ""):
+    """Run one snippet against service-worker.js with Chrome stubbed out.
+
+    `prelude` runs before the import, which is the only moment a test can shape
+    the world the worker wakes up in: a Chrome without the alarms permission, or
+    a session store left behind by a worker Chrome has already evicted.
+    """
     module = (
         _WORKER_STUBS
+        + f"{prelude}\n"
         + f"const worker = await import({json.dumps(SERVICE_WORKER_MODULE)});\n"
         + f"const result = await (async () => {{\n{body}\n}})();\n"
         + "fs.writeSync(1, JSON.stringify(result ?? null));\n"
@@ -390,6 +444,242 @@ def test_the_token_is_re_read_after_it_was_missing() -> None:
     assert outcome["failure"], "the first read should fail while the token file is absent"
     assert outcome["recovered"] == TEST_TOKEN
     assert "no usable token" in outcome["junk"]
+
+
+# The bridge port is closed for most of the day and Chrome logs every refused
+# attempt as a runtime error of the extension, so the schedule below is what
+# keeps chrome://extensions from filling with identical lines. The tests that
+# follow all start the same way: let the worker spend its own first attempt on
+# the token that is not there yet, then hand it one, so what they measure is the
+# schedule and not the load order.
+_WORKER_READY = (
+    'await globalThis.__waitFor(() => globalThis.__fetchCalls() >= 1, "the first token read");\n'
+    "await globalThis.__sleep(20);\n"
+    f"globalThis.__setToken('export const BRIDGE_TOKEN = \"{TEST_TOKEN}\";');\n"
+)
+
+# One attempt that finds nobody listening: the socket is built, never opens, and
+# closes the way Chrome closes a refused connection.
+_FAIL_ONCE = """
+const failOnce = async () => {
+  await worker.connect();
+  const socket = globalThis.__sockets[globalThis.__sockets.length - 1];
+  globalThis.__resetSchedule();
+  socket.onclose({code: 1006, reason: ""});
+  return {wait: globalThis.__scheduledWait(), via_alarm: globalThis.__alarms().length > 0};
+};
+"""
+
+
+@requires_node
+def test_each_refused_connection_is_retried_later_than_the_last_up_to_a_minute() -> None:
+    schedule = _node_worker_eval(
+        """
+        const rows = {};
+        for (const kind of ["transport", "auth"]) {
+          for (const streak of [0, 1, 2, 5, 40]) {
+            const samples = [];
+            for (let sample = 0; sample < 64; sample += 1) {
+              samples.push(worker.backoffDelay(kind, streak));
+            }
+            rows[kind + ":" + streak] = {min: Math.min(...samples), max: Math.max(...samples)};
+          }
+        }
+        return rows;
+        """
+    )
+    floor = schedule["transport:0"]
+    assert 1000 <= floor["min"] and floor["max"] <= 1500
+    # A flat retry would repeat one number; jitter and growth both rule that out.
+    assert floor["min"] < floor["max"], "the delay carries no jitter"
+    for earlier, later in (
+        ("transport:0", "transport:1"),
+        ("transport:1", "transport:2"),
+        ("transport:2", "transport:5"),
+    ):
+        assert schedule[later]["min"] > schedule[earlier]["max"], (earlier, later)
+    capped = schedule["transport:40"]
+    assert capped["max"] <= 60000 and capped["min"] >= 45000
+    # A peer that answered and refused us is a slower problem than a closed port.
+    assert schedule["auth:0"]["min"] >= floor["max"]
+    assert schedule["auth:40"]["max"] <= 120000
+
+
+@requires_node
+def test_a_verified_handshake_puts_the_retry_back_on_its_floor() -> None:
+    outcome = _node_worker_eval(
+        _WORKER_READY
+        + _FAIL_ONCE
+        + """
+        const waits = [];
+        for (let attempt = 0; attempt < 5; attempt += 1) waits.push((await failOnce()).wait);
+
+        await worker.connect();
+        const accepted = globalThis.__sockets[globalThis.__sockets.length - 1];
+        accepted.onopen();
+        const hello = JSON.parse(accepted.sent[0]);
+        accepted.onmessage({data: JSON.stringify({
+          type: "hello_ack",
+          protocol: hello.protocol,
+          proof: await globalThis.__hmac(hello.token, hello.nonce),
+        })});
+        globalThis.__resetSchedule();
+        accepted.onclose({code: 1006, reason: "server stopped"});
+
+        return {waits, after_a_good_session: globalThis.__scheduledWait()};
+        """
+    )
+    waits = outcome["waits"]
+    assert waits[0] < 2000, "the first retry should still be prompt"
+    assert waits == sorted(waits) and len(set(waits)) == len(waits), waits
+    assert waits[-1] > 15000, "five refusals in a row should have slowed right down"
+    assert outcome["after_a_good_session"] <= 1500, "a working session must clear the streak"
+
+
+@requires_node
+def test_a_refused_handshake_waits_on_its_own_slower_schedule() -> None:
+    """A peer that answered and turned us away is not retried like a closed port."""
+    outcome = _node_worker_eval(
+        _WORKER_READY
+        + """
+        await worker.connect();
+        const answered = globalThis.__sockets[globalThis.__sockets.length - 1];
+        answered.onopen();
+        globalThis.__resetSchedule();
+        answered.onclose({code: 1008, reason: "token mismatch"});
+        const refused = globalThis.__scheduledWait();
+
+        await worker.connect();
+        const unanswered = globalThis.__sockets[globalThis.__sockets.length - 1];
+        globalThis.__resetSchedule();
+        unanswered.onclose({code: 1006, reason: ""});
+        return {refused, closed_port: globalThis.__scheduledWait()};
+        """
+    )
+    assert outcome["closed_port"] < 2000, "a closed port should be retried promptly"
+    assert outcome["refused"] >= 7500 <= 120000
+    assert outcome["refused"] > outcome["closed_port"] * 4
+    # The two schedules are counted apart: a refusal must not slow down the
+    # ordinary retry that follows it.
+    assert outcome["closed_port"] <= 1500
+
+
+@requires_node
+def test_a_wait_the_worker_would_not_survive_is_handed_to_an_alarm() -> None:
+    """MV3 suspends an idle worker, so only an alarm can bring it back."""
+    steps = _node_worker_eval(
+        _WORKER_READY
+        + _FAIL_ONCE
+        + """
+        const steps = [];
+        for (let attempt = 0; attempt < 8; attempt += 1) steps.push(await failOnce());
+        return steps;
+        """
+    )
+    assert [step["via_alarm"] for step in steps] == [step["wait"] >= 30000 for step in steps]
+    assert any(step["via_alarm"] for step in steps), "no wait ever grew past the idle window"
+    assert max(step["wait"] for step in steps) <= 60000
+
+
+@requires_node
+def test_without_the_alarms_permission_no_wait_outlives_the_idle_worker() -> None:
+    """A timer Chrome would kill mid-wait leaves the bridge offline for good."""
+    steps = _node_worker_eval(
+        _WORKER_READY
+        + _FAIL_ONCE
+        + """
+        const steps = [];
+        for (let attempt = 0; attempt < 8; attempt += 1) steps.push(await failOnce());
+        return {steps, alarms: globalThis.__alarms()};
+        """,
+        prelude="delete globalThis.chrome.alarms;",
+    )
+    waits = [step["wait"] for step in steps["steps"]]
+    assert steps["alarms"] == []
+    assert max(waits) <= 25000
+    assert waits[1] > waits[0], "the backoff should still grow up to the ceiling"
+
+
+@requires_node
+def test_a_restarted_worker_resumes_the_stored_wait_instead_of_attempting_at_once() -> None:
+    """Any event that wakes an evicted worker would otherwise spend an attempt."""
+    outcome = _node_worker_eval(
+        """
+        await globalThis.__sleep(60);
+        return {
+          attempts: globalThis.__fetchCalls(),
+          sockets: globalThis.__sockets.length,
+          wait: globalThis.__scheduledWait(),
+        };
+        """,
+        prelude=(
+            "globalThis.__seedSession({bridge_backoff: "
+            "{transport: 6, auth: 0, nextAttemptAt: Date.now() + 45000}});"
+        ),
+    )
+    assert outcome["attempts"] == 0 and outcome["sockets"] == 0
+    assert 30000 <= outcome["wait"] <= 46000
+
+
+@requires_node
+def test_the_toolbar_click_retries_at_once_but_two_clicks_are_not_two_attempts() -> None:
+    """The click is how a user says the server is up; it must not become a loop."""
+    outcome = _node_worker_eval(
+        _WORKER_READY
+        + """
+        await globalThis.__sleep(1600);
+        globalThis.__resetSchedule();
+        globalThis.__fire("clicked");
+        await globalThis.__waitFor(() => globalThis.__sockets.length >= 1, "the socket the click asked for");
+        const after_one = globalThis.__sockets.length;
+        globalThis.__fire("clicked");
+        const wait = globalThis.__scheduledWait();
+        await globalThis.__sleep(50);
+        return {after_one, after_two: globalThis.__sockets.length, wait};
+        """
+    )
+    assert outcome["after_one"] == 1, "the click should connect straight away"
+    assert outcome["after_two"] == 1, "a second click inside the floor must not attempt again"
+    assert 0 < outcome["wait"] <= 1500
+
+
+@requires_node
+def test_the_reload_command_answers_before_it_takes_the_worker_down() -> None:
+    """Reloading is the only way to update the companion without a manual click."""
+    outcome = _node_worker_eval(
+        _WORKER_READY
+        + """
+        await worker.connect();
+        const socket = globalThis.__sockets[globalThis.__sockets.length - 1];
+        socket.onopen();
+        const hello = JSON.parse(socket.sent[0]);
+        socket.onmessage({data: JSON.stringify({
+          type: "hello_ack",
+          protocol: hello.protocol,
+          proof: await globalThis.__hmac(hello.token, hello.nonce),
+        })});
+        // A wait left over from an earlier outage; the worker that comes back
+        // would otherwise honour it instead of connecting.
+        globalThis.__seedSession({bridge_backoff: {transport: 9, auth: 9, nextAttemptAt: Date.now() + 60000}});
+
+        socket.onmessage({data: JSON.stringify({
+          type: "command", id: "reload-1", method: "runtime.reload",
+        })});
+        await globalThis.__waitFor(() => socket.sent.length > 1, "the answer to the reload request");
+        const answer = JSON.parse(socket.sent[1]);
+        const before = globalThis.__reloads();
+        const stored = globalThis.__session().bridge_backoff;
+        await globalThis.__sleep(500);
+        return {answer, before, after: globalThis.__reloads(), stored};
+        """
+    )
+    assert outcome["answer"]["id"] == "reload-1"
+    assert outcome["answer"]["result"]["reloading"] is True
+    assert outcome["answer"]["result"]["version"] == "0.0.0-test"
+    assert outcome["answer"]["result"]["extension_id"] == "stub-extension-id"
+    assert outcome["before"] == 0, "the worker went down before the caller was answered"
+    assert outcome["after"] == 1, "the reload never happened"
+    assert outcome["stored"] == {"transport": 0, "auth": 0, "nextAttemptAt": 0}
 
 
 def test_a_first_frame_that_is_not_an_object_is_refused_with_a_reason() -> None:

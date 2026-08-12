@@ -256,11 +256,14 @@ on `keydown`, and they clear that latch themselves on death, respawn, a menu, or
 a level restart. With a single synthetic `keydown` the latch is never re-armed,
 so the character stays frozen even though the agent is still "holding" the key.
 
-Before every released frame, the session therefore re-sends a `keydown` with the
-repeat flag for each key it is holding. Two details matter:
+Before a call releases frames, the session therefore re-sends a `keydown` with
+the repeat flag for each key it is holding. This happens once per call, not once
+per released frame: a `step` of 30 frames delivers exactly one repeat, not
+thirty, so an engine that counts `keydown` events sees one per input or `step`
+action rather than one per tick. Two details matter:
 
-- a key that was pressed *for this very frame* is not repeated inside it, the
-  same way a real keyboard waits before it repeats;
+- a key that was pressed *by this very call* is not repeated by it, the same way
+  a real keyboard waits before it repeats;
 - re-holding a key that is already down does not silence its repeat.
 
 This is on by default and is not exposed through MCP. The Python API can turn it
@@ -310,9 +313,10 @@ plus its left/top border and padding — before dispatching. A frame with a 4 px
 border would otherwise land every click 4 px off.
 
 The host document keeps animating while only the frame is gated. `game_probe`
-knows this: while a gate is engaged anywhere in the session it returns
-`fps: null`, `animation_suspended: true`, and a `reason` naming the gated frame,
-instead of reporting the host's healthy frame rate for a frozen game.
+knows this: while a gate is engaged anywhere in the session its `animation`
+object reads `fps: null`, `animation_suspended: true`, and a `reason` naming the
+gated frame, instead of reporting the host's healthy frame rate for a frozen
+game.
 
 ## Pointer lock and first-person controls
 
@@ -395,7 +399,7 @@ frame in step mode.
 
 | Call | What it tells you |
 | --- | --- |
-| `web_info(topic="game_probe")` | Canvas and WebGL context, iframe surfaces, document focus, FPS (or `animation_suspended` while gated), load time, console warnings and errors, and which keys and buttons the session is still holding. |
+| `web_info(topic="game_probe")` | Canvas and WebGL context, iframe surfaces, document focus, `animation.fps` (or `animation.animation_suspended` while gated), load time, console warnings and errors, and which keys and buttons the session is still holding. |
 | `web_info(topic="screenshot")` | A PNG of the current frame. In step mode it shows the last *released* frame, so take it after the step, never before. |
 | `web_info(topic="console")` | `console.log/info/warn/error`, uncaught exceptions, and rejections with stack frames. Filter with `levels`, `kinds`, `contains`. |
 | `web_info(topic="page_text")` | The DOM status line or HUD many games render outside the canvas. |

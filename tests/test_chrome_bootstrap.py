@@ -48,6 +48,27 @@ class _OutdatedBridge(_ConnectedBridge):
     version = "1.2.0"
 
 
+class _SelfUpdatingBridge(_OutdatedBridge):
+    """A companion new enough to re-read its own folder when asked."""
+
+    def __init__(self):
+        super().__init__()
+        self.reloads = 0
+
+    def request(self, method, params=None, timeout=20.0):
+        assert method == "runtime.reload"
+        self.reloads += 1
+        replaced, self.version = self.version, None  # None == the bundled build
+        return {"reloading": True, "version": replaced}
+
+
+class _StubbornBridge(_OutdatedBridge):
+    """A build that predates runtime.reload, so a person still has to click."""
+
+    def request(self, method, params=None, timeout=20.0):
+        raise RuntimeError(f"Unknown bridge method: {method}")
+
+
 def _use_bridge(monkeypatch, bridge):
     monkeypatch.setattr(chrome_bootstrap, "get_chrome_bridge", lambda: bridge)
     return bridge
@@ -93,6 +114,31 @@ def test_setup_demands_a_reload_when_the_connected_build_is_older(monkeypatch):
     assert result["connected_version"] == "1.2.0"
     assert any("Reload" in step for step in result["manual_steps"])
     assert "1.2.0" in result["next"]
+
+
+def test_setup_updates_a_stale_companion_without_asking_anyone_to_click(monkeypatch):
+    bridge = _use_bridge(monkeypatch, _SelfUpdatingBridge())
+    result = chrome_bootstrap.setup_current_chrome()
+
+    assert bridge.reloads == 1
+    assert result["self_update"] == "done"
+    assert result["replaced_version"] == "1.2.0"
+    # Having fixed it, the report must not still be telling a person to fix it.
+    assert result["ready"] is True
+    assert result["update_required"] is False
+    assert result["manual_steps"] == []
+
+
+def test_setup_falls_back_to_the_manual_reload_when_the_worker_is_too_old(monkeypatch):
+    _use_bridge(monkeypatch, _StubbornBridge())
+    result = chrome_bootstrap.setup_current_chrome()
+
+    assert result["self_update"] == "unsupported"
+    assert "Unknown bridge method" in result["self_update_error"]
+    assert result["ready"] is False
+    assert any("Reload" in step for step in result["manual_steps"])
+    # The promise that this is the last click matters more than the diagnosis.
+    assert "without a click" in result["next"]
 
 
 def test_setup_publishes_the_bridge_token_before_touching_chrome(isolated_token, monkeypatch):

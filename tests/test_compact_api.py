@@ -205,6 +205,41 @@ def test_capabilities_names_required_parameters_and_where_the_rest_live():
     )
 
 
+def test_capabilities_states_the_requirements_that_python_defaults_hide():
+    document = main._capabilities()
+    actions = document["actions"]
+    # "input" takes both lists as optional in Python and rejects a call with
+    # neither, so silence here would teach the contract only by failing.
+    also_required = actions["input"]["also_required"]
+    assert "key_actions" in also_required and "pointer_actions" in also_required
+    assert actions["touch"]["required"] == ["touch_action"]
+    assert "points" in actions["touch"]["also_required"]
+    assert "release" in actions["touch"]["also_required"]  # the exempt verbs
+    # An unexplained key is a key a small model skips.
+    assert "also_required" in document["discovery"]["parameters"]
+    # Unconditional actions keep the plain shape, so the key stays a signal.
+    assert "also_required" not in actions["pointer"]
+    assert "also_required" not in actions["open"]
+    assert len(json.dumps(document)) < 8_000
+
+
+def test_input_and_touch_reject_exactly_what_the_document_calls_required():
+    # The document is only honest while it still matches the handlers; both of
+    # these fail before any browser session is touched.
+    result = asyncio.run(
+        main.web_action(
+            [
+                {"action": "input", "session_id": "documented"},
+                {"action": "touch", "touch_action": "tap", "session_id": "documented"},
+            ],
+            continue_on_error=True,
+        )
+    )
+    assert result["failure_count"] == 2
+    assert "key action or pointer action" in result["results"][0]["error"]
+    assert "touch points" in result["results"][1]["error"]
+
+
 def test_compact_web_action_reports_and_controls_failures(monkeypatch):
     stopped = asyncio.run(
         main.web_action(
