@@ -133,26 +133,42 @@ async function waitForTab(tabId, timeoutMs = 20000) {
 // one they are working in and every tab we add there moves their tab strip under
 // their hands. In order of preference it joins the window that already holds our
 // own group - agent tabs then cluster in one place the user can ignore or close
-// as a unit - then any window that is not focused, and only then the focused one.
-// Opening a window of our own is never the answer: on Windows a new window
-// raises itself and lands in the taskbar, which is the very interruption
-// background mode exists to avoid.
+// as a unit - then any other window, and only then the focused one.
+//
+// A minimized window is out of the running entirely, our own group's included.
+// Chrome never composites one, and a tab that is never painted cannot be
+// photographed: every screenshot from it spends the whole capture budget and
+// comes back as the obscured-window error, not once but for the life of the
+// session, with nothing to connect that failure to a window the user minimized
+// an hour ago. Passing our own group by costs a second group of the same name in
+// whichever window is used instead; a duplicated heading is untidy, a screenshot
+// feature that never works is broken. Restoring the window would settle it and is
+// not on the table: raising a window is the interruption this mode exists to
+// avoid.
+//
+// Returning null means "let Chrome choose", which happens only when the browser
+// has no normal window at all - it can outlive its last one - and Chrome then
+// makes a window that raises itself. That is the one case where a background tab
+// cannot help being seen, and there is no alternative: a tab needs a window.
 async function windowForNewTab(group, active) {
   const windows = await chrome.windows.getAll({windowTypes: ["normal"]});
   if (!windows.length) return null;
   const focused = windows.find(window => window.focused) || windows[0];
   if (active) return focused.id;
+  const painted = window => window.state !== "minimized";
   if (group) {
     const groups = await chrome.tabGroups.query({});
-    const ours = groups.find(
-      item => item.title === group && windows.some(window => window.id === item.windowId),
+    const ours = groups.find(item =>
+      item.title === group
+        && windows.some(window => window.id === item.windowId && painted(window)),
     );
     if (ours) return ours.windowId;
   }
-  // A minimized window is the last place to put work someone may want to look
-  // at later, so it is only taken when there is nothing else.
-  const spare = windows.filter(window => !window.focused);
-  return (spare.find(window => window.state !== "minimized") || spare[0] || focused).id;
+  // The focused window is the last resort, never "no window": a browser whose
+  // windows are all minimized still gets its tab somewhere that already exists,
+  // because the alternative is a brand new window putting itself in front.
+  const spare = windows.filter(window => !window.focused && painted(window));
+  return (spare[0] || focused).id;
 }
 
 async function ensureGroupUnlocked(tabId, title) {
@@ -272,33 +288,52 @@ async function ensureDebugger(tabId) {
   try {
     await chrome.debugger.attach({tabId}, DEBUGGER_VERSION);
   } catch (error) {
-    // A restarted worker forgets the attachment while Chrome keeps it alive.
+    // Chrome refuses a second attach both when the debugger already on the tab
+    // is this worker's own - the ordinary case after an eviction, since Chrome
+    // keeps the attachment that the worker forgot - and when it belongs to
+    // somebody else: a DevTools window, another extension. The message does not
+    // reliably tell those apart, so this does not try to. The setup below is
+    // what decides: a session that is ours answers it, and one that is not
+    // throws, leaving the tab unattached rather than recorded as ready.
     if (!/already attached/i.test(String(error?.message || error))) throw error;
   }
+  try {
+    await chrome.debugger.sendCommand({tabId}, "Runtime.enable");
+    await sendSafe(tabId, "Page.enable");
+    await sendSafe(tabId, "Log.enable");
+    await sendSafe(tabId, "Target.setAutoAttach", {
+      autoAttach: true,
+      waitForDebuggerOnStart: false,
+      flatten: true,
+    });
+    // Without this a tab that was never in front is barely controllable, which
+    // measurement rather than theory established: Input.dispatchKeyEvent and
+    // dispatchMouseEvent return success and are then dropped on the floor, no
+    // event reaches the page at all; requestAnimationFrame never fires; and
+    // setTimeout is clamped to one second, then to sixty after a minute or so
+    // hidden. With focus emulation on, the same hidden tab measured 49 fps and
+    // 4.5 ms timers - foreground numbers - and input arrives.
+    //
+    // The cost is that the page is told it is focused and visible when it is
+    // not, so a script watching visibilitychange sees a tab that never hides.
+    // For a page an agent is driving that is closer to the truth than the
+    // alternative: something is looking at it, and it should behave as if. The
+    // setting belongs to this debugger session and dies with it, so the tab goes
+    // back to ordinary background behaviour the moment the session detaches.
+    await sendSafe(tabId, "Emulation.setFocusEmulationEnabled", {enabled: true});
+  } catch (error) {
+    // Nothing here is optional: a tab that skipped this is the one that accepts
+    // keystrokes and drops them. So it is not recorded, the half-open session is
+    // let go, and the next call attaches again - which is what recovers a tab
+    // whose DevTools window the user has meanwhile closed.
+    await chrome.debugger.detach({tabId}).catch(() => {});
+    throw new Error(
+      `Chrome would not let the companion drive tab ${tabId}: ` +
+        `${error?.message || error}. Something else is debugging that tab - close its ` +
+        "DevTools window (or the other extension using it) and try again.",
+    );
+  }
   attachedTabs.add(tabId);
-  await chrome.debugger.sendCommand({tabId}, "Runtime.enable");
-  await sendSafe(tabId, "Page.enable");
-  await sendSafe(tabId, "Log.enable");
-  await sendSafe(tabId, "Target.setAutoAttach", {
-    autoAttach: true,
-    waitForDebuggerOnStart: false,
-    flatten: true,
-  });
-  // Without this a tab that was never in front is barely controllable, which
-  // measurement rather than theory established: Input.dispatchKeyEvent and
-  // dispatchMouseEvent return success and are then dropped on the floor, no
-  // event reaches the page at all; requestAnimationFrame never fires; and
-  // setTimeout is clamped to one second, then to sixty after a minute or so
-  // hidden. With focus emulation on, the same hidden tab measured 49 fps and
-  // 4.5 ms timers - foreground numbers - and input arrives.
-  //
-  // The cost is that the page is told it is focused and visible when it is
-  // not, so a script watching visibilitychange sees a tab that never hides.
-  // For a page an agent is driving that is closer to the truth than the
-  // alternative: something is looking at it, and it should behave as if. The
-  // setting belongs to this debugger session and dies with it, so the tab goes
-  // back to ordinary background behaviour the moment the session detaches.
-  await sendSafe(tabId, "Emulation.setFocusEmulationEnabled", {enabled: true});
   persistState();
 }
 
@@ -372,11 +407,23 @@ const commands = {
   async "tabs.create"({url = "about:blank", group = "AI", active = false}) {
     const wanted = Boolean(active);
     const windowId = await windowForNewTab(group, wanted);
-    const tab = await chrome.tabs.create({
-      url,
-      active: wanted,
-      ...(windowId === null ? {} : {windowId}),
-    });
+    let tab;
+    try {
+      tab = await chrome.tabs.create({
+        url,
+        active: wanted,
+        ...(windowId === null ? {} : {windowId}),
+      });
+    } catch (error) {
+      // The window is chosen and then used, and a user can close it in between:
+      // Chrome answers "No window with id: N" and the agent, which asked only
+      // for a tab, is told about a window it never mentioned. Asking again
+      // without naming one is the same request with a free hand, so it is worth
+      // one attempt before the failure is passed on.
+      if (windowId === null) throw error;
+      console.warn(`bridge: window ${windowId} is gone, opening the tab anywhere`, error);
+      tab = await chrome.tabs.create({url, active: wanted});
+    }
     await ensureGroup(tab.id, group);
     return serializeTab(await waitForTab(tab.id, 10000), await groupMap());
   },

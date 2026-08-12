@@ -1129,6 +1129,128 @@ def test_a_tab_lost_while_the_link_was_down_stops_being_ours() -> None:
         client.shutdown()
 
 
+def test_a_claim_survives_the_daemon_learning_which_browser_it_serves() -> None:
+    """A daemon starts knowing no run at all, and that is not a browser change.
+
+    Anything claimed before the companion said hello was claimed against the
+    browser that is about to say hello - there is only one - so learning its name
+    must adopt those claims, not throw them away behind the holder's back.
+    """
+    with _running_daemon() as daemon:
+        with _attached_client(daemon) as holder:
+            assert holder.claim_tab(41)["granted"] is True
+            companion = _FakeCompanion(daemon.port, run="run-X")
+            try:
+                _settled(lambda: holder.browser_run == "run-X", "the client to see the browser")
+                assert set(daemon.claimed_tabs) == {41}, "the claim was thrown away"
+                assert holder.claimed_tabs == (41,)
+                with _attached_client(daemon) as newcomer:
+                    assert newcomer.claim_tab(41)["granted"] is False
+            finally:
+                companion.close()
+
+
+def test_a_re_asserted_claim_survives_the_companion_coming_back() -> None:
+    """The whole sequence: daemon replaced, client re-claims, companion returns."""
+    port = _free_port()
+    client = ChromeBridge(port=port, token=TEST_TOKEN, spawn=False)
+    try:
+        with _running_daemon(port=port) as first_daemon:
+            companion = _FakeCompanion(first_daemon.port, run="run-X")
+            client.start()
+            assert client.claim_tab(41)["browser_run"] == "run-X"
+            companion.close()
+        # The daemon is replaced - the version handshake does exactly this on an
+        # upgrade - and the client, which reconnects in well under a second, gets
+        # there long before the companion is out of its own backoff.
+        with _running_daemon(port=port) as second_daemon:
+            _settled(lambda: set(second_daemon.claimed_tabs) == {41}, "the client to re-claim")
+            returning = _FakeCompanion(second_daemon.port, nonce="5e" * 16, run="run-X")
+            try:
+                _settled(lambda: client.browser_run == "run-X", "the state push")
+                assert set(second_daemon.claimed_tabs) == {41}, "the re-asserted claim was lost"
+                assert client.claimed_tabs == (41,)
+                with _attached_client(second_daemon) as newcomer:
+                    assert newcomer.claim_tab(41)["granted"] is False
+            finally:
+                returning.close()
+    finally:
+        client.shutdown()
+
+
+def test_a_re_asserted_claim_still_goes_when_the_browser_really_changed() -> None:
+    """The other half: adopting the unknown must not adopt the genuinely stale."""
+    port = _free_port()
+    client = ChromeBridge(port=port, token=TEST_TOKEN, spawn=False)
+    try:
+        with _running_daemon(port=port) as first_daemon:
+            companion = _FakeCompanion(first_daemon.port, run="run-X")
+            client.start()
+            assert client.claim_tab(41)["browser_run"] == "run-X"
+            companion.close()
+        with _running_daemon(port=port) as second_daemon:
+            _settled(lambda: set(second_daemon.claimed_tabs) == {41}, "the client to re-claim")
+            # A different browser this time: tab 41 is somebody else's tab now.
+            other_browser = _FakeCompanion(second_daemon.port, nonce="6f" * 16, run="run-Y")
+            try:
+                _settled(lambda: second_daemon.claimed_tabs == {}, "the stale claim to go")
+                _settled(lambda: client.claimed_tabs == (), "the client to stop believing")
+                with _attached_client(second_daemon) as newcomer:
+                    assert newcomer.claim_tab(41)["granted"] is True
+            finally:
+                other_browser.close()
+    finally:
+        client.shutdown()
+
+
+def test_a_claim_made_against_a_browser_that_is_gone_is_refused() -> None:
+    """A re-assert naming a run the daemon knows is over cannot be honoured."""
+    with _running_daemon() as daemon:
+        companion = _FakeCompanion(daemon.port, run="run-now")
+        try:
+            with _attached_client(daemon) as client:
+                _settled(lambda: client.browser_run == "run-now", "the browser state")
+                answer = client._control("claim_tab", {"tab_id": 41, "browser_run": "run-before"})
+                assert answer["granted"] is False
+                assert "different browser" in answer["reason"]
+                assert daemon.claimed_tabs == {}
+        finally:
+            companion.close()
+
+
+def test_a_peer_that_accepts_and_then_says_nothing_is_hung_up_on() -> None:
+    """An abandoned socket keeps a reader thread, and the retry dials another.
+
+    The trigger is narrow - something is listening on the port and will not talk,
+    a wedged daemon or a foreign server - but the server that meets it runs for
+    days, and every attempt would leave one more socket behind it.
+    """
+
+    class _SilentPeer:
+        def __init__(self, on_send: Exception | None = None) -> None:
+            self.closed: list[int] = []
+            self.on_send = on_send
+
+        def send(self, text: str) -> None:
+            if self.on_send is not None:
+                raise self.on_send
+
+        def recv(self, timeout: float | None = None):
+            raise TimeoutError("timed out waiting for the hello_ack")
+
+        def close(self, code: int = 1000, reason: str = "") -> None:
+            self.closed.append(code)
+
+    client = ChromeBridge(port=_free_port(), token=TEST_TOKEN, spawn=False, start_timeout=0.1)
+    try:
+        for peer in (_SilentPeer(), _SilentPeer(on_send=OSError("broken pipe"))):
+            with pytest.raises(ChromeBridgeError):
+                client._handshake(peer)
+            assert peer.closed, "the socket was left open for the garbage collector"
+    finally:
+        client.shutdown()
+
+
 def test_a_claim_with_nobody_to_ask_is_not_a_refusal() -> None:
     """'Nobody answered' and 'someone else has it' must not look the same."""
     lonely = ChromeBridge(port=_free_port(), token=TEST_TOKEN, spawn=False, start_timeout=0.2)
@@ -1327,6 +1449,46 @@ def test_a_new_tab_joins_the_window_that_already_holds_the_agents_group() -> Non
 
 
 @requires_node
+def test_the_agents_own_group_does_not_win_a_minimized_window() -> None:
+    """A tab that is never painted cannot be photographed, group or no group.
+
+    Chrome does not composite a minimized window, so a session parked there
+    spends the full capture budget on every screenshot and then reports an
+    obscured window - for good, and with nothing to point the user back at the
+    window they minimized an hour ago. A duplicate group heading somewhere else
+    is the cheaper mess by a wide margin.
+    """
+    outcome = _node_worker_eval(
+        _WORKER_READY
+        + _TAB_WORLD
+        + _VERIFIED_SOCKET
+        + """
+        globalThis.__world.groups = [{id: 11, title: "AI", windowId: 3}];
+        globalThis.__world.windows = [
+          {id: 1, focused: true, state: "normal"},
+          {id: 2, focused: false, state: "normal"},
+          {id: 3, focused: false, state: "minimized"}];
+        const socket = await openSocket();
+        await ask(socket, "tabs.create", {url: "about:blank", group: "AI"});
+        const elsewhere = {...globalThis.__world.created};
+
+        // And with nowhere else to go, the user's own window still beats it: a
+        // window that already exists is better than one Chrome would raise.
+        globalThis.__world.windows = [
+          {id: 1, focused: true, state: "normal"},
+          {id: 3, focused: false, state: "minimized"}];
+        const answer = await ask(socket, "tabs.create", {url: "about:blank", group: "AI"});
+        return {elsewhere, answer, lastResort: globalThis.__world.created};
+        """
+    )
+    assert outcome["elsewhere"]["windowId"] == 2, "the group's window is minimized"
+    assert outcome["elsewhere"]["active"] is False
+    assert answer_error(outcome["answer"]) is None
+    assert outcome["lastResort"]["windowId"] == 1, "a minimized window is never the answer"
+    assert outcome["lastResort"]["active"] is False
+
+
+@requires_node
 def test_a_tab_asked_for_in_front_opens_where_the_user_is_looking() -> None:
     """Opting in has to give the old behaviour back, or it is not an escape hatch."""
     outcome = _node_worker_eval(
@@ -1359,10 +1521,87 @@ def test_a_lone_window_gets_the_background_tab_rather_than_a_new_window() -> Non
         return {answer, created: globalThis.__world.created};
         """
     )
-    # chrome.windows.create is not stubbed at all, so reaching for one would have
-    # come back as an error rather than as a passing test.
     assert answer_error(outcome["answer"]) is None
+    # The window it was given is the window it used: naming the only window there
+    # is, rather than leaving the choice to Chrome, is what keeps a new window out
+    # of it. (Chrome itself decides when no window is named - see the test above -
+    # so an omitted windowId, not a call to chrome.windows.create, is the shape a
+    # regression would take here.)
     assert outcome["created"] == {"url": "about:blank", "active": False, "windowId": 5}
+
+
+@requires_node
+def test_a_background_tab_prefers_the_focused_window_to_a_minimized_one() -> None:
+    """Chrome does not paint a minimized window, and an unpainted tab cannot be seen.
+
+    Every screenshot of a tab parked there spends the whole capture budget and
+    comes back as the obscured-window error, for the life of the session. The
+    user's own window is the lesser intrusion by far: their tab stays in front.
+    """
+    outcome = _node_worker_eval(
+        _WORKER_READY
+        + _TAB_WORLD
+        + _VERIFIED_SOCKET
+        + """
+        globalThis.__world.windows = [
+          {id: 1, focused: true, state: "normal"},
+          {id: 2, focused: false, state: "minimized"}];
+        const socket = await openSocket();
+        await ask(socket, "tabs.create", {url: "about:blank", group: "AI"});
+        return globalThis.__world.created;
+        """
+    )
+    assert outcome["windowId"] == 1
+    assert outcome["active"] is False
+
+
+@requires_node
+def test_a_window_that_closes_under_the_new_tab_is_not_fatal() -> None:
+    """The window is chosen and then used; a user can close it in between."""
+    outcome = _node_worker_eval(
+        _WORKER_READY
+        + _TAB_WORLD
+        + _VERIFIED_SOCKET
+        + """
+        globalThis.__world.windows = [
+          {id: 1, focused: true, state: "normal"},
+          {id: 3, focused: false, state: "normal"}];
+        const attempts = [];
+        const create = chrome.tabs.create;
+        chrome.tabs.create = async info => {
+          attempts.push({...info});
+          if (info.windowId !== undefined) throw new Error("No window with id: 3.");
+          return create(info);
+        };
+        const socket = await openSocket();
+        const answer = await ask(socket, "tabs.create", {url: "about:blank", group: "AI"});
+        return {answer, attempts};
+        """
+    )
+    assert answer_error(outcome["answer"]) is None, "a closed window must not fail the call"
+    assert outcome["attempts"][0]["windowId"] == 3
+    assert "windowId" not in outcome["attempts"][1], "the retry must let Chrome choose"
+    assert outcome["answer"]["result"]["id"] == 7
+
+
+@requires_node
+def test_a_browser_with_no_window_left_still_gets_its_tab() -> None:
+    """Chrome can outlive its last window, and a tab has to live in one."""
+    outcome = _node_worker_eval(
+        _WORKER_READY
+        + _TAB_WORLD
+        + _VERIFIED_SOCKET
+        + """
+        globalThis.__world.windows = [];
+        const socket = await openSocket();
+        const answer = await ask(socket, "tabs.create", {url: "about:blank", group: ""});
+        return {answer, created: globalThis.__world.created};
+        """
+    )
+    assert answer_error(outcome["answer"]) is None
+    # Chrome makes the window itself, and that window will raise itself: the one
+    # case where a background tab cannot help being seen.
+    assert outcome["created"] == {"url": "about:blank", "active": False}
 
 
 @requires_node
@@ -1412,6 +1651,92 @@ def test_attaching_the_debugger_makes_a_hidden_tab_controllable() -> None:
     # or that command is the one that gets dropped.
     methods = [item["method"] for item in outcome["sent"]]
     assert methods.index("Emulation.setFocusEmulationEnabled") < methods.index("Runtime.evaluate")
+
+
+@requires_node
+def test_a_tab_that_could_not_be_configured_is_not_recorded_as_attached() -> None:
+    """Recording a half-attached tab as done is how focus emulation goes missing.
+
+    Chrome refuses a second attach whether the debugger holding the tab is this
+    worker's own or a DevTools window the user opened, so an attach that "worked"
+    proves nothing. The first command is what proves it, and until it answers the
+    tab must stay unattached - otherwise one failure leaves the tab silently
+    uncontrollable for the life of the worker: input accepted and dropped, no
+    frames, timers clamped.
+    """
+    outcome = _node_worker_eval(
+        _WORKER_READY
+        + _TAB_WORLD
+        + _VERIFIED_SOCKET
+        + """
+        const attaches = [];
+        const sent = [];
+        let detaches = 0;
+        let failFirstEnable = true;
+        chrome.debugger.attach = async target => { attaches.push(target.tabId); };
+        chrome.debugger.detach = async () => { detaches += 1; };
+        chrome.debugger.sendCommand = async (target, method, params) => {
+          if (method === "Runtime.enable" && failFirstEnable) {
+            failFirstEnable = false;
+            throw new Error("Debugger is not attached to the tab with id: 7");
+          }
+          sent.push({method, params: params || null});
+          return {};
+        };
+        const socket = await openSocket();
+        const first = await ask(socket, "cdp.send",
+          {tabId: 7, method: "Runtime.evaluate", params: {expression: "1"}});
+        const second = await ask(socket, "cdp.send",
+          {tabId: 7, method: "Runtime.evaluate", params: {expression: "2"}});
+        return {first, second, attaches, detaches, methods: sent.map(item => item.method)};
+        """
+    )
+    assert answer_error(outcome["first"]), "a tab that could not be set up must say so"
+    assert answer_error(outcome["second"]) is None, "the next call must try again"
+    assert outcome["attaches"] == [7, 7], "the failed attach was never retried"
+    assert outcome["detaches"] == 1, "a half-open session was left behind"
+    assert "Emulation.setFocusEmulationEnabled" in outcome["methods"]
+    # And the command the caller actually asked for ran only after the setup.
+    assert outcome["methods"].index("Emulation.setFocusEmulationEnabled") < outcome[
+        "methods"
+    ].index("Runtime.evaluate")
+
+
+@requires_node
+def test_a_tab_another_debugger_holds_is_reported_rather_than_silently_broken() -> None:
+    """DevTools open on the tab is the everyday case, and it must not read as fine."""
+    outcome = _node_worker_eval(
+        _WORKER_READY
+        + _TAB_WORLD
+        + _VERIFIED_SOCKET
+        + """
+        let attaches = 0;
+        chrome.debugger.attach = async () => {
+          attaches += 1;
+          throw new Error("Another debugger is already attached to the tab with id: 7");
+        };
+        chrome.debugger.sendCommand = async (target, method) => {
+          if (method === "Runtime.enable") {
+            throw new Error("Debugger is not attached to the tab with id: 7");
+          }
+          return {};
+        };
+        const socket = await openSocket();
+        const answer = await ask(socket, "cdp.send",
+          {tabId: 7, method: "Runtime.evaluate", params: {expression: "1"}});
+        // The user closes DevTools and asks again.
+        chrome.debugger.attach = async () => { attaches += 1; };
+        chrome.debugger.sendCommand = async () => ({});
+        const recovered = await ask(socket, "cdp.send",
+          {tabId: 7, method: "Runtime.evaluate", params: {expression: "1"}});
+        return {answer, recovered, attaches};
+        """
+    )
+    failure = answer_error(outcome["answer"])
+    assert failure and "DevTools" in failure, "the agent cannot act on a bare CDP error"
+    assert "7" in failure
+    assert answer_error(outcome["recovered"]) is None, "closing DevTools must fix it"
+    assert outcome["attaches"] == 2
 
 
 @requires_node

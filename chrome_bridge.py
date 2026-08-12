@@ -377,27 +377,38 @@ class ChromeBridge:
         """Prove we hold the machine secret, and make the daemon prove it too."""
         token = self._ensure_token()
         nonce = secrets.token_hex(16)
-        connection.send(
-            json.dumps(
-                {
-                    "type": "hello",
-                    "protocol": PROTOCOL,
-                    "role": "client",
-                    "token": token,
-                    "nonce": nonce,
-                    "version": self._expected_version(),
-                    "client": {
-                        "pid": os.getpid(),
-                        "program": Path(sys.argv[0] or "python").name,
-                    },
-                }
-            )
-        )
         try:
+            connection.send(
+                json.dumps(
+                    {
+                        "type": "hello",
+                        "protocol": PROTOCOL,
+                        "role": "client",
+                        "token": token,
+                        "nonce": nonce,
+                        "version": self._expected_version(),
+                        "client": {
+                            "pid": os.getpid(),
+                            "program": Path(sys.argv[0] or "python").name,
+                        },
+                    }
+                )
+            )
             acknowledgement = json.loads(connection.recv(timeout=5.0))
         except (TypeError, ValueError) as exc:
             close_quietly(connection, 1008, "Bridge daemon hello_ack must be JSON")
             raise ChromeBridgeError(f"The bridge daemon answered with junk: {exc}") from exc
+        except Exception as exc:
+            # Every other failure here closes the socket, and this one has to as
+            # well: a peer that accepts the connection and then says nothing - a
+            # wedged daemon, or something else listening on the port - would
+            # otherwise leave one abandoned socket and its reader thread behind
+            # on every retry, for as long as the server runs.
+            close_quietly(connection, 1002, "The bridge daemon did not finish the hello")
+            raise ChromeBridgeError(
+                f"The peer on the bridge port did not answer the hello: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
         if not isinstance(acknowledgement, dict) or acknowledgement.get("type") != "hello_ack":
             close_quietly(connection, 1008, "Expected a bridge daemon hello_ack")
             raise ChromeBridgeError("The peer on the bridge port is not a bridge daemon")
@@ -494,10 +505,18 @@ class ChromeBridge:
         :attr:`claimed_tabs` is never told it owns a tab that it does not.
         """
         with self._state_lock:
-            remembered = list(self._claimed)
-        for tab_id in remembered:
+            remembered = list(self._claimed.items())
+        for tab_id, granted_run in remembered:
+            # The run travels with the claim. A daemon that has just started has
+            # not met the companion yet, and without this it records the claim as
+            # belonging to no browser in particular - then voids it seconds later,
+            # when the companion says hello and the daemon reads its own former
+            # ignorance as a browser change.
+            fields: dict[str, Any] = {"tab_id": tab_id}
+            if isinstance(granted_run, str) and granted_run:
+                fields[bridge_daemon.BROWSER_RUN_KEY] = granted_run
             try:
-                answer = self._control_inline(connection, "claim_tab", {"tab_id": tab_id})
+                answer = self._control_inline(connection, "claim_tab", fields)
             except Exception as exc:
                 # A daemon that cannot answer at all is either too old to know
                 # about claims or already gone; the next link will try again, and
@@ -511,6 +530,9 @@ class ChromeBridge:
                 )
                 return
             if isinstance(answer, dict) and answer.get("granted"):
+                with self._state_lock:
+                    if tab_id in self._claimed:
+                        self._claimed[tab_id] = answer.get("browser_run") or granted_run
                 continue
             with self._state_lock:
                 self._claimed.pop(tab_id, None)
@@ -564,6 +586,7 @@ class ChromeBridge:
             LOGGER.warning("Ignored unknown bridge daemon frame type %r", kind)
 
     def _apply_state(self, state: dict[str, Any]) -> None:
+        lost: list[int] = []
         with self._state_lock:
             self._browser_info = dict(state.get("browser") or {})
             if state.get("version") is not None:
@@ -574,6 +597,26 @@ class ChromeBridge:
                 self._connected.set()
             else:
                 self._connected.clear()
+            # Every companion connect pushes this state, so it is also where we
+            # learn that the browser changed under us. The daemon has already
+            # dropped the claims of the browser that is gone; keeping them in our
+            # own book would leave `claimed_tabs` promising tabs that now belong
+            # to whoever asks next. A claim granted before anyone knew the run is
+            # adopted into it, exactly as the daemon adopts its copy.
+            run = self._browser_info.get(bridge_daemon.BROWSER_RUN_KEY)
+            if isinstance(run, str) and run:
+                for tab_id, granted_run in list(self._claimed.items()):
+                    if granted_run is None:
+                        self._claimed[tab_id] = run
+                    elif granted_run != run:
+                        self._claimed.pop(tab_id, None)
+                        lost.append(tab_id)
+        for tab_id in lost:
+            LOGGER.warning(
+                "Tab %s belonged to a browser that is no longer the one on the bridge; "
+                "this server no longer holds it",
+                tab_id,
+            )
 
     def _fail_pending(self, message: str, connection: Any | None = None) -> None:
         with self._state_lock:
@@ -760,10 +803,14 @@ class ChromeBridge:
         different things and only one of them is a "no":
 
         ``granted``
-            The tab is yours until you release it or this client's link to the
-            daemon ends, whichever comes first. ``browser_run`` is the run the
-            claim is tied to; record it with the session and the claim is void
-            once the browser behind the bridge changes.
+            The tab is yours until the first of three things happens: you release
+            it, this client's link to the daemon ends, or the browser behind the
+            bridge turns out to be a different one. ``browser_run`` is the run the
+            claim is tied to - record it with the session, because a claim is
+            about a tab id, and tab ids only mean anything within one browser run.
+            A link this client rebuilds by itself does not end the claim: the
+            remembered run travels with the re-assert, so the daemon puts it back
+            where it belongs.
         ``refused``
             Somebody else is driving that tab. ``reason`` is a sentence written
             to be shown to a person, and ``holder`` describes the other client.

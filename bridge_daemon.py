@@ -402,7 +402,7 @@ class BridgeDaemon:
     # -- tab ownership -----------------------------------------------------
 
     def _adopt_browser_run(self, run: str | None) -> None:
-        """Note the run a fresh companion reports, dropping claims of an older one.
+        """Note the run a companion reports, dropping claims of a *different* one.
 
         Caller holds the lock. Tab ids are only unique inside one browser run, so
         a claim on tab 100 made against the browser that has just been replaced
@@ -414,21 +414,58 @@ class BridgeDaemon:
         outcome for a different reason: the reload drops every ``chrome.debugger``
         attachment, so the sessions behind those claims are already broken.
 
-        ``None`` means a companion too old to say, and unchanged means the same
-        browser: neither is a reason to take a tab away from whoever is using it.
-        """
-        if run is None or run == self._browser_run:
-            return
-        self._browser_run = run
-        if self._claims:
-            LOGGER.info(
-                "A different browser run is on the bridge; dropping %d tab claim(s)",
-                len(self._claims),
-            )
-            self._claims.clear()
+        The delicate case is a run this daemon did not know yet, which is every
+        daemon's first seconds: a client reconnects in well under a second, while
+        the companion is still working through its own backoff, so its claims
+        land here before anything can say which browser they belong to. They
+        belong to the browser that is about to say hello - there is only one - so
+        learning its name adopts them. Reading "newly known" as "changed" voided
+        those claims while their holder went on believing it held them, and the
+        next agent to ask was handed the same tab.
 
-    def _claim_tab(self, client: _Client, raw_tab_id: Any) -> dict[str, Any]:
-        """Hand one tab to one client, or say who already has it."""
+        ``None`` means a companion too old to say: nothing can be concluded from
+        it, so nothing is taken from anybody.
+        """
+        if run is None:
+            return
+        previous = self._browser_run
+        self._browser_run = run
+        if run == previous:
+            return
+        adopted: list[int] = []
+        dropped: list[int] = []
+        for tab_id, claim in list(self._claims.items()):
+            if claim.browser_run is None:
+                claim.browser_run = run
+                adopted.append(tab_id)
+            elif claim.browser_run != run:
+                self._claims.pop(tab_id, None)
+                dropped.append(tab_id)
+        if dropped:
+            LOGGER.info(
+                "A different browser is on the bridge (run %s); dropping tab claim(s) %s",
+                run,
+                ", ".join(str(tab_id) for tab_id in dropped),
+            )
+        if adopted:
+            LOGGER.info(
+                "The bridge now knows it serves browser run %s; the tab claim(s) %s made "
+                "before that belong to it",
+                run,
+                ", ".join(str(tab_id) for tab_id in adopted),
+            )
+
+    def _claim_tab(
+        self, client: _Client, raw_tab_id: Any, raw_run: Any = None
+    ) -> dict[str, Any]:
+        """Hand one tab to one client, or say who already has it.
+
+        ``raw_run`` is the browser run a client believes its claim was granted
+        under. A first claim sends none; a client re-asserting a claim on a link
+        it had to rebuild sends the run it was told, which is what lets a daemon
+        that has not met the companion yet record the claim against the right
+        browser instead of against nothing.
+        """
         try:
             tab_id = int(raw_tab_id)
         except (TypeError, ValueError):
@@ -437,8 +474,31 @@ class BridgeDaemon:
                 "tab_id": raw_tab_id,
                 "reason": "A tab claim needs a numeric tab id",
             }
+        asserted = raw_run if isinstance(raw_run, str) and raw_run else None
         with self._lock:
             run = self._browser_run
+            if asserted is not None and run is not None and asserted != run:
+                # The claim is about a browser that is over. Its tab 41 and this
+                # browser's tab 41 are different tabs, so honouring it would hand
+                # out exactly the stranger's tab this register exists to protect.
+                LOGGER.info(
+                    "Refused %s a claim on tab %s made against browser run %s, not %s",
+                    client.label,
+                    tab_id,
+                    asserted,
+                    run,
+                )
+                return {
+                    "granted": False,
+                    "tab_id": tab_id,
+                    "browser_run": run,
+                    "reason": (
+                        f"Chrome tab {tab_id} was claimed against a different browser "
+                        f"(run {asserted}); this bridge is now serving run {run}, where "
+                        "that tab id means another tab. Open a tab in the browser that "
+                        "is running now."
+                    ),
+                }
             held = self._claims.get(tab_id)
             # Re-claiming a tab you already hold is how a caller renews its grip
             # after a reconnect, and must never be mistaken for a conflict.
@@ -470,11 +530,15 @@ class BridgeDaemon:
                         "held_seconds": round(held_for, 1),
                     },
                 }
+            # A run the daemon knows wins over one a client remembers; when it
+            # knows none, remembering the client's is what survives the moment
+            # the companion finally says hello.
+            recorded = run if run is not None else asserted
             self._claims[tab_id] = _Claim(
-                client=client, tab_id=tab_id, browser_run=run, claimed_at=time.monotonic()
+                client=client, tab_id=tab_id, browser_run=recorded, claimed_at=time.monotonic()
             )
         LOGGER.info("Bridge client %s claimed tab %s", client.label, tab_id)
-        return {"granted": True, "tab_id": tab_id, "browser_run": run}
+        return {"granted": True, "tab_id": tab_id, "browser_run": recorded}
 
     def _release_tab(self, client: _Client, raw_tab_id: Any) -> dict[str, Any]:
         try:
@@ -777,7 +841,9 @@ class BridgeDaemon:
                 {
                     "type": "control_result",
                     "id": message.get("id"),
-                    "result": self._claim_tab(client, message.get("tab_id")),
+                    "result": self._claim_tab(
+                        client, message.get("tab_id"), message.get(BROWSER_RUN_KEY)
+                    ),
                 }
             )
             return
