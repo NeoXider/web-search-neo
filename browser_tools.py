@@ -321,14 +321,16 @@ def create_driver(
         if service is not None:
             try:
                 driver = webdriver.Chrome(options=options)
-            except Exception:
+            except Exception as retry_exc:
                 _browser_available = False
-                _browser_error = f"{type(exc).__name__}: {exc}"
-                raise
+                # Report the retry, not the stale cached-driver attempt: the
+                # caller was previously shown an error it had not just hit.
+                _browser_error = _describe_browser_failure(retry_exc)
+                raise WebDriverException(_browser_error) from retry_exc
         else:
             _browser_available = False
-            _browser_error = f"{type(exc).__name__}: {exc}"
-            raise
+            _browser_error = _describe_browser_failure(exc)
+            raise WebDriverException(_browser_error) from exc
     if mode != "attach" and headless and not browser_user_agent:
         try:
             native_user_agent = str(
@@ -456,6 +458,23 @@ def _create_session(
     if session is None:
         raise RuntimeError("Browser session creation failed")
     return session
+
+
+def _describe_browser_failure(exc: Exception) -> str:
+    """Turn a driver-creation failure into something a caller can act on.
+
+    Selenium's own text is doubled ("Message: Message: ...") and says nothing
+    about what still works, which matters here: search, fetch, and the status
+    topics never needed a browser.
+    """
+    detail = " ".join(str(exc).replace("Message:", "").split()).strip(" .")
+    if "cannot find chrome binary" in detail.lower() or "no chrome binary" in detail.lower():
+        detail = "Google Chrome was not found on this machine"
+    return (
+        f"Chrome is unavailable: {detail}. Install Google Chrome 116 or newer to use "
+        "browser actions. Search, fetch_text, fetch_links, fetch_many and the "
+        "search_status and time topics work without a browser."
+    )
 
 
 def _get_session(session_id: str) -> BrowserSession:
@@ -3183,13 +3202,25 @@ def get_status(session_id: str = "default") -> dict[str, Any]:
         active_ids = sorted(_sessions)
     if session is None:
         bridge_status = _companion_status()
+        available = bool(bridge_status["connected"] or _browser_available)
         return {
-            "available": bool(bridge_status["connected"] or _browser_available),
+            "available": available,
             "availability_error": _browser_error,
             "session_open": False,
             "session_id": session_id,
             "active_sessions": active_ids,
             "engine": "Chrome companion extension or Selenium Manager",
+            # Say which half of the server still works, so a caller that only
+            # needs search or fetch does not conclude the server is dead.
+            "next": (
+                None
+                if available
+                else (
+                    "Browser actions need Chrome; search, fetch_text, fetch_links, "
+                    "fetch_many and the search_status and time topics do not. "
+                    + (bridge_status.get("next") or "")
+                ).strip()
+            ),
             "current_chrome": bridge_status,
         }
     with session.lock:
