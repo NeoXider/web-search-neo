@@ -169,3 +169,8 @@ cython_debug/
 
 # Machine-local companion secret written by bridge_auth.write_extension_token
 chrome-extension/bridge-token.js
+
+# Scratch files from audit and benchmark runs
+_audit_*.py
+_tmp_*.py
+_tmp_*.json
