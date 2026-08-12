@@ -316,3 +316,100 @@ def test_open_on_a_session_of_our_own_reports_no_freed_tab(monkeypatch, companio
     )
 
     assert "left_claimed_tab" not in result
+
+
+def test_a_refusal_on_a_tab_we_opened_does_not_leave_it_behind(monkeypatch, companion):
+    """The claim on a tab we opened ourselves can still be refused - another
+    agent holding a claim on that id - and the tab was then left open in the
+    user's Chrome, debugger attached, with no session able to close it."""
+    companion.refuse = 7
+    opened = _Tab(7)
+    monkeypatch.setattr(browser_tools, "create_driver", lambda *a, **k: opened)
+
+    with pytest.raises(RuntimeError):
+        browser_tools._create_session("fresh", 1280, 800, None, profile_mode="current")
+
+    assert browser_tools._sessions == {}
+    assert opened.calls == ["close_tab", "quit"]
+
+
+def test_a_refusal_on_a_tab_we_borrowed_still_leaves_it_open(monkeypatch, companion):
+    """The other half of the same rule: a tab the user opened is handed back,
+    never closed, however the session ends."""
+    companion.refuse = 41
+    borrowed = _Tab(41)
+    monkeypatch.setattr(browser_tools, "create_driver", lambda *a, **k: borrowed)
+
+    with pytest.raises(RuntimeError):
+        browser_tools._create_session(
+            "fresh", 1280, 800, None, profile_mode="current", current_tab_id=41
+        )
+
+    assert "close_tab" not in borrowed.calls
+
+
+def test_leaving_a_borrowed_tab_does_not_leak_the_new_one(monkeypatch, companion):
+    """`_leave_claimed_tab` opens the new tab before it claims it, so a refusal
+    lands with that tab already open and nothing yet owning it."""
+    _borrowed()
+    session = browser_tools._sessions["reader"]
+    companion.refuse = 7
+    opened = _Tab(7)
+    monkeypatch.setattr(browser_tools, "create_driver", lambda *a, **k: opened)
+
+    with pytest.raises(RuntimeError):
+        browser_tools._leave_claimed_tab(
+            session, 1280, 800, browser_tools.DEFAULT_TAB_GROUP
+        )
+
+    assert opened.calls == ["close_tab", "quit"]
+    # And the session never moved: it is still on the tab it borrowed.
+    assert session.driver is not opened
+    assert session.current_tab_id == 42
+
+
+def test_open_closes_the_session_when_the_move_off_a_borrowed_tab_fails(
+    monkeypatch, companion
+):
+    """A refused claim raises a plain RuntimeError, which used to walk straight
+    past open_page's cleanup and leave the session registered and half moved."""
+    borrowed = _borrowed()
+    companion.refuse = 7
+    monkeypatch.setattr(browser_tools, "create_driver", lambda *a, **k: _Tab(7))
+
+    with pytest.raises(RuntimeError):
+        browser_tools.open_page(
+            "https://example.test/report", session_id="reader", profile_mode="current"
+        )
+
+    assert "reader" not in browser_tools._sessions
+    # The borrowed tab is handed back rather than held by a session nobody has.
+    assert companion.released == [42]
+    assert not any(call.startswith("get ") for call in borrowed.calls)
+
+
+def test_the_move_records_the_run_the_new_claim_was_granted_in(monkeypatch, companion):
+    _borrowed()
+    session = browser_tools._sessions["reader"]
+    companion.browser_run = "run-from-the-daemon"
+    monkeypatch.setattr(browser_tools, "create_driver", lambda *a, **k: _Tab(7))
+
+    browser_tools._leave_claimed_tab(session, 1280, 800, browser_tools.DEFAULT_TAB_GROUP)
+
+    assert session.browser_run == "run-from-the-daemon"
+
+
+def test_a_companion_that_blinks_during_the_move_does_not_erase_the_run(
+    monkeypatch, companion
+):
+    """An unknowable run is not evidence of anything, and writing it over a
+    known one switches this session's stale check off for good."""
+    _borrowed()
+    session = browser_tools._sessions["reader"]
+    companion.browser_run = None
+    monkeypatch.setattr(browser_tools, "create_driver", lambda *a, **k: _Tab(7))
+    monkeypatch.setattr(browser_tools, "_current_browser_run", lambda: None)
+
+    browser_tools._leave_claimed_tab(session, 1280, 800, browser_tools.DEFAULT_TAB_GROUP)
+
+    assert session.browser_run == "run-one"

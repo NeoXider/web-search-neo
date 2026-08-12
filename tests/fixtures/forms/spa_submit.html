@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Sign up</title></head>
+<body>
+<h1>Sign up</h1>
+<form id="signup" action="/submit" method="post">
+  <label for="handle">Handle</label>
+  <input id="handle" name="handle" value="ada">
+  <button id="go" type="submit">Go</button>
+</form>
+<script>
+  // A framework that owns the form takes the event and stops it dead: no other
+  // listener on the form ever runs, and the page does not navigate. The submit
+  // still happened, and re-sending it would post twice.
+  window.spaHandled = false;
+  document.getElementById('signup').addEventListener('submit', (event) => {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    window.spaHandled = true;
+  });
+</script>
+</body>
+</html>

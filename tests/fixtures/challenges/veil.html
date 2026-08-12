@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Archive</title></head>
+<body>
+<h1>Archive</h1>
+<p id="body-copy"></p>
+<!-- Same modal as overlay.html, with the transparent veil a provider paints over
+     its own widget while it verifies. The veil wins the hit test at the centre
+     of the viewport; the page underneath is still just as unreachable. -->
+<div id="scrim" style="position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:9999">
+  <div class="g-recaptcha" data-sitekey="6Lc_aaaa"
+       style="position:absolute;left:50%;top:50%;width:304px;height:78px;
+              margin:-39px 0 0 -152px;background:#fff"></div>
+</div>
+<div id="veil" style="position:fixed;inset:0;z-index:99999;background:transparent"></div>
+<script>
+  document.getElementById('body-copy').textContent =
+    'Twenty years of back issues, indexed and searchable. '.repeat(60);
+</script>
+</body>
+</html>

@@ -1,0 +1,25 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Marketplace listings</title></head>
+<body>
+<h1>Listings</h1>
+<p id="body-copy"></p>
+<!-- The pages most likely to gate - marketplaces, search results, forums - are
+     also the ones with tens of thousands of nodes. The widget sits behind a
+     shadow root at the very end of the document, so it is only found by a walk
+     that gets that far. ?nodes= sets how much filler stands in front of it. -->
+<div id="filler"></div>
+<div id="gate" style="width:304px;height:78px;background:#fff"></div>
+<script>
+  const wanted = Number(new URLSearchParams(location.search).get('nodes') || 12000);
+  document.getElementById('body-copy').textContent =
+    'Listing after listing, none of them what you were looking for. '.repeat(40);
+  document.getElementById('filler').insertAdjacentHTML('beforeend', '<i></i>'.repeat(wanted));
+  const root = document.getElementById('gate').attachShadow({mode: 'open'});
+  root.innerHTML =
+    '<div class="cf-turnstile" data-sitekey="0x4AAAAAAA" ' +
+    'style="width:304px;height:78px;background:#fff"></div>';
+  window.fillerCount = document.querySelectorAll('*').length;
+</script>
+</body>
+</html>

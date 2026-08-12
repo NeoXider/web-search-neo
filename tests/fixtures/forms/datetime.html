@@ -1,0 +1,48 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Dates and dials</title></head>
+<body>
+<h1>Dates and dials</h1>
+<form id="booking">
+  <label for="day">Day</label>
+  <input id="day" name="day" type="date">
+
+  <label for="at">Time</label>
+  <input id="at" name="at" type="time">
+
+  <label for="when">When</label>
+  <input id="when" name="when" type="datetime-local">
+
+  <label for="cycle">Month</label>
+  <input id="cycle" name="cycle" type="month">
+
+  <label for="sprint">Week</label>
+  <input id="sprint" name="sprint" type="week">
+
+  <label for="volume">Volume</label>
+  <input id="volume" name="volume" type="range" min="0" max="100" value="80">
+
+  <label for="shade">Shade</label>
+  <input id="shade" name="shade" type="color" value="#000000">
+
+  <label for="custom">Custom control</label>
+  <x-field id="custom" style="display:block;width:200px;height:30px;border:1px solid #888"></x-field>
+</form>
+<script>
+  // A design-system control: a real element with a real value property, which
+  // WebDriver refuses to clear because it is not user-editable.
+  class XField extends HTMLElement {
+    constructor() { super(); this._value = 'preset'; }
+    get value() { return this._value; }
+    set value(text) { this._value = String(text); }
+  }
+  customElements.define('x-field', XField);
+  window.changed = [];
+  window.inputEvents = [];
+  for (const node of document.querySelectorAll('#booking input')) {
+    node.addEventListener('change', () => window.changed.push(node.id));
+    node.addEventListener('input', () => window.inputEvents.push(node.id));
+  }
+</script>
+</body>
+</html>

@@ -45,13 +45,32 @@ The gate is installed into every new document of the session, so it survives a
 page reload or a game iframe that swaps its own document. A `step` that lands on
 a fresh document re-applies step mode once and reports `gate_reinstalled: true`.
 
+### The clock never runs backwards
+
+Stepping makes page time run *ahead* of the wall clock: sixty frames released
+back to back advance `performance.now()` by a second while barely a moment has
+passed outside. Returning to `normal` therefore cannot simply hand the native
+clock back — that would drop page time by however much the stepping had gained,
+measured at −5.9 s on a real run, which a game reads as a negative frame delta
+and a physics engine reads as a reason to throw everything off the screen.
+
+So the gap is kept. `performance.now()`, `Date.now()` and the timestamps handed
+to `requestAnimationFrame` are monotonic across every mode change in either
+direction, and stay ahead of wall time by whatever stepping earned. The gap only
+ever grows. A session that has stepped even once keeps the clock wrapper for the
+rest of its life, because the wrapper is the only thing that can keep applying
+the offset; a session that never stepped gets its untouched native clock back.
+The practical consequence is short: do not compare a page-side timestamp with
+one you took in the agent, and do not expect `Date.now()` in the page to agree
+with the wall clock after a run.
+
 ## Render modes
 
 | `mode` | Behavior | Use it for |
 | --- | --- | --- |
 | `normal` | Removes the gate, restores real clocks and the page's own `requestAnimationFrame` loop. | Finishing up, or watching the game run by itself. |
 | `throttled` | Continuously releases animation callbacks at up to `target_fps` (default 10, clamped 1-60). Page time is still frozen between frames. | Slow motion while you watch, without hand-driving frames. |
-| `step` | Holds every queued animation callback. Frames are released only by the `step` action (1-120 frames) or by an input action, which releases exactly one. | Deterministic play, frame-exact input, reproducible runs. |
+| `step` | Holds every queued animation callback. Frames are released only by the `step` action (1-120 frames) or by an input action, which releases one — except a `press_keys` tap, which releases [`hold_frames` per `repeat`](#why-a-tapped-key-stays-down-for-a-whole-frame). | Deterministic play, frame-exact input, reproducible runs. |
 
 `render` reports `frame_delta_ms`, `time_frozen`, `timers_gated`,
 `pending_callbacks`, and `input_advances_frame`. `step` reports `frames`,
@@ -225,7 +244,10 @@ So a tap is not a pulse:
   the batch, the frame is released, and only then is the key lifted;
 - in `press_keys` with `key_action="tap"` under step mode, the key goes down,
   `hold_frames` frames are released (1 by default, up to 30), and the key goes
-  up afterwards. `repeat` runs the whole sequence again, up to 50 times;
+  up afterwards. `repeat` runs the whole sequence again, up to 50 times — so this
+  is the one input action that does not release exactly one frame: it releases
+  `hold_frames × repeat` of them, and `frames_advanced` in the result is the
+  number to trust;
 - outside step mode a tap holds for `hold_seconds` (0.05 s by default) instead,
   because there is no frame to hang it on.
 
@@ -250,6 +272,16 @@ Held modifiers work the same way across a batch: a key held with `hold` is
 carried into subsequent mouse and touch events, so `Shift`-click and
 `Ctrl`-click behave the way a user's would. A key held as `W` is released by
 `w` as well, and the release dispatches exactly the character that was pressed.
+
+Tapping a key this session is already **holding** is refused, in `press_keys` and
+in an `input` batch alike, before anything is switched, focused or sent. A tap is
+a press followed by a release, and the release would lift a key the session still
+counts as down — the page would see it up while every later batch kept carrying
+it. Release it first, or drop the tap. Two taps of the same key *inside one
+batch* are not this case and simply collapse; only a hold from an earlier call
+conflicts. Pressing a touch id that is already down is refused for the same
+reason: Chrome ignores the second press, so `move` that finger or `release` it
+first.
 
 ## Auto-repeat for held keys
 
@@ -311,9 +343,54 @@ The second call reports the canvas inside it. Then gate the frame, not the host:
 
 Coordinates stay frame-local: `x` and `y` are measured from the top-left corner
 of the frame's *content* box. Chrome's input events are addressed in top-level
-page pixels, so the server adds the frame's content origin — its bounding rect
-plus its left/top border and padding — before dispatching. A frame with a 4 px
-border would otherwise land every click 4 px off.
+page pixels, so the server maps every point before dispatching it. That map is a
+full affine transform, composed from the frame's own CSS `transform` and every
+ancestor's, with its translation read back off the painted bounding rect so scroll
+and layout are already in it; the frame's left/top border and padding are the
+origin it starts from. Adding that origin alone, which is all it used to do, put
+every click in a scaled frame at roughly twice its offset — and a 4 px border on
+its own was enough to miss by 4 px. A frame under a 3D transform is mapped by its
+best flat approximation, and the server logs that it did.
+
+A point inside the frame that maps to somewhere outside the window is **refused**,
+with both coordinates and the advice to scroll the frame into view, rather than
+dispatched into nothing. The one exception is `coordinate_mode="relative"` under
+pointer lock, which is unbounded on purpose.
+
+A point that lands *on* the page but not on the frame is refused too, and the
+error names what is in the way — `div#banner`, or `nothing this document paints`.
+A frame answers every question about its own viewport as if it were whole, so a
+frame clipped by an `overflow: hidden` ancestor, or with a fixed header painted
+over part of it, reports a perfectly good coordinate that Chrome then delivers to
+the header. The same `elementFromPoint` question the browser asks before
+delivering is asked first, which is why one check covers the clip and the overlay
+alike. Mid-gesture interpolated points are exempt — a swipe may legitimately pass
+under something — and if the document moves on between the measurement and the
+test, it fails open rather than inventing a blocker.
+
+The map also composes the individual `rotate` and `scale` CSS properties and CSS
+`zoom`. Chrome reports `transform: none` for a frame styled with `rotate: 20deg`,
+and `zoom` is not a transform at all, so a frame styled that way used to be aimed
+at as though it were unstyled: the click landed elsewhere and the call reported
+success. The `translate` property is deliberately not read — it is a pure
+translation, and every translation in the chain is already recovered from the
+painted bounding rect.
+
+One thing this map does not accept is a piercing path. `frame_selector` on
+`render`, `wait`, `click`, `fill` and the reading topics takes CSS, a `ref:`
+handle or `#host >>> #frame`. On the input actions — `input`'s pointer entries,
+`press_keys`, `pointer`, `touch`, `game_probe` and `pointer_lock` — it is plain
+CSS and nothing else, refused before the first event rather than part way through
+a batch, because the map needs the frame's box in the top document and neither
+other form gives one. An ambiguous CSS selector is refused there too, with the
+count, exactly as everywhere else. So a nested game frame the outline can only
+name as `#host >>> #frame` needs a CSS selector of its own before it can be
+played — and `game_probe` is on this side of the line as well. It dispatches
+nothing, but the canvas rectangles it reports are aimed at with the same string,
+so probing one of several matching frames and playing another was one defect, not
+two. `pointer_lock` refuses the other forms on `release` and `status` as well,
+even though only `acquire` sends a click; one call cannot read one string two
+ways.
 
 The host document keeps animating while only the frame is gated. `game_probe`
 knows this: while a gate is engaged anywhere in the session its `animation`
@@ -426,15 +503,21 @@ rather than accepted and dropped.
 ```
 
 The console buffer is armed when the session takes its tab, before the first
-navigation, so in `current` mode an error thrown while the game boots is captured
-rather than lost — which matters for a WebGL context that fails at startup and
-never logs again. Two exceptions: a tab claimed with `attach_tab` is recorded only
-from the claim onwards, and the Selenium-backed modes install their in-page hook
-the first time the console is read, so the *first* page's boot output reaches them
-only through Chrome's browser log. Once installed, that hook survives navigation
-and reports each later page from its first line. Uncaught exceptions reach the
-browser log either way. `game_probe` and the `console` topic read from the same
-buffers, each keeping its own place in them; neither steals the other's entries.
+navigation, so an error thrown while the game boots is captured rather than lost —
+which matters for a WebGL context that fails at startup and never logs again. The
+in-page hook is registered through `Page.addScriptToEvaluateOnNewDocument` before
+the session navigates anywhere, in the Selenium-backed modes exactly as in
+`current`, so it runs ahead of each document's own first script and keeps doing so
+across every later navigation. It used to be installed the first time the `console`
+topic was read, which cost a Selenium session its first page's boot output and made
+"reload and read again" the standard advice. Do not: the reload destroys the run
+you were debugging, and the lines you wanted are already in the buffer.
+
+The one exception is `attach_tab` — a claimed tab is recorded from the claim
+onwards, and what it logged before that was recorded by nobody. Uncaught exceptions
+reach Chrome's browser log either way. `game_probe` and the `console` topic read
+from the same buffers, each keeping its own place in them; neither steals the
+other's entries.
 
 ### Reading the console between probes
 
@@ -494,10 +577,22 @@ document — and re-arms the gate on the new one, reporting `render_mode` and
 `render_mode_restored`. That is a safety net for a level change, not a substitute
 for cleaning up when you are done.
 
+When an `input` batch fails part way through, `held_keys` deliberately reports
+*more* than it can prove. Dispatch is not atomic — the bridge sends one event per
+round trip — so once it has failed, any of the batch's keys may be physically
+down. The books assume they all are, because a key the page holds and the session
+has forgotten cannot be reached by `release_inputs` or by anything else, and
+every later keystroke silently carries it. So a failed batch that reports three
+held keys may really be holding none, and `release_inputs` is the cure either
+way: releasing a key that was never pressed costs nothing. This is the deliberate
+opposite of the old behaviour, which under-reported and left keys down with
+nothing able to lift them.
+
 ## What is verified, and what is not
 
 Verified by the deterministic test suite (`tests/test_game_playthrough.py`,
-`tests/test_browser.py`, `tests/test_input_extras.py`), with no network access:
+`tests/test_browser.py`, `tests/test_input_extras.py`,
+`tests/test_input_defects.py`), with no network access:
 
 - the level is finished with the same ticks, jumps, and deaths on every run:
   one released frame is exactly one physics tick;
@@ -526,4 +621,6 @@ python scripts/live_agent_game.py --model qwen3.5-4b-mtp
 Public game sites also change without notice, which is why the frame gate, input
 atomicity, and held-input recovery are verified against local fixtures
 (`tests/fixtures/games/`: `platformer.html`, `iframe_host.html`, `webgl.html`,
-`pointer.html`) rather than against a live portal.
+`pointer.html`, `frame_transforms.html` for the scaled, rotated, and nested frames
+the coordinate map has to survive, and `timers.html` for the gated clock) rather
+than against a live portal.

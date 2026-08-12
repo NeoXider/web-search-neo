@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Archive</title></head>
+<body>
+<h1>Archive</h1>
+<p id="body-copy"></p>
+<!-- The provider ships the challenge as a web component: the scrim covers the
+     page, and the widget itself lives behind an open shadow root, where
+     elementFromPoint only ever names the host. -->
+<div id="scrim" style="position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:9999">
+  <div id="gate" style="position:absolute;left:50%;top:50%;width:304px;height:78px;
+                        margin:-39px 0 0 -152px;background:#fff"></div>
+</div>
+<script>
+  document.getElementById('body-copy').textContent =
+    'Twenty years of back issues, indexed and searchable. '.repeat(60);
+  const root = document.getElementById('gate').attachShadow({mode: 'open'});
+  root.innerHTML =
+    '<div class="cf-turnstile" data-sitekey="0x4AAAAAAA" ' +
+    'style="width:304px;height:78px;background:#fff"></div>';
+</script>
+</body>
+</html>

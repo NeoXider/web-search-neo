@@ -49,6 +49,23 @@ class ChromeBridgeError(RuntimeError):
     """Raised when the companion extension isn't connected or rejects a command."""
 
 
+class ChromeBridgeUnavailable(ChromeBridgeError):
+    """Raised when the question never reached the companion at all.
+
+    The distinction is the whole point of the class: an answer is evidence about
+    the browser, and a transport failure is evidence about the link. A command
+    that was refused by name ("No tab with id 42") says the tab is gone; a
+    command that could not be sent - no companion connected, the link dropped
+    between the check and the send, the daemon stopped mid-flight - says only
+    that nobody was listening, and a caller that reads the second as the first
+    condemns every live tab the moment Chrome's service worker blinks.
+
+    It subclasses :class:`ChromeBridgeError` so that every existing
+    ``except ChromeBridgeError`` keeps catching it; only a caller that has to
+    tell the two apart needs to name it.
+    """
+
+
 LOGGER = logging.getLogger("web_search_neo.bridge")
 PROJECT_DIR = Path(__file__).resolve().parent
 DAEMON_ENTRY = PROJECT_DIR / "main.py"
@@ -70,6 +87,7 @@ __all__ = [
     "ChromeBridgeDriver",
     "ChromeBridgeElement",
     "ChromeBridgeError",
+    "ChromeBridgeUnavailable",
     "get_chrome_bridge",
     "list_current_chrome_tabs",
     "spawn_bridge_daemon",
@@ -86,6 +104,9 @@ class _PendingRequest:
     connection: Any = None
     result: Any = None
     error: str | None = None
+    # Set when the error was written by this side because the link ended, rather
+    # than read off an answer the companion sent. See ChromeBridgeUnavailable.
+    transport_failure: bool = False
 
 
 def spawn_bridge_daemon(port: int) -> None:
@@ -626,7 +647,12 @@ class ChromeBridge:
                 if connection is None or item.connection is connection
             ]
         for pending in pending_items:
-            pending.error = pending.error or message
+            if not pending.error:
+                pending.error = message
+                # Nobody answered this; the link under it ended. Marked so the
+                # waiter raises ChromeBridgeUnavailable rather than passing a
+                # dead link off as the companion's verdict.
+                pending.transport_failure = True
             pending.event.set()
 
     # -- public surface ----------------------------------------------------
@@ -693,11 +719,17 @@ class ChromeBridge:
         params: dict[str, Any] | None = None,
         timeout: float = 20.0,
     ) -> Any:
+        """Ask the companion something and return its answer.
+
+        Raises :class:`ChromeBridgeUnavailable` when the question never reached
+        the companion and plain :class:`ChromeBridgeError` when it did and came
+        back refused; ``TimeoutError`` when it was sent and nothing came back.
+        """
         if not self.wait_connected(min(max(timeout, 0.0), 3.0)):
             detail = f" ({self._startup_error})" if self._startup_error else ""
             # Telling a caller to click through chrome://extensions is useless to
             # an agent: name the two calls it can actually make instead.
-            raise ChromeBridgeError(
+            raise ChromeBridgeUnavailable(
                 "Chrome companion extension is not connected, so profile_mode "
                 f"'current' cannot be used{detail}. Either retry with "
                 '{"action": "open", "url": "...", "profile_mode": "temporary"}, '
@@ -712,7 +744,7 @@ class ChromeBridge:
         if connection is None:
             with self._state_lock:
                 self._pending.pop(request_id, None)
-            raise ChromeBridgeError("Chrome companion extension disconnected")
+            raise ChromeBridgeUnavailable("Chrome companion extension disconnected")
         try:
             payload = json.dumps(
                 {
@@ -729,12 +761,14 @@ class ChromeBridge:
             except Exception as exc:
                 # The link can drop between the check above and this send, and a
                 # raw websocket error here would reach the agent as a stack trace.
-                raise ChromeBridgeError(
+                raise ChromeBridgeUnavailable(
                     f"The bridge daemon link dropped while sending '{method}': {exc}"
                 ) from exc
             if not pending.event.wait(max(0.1, timeout)):
                 raise TimeoutError(f"Chrome bridge command '{method}' timed out")
             if pending.error:
+                if pending.transport_failure:
+                    raise ChromeBridgeUnavailable(pending.error)
                 raise ChromeBridgeError(pending.error)
             return pending.result
         finally:
@@ -1461,7 +1495,14 @@ class ChromeBridgeDriver:
         )
 
     def close_tab(self, *, timeout: float = 5.0) -> dict[str, Any]:
-        """Detach and close the tab this driver owns."""
+        """Detach and close the tab this driver owns.
+
+        ``removed: false`` is not the same fact as "the tab is still open": the
+        extension answers that way whenever ``chrome.tabs.remove`` throws, and
+        the commonest reason for that is a tab the user closed by hand. A caller
+        that wants to report a leak has to ask whether the tab is there, which is
+        what :func:`browser_tools._tab_still_exists` is for.
+        """
         try:
             return dict(
                 self.bridge.request("tabs.remove", {"tabId": self.tab_id}, timeout=timeout) or {}
@@ -1470,9 +1511,23 @@ class ChromeBridgeDriver:
             LOGGER.warning("Closing tab %s failed: %s: %s", self.tab_id, type(exc).__name__, exc)
             return {"removed": False, "id": self.tab_id}
 
-    def quit(self) -> None:
+    def quit(self) -> dict[str, Any]:
+        """Detach the debugger; say whether it came off.
+
+        Never raises - teardown may not take its caller down with it - so the
+        outcome has to travel in the return value instead. A debugger left
+        attached keeps the "is being debugged" banner on a tab the user has been
+        given back, and only they can clear it, so ``error`` is how a caller
+        learns to say so rather than reporting a clean detach over the top of it.
+
+        ``detached`` is what the extension reported: ``False`` with no ``error``
+        means there was nothing attached, which is a clean outcome, not a
+        failure.
+        """
         try:
-            self.bridge.request("debugger.detach", {"tabId": self.tab_id}, timeout=5.0)
+            answer = self.bridge.request(
+                "debugger.detach", {"tabId": self.tab_id}, timeout=5.0
+            )
         except Exception as exc:
             LOGGER.warning(
                 "Detaching the debugger from tab %s failed: %s: %s",
@@ -1480,6 +1535,15 @@ class ChromeBridgeDriver:
                 type(exc).__name__,
                 exc,
             )
+            return {
+                "detached": False,
+                "id": self.tab_id,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        result = dict(answer or {})
+        result.setdefault("id", self.tab_id)
+        result["detached"] = bool(result.get("detached"))
+        return result
 
 
 def list_current_chrome_tabs(wait_seconds: float = 1.0) -> dict[str, Any]:

@@ -27,6 +27,19 @@
 
   <label for="free">Free text</label>
   <input id="free" name="free">
+
+  <!-- The value sanitisation algorithm strips the whitespace around an email or
+       a url before the field ever holds it, and a change handler is free to trim
+       or fold case as well. The field took the value in all three cases. -->
+  <label for="email">Email</label>
+  <input id="email" name="email" type="email">
+
+  <label for="site">Site</label>
+  <input id="site" name="site" type="url">
+
+  <label for="city">City</label>
+  <input id="city" name="city"
+         onchange="this.value = this.value.trim().toLowerCase()">
 </form>
 </body>
 </html>

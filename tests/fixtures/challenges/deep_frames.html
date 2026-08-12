@@ -1,0 +1,33 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Checkout</title></head>
+<body style="margin:0">
+<h1>Checkout</h1>
+<p id="body-copy"></p>
+<!-- Payment pages nest frames several documents deep, and the gate is at the
+     bottom of the chain. ?depth= sets how many documents down it sits. -->
+<script>
+  const depth = Number(new URLSearchParams(location.search).get('depth') || 5);
+  document.getElementById('body-copy').textContent =
+    'Order summary, delivery estimate and the small print. '.repeat(40);
+  let markup =
+    '<div class="cf-turnstile" data-sitekey="0x4AAAAAAA" ' +
+    'style="width:304px;height:78px;background:#fff"></div>';
+  for (let level = 0; level < depth; level += 1) {
+    markup = '<iframe width="600" height="400" style="border:0" srcdoc="' +
+      markup.replace(/&/g, '&amp;').replace(/"/g, '&quot;') + '"></iframe>';
+  }
+  document.body.insertAdjacentHTML('beforeend', markup);
+  window.gateDepth = depth;
+  window.gateReady = function () {
+    let doc = document;
+    for (let level = 0; level < depth; level += 1) {
+      const frame = doc.querySelector('iframe');
+      if (!frame || !frame.contentDocument) return false;
+      doc = frame.contentDocument;
+    }
+    return !!doc.querySelector('.cf-turnstile');
+  };
+</script>
+</body>
+</html>

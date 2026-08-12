@@ -292,7 +292,7 @@ case, because that build cannot even authenticate:
 
 The bridge accepts only the fixed bundled extension ID, binds only to loopback, and never reads Chrome profile files, cookies, or saved passwords directly. The extension uses Chrome's standard [tabs](https://developer.chrome.com/docs/extensions/reference/api/tabs), [tab groups](https://developer.chrome.com/docs/extensions/reference/api/tabGroups), and [debugger](https://developer.chrome.com/docs/extensions/reference/api/debugger) APIs, plus `storage` for its own session state and [alarms](https://developer.chrome.com/docs/extensions/reference/api/alarms) for the long waits in its reconnect backoff, with the permissions shown by Chrome.
 
-A badge reading `OFF` means nothing is listening on the bridge port: no daemon has been started since the machine booted, the last one exited after its idle window, or it was stopped with `--bridge --stop`. That is the normal state of a machine on which no MCP server has run yet, not a fault — but it is no longer the state between two agent calls, which is what it was when the port lived inside the MCP server. While nothing listens, the worker retries with an exponential backoff — about 1.5 seconds after the first failure, doubling to a ceiling of one minute, and dropping back to the floor the moment a handshake verifies. Chrome suspends an idle service worker after roughly thirty seconds, which is why the longer waits are `chrome.alarms` rather than timers: a timer that long would die with the worker. Chrome also logs every refused attempt as an extension error of ours and an extension cannot suppress that, so a red **Errors** button on the card of an idle machine is expected; before 1.3.1 the worker retried every two seconds and could fill that page with hundreds of identical `ERR_CONNECTION_REFUSED` lines. Starting the browser, reloading the extension, or clicking its toolbar icon resets the schedule and retries immediately.
+A badge reading `OFF` means this companion is not connected and authenticated, which is usually — but not only — because nothing is listening on the bridge port: no daemon has been started since the machine booted, the last one exited after its idle window, or it was stopped with `--bridge --stop`. That is the normal state of a machine on which no MCP server has run yet, not a fault — but it is no longer the state between two agent calls, which is what it was when the port lived inside the MCP server. The badge also reads `OFF` in two cases where the port is very much held: when the daemon refused this companion's token, and when a companion in a second Chrome profile authenticated later and displaced it. So `OFF` is not by itself a reason to start a daemon — read `web_info(topic="browser_status")` and `bridge-daemon.log` before concluding the port is free. While nothing listens, the worker retries with an exponential backoff — about 1.5 seconds after the first failure, doubling to a ceiling of one minute, and dropping back to the floor the moment a handshake verifies. Chrome suspends an idle service worker after roughly thirty seconds, which is why the longer waits are `chrome.alarms` rather than timers: a timer that long would die with the worker. Chrome also logs every refused attempt as an extension error of ours and an extension cannot suppress that, so a red **Errors** button on the card of an idle machine is expected; before 1.3.1 the worker retried every two seconds and could fill that page with hundreds of identical `ERR_CONNECTION_REFUSED` lines. Starting the browser, reloading the extension, or clicking its toolbar icon resets the schedule and retries immediately.
 
 Keep the companion enabled in one Chrome profile at a time. The bridge holds exactly one companion connection and the most recent authenticated one wins, so a second profile with the companion enabled quietly takes the agent's tabs with it.
 
@@ -487,6 +487,25 @@ shutdown hook that runs it — applies the same rule instead of leaving every
 self-opened tab behind. The MCP doesn't read cookies or passwords; the page
 simply continues using the authorization already present in Chrome.
 
+Teardown is not unconditional, and the exception is the point of it. Tab ids
+restart with Chrome, so a session that outlived a restart holds a number that now
+names somebody else's tab. Every teardown path — `close`, `close_all`, the
+shutdown hook, the cap sweep — asks first whether the session's browser run is
+still the one it was opened in, and if it is not, sends nothing at all and forgets
+the session. `close` reports that as `browser_gone: true` with a note;
+`close_all` lists the affected ids under `browser_gone` and still answers
+`closed_all: true`, because nothing of ours was left to leak. Both keys are absent
+on the ordinary path. The claim is not released either: the daemon dropped its
+whole registry when the run changed, so a release aimed at the old id could only
+hit a claim made since. Before this, closing such a session sent `tabs.remove` for
+the stale id to the new browser, closed a tab of the user's, and reported success.
+
+`browser_status` answers the same way rather than describing a stranger's tab: a
+session whose Chrome is gone is dropped and reported as `session_open: false`,
+`browser_gone: true`, with a `next` saying to open the page again. It used to read
+a page summary off whatever tab had inherited the id and answer `session_open:
+true` — the same identity bug, in the topic an agent uses to check for it.
+
 If the companion isn't ready, read `web_info(topic="browser_status")` and run the
 `setup_current_chrome` action for the exact steps. Use `profile_mode="auto"` only
 when opening a separate visible Selenium window is an acceptable fallback.
@@ -549,6 +568,13 @@ disposable Chrome and with `headless=true` a clean headless one;
 launcher — not the `headless` argument — determines whether the already-running
 Chrome is visible or headless.
 
+`headless=true` cannot be combined with `current`: that mode drives a Chrome the
+user is looking at, so the request is refused outright rather than quietly
+answered by some other browser. `auto` with `headless=true` resolves straight to
+`temporary` without even probing for the companion — worth knowing, because it is
+the one way `auto` reaches a Selenium profile on a machine where `current` works
+perfectly.
+
 Start a durable visible Chrome for attach mode (visible is the launcher default):
 
 ```powershell
@@ -590,8 +616,8 @@ Four observation topics describe an open session, from semantic structure down t
 | --- | --- |
 | `page_outline` | An indented tree of roles, accessible names, states, `ref:<epoch>:N` handles, and boxes. `limit=200` nodes, `output="text"` by default; `output="json"` returns one object per node with `rect`, `page_rect`, `center`, `visible`, `in_viewport`, and `occluded`. |
 | `page_text` | The rendered text, with headings, list items, and table cells preserved. `mode="full"` is the whole `<body>`, same-origin frames and open dialogs included; `mode="main"` narrows to the main-content sub-tree and drops navigation, header, footer, aside, and form chrome. `max_chars=20000`, `include_links=false`. |
-| `find` | Ranked matches for a plain-language `query` such as `"submit application"`, each with a `ref`, role, name, box, a `match_score` (query against the element alone) and the ranking `score` that adds context. `limit=5`; `role` filters rather than nudges. `low_confidence` means nothing on the page answers the query — the closest few still come back, as the guesses they are — and `ambiguous` means the top two matched *and* ranked equally, so document order picked the winner. `candidates`/`scored`/`matched`/`returned`, `truncated` and `aria_hidden_skipped` account for what was examined, cut, and skipped as hidden from assistive technology. |
-| `page_elements` | The flat lists of links, forms, fields with `<select>` options, and buttons, addressed by CSS selector — or by a piercing path when they live in an open shadow root or a same-origin frame. Each entry carries `visible` and, when it is not, a `hidden_reason`; visible entries come first, so `limit` never drops the reachable control in favour of a hidden one. `found` and `truncated` say whether the list is the whole of what is there. |
+| `find` | Ranked matches for a plain-language `query` such as `"submit application"`, each with a `ref`, role, name, box, a `match_score` (query against the element alone) and the ranking `score` that adds context. `limit=5`, capped at 25; `visible_only=true` by default, so a control the page has not revealed yet is not a candidate; `role` filters rather than nudges. `low_confidence` means nothing on the page answers the query — the closest few still come back, as the guesses they are — and `ambiguous` means the top two matched *and* ranked equally, so document order picked the winner. `candidates`/`scored`/`matched`/`returned`, `truncated` and `aria_hidden_skipped` account for what was examined, cut, and skipped as hidden from assistive technology. |
+| `page_elements` | The flat lists of links, forms, fields with `<select>` options, and buttons, addressed by CSS selector — or by a piercing path when they live in an open shadow root or a same-origin frame, or by an empty string when nothing addresses them uniquely, which is the honest answer and not a bug to work around. Each entry carries `visible` and, when it is not, a `hidden_reason`; visible entries come first, so `limit` never drops the reachable control in favour of a hidden one. `found` and `truncated` say whether the list is the whole of what is there. Alone among the four it takes no `frame_selector`: it always answers for the whole page, walking into open shadow roots and same-origin frames itself and prefixing the selectors it finds there. |
 
 ```json
 {"topic":"page_outline","params":{"session_id":"demo","output":"json","limit":80}}
@@ -614,7 +640,7 @@ Each match carries two numbers, because one number cannot say both things:
 | Field | Meaning |
 | --- | --- |
 | `match_score` | 0–100. How well the query matched *that element alone*, before any ranking bonus: 100 the whole field, 62 a prefix, 45 a substring, 34 every query token present — times the field's weight. `matched_field` names the field it came from. |
-| `score` | The ranking score: `match_score` plus context — in the viewport +18, an action-shaped query on an interactive element +12, the requested role +8, enabled +6, occluded −25. It orders the results and says nothing about whether the page holds an answer. |
+| `score` | The ranking score: `match_score` plus context — in the viewport +18, an action-shaped query on an interactive element +12, the requested role +8, enabled +6, a child of `<main>` or `<form>` +4, disabled −15, a generic non-interactive node on a page that has interactive ones −12, a role other than the one asked for −20, occluded −25. It orders the results and says nothing about whether the page holds an answer. |
 
 Field weights, and the values `matched_field` can take: `name` 1.0, `text` — the
 element's own visible words, scored separately when an accessible name overrode
@@ -669,10 +695,8 @@ Ref handles and piercing paths are accepted by `fill` (both its field and its fi
 `upload`, `click`, `wait`, and the `form_selector` of `submit`. `click` and `wait` took
 plain CSS only until 1.3.0, which made the natural `find` → `click` sequence fail with
 `InvalidSelectorException`; they now poll the resolved handle for the requested
-`present`/`visible`/`clickable` state. `frame_selector` takes the same three forms; a plain
-CSS one that matches more than one element is refused with the count rather than reading
-whichever came first. The `submit_selector` still expects a plain CSS selector. Both
-non-CSS forms need a live element handle, so they
+`present`/`visible`/`clickable` state. The `submit_selector` still expects a plain CSS
+selector. Both non-CSS forms need a live element handle, so they
 resolve in the Selenium-backed modes (`temporary`, `persistent`, `attach`); in companion
 `current` mode they are refused with an explicit message and CSS selectors remain the way
 to address elements.
@@ -680,6 +704,34 @@ to address elements.
 A CSS selector that contains ` >>> ` inside quotes or brackets — `div[data-op='a >>> b']`
 — is no longer mistaken for a piercing path; the separator is only recognised outside
 quoted strings and attribute brackets.
+
+### `frame_selector` accepts less than the locators do
+
+A `frame_selector` always names exactly one frame. A CSS selector matching more than one is
+refused with the count, everywhere, rather than answered with whichever came first.
+
+What differs is which *forms* are accepted. `render` and the reading topics —
+`page_outline`, `page_text`, `find` — take all three, so a nested frame can be named by the
+`#host >>> #frame` path the outline reports for it, as can `fill`, `click`, `wait`, `submit`
+and `upload`.
+
+The input actions take plain CSS and nothing else: `press_keys`, `pointer`, `touch`, the
+pointer entries of an `input` batch, `pointer_lock`, and `game_probe`. They aim by
+coordinate, which needs the frame's own box measured in the top-level page, and neither a
+`ref:` handle nor a piercing path yields one. Both are refused before a single event is sent
+— not half-way through a batch, which is what an `input` mixing keys and pointer entries
+used to do — with an error that says to pass a CSS selector matching this frame and nothing
+else. `pointer_lock` refuses them on `release` and `status` too, though only `acquire`
+dispatches a click: one call cannot read the same string two ways.
+
+`game_probe` sits on that side too, though it dispatches nothing. It reports canvas
+rectangles that are then aimed at with the same string, so a probe that read one of four
+matching frames while the input went to another was the same defect wearing a different hat.
+
+So the sequence the games section leads to has one step in it: the outline names a nested
+game frame `#host >>> #frame`, and that path cannot be handed to `game_probe` or `input`.
+Give the input actions a CSS selector that is unique by itself, and keep the piercing path
+for reading.
 
 ## Console and network diagnostics
 
@@ -710,9 +762,9 @@ Capture is armed when the session takes its tab, not when a topic is first read.
 
 `attach_tab` is necessarily different. Capture starts at the claim, and whatever the tab did before it was claimed was recorded by nobody and cannot be recovered — reload the claimed page if you need its load traffic.
 
-Each stream keeps up to 500 entries within a 512 KB budget shared between console and network, with in-flight requests capped at 1000, and reports how many older records were `dropped`. Those limits bite on a chatty page: one that fires 700 requests keeps the newest 500 and reports a little over 200 `dropped` — a few more than the arithmetic, because the shared byte budget evicts as well — and eviction is oldest-first, so the very first navigation is the first thing to go. Read `network` before the page has had time to bury it. An empty list next to a non-zero `dropped` means "evicted", not "quiet".
+Each stream keeps up to 500 entries and reports how many older records were `dropped`. Two further ceilings belong to companion `current` mode alone, because there the buffers live inside the extension: a 512 KB budget shared between console and network, and in-flight requests capped at 1000. Those limits bite on a chatty page: one that fires 700 requests keeps the newest 500 and reports a little over 200 `dropped` — a few more than the arithmetic, because the shared byte budget evicts as well — and eviction is oldest-first, so the very first navigation is the first thing to go. Read `network` before the page has had time to bury it. An empty list next to a non-zero `dropped` means "evicted", not "quiet".
 
-Both topics work in companion `current` mode and in the Selenium-backed modes; the Selenium path reads Chrome's browser and performance logs instead of the extension's buffer, so field coverage is close but not identical, and its own in-flight cap is 500. Its performance log is switched on when the session starts, so the first navigation is covered there too — but its page console is not: that hook is installed the first time the `console` topic is read, so the first page's boot output reaches a Selenium session only through Chrome's browser log. Once installed, the hook survives navigation and reports each later page from its first line.
+Both topics work in companion `current` mode and in the Selenium-backed modes; the Selenium path reads Chrome's browser and performance logs instead of the extension's buffer, so field coverage is close but not identical. It caps in-flight requests at 500 and keeps no byte budget. Its performance log is switched on when the session starts, and its page console hook is registered with `Page.addScriptToEvaluateOnNewDocument` before the session navigates anywhere, so it runs ahead of each document's own first script and the first page's boot output is covered too. That hook used to be installed the first time the `console` topic was read, which lost exactly those lines and made a reload the price of seeing them.
 
 ## Forms and multi-step flows
 
@@ -730,11 +782,16 @@ with `page_text` or a screenshot.
 }
 ```
 
-- `fill` applies what it can and returns `filled`, `field_values`, `files_uploaded` and a per-selector `errors` map; `success` is `false` whenever `errors` is non-empty. Every write is read back off the control, so a number input that dropped the text, a `maxlength` truncation and an `oninput` handler that rewrote the value are errors naming both values instead of successes.
-- `submit` runs native validation first and reports `validation_passed` with the offending field ids, then `submit_triggered` from the fired `submit` event or from the document being replaced — including a reload of the same URL, which a check on url and title alone reported as a failed submit. `submit_default_prevented` marks the SPA case where a handler cancelled the navigation on purpose.
+- `fill` applies what it can and returns `filled`, `field_values`, `files_uploaded` and a per-selector `errors` map; `success` is `false` whenever `errors` is non-empty. Every write is read back off the control, so a `maxlength` truncation and an `oninput` handler that rewrote the value are errors naming both values instead of successes. `field_values` answers for every selector you sent, failures included — a refused control shows what it still holds, and `null` means nothing could be read back, because the selector matched nothing or the control has left the page.
+- Sanitisation is not refusal. Whitespace trimmed off a `type=email` value, `\r\n` normalised to `\n`, a handler that lower-cases the input — the control kept what you gave it, in its own terms, and all three read back as filled. A byte-for-byte comparison used to call them failures.
+- A `<select multiple>` is the one control that takes a list of values and reads back as one. A scalar sent to it *replaces* the whole selection rather than extending it, and a list sent to anything else is refused.
+- Date, time, datetime-local, month, week, range and colour inputs are set rather than typed, since typing into them depends on the browser's locale. The value is rehearsed on a throwaway input first, so an unparseable one is refused **without touching the control** — no more valid-looking wrong date, no more slider dropped to its midpoint — and the error names the format the control wants.
+- `submit` runs native validation first and reports `validation_passed` with the offending field ids, then `submit_triggered` from the fired `submit` event or from the document being replaced — including a reload of the same URL, which a check on url and title alone reported as a failed submit. `submit_default_prevented` marks the SPA case where a handler cancelled the navigation on purpose. `submit_evidence` states in a sentence what the verdict rests on, and `new_tab_opened` warns that a `target="_blank"` result landed in a tab this session does not own — so the `url` and `title` beside it are still this page's, not the answer you are looking for.
 - A checkbox takes `1`/`yes`/`y`/`on`/`check`/`checked` or `0`/`no`/`n`/`off`/`uncheck`/`unchecked`/`""` and refuses anything else, a `<select>` takes an option `value` or its visible text, and a file input must go through `files`/`upload`.
+- Every control `fill` writes is blurred afterwards, because that is the only way the last field of a fill ever fires its `change` event. Three consequences follow and the third bites: focus ends on `document.body`, an autocomplete list the fill opened is dismissed, and a following `press_keys(["ENTER"])` goes to the body rather than the field — pass `target_selector`, or `focus_mode="click"`, when you mean to submit by keyboard. The `files` entries are the exception: nothing is typed into them, so nothing is blurred.
 - `fill`, `click`, `submit`, `upload` and `wait` take `frame_selector`, so a form inside an iframe is addressable by name and not only through a ref.
-- After any navigation or step change, read `page_outline` again and compare `dom_epoch`: old ref handles are stale by definition.
+- `wait` takes `present`, `visible`, or `clickable`, and its `timeout_seconds` is clamped to 30 — but the result now reports the *effective* value, so a hopeful `120` comes back as `30.0` rather than leaving you to wonder. A timeout names the seconds actually waited in its message. For a longer wait, loop the call.
+- After any navigation or step change, read `page_outline` again: old ref handles are stale by definition. `dom_epoch` only tests one direction of that. A different epoch proves your refs are dead; the same epoch proves nothing, because the epoch belongs to the document and a wizard step that swaps its own markup in place keeps it while every ref it issued goes with the old nodes. A ref read inside a frame carries that frame's epoch rather than the page's, so a mismatch there is normal and not staleness at all.
 
 **[→ Complex forms](docs/complex-forms.md)** covers the rest with worked calls:
 choosing between the three locator forms, finding a field by meaning when
@@ -751,7 +808,7 @@ Browser automation is not limited to DOM forms. The compact contract covers comm
 | --- | --- |
 | `web_info(topic="game_probe")` | Reports canvases, 2D/WebGL context, iframe surfaces, document focus, sampled FPS under `animation`, loading time, the console warnings and errors new since the previous probe, and held input. |
 | `input` | Mixes per-key `tap`/`hold`/`release` with pointer `click`, `double_click`, `hover`, `move`, `drag`, `press`, `release`, and `wheel`, using absolute coordinates, deltas, or unbounded relative motion, up to 16 entries of each kind. |
-| `press_keys` | Keyboard-only shortcut: `keys` plus `key_action` (`tap`, `hold`, `release`), `repeat`, `hold_seconds`, `focus_mode` (`focus`, `click`, `none`), and `hold_frames`, which keeps a tap down across N released frames in `step` mode. |
+| `press_keys` | Keyboard-only shortcut: 1-8 `keys` plus `key_action` (`tap`, `hold`, `release`), `repeat` (1-50), `hold_seconds`, `focus_mode` (`focus`, `click`, `none`), and `hold_frames` (1-30), which keeps a tap down across N released frames in `step` mode. |
 | `touch`, `touch_emulation` | `tap`, `press`, `move`, `release`, `swipe`, or `cancel` with up to ten simultaneous points; the emulation makes the page report `navigator.maxTouchPoints` and `ontouchstart` so a game's mobile code path actually runs. |
 | `pointer_lock` | Acquires, releases, or reports pointer lock for first-person controls; while locked, `coordinate_mode="relative"` moves without clamping to the viewport, which is what feeds `movementX`/`movementY`. |
 | `render`, `step`, `release_inputs` | Control the animation gate and safely reset held input. |
@@ -795,6 +852,8 @@ Example for a game hosted inside an iframe:
 
 Send the batch to `web_action`; use `web_info(topic="game_probe", params={"session_id": "ufo", "frame_selector": "#game-frame"})` or the `screenshot` topic to observe it.
 
+A batch like that one ends with `release_inputs` and `render mode=normal` for a reason, and `web_action` stops at the first action that fails unless `continue_on_error=true`. So the failure of a single `input` in the middle is the case where the cleanup at the end never runs and the page is left frozen with keys held. Either send the cleanup as its own call, or pass `continue_on_error=true` on any batch whose tail is cleanup.
+
 For a top-level canvas application such as `https://redoschool.ru/demo/?auto=true`, omit `frame_selector`. Pointer coordinates are relative to the selected top-level viewport or iframe.
 
 **[→ Playing games](docs/playing-games.md)** is the full walkthrough: a complete
@@ -815,7 +874,8 @@ While the gate is engaged — in `throttled` as well as in `step` — page time 
 - `performance.now()` and `Date.now()` advance by exactly one frame delta of 16.667 ms per released frame;
 - `setTimeout`, `setInterval`, and `requestIdleCallback` are queued against that same virtual clock and run immediately before the frame's animation callbacks. Without this a game reads the agent's thinking time as its `deltaTime`, and a batch of frames released back to back arrives with a delta near zero;
 - promises and `queueMicrotask` are not gated, and `new Date()` still reports wall-clock time;
-- queued timers are handed back to the real scheduler, with their remaining delay intact, when the mode returns to `normal`.
+- queued timers are handed back to the real scheduler, with their remaining delay intact, when the mode returns to `normal`;
+- page time never runs backwards. Stepping carries the clock *ahead* of wall time — sixty frames released back to back advance it by a second in barely a moment — and returning to `normal` keeps that gap instead of dropping it. Handing the native clock back used to lose the whole gain at once, measured at −5.9 s, which a game reads as a negative frame delta. A session that has stepped keeps the clock wrapper for the rest of its life, since only the wrapper can go on applying the offset; one that never stepped gets the untouched native clock back.
 
 `render` also accepts `frame_delta_ms`, `freeze_time`, and `gate_timers` when an
 engine needs something other than those defaults. One knob stays Python-only:
@@ -877,9 +937,9 @@ cheapest of the four. Absolute numbers depend on the machine; the ratios do not.
 | `web_info` | Return the whole contract, or one action schema on demand; read search, current Chrome tabs, browser, page outline/text/find, console, network, game, screenshot, or time state. |
 | `web_action` | Execute one or up to 32 ordered setup, search, fetch, tab attach/open, form, input, render, and close actions. Supports fail-fast or `continue_on_error=true`. |
 
-Start with `web_info()`. With no arguments it returns `actions` with each action's required and optional parameters, `action_groups`, `info_topics`, `recipes`, `pitfalls`, `limits`, and worked `examples`. Request only the needed, generated JSON Schema with `web_info(topic="action_schema", params={"action": "input"})`, then invoke it through `web_action`. This follows the on-demand Tool Search principle used by [official Unreal MCP](https://dev.epicgames.com/documentation/unreal-engine/unreal-mcp-in-unreal-editor): keep the eager tool list small, disclose schemas only when needed, and dispatch actions through a meta-tool. Web Search Neo combines Unreal's list/describe discovery tools into one `web_info`, so only two tools are advertised.
+Start with `web_info()`. With no arguments it returns `actions` with each action's summary and its required parameter names, `action_groups`, `info_topics`, `recipes`, `pitfalls`, `limits`, and worked `examples`. Optional names, types, and defaults are deliberately left out of it. Request only the needed, generated JSON Schema with `web_info(topic="action_schema", params={"action": "input"})`, then invoke it through `web_action`. The same call describes an observation topic — `params={"action": "find"}` returns `find`'s parameters — which matters because a topic refuses any argument it does not list, and that list appears nowhere else. This follows the on-demand Tool Search principle used by [official Unreal MCP](https://dev.epicgames.com/documentation/unreal-engine/unreal-mcp-in-unreal-editor): keep the eager tool list small, disclose schemas only when needed, and dispatch actions through a meta-tool. Web Search Neo combines Unreal's list/describe discovery tools into one `web_info`, so only two tools are advertised.
 
-Measured on the current build, summing each advertised tool's `name`, `description`, and serialized `inputSchema`: the compact surface is 1,091 characters across two tools, against 22,110 characters across the 40 tools of legacy mode. The self-describing contract behind `web_info()` is 7,379 characters, and it is fetched only when an agent asks for it. Each action in it now lists its required parameter names; optional names, types, and defaults stay in `action_schema`, where they cost nothing until needed.
+Measured on the current build, summing each advertised tool's `name`, `description`, and serialized `inputSchema`: the compact surface is 1,091 characters across two tools, against 22,721 characters across the 40 tools of legacy mode. The self-describing contract behind `web_info()` is 7,833 characters, and it is fetched only when an agent asks for it. Each action in it lists its required parameter names; optional names, types, and defaults stay in `action_schema`, where they cost nothing until needed — and where an observation topic's parameters live too, since a topic accepts exactly the list it publishes and nothing else.
 
 Every action is declared once in a single registry that also generates its published schema, and arguments are validated against that same model before the handler runs. An unknown or malformed field returns the offending names and the list of allowed parameters instead of an internal `TypeError`:
 
@@ -895,7 +955,7 @@ Browser state is keyed by `session_id`. The `open_many` action can create up to 
 
 ## Optional agent skill
 
-`web_info()` called with no arguments returns the entire agent-facing contract: every action with its required and optional parameters, the observation topics, ready-made recipes, the common mistakes, the hard limits, and runnable examples. An agent that reads it needs no external instructions, so the bundled skill is a convenience, not a requirement.
+`web_info()` called with no arguments returns the entire agent-facing contract: every action with its summary and required parameter names, the observation topics, ready-made recipes, the common mistakes, the hard limits, and runnable examples. Optional parameters — for an action or for a topic — come from `action_schema`, one at a time. An agent that reads it needs no external instructions, so the bundled skill is a convenience, not a requirement.
 
 The repository still includes a short [Web Search Neo skill](skills/web-search-neo/SKILL.md) for clients that prefer a resident description of when to reach for the server at all.
 
@@ -934,7 +994,7 @@ Only use a proxy you are authorized to use. HTTP sessions use desktop browser he
 
 ### Transport policy
 
-Unencrypted `http://` to a public host is refused, for plain fetches and for browser `open` alike, with an error that names the host and the override. Loopback, private, link-local, and unspecified addresses stay reachable over plain HTTP, as do `localhost` and any host ending in `.local`, `.localhost`, `.internal`, or `.home.arpa` — a local ComfyUI, Ollama, or dev server keeps working unchanged. Set `WEB_SEARCH_NEO_ALLOW_PLAIN_HTTP=1` to accept plain HTTP everywhere.
+Unencrypted `http://` to a public host is refused, for plain fetches and for browser `open` alike, with an error that names the host and the override. Loopback, private, link-local, and unspecified addresses stay reachable over plain HTTP, as do `localhost` and any host ending in `.local`, `.localhost`, `.internal`, `.home.arpa`, `.lan`, `.home`, `.intranet`, `.private`, or `.corp` — a local ComfyUI, Ollama, or dev server keeps working unchanged. So does any single-label host, `http://nas/` or `http://raspberrypi:8080/`: a name with no dot cannot be published on the public DNS, and deciding it by resolution would cost a lookup on every URL and every redirect hop. Set `WEB_SEARCH_NEO_ALLOW_PLAIN_HTTP=1` to accept plain HTTP everywhere.
 
 Redirects are followed one hop at a time, at most five, and every hop is validated again, so a public HTTPS URL cannot quietly land on plain HTTP.
 
@@ -948,7 +1008,7 @@ python -m pytest
 python -m pytest --cov=. --cov-report=term-missing
 ```
 
-The deterministic suite is 504 tests, grouped by what they protect:
+The deterministic suite is 571 tests, grouped by what they protect:
 
 | Area | Covered |
 | --- | --- |
@@ -965,7 +1025,7 @@ The deterministic suite is 504 tests, grouped by what they protect:
 | Games and input | Canvas probing, normal/throttled/step rendering, atomic mixed input, held modifiers across a batch, gate and held-input reset on navigation, coordinates that follow a frame's CSS transforms, key spellings that release each other, and a virtual clock whose intervals keep their period. |
 | Sessions | Sessions that close the tabs they own, concurrent sessions, persistent storage, a session dropped when the browser it was opened in is gone, a borrowed tab handed back instead of navigated, and a real managed-Chrome attach/detach that leaves Chrome running. |
 
-Public search engines may rate-limit an IP or region, so live internet smoke checks are kept separate from deterministic tests. `scripts/live_smoke.py` is the only committed check that touches the public internet. It runs a search, opens two pages concurrently, fills and submits a public Selenium test form, uploads a file, and verifies exact screenshot dimensions; it does not cover games. Public game sites change without notice, so the frame gate, input atomicity, and held-input recovery are verified by the deterministic local suite instead.
+Public search engines may rate-limit an IP or region, so live internet smoke checks are kept separate from deterministic tests. `scripts/live_smoke.py` runs a search, opens two pages concurrently, fills and submits a public Selenium test form, uploads a file, and verifies exact screenshot dimensions; it does not cover games. `scripts/companion_live_smoke.py` reaches the network too, though its subject is the extension: it starts a disposable Chromium with the companion loaded and drives whatever `--url` names, which defaults to `https://example.com`. Public game sites change without notice, so the frame gate, input atomicity, and held-input recovery are verified by the deterministic local suite instead.
 
 ### End-to-end check with a local model
 

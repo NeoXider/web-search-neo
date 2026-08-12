@@ -253,6 +253,11 @@ async def search_web(
             url=waited["url"],
             title=waited["title"],
         )
+        # "Nothing blocking here" and "the scan gave up early" have to stay apart
+        # in the one place a person is watching the browser: this branch is the
+        # human handoff, and a caller told the challenge is gone would close it.
+        if waited.get("captcha_scan_incomplete"):
+            manual["captcha_scan_incomplete"] = True
     except Exception as exc:
         manual["error"] = f"{type(exc).__name__}: {exc}"
 
@@ -1149,7 +1154,8 @@ def _validate_arguments(tool_name: str, label: str, arguments: dict[str, Any]) -
         raise ValueError(
             f"{label}: unknown parameter(s) {sorted(unknown)}. "
             f"Allowed: {allowed}. "
-            "Call web_info(topic='action_schema', params={'action': '<name>'}) for the full schema."
+            "Call web_info(topic='action_schema', params={'action': '<action or topic>'}) "
+            "for the full schema."
         )
     try:
         validated = model.model_validate(arguments)
@@ -1167,14 +1173,14 @@ def _validate_arguments(tool_name: str, label: str, arguments: dict[str, Any]) -
 
 _INFO_TOPICS = {
     "capabilities": "This contract: topics, actions, recipes, and pitfalls.",
-    "action_schema": "Full JSON Schema for one action; pass params.action.",
+    "action_schema": "Full JSON Schema for one action or topic; pass params.action.",
     "page_outline": "Roles, names, states, refs, and boxes - start looking here.",
     "page_text": "Readable text of the rendered page; params.mode=main|full.",
     "find": "Find an element by meaning: params.query='submit application'.",
-    "page_elements": "Flat CSS selectors for links, forms, fields, buttons.",
+    "page_elements": "Links, forms, fields, buttons by selector: CSS, '#host >>> #leaf' in a shadow root or frame, or '' when none is unique.",
     "console": "console.log/warn/error and uncaught errors; params.levels, params.contains.",
     "network": "HTTP requests with status, type, ms, size; params.only_errors=true.",
-    "network_body": "One response body; params.request_id from the network topic.",
+    "network_body": "One response body; params.request_id is the id from a network read with output='json'.",
     "screenshot": "PNG image of the current page.",
     "game_probe": "Canvas/WebGL/iframe surfaces, FPS, focus, console, held input.",
     "browser_status": "Chrome availability and named session state.",
@@ -1189,7 +1195,96 @@ _HOT_PATH_SPEED = (
     "page read; both matter when you drive a game frame by frame."
 )
 
+# step is the one hot-path action without wait_seconds, and the argument check
+# refuses an unknown key - so the shared note above advertised a hard error.
+_STEP_SPEED = (
+    "include_summary=false skips the post-action page read; step takes no "
+    "wait_seconds and refuses one."
+)
+
+# frame_selector always names exactly one frame - ambiguous CSS is refused with
+# the count everywhere. Only the accepted form differs: whatever aims by
+# coordinate needs the frame's box in the top document, so it takes CSS alone.
+_FRAME_ANY = "Frame to work inside: CSS, a ref: handle, or '#host >>> #inner'; ambiguous CSS is refused with the count."
+_FRAME_CSS = "Frame to work inside: plain CSS only - a ref or a '>>>' path is refused before any event is sent; ambiguous CSS is refused with the count."
+
+# Keyed by action name or info topic name; both are described from here.
 _ACTION_NOTES = {
+    "fill": {
+        "results": "filled took your value, field_values answers for every selector you sent including the failures, errors maps selector to the driver's own message, success=false if errors is non-empty.",
+        "field_values": "null means nothing could be read back - the selector matched nothing, or the control is gone. A refused control reports what it still holds, so you can see the write did not land.",
+        "checkbox": "1|yes|y|on|check|checked or 0|no|n|off|uncheck|unchecked|''; anything else is refused, and field_values reports a JSON boolean.",
+        "multi_select": "A <select multiple> reads back as a list and only it takes a list of values; a scalar replaces its whole selection rather than adding to it.",
+        "sanitisation": "The browser's own tidying is accepted - trimmed whitespace on email/url, CRLF, a handler's case folding - while maxlength truncation and a rewritten value still fail.",
+        "typed_controls": "date/time/datetime-local/month/week/range/color are set, not typed: an unparseable value is refused without touching the control and the error names the format.",
+        "files": "A file input is refused in fields; pass files={selector: path}, which replaces the input's selection rather than adding to it.",
+        "blur": "Every control written is blurred, which is how the last field fires its change event - so focus ends on the body and a following press_keys needs target_selector to reach a field.",
+        "frame_selector": _FRAME_ANY,
+    },
+    "upload": {
+        "replaces": "The input is cleared first: this sets its selection to exactly file_paths. Two files means one call with two paths; a second call discards the first file.",
+        "files_uploaded": "{selector: [names]}, read back off the input - the same shape fill returns.",
+        "frame_selector": _FRAME_ANY,
+    },
+    "submit": {
+        "validation": "validation_passed=false means native validation blocked it and nothing was sent; validation_errors names the fields by id/name, never match on the message.",
+        "proof": "submit_triggered is submit_event_fired or navigation_observed; submit_default_prevented marks a handler that cancelled the navigation on purpose. Neither says the server accepted it.",
+        "evidence": "submit_evidence is a sentence naming what the verdict rests on; new_tab_opened=true means a target='_blank' result is in a tab this session does not own, so the url and title here are still this page's.",
+        "submit_selector": "Plain CSS only, unlike form_selector.",
+        "frame_selector": _FRAME_ANY,
+    },
+    "click": {"frame_selector": _FRAME_ANY},
+    "wait": {
+        "state": "present|visible|clickable; timeout_seconds is clamped to 30 and the result reports the effective value, so a requested 120 comes back as 30.",
+        "frame_selector": _FRAME_ANY,
+    },
+    "find": {
+        "scores": "match_score is how well the query matched that element alone; score adds ranking context. low_confidence is derived from match_score only.",
+        "role": "A filter, not a nudge: another role is dropped. Under low_confidence the guesses come from the unfiltered set, so a wrong role can reappear there.",
+        "ambiguous": "The top two matched and ranked equally, so document order alone chose; say which you mean instead of taking matches[0].",
+        "limits": "visible_only=true by default; limit is clamped to 25.",
+    },
+    "page_elements": {
+        "selector": "CSS in the top document, '#host >>> #leaf' inside an open shadow root or same-origin frame, and '' when nothing addresses the element uniquely.",
+        "scope": "Always the whole page: this topic takes no frame_selector, and it is the only read topic reporting challenge_detected/captcha_widgets.",
+        "captcha_scan_incomplete": "true means the captcha walk stopped early, so an empty captcha_widgets is not proof there is none. Every page summary carries this key.",
+        "contenteditable": "Only [contenteditable=\"true\"] is listed; a bare contenteditable attribute is a field to page_outline and invisible here.",
+    },
+    "page_text": {
+        "fallback": "mode='main' on a page that is one big form would be empty, so it re-reads the whole body and says so with fallback_used=true and mode_used='full'.",
+    },
+    "network": {
+        "id": "The default output='text' carries no ids. Pass output='json' and hand that row's id to network_body as request_id.",
+    },
+    "game_probe": {
+        "frame_selector": _FRAME_CSS,
+        "why_strict": "It sends nothing, but the canvas rects it reports are aimed at with this same string, so it is as strict as the input actions.",
+    },
+    "open": {
+        "profile_mode": {
+            "current": "the user's signed-in Chrome through the companion extension (default)",
+            "auto": "current, falling back to a visible temporary profile",
+            "temporary": "clean disposable profile",
+            "persistent": "durable server-owned profile, keeps logins",
+            "attach": "a Chrome you started with a DevTools port",
+        },
+        "headless": "headless=true is refused with current and makes auto resolve straight to temporary without trying current.",
+        "claimed_tab": "open on a session claimed by attach_tab does not navigate the user's tab: it takes a new one and reports the released id as left_claimed_tab.",
+    },
+    "attach_tab": {
+        "ownership": "Refused, naming the holder, when another agent is already driving that tab. Pick another tab or open your own; do not retry.",
+        "capture": "Console and network are recorded from the claim onwards; whatever the tab did before it was claimed is unrecoverable.",
+    },
+    "close": {
+        "tab": "Closes a tab the agent opened, reported as tab_closed; an attach_tab tab is only detached and stays open.",
+        "browser_gone": "browser_gone=true with a note means the Chrome it was opened in is gone: nothing was sent, because the tab id now names someone else's tab. Open again, do not retry close.",
+    },
+    "close_all": {
+        "browser_gone": "A list of session ids left alone because their Chrome is gone; closed_all stays true, since nothing of ours was left to leak.",
+    },
+    "browser_status": {
+        "browser_gone": "session_open=false with browser_gone=true means the session was dropped because its Chrome restarted; follow the 'next' field and open the page again.",
+    },
     "input": {
         "key_action": {"key": "W|SPACE|ARROW_LEFT|F5|NUMPAD1|...", "action": "tap|hold|release"},
         "pointer_action": {
@@ -1198,12 +1293,19 @@ _ACTION_NOTES = {
             "wheel": "pass delta_x/delta_y; x/y is where the wheel is scrolled",
         },
         "atomicity": "Every change lands before the single released frame; taps stay down for it.",
+        "limits": "At most 16 key and 16 pointer entries.",
+        "refusals": "Raised before anything is sent: tapping a key this session already holds (release it first), and a point that maps outside the window or onto another element, which is named.",
+        "held_keys": "After a failed batch this over-reports on purpose - any event may have landed - so call release_inputs rather than trusting the list.",
+        "frame_selector": _FRAME_CSS,
         "speed": _HOT_PATH_SPEED,
     },
     "press_keys": {
         "key_action": "tap|hold|release",
         "note": "The dispatcher key is 'action'; the keyboard verb is 'key_action'.",
-        "hold_frames": "With key_action='tap' in render=step, the key stays down for N released frames.",
+        "hold_frames": "With key_action='tap' in render=step, the key stays down for N released frames - so one call releases hold_frames per repeat, not one. Read frames_advanced.",
+        "limits": "1-8 keys, repeat 1-50, hold_frames 1-30.",
+        "refusals": "Tapping a key this session already holds is refused before anything is sent; release it first, or drop the tap.",
+        "frame_selector": _FRAME_CSS,
         "speed": _HOT_PATH_SPEED,
     },
     "render": {
@@ -1213,16 +1315,21 @@ _ACTION_NOTES = {
             "released frame is a fixed frame_delta_ms. Without it a game measures "
             "your thinking time as its frame delta."
         ),
+        "monotonic": "Stepping carries page time ahead of wall time and returning to normal keeps the gap, so the page clock never goes backwards - and never matches yours again.",
+        "frame_selector": _FRAME_ANY,
     },
     "pointer": {
         "pointer_action": "click|double_click|hover|move|drag|press|release|wheel",
         "note": "The dispatcher key is 'action'; the pointer verb is 'pointer_action'.",
+        "refusals": "A point that maps outside the window, or onto an element covering the frame there, is refused with the blocker named - never clamped or dropped.",
+        "frame_selector": _FRAME_CSS,
         "speed": _HOT_PATH_SPEED,
     },
     "pointer_lock": {
         "operation": "acquire|release|status",
         "note": "After acquire, move with coordinate_mode='relative'.",
         "movement": "Each move reports exactly the delta you sent; nothing recentres.",
+        "frame_selector": _FRAME_CSS,
     },
     "touch": {
         "touch_action": "tap|press|move|release|swipe|cancel",
@@ -1231,10 +1338,13 @@ _ACTION_NOTES = {
             "release with points=[{id}] lifts only those fingers and leaves the "
             "rest down; release with no points lifts all of them."
         ),
+        "refusals": "Pressing an id that is already down is refused - Chrome ignores it - so move that finger or release it first; a point landing outside the window or on another element is refused and the blocker named.",
+        "frame_selector": _FRAME_CSS,
         "speed": _HOT_PATH_SPEED,
     },
     "step": {
-        "speed": _HOT_PATH_SPEED,
+        "frames": "1-120. step has no frame_selector - it reuses the one render stored - and fails unless render mode=step is active.",
+        "speed": _STEP_SPEED,
     },
     "setup_current_chrome": {
         "opens_no_page": (
@@ -1249,15 +1359,6 @@ _ACTION_NOTES = {
             "not: the companion re-reads its own folder when asked."
         ),
         "wait_seconds": "Raise it right after the user pressed Load unpacked.",
-    },
-    "open": {
-        "profile_mode": {
-            "current": "the user's signed-in Chrome through the companion extension (default)",
-            "auto": "current, falling back to a visible temporary profile",
-            "temporary": "clean disposable profile",
-            "persistent": "durable server-owned profile, keeps logins",
-            "attach": "a Chrome you started with a DevTools port",
-        }
     },
 }
 
@@ -1285,9 +1386,9 @@ _PITFALLS = [
     "web_action success=true is not task success: check failure_count and every results[i].success.",
     "Selectors die when the document changes; re-read page_elements after navigation.",
     "A ref: id belongs to the page_outline you just read; after navigation or a re-render, read page_outline again.",
-    "challenge_detected means a CAPTCHA: use wait_challenge or let search fall back, never hammer clicks.",
+    "challenge_detected means a CAPTCHA is in the way: use wait_challenge or let search fall back, never hammer clicks. captcha_widgets lists ones merely present; ignore those.",
     "find low_confidence=true means it is guessing: re-query with other words or a role, do not click matches[0].",
-    "profile_mode=current drives the user's real Chrome; close frees the session and leaves their tab open.",
+    "profile_mode=current drives the user's real Chrome; close closes a tab the agent opened and leaves an attach_tab tab open.",
     "In render=step nothing moves until input or step runs, so a screenshot taken first shows the old frame.",
     "Always release_inputs after hold, and return render to normal before you finish.",
     "Pointer coordinates are viewport-local; inside an iframe pass frame_selector and frame-local x/y.",
@@ -1394,15 +1495,41 @@ def _action_documentation() -> dict[str, dict[str, Any]]:
     return document
 
 
+def _topic_schema(topic: str) -> dict[str, Any]:
+    """Publish the parameters of one web_info topic.
+
+    A topic's params are validated exactly as strictly as an action's, so an
+    unlisted key is refused - and until now nothing published the list, which
+    left ``output``, ``limit``, ``since_seq`` and the rest mandatory to know and
+    written down nowhere. Every topic is backed by the same kind of wrapper
+    function an action is, so the same generated schema answers for both.
+    """
+    handler = _TOPIC_HANDLERS.get(topic)
+    if handler is None:
+        raise ValueError(
+            f"Unknown action schema: {topic}. Available actions: {sorted(_ACTIONS)}. "
+            f"Available info topics: {sorted(_TOPIC_HANDLERS)}"
+        )
+    original = legacy_mcp._tool_manager._tools[handler.__name__].parameters
+    response: dict[str, Any] = {
+        "topic": topic,
+        "summary": _INFO_TOPICS[topic],
+        "params_schema": {**original, "title": f"{topic}Params"},
+        "call": {"tool": "web_info", "arguments": {"topic": topic, "params": {}}},
+    }
+    notes = _ACTION_NOTES.get(topic)
+    if notes:
+        response["notes"] = notes
+    return response
+
+
 def _capabilities(action_name: str | None = None) -> dict[str, Any]:
-    """Return the whole agent-facing contract, or one action's schema."""
+    """Return the whole agent-facing contract, one action's schema, or one topic's."""
     if action_name is not None:
         selected = action_name.strip().lower()
         spec = _ACTIONS.get(selected)
         if spec is None:
-            raise ValueError(
-                f"Unknown action schema: {selected}. Available: {sorted(_ACTIONS)}"
-            )
+            return _topic_schema(selected)
         original = legacy_mcp._tool_manager._tools[spec.tool_name].parameters
         input_schema = {
             **original,
@@ -1448,7 +1575,7 @@ def _capabilities(action_name: str | None = None) -> dict[str, Any]:
         "limits": {
             "ordered_actions_per_call": 32,
             "parallel_browser_sessions": browser_tools.MAX_SESSIONS,
-            "input_actions_per_batch": 16,
+            "input_actions_per_batch": "16 key + 16 pointer",
             "automatic_captcha": False,
             "captcha_modes": ["fallback", "manual"],
         },
@@ -1456,7 +1583,7 @@ def _capabilities(action_name: str | None = None) -> dict[str, Any]:
             "next_call": "web_info",
             "topic": "action_schema",
             "params_example": {"action": "input"},
-            "note": "Describe only the action you need, then call it through web_action.",
+            "note": "params.action names an action or an info topic; a topic's parameters are published nowhere else, and any key it does not list is refused.",
             "parameters": (
                 "actions[name].required lists parameters you must always send; "
                 "also_required is a condition a list cannot express and is just as "
@@ -1515,12 +1642,18 @@ async def web_info(
             raise ValueError("capabilities does not accept params")
         return _capabilities()
     if topic == "action_schema":
-        action_name = str(arguments.pop("action", ""))
+        # params.topic is accepted as an alias: what is being described may be an
+        # info topic, and naming one under the key "action" reads as a mistake.
+        named = str(arguments.pop("action", "") or "")
+        alias = str(arguments.pop("topic", "") or "")
         if arguments:
-            raise ValueError("action_schema accepts only params.action")
-        if not action_name:
-            raise ValueError("action_schema requires params.action")
-        return _capabilities(action_name)
+            raise ValueError("action_schema accepts only params.action or params.topic")
+        if not named and not alias:
+            raise ValueError(
+                "action_schema requires params.action: an action name for web_action, "
+                f"or an info topic name. Topics: {sorted(_TOPIC_HANDLERS)}"
+            )
+        return _capabilities(named or alias)
     if topic == "time":
         if arguments:
             raise ValueError("time does not accept params")

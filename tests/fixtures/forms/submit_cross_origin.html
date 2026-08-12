@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Payment handoff</title></head>
+<body>
+<h1>Payment handoff</h1>
+<!-- Checkout hands the order to another origin. Nothing the watcher wrote into
+     this document survives that load, so the submit event cannot be read back. -->
+<form id="handoff" method="post">
+  <input id="order" name="order" value="A-1">
+  <button id="pay" type="submit">Pay</button>
+</form>
+<script>
+  document.getElementById('handoff').action =
+    location.origin.replace('127.0.0.1', 'localhost') + '/submit';
+</script>
+</body>
+</html>

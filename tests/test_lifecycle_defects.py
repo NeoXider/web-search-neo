@@ -8,9 +8,17 @@ never usable in the first place.
 
 from __future__ import annotations
 
+import socket
+import threading
+
 import pytest
 
-from chrome_bridge import ChromeBridgeError
+from chrome_bridge import (
+    ChromeBridge,
+    ChromeBridgeDriver,
+    ChromeBridgeError,
+    ChromeBridgeUnavailable,
+)
 import browser_tools
 
 
@@ -20,7 +28,15 @@ class _SwitchTo:
 
 
 class _Bridge:
-    """The companion, answering the one question eviction asks it."""
+    """The companion, answering the one question eviction asks it.
+
+    ``reachable=False`` raises what the real client raises when there is nobody
+    to ask - ``ChromeBridgeUnavailable`` - and not ``ConnectionError``. The
+    difference is the whole test: every transport failure in
+    :meth:`ChromeBridge.request` is a ``ChromeBridgeError`` of some kind, so a
+    fake that raised something else let a caller that condemns tabs on
+    ``ChromeBridgeError`` pass a test written to prove it does not.
+    """
 
     def __init__(self, gone: bool = False, reachable: bool = True) -> None:
         self.gone = gone
@@ -30,13 +46,24 @@ class _Bridge:
     def request(self, method: str, params: dict | None = None, **_kwargs: object) -> dict:
         self.asked += 1
         if not self.reachable:
-            raise ConnectionError("no daemon on 127.0.0.1:8765")
+            raise ChromeBridgeUnavailable(
+                "Chrome companion extension is not connected, so profile_mode "
+                "'current' cannot be used."
+            )
         if self.gone:
             raise ChromeBridgeError(f"No tab with id {(params or {}).get('tabId')}")
         return {"id": (params or {}).get("tabId"), "url": "https://example.test/"}
 
 
 class _Tab:
+    """The extension-backed driver, in the respects teardown depends on.
+
+    ``quit`` returns rather than raises, because :meth:`ChromeBridgeDriver.quit`
+    structurally cannot raise - teardown may not take its caller down with it -
+    and a fake that raised let "a debugger left attached is never reported" pass
+    as covered.
+    """
+
     def __init__(self, tab_id: int = 42, bridge: _Bridge | None = None) -> None:
         self.tab_id = tab_id
         self.bridge = bridge or _Bridge()
@@ -50,10 +77,15 @@ class _Tab:
     def get(self, url: str) -> None:
         self.calls.append(f"get {url}")
 
-    def quit(self) -> None:
+    def quit(self) -> dict[str, object]:
         self.calls.append("quit")
         if not self.detaches:
-            raise ChromeBridgeError("the companion never answered debugger.detach")
+            return {
+                "detached": False,
+                "id": self.tab_id,
+                "error": "ChromeBridgeError: the companion never answered debugger.detach",
+            }
+        return {"detached": True, "id": self.tab_id}
 
     def close_tab(self) -> dict[str, bool]:
         self.calls.append("close_tab")
@@ -129,6 +161,7 @@ def test_close_says_so_when_the_tab_would_not_close():
 
 
 def test_close_says_so_when_the_debugger_stays_attached():
+    """The one thing only the user can undo: the banner stays on their tab."""
     driver = _Tab()
     driver.detaches = False
     _register("attached", driver)
@@ -136,7 +169,56 @@ def test_close_says_so_when_the_debugger_stays_attached():
     result = browser_tools.close_session("attached")
 
     assert result["released"] is False
-    assert "detaching from Chrome failed" in result["warning"]
+    assert "debugger may still be attached to tab 42" in result["warning"]
+
+
+def test_a_clean_detach_is_not_reported_as_a_problem():
+    _register("tidy", _Tab())
+
+    result = browser_tools.close_session("tidy")
+
+    assert "warning" not in result
+
+
+def test_nothing_to_detach_is_not_a_failed_detach():
+    """The extension answers `detached: false` for a tab it never held, which is
+    a clean outcome and not a banner left on anybody's tab."""
+    driver = _Tab()
+    driver.quit = lambda: {"detached": False, "id": driver.tab_id}
+    _register("loose", driver)
+
+    result = browser_tools.close_session("loose")
+
+    assert "warning" not in result
+
+
+def test_a_tab_the_user_already_closed_is_not_reported_as_a_leak():
+    """`removed: false` is also what the extension says when `tabs.remove`
+    throws, and a tab closed from the tab strip is the commonest reason."""
+    driver = _Tab(bridge=_Bridge(gone=True))
+    driver.closes = False
+    _register("byhand", driver)
+
+    result = browser_tools.close_session("byhand")
+
+    assert result["closed"] is True
+    assert result["tab_closed"] is False
+    assert "warning" not in result
+    assert "released" not in result
+
+
+def test_close_does_not_claim_a_leak_it_could_not_check():
+    """A companion that cannot be asked has not said the tab is still there,
+    and has not said it is gone either. Say that, rather than either."""
+    driver = _Tab(bridge=_Bridge(reachable=False))
+    driver.closes = False
+    _register("unsure", driver)
+
+    result = browser_tools.close_session("unsure")
+
+    assert result["tab_closed"] is False
+    assert "could not be asked" in result["warning"]
+    assert "the tab is still open" not in result["warning"]
 
 
 def test_one_failed_step_does_not_skip_the_others(monkeypatch):
@@ -240,3 +322,134 @@ def test_selenium_sessions_are_never_asked_about_their_tab(monkeypatch):
 
     assert bridge.asked == 0
     assert "selenium" in browser_tools._sessions
+
+
+@pytest.mark.parametrize(
+    ("bridge", "exists"),
+    [
+        (_Bridge(), True),
+        (_Bridge(gone=True), False),
+        (_Bridge(reachable=False), None),
+    ],
+    ids=["answered-it-is-there", "answered-it-is-not", "never-answered"],
+)
+def test_only_an_answer_says_anything_about_a_tab(bridge, exists):
+    session = browser_tools.BrowserSession(
+        driver=_Tab(42, bridge),
+        headless=False,
+        profile_mode="current",
+        current_tab_id=42,
+    )
+
+    assert browser_tools._tab_still_exists(session) is exists
+    assert browser_tools._tab_is_gone(session) is (exists is False)
+
+
+def test_the_cap_sweep_asks_chrome_with_the_session_registry_unlocked(monkeypatch):
+    """Every browser tool call goes through `_get_session`, which wants
+    `_sessions_lock`; the sweep used to hold it for a round trip per dead
+    session, so one wedged companion stalled the whole server."""
+    probing = threading.Event()
+    may_answer = threading.Event()
+
+    class _Wedged(_Bridge):
+        def request(self, method: str, params: dict | None = None, **kwargs: object) -> dict:
+            probing.set()
+            assert may_answer.wait(20), "the sweep was never let go"
+            return super().request(method, params, **kwargs)
+
+    for index in range(browser_tools.MAX_SESSIONS):
+        _register(f"dead{index}", _Tab(index, _Wedged(gone=True)))
+    monkeypatch.setattr(browser_tools, "create_driver", lambda *a, **k: _Tab(99))
+
+    opened: list[object] = []
+    caller = threading.Thread(
+        target=lambda: opened.append(
+            browser_tools._create_session("fresh", 1280, 800, None, profile_mode="current")
+        )
+    )
+    caller.start()
+    try:
+        assert probing.wait(20), "the sweep never got as far as asking"
+        took_it = browser_tools._sessions_lock.acquire(timeout=5)
+        if took_it:
+            browser_tools._sessions_lock.release()
+        assert took_it, "the sweep is holding _sessions_lock across a bridge round trip"
+    finally:
+        may_answer.set()
+        caller.join(timeout=30)
+
+    assert opened, "the fifth session never opened"
+    assert sorted(browser_tools._sessions) == ["fresh"]
+
+
+def test_the_sweep_leaves_alone_a_session_another_thread_is_using():
+    """Its driver is not idle: quitting it would pull the debugger out from
+    under whatever that thread is in the middle of."""
+    busy = _Tab(1, _Bridge(gone=True))
+    idle = _Tab(2, _Bridge(gone=True))
+    _register("busy", busy)
+    _register("idle", idle)
+    sweep = threading.Thread(target=browser_tools._drop_sessions_whose_tab_is_gone)
+
+    with browser_tools._sessions["busy"].lock:
+        sweep.start()
+        sweep.join(timeout=20)
+
+    assert not sweep.is_alive(), "the sweep waited for a session in use"
+    assert "busy" in browser_tools._sessions
+    assert busy.calls == []
+    # The one nobody was using is still swept.
+    assert "idle" not in browser_tools._sessions
+    assert "quit" in idle.calls
+
+
+# What the real client and the real driver do, which is the only thing that
+# makes the fakes above worth anything: two of the tests here were green over
+# live defects because the fakes were kinder than the code they stood in for.
+
+
+def test_a_client_with_nobody_to_ask_raises_the_unavailable_kind():
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = int(probe.getsockname()[1])
+    client = ChromeBridge(
+        port=port, token="a1" * 32, spawn=False, connect_timeout=0.2, start_timeout=0.2
+    )
+    try:
+        with pytest.raises(ChromeBridgeUnavailable):
+            client.request("tabs.get", {"tabId": 42}, timeout=0.5)
+    finally:
+        client.shutdown()
+    # And it is still a ChromeBridgeError, so nothing that catches those changes.
+    assert issubclass(ChromeBridgeUnavailable, ChromeBridgeError)
+
+
+def test_the_real_driver_reports_a_failed_detach_instead_of_raising():
+    """`quit` cannot raise - teardown may not take its caller down - so the
+    outcome has to be in the return value or it is nowhere."""
+
+    class _Deaf:
+        def request(self, method: str, params: dict | None = None, **_kwargs: object):
+            raise ChromeBridgeError("the companion never answered debugger.detach")
+
+    driver = ChromeBridgeDriver.__new__(ChromeBridgeDriver)
+    driver.bridge = _Deaf()
+    driver.tab_id = 42
+
+    answer = driver.quit()
+
+    assert answer["detached"] is False
+    assert "never answered" in answer["error"]
+
+
+def test_the_real_driver_passes_on_a_detach_that_worked():
+    class _Companion:
+        def request(self, method: str, params: dict | None = None, **_kwargs: object):
+            return {"detached": True}
+
+    driver = ChromeBridgeDriver.__new__(ChromeBridgeDriver)
+    driver.bridge = _Companion()
+    driver.tab_id = 42
+
+    assert driver.quit() == {"detached": True, "id": 42}

@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixture: individually transformed, zoomed, clipped and covered frames</title>
+<link rel="icon" href="data:,">
+
+<style>
+  html, body { margin: 0; padding: 0; background: #0b0e14; color: #d7dde8;
+               font: 13px/1.4 monospace; }
+  iframe { width: 620px; height: 420px; border: 0; display: block; background: #000; }
+  .slot { position: absolute; }
+  /* The CSS Transforms 2 individual properties never appear in the computed
+     `transform`, and `zoom` is not a transform at all, so a frame map that only
+     reads `transform` sees the identity here and aims at the wrong place. */
+  #rotprop-slot   { left: 200px; top: 20px;   rotate: 20deg; transform-origin: 0 0; }
+  #scaleprop-slot { left: 20px;  top: 700px;  scale: 0.5;    transform-origin: 0 0; }
+  #zoom-slot      { left: 20px;  top: 1000px; zoom: 2; }
+  /* Only the frame's top-left corner survives its ancestor's clip; the rest of
+     it answers questions about its own viewport as if it were on screen. */
+  #clip-window { position: absolute; left: 20px; top: 3000px;
+                 width: 100px; height: 80px; overflow: hidden; }
+  /* Whole and on screen, but something else is painted over the aim point. */
+  #cover-slot { left: 400px; top: 3000px; }
+  #banner { position: absolute; left: 400px; top: 3000px;
+            width: 400px; height: 300px; background: #c3423f; z-index: 5; }
+  #page { height: 4000px; }
+</style>
+</head>
+<body>
+<div id="page">
+  <div class="slot" id="rotprop-slot"><iframe id="rotprop" src="pointer.html" title="rotate property"></iframe></div>
+  <div class="slot" id="scaleprop-slot"><iframe id="scaleprop" src="pointer.html" title="scale property"></iframe></div>
+  <div class="slot" id="zoom-slot"><iframe id="zoomed" src="pointer.html" title="zoomed"></iframe></div>
+  <div id="clip-window"><iframe id="clipped" src="pointer.html" title="clipped"></iframe></div>
+  <div class="slot" id="cover-slot"><iframe id="covered" src="pointer.html" title="covered"></iframe></div>
+  <div id="banner">banner</div>
+</div>
+</body>
+</html>

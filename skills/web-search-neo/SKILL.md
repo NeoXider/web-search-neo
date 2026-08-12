@@ -6,9 +6,12 @@ description: Use the Web Search Neo MCP server for free web search without API k
 # Web Search Neo
 
 This file is optional. The server carries its own contract: `web_info()` with no arguments
-returns every action with its required and optional parameters, the observation topics,
-recipes, pitfalls, limits, and examples. Read that first, and use
-`web_info(topic="action_schema", params={"action": "<name>"})` for one full schema.
+returns every action with its summary and its required parameter names, the observation
+topics, recipes, pitfalls, limits, and examples. Optional names, types, and defaults are not
+in it. Read it first, then use `web_info(topic="action_schema", params={"action": "<name>"})`
+for one full schema — which also answers for an observation topic, so
+`params={"action": "network"}` lists what `network` accepts. Ask before guessing: a topic
+refuses any parameter it does not list.
 
 Two tools only. `web_info` reads state; `web_action` performs 1-32 ordered operations.
 One `session_id` is one page — reuse it.
@@ -25,8 +28,11 @@ One `session_id` is one page — reuse it.
   `low_confidence: true` means nothing on the page answers the query - the matches are
   guesses, so read the page instead of clicking one. `ambiguous: true` means two matched
   equally and order alone chose; say which you mean. `role` filters.
-- `page_elements`: flat CSS selectors (piercing paths inside shadow roots and frames),
-  `<select>` options, form metadata, and `visible`/`hidden_reason` per entry.
+- `page_elements`: flat selectors — CSS, a piercing path inside a shadow root or frame, or
+  `""` when none is unique — plus `<select>` options, form metadata, and
+  `visible`/`hidden_reason` per entry. It takes no `frame_selector`: it always answers for
+  the whole page. Only `[contenteditable="true"]` is listed as a field, so a bare
+  `<div contenteditable>` shows up in `page_outline` and here not at all.
 - `console`: console output and uncaught errors with stack frames. Pages through history
   with `since_seq` and `limit`, and keeps its own place, so it never competes with
   `game_probe` for entries.
@@ -45,10 +51,18 @@ is a stub, so pass its selector as `frame_selector` to read it.
 Plain CSS works everywhere and stays the default. `fill`, `upload`, `click`, `wait`, and the
 `form_selector` of `submit` also accept a ref handle such as `ref:3f9a1c04b7e25d18:12` from the
 outline or `find`, and a piercing path such as `#host >>> .inner` that steps through an open
-shadow root or a same-origin iframe per segment. `submit_selector` and every
-`frame_selector` still need plain CSS. Those two forms need a live element handle, so they
-resolve in `temporary`, `persistent`, and `attach` sessions, not in companion `current`
-mode.
+shadow root or a same-origin iframe per segment. `submit_selector` still needs plain CSS.
+Those two forms need a live element handle, so they resolve in `temporary`, `persistent`,
+and `attach` sessions, not in companion `current` mode.
+
+A `frame_selector` always names exactly one frame: CSS matching two is refused with the
+count, everywhere. The accepted *forms* differ. `fill`, `click`, `wait`, `submit`, `upload`,
+`render` and the `page_outline`/`page_text`/`find` topics take all three. The input actions
+— `press_keys`, `pointer`, `touch`, `game_probe`, an `input` batch's pointer entries and
+every `pointer_lock` operation — take plain CSS only: they aim by coordinate and need the
+frame's box in the top-level page, so a ref or a `>>>` path is refused before any event. Do
+not copy the outline's `#host >>> #frame` path into `game_probe` or `input`; give those a
+CSS selector that is unique by itself.
 
 Pass a ref back exactly as it was returned: the first field is the document it came from, so
 a handle from a page you have since navigated away from resolves to nothing and the action
@@ -92,10 +106,31 @@ stay reachable, so local services work unchanged.
 
 `fill` reads every value back off the control, so `filled` means the field holds what you
 asked for and `field_values` says what it actually holds; a rejected value is an error, not
-a success. Checkboxes take `1/yes/y/on/check/checked` or `0/no/n/off/uncheck/unchecked`.
-`fill`, `click`, `submit`, `upload` and `wait` accept `frame_selector`.
-`challenge_detected` means a challenge is *blocking*; `captcha_widgets` lists captchas that
-are merely present, which you can ignore.
+a success, and `success` is false whenever the `errors` map is non-empty. `field_values`
+answers for every selector you sent, failures included, so a control refused before anything
+was typed — disabled, readonly, no such `<option>` — still shows what it holds; `null` means
+nothing could be read back, i.e. the selector matched nothing or the control is gone. The
+browser's own tidying is not a refusal: trimmed whitespace on `email`/`url`, `\r\n`, and a
+handler's case folding all count as filled, while `maxlength` truncation and a rewritten
+value still fail. Checkboxes take `1/yes/y/on/check/checked` or
+`0/no/n/off/uncheck/unchecked`. Only a `<select multiple>` takes a list, reads back as one,
+and has its whole selection replaced by a scalar. Date, time, range and colour controls are
+set rather than typed, so an unparseable value is refused without touching the control and
+the error names the format. `upload`, and `fill`'s `files` key, *replace* an input's
+selection instead of adding to it.
+`fill`, `click`, `submit`, `upload` and `wait` accept `frame_selector`; `wait`'s
+`timeout_seconds` is clamped to 30 and the result reports the effective value.
+`challenge_detected` means a challenge is *blocking* — a widget, or a positioned ancestor of
+it, covering at least half the viewport over the centre, so a dismissible modal with a
+captcha in it does not count. `captcha_widgets` lists captchas that are merely present,
+which you can ignore, and `captcha_scan_incomplete: true` means the walk stopped early, so
+an empty list is not proof of absence. All ride on page summaries — `open`, `fill`, `click`,
+`submit`, `upload`, `wait_challenge` and the `page_elements` topic — and not on
+`page_outline`, `page_text` or `find`, which build no summary.
+
+`fill` blurs every control it writes, which is how the last field fires its `change` event.
+Focus therefore ends on the body: a following `press_keys(["ENTER"])` needs `target_selector`
+to reach a field, and `submit` needs no focus at all.
 
 Open the page, read `page_outline` or `page_elements`, then send ordered `fill`, `upload`,
 `click`, and `submit`. Inspect every result: `success=false`, a validation error, or
@@ -108,9 +143,11 @@ Read `game_probe` first and reuse its `frame_selector` for input and render acti
 
 Use one `input` action for everything that must land in the same frame. Key entries take
 `tap`, `hold`, or `release`; pointer entries take `click`, `double_click`, `hover`, `move`,
-`drag`, `press`, `release`, or `wheel` with `delta_x`/`delta_y`. Coordinates are viewport- or
-frame-local; `coordinate_mode="delta"` moves relatively and `"relative"` is the unclamped
-mode for pointer lock. A held modifier reaches later mouse and touch events. Keys include
+`drag`, `press`, `release`, or `wheel` with `delta_x`/`delta_y`, up to 16 of each kind in one
+call. Coordinates are viewport- or frame-local, and a point that maps outside the window is
+refused rather than dropped; `coordinate_mode="delta"` moves relatively and `"relative"` is
+the unclamped mode for pointer lock. A held modifier reaches later mouse and touch events.
+Keys include
 `F1`-`F12`, `NUMPAD0`-`NUMPAD9`, `META`, arrows, and any printable character; releasing `w`
 lifts a key held as `W`.
 
@@ -133,18 +170,28 @@ lifts a key held as `W`.
 }
 ```
 
-Other input actions: `press_keys` for keyboard-only work — `keys` plus `key_action`
+Other input actions: `press_keys` for keyboard-only work — 1-8 `keys` plus `key_action`
 (`tap|hold|release`), with `repeat`, `hold_seconds`, `focus_mode`, and `hold_frames`, which
-keeps a tap down across N released frames in step mode; `touch` for tap, swipe, and
+keeps a tap down across N released frames in step mode — so one tap call releases
+`hold_frames` frames per `repeat`, not one; `touch` for tap, swipe, and
 multi-finger press/move/release; `touch_emulation` so a game's mobile code path runs at all;
 `pointer_lock` for first-person controls. The keyboard verb is `key_action`, the pointer
 verb `pointer_action`, the touch verb `touch_action`, and pointer lock's is `operation`,
 because the dispatcher itself owns `action`.
 
 `input`, `press_keys`, `pointer`, `touch`, and `step` all accept `include_summary=false`,
-which skips the page read and returns only the action result; `wait_seconds` already
-defaults to `0`. Use both while driving a game frame by frame, and read the page explicitly
-when you actually want to look at it.
+which skips the page read and returns only the action result. Use it while driving a game
+frame by frame, and read the page explicitly when you actually want to look at it. The four
+input actions also take `wait_seconds`, which already defaults to `0`; `step` does not take
+it at all and rejects the call if you send it.
+
+Three refusals arrive before anything reaches the page, so treat them as a fix to make, not
+a retry: tapping a key the session already holds (release it first — a tap's release would
+lift a key the session still counts down), pressing a touch id that is already down (`move`
+or `release` that finger instead), and a point that maps outside the window or onto whatever
+covers the frame there, which is named for you. After a *failed* `input` batch `held_keys`
+over-reports on purpose, because any event in it may have landed — call `release_inputs`
+rather than reading the list.
 
 Render modes:
 
@@ -171,6 +218,8 @@ Use the `console` topic when you need history, `log`/`info` levels, or stack fra
 
 ## Batch results
 
-`web_action` runs up to 32 ordered actions. Check top-level `success`, `failure_count`, and
-every entry in `results`. Use `continue_on_error=true` only when later actions are
-independent or cleanup must still run.
+`web_action` runs up to 32 ordered actions and stops at the first failure. Check top-level
+`success`, `failure_count`, `stopped_early`, and every entry in `results`. Use
+`continue_on_error=true` when later actions are independent or cleanup must still run — a
+game batch ending in `release_inputs` and `render mode=normal` skips both if an earlier
+action fails, leaving the page frozen with keys held.

@@ -92,8 +92,10 @@ If an older prompt or client still requires the previous individual tool names, 
 ### Optional Codex-compatible skill
 
 The server describes itself: `web_info()` with no arguments returns every action with its
-parameters, the observation topics, recipes, pitfalls, limits, and examples. Installing the
-skill is therefore optional.
+summary and its required parameter names, the observation topics, recipes, pitfalls, limits,
+and examples. Optional parameters are not in that document — `web_info(topic="action_schema",
+params={"action": "<action or topic>"})` generates the full schema for one of them on demand.
+Installing the skill is therefore optional.
 
 Copy the bundled skill to the local Codex skill directory and restart Codex:
 
@@ -125,9 +127,21 @@ Some clients do not support a separate working-directory field. In that case kee
 ## 6. Connect the current signed-in Chrome (default)
 
 `profile_mode="current"` is the default. It controls tabs in the Chrome you already
-use, preserves the page's existing login, opens new tabs into a visible group named
-`🟢 AI` — purple, when the companion is the one creating it — and leaves tabs open when MCP
-sessions close.
+use, preserves the page's existing login, and opens new tabs into a visible group named
+`🟢 AI` — purple, when the companion is the one creating it. It cleans up after itself: a
+tab the agent opened is closed when its session closes, and so is any still open when the
+server exits, because otherwise every run would leave another tab behind in your browser. A
+tab you had open and handed over with `attach_tab` is the one that survives — it was never
+the agent's to close, and `close` only detaches from it.
+
+With one deliberate exception, and it is the one that protects your tabs. Tab ids restart
+with Chrome, so a session that outlived a Chrome restart names a tab number that now belongs
+to somebody else — quite possibly a tab of yours. Nothing at all is sent to the browser for
+such a session: not by `close`, not by `close_all`, not by the shutdown hook, not by the
+sweep that reclaims session slots. The session is dropped in silence and `close` says so
+with `browser_gone: true` and a note, instead of reporting a clean close. Until this landed,
+closing one of those sessions sent `tabs.remove` for the old id to the *new* browser, closed
+whichever of your tabs had inherited the number, and reported success.
 
 From 1.3.2 it stays out of your way while it does so: agent tabs open in the background, in
 a window that is already there, and navigation no longer brings a tab to the front, so you
@@ -161,8 +175,11 @@ one afterwards. So these three steps are yours:
 2. Switch on **Developer mode** (top-right of that page).
 3. Choose **Load unpacked** and select the repository's `chrome-extension` folder.
 
-Leave **Web Search Neo Companion** enabled; its toolbar badge reads `ON` once it reaches the
-server. You never create or copy a token by hand — the server writes it on every start.
+Leave **Web Search Neo Companion** enabled; its toolbar badge reads `ON` once it has
+connected and authenticated to the [bridge daemon](#the-bridge-daemon). The daemon, not the
+MCP server — it outlives every server process, so the badge says nothing about whether an
+agent is running, and stays `ON` when none is. You never create or copy a token by hand —
+the server writes it on every start.
 
 Earlier revisions tried to perform those clicks for you through Windows UI Automation. That
 code is gone. It depended on the interface language, on which window happened to have focus,
@@ -265,10 +282,10 @@ work; it is documented because the file exists on your disk.
   `$XDG_DATA_HOME/WebSearchNeo/bridge-token` — by default
   `~/.local/share/WebSearchNeo/bridge-token` — created with `0600` permissions on POSIX.
 - The token is machine-local and per-user. Never copy it to another machine or into a
-  repository. If it leaks: delete the file, run `python main.py --bridge --stop`, restart the
-  MCP server, and reload the companion. Stopping the daemon is the part that is easy to
-  forget — it keeps the token it read at startup in memory, so a new secret it never saw
-  would simply be refused.
+  repository. If it leaks: delete the file, restart the MCP server, and reload the companion.
+  Stopping the daemon used to be a required step, because it kept the token it had read at
+  startup and would refuse a secret it had never seen; it now re-reads the file before
+  calling any token a mismatch, so rotation survives a running daemon.
 - A copy is written into `chrome-extension/bridge-token.js` whenever the bridge comes up and
   on every `setup_current_chrome` call. That file is in `.gitignore`; a fresh clone does not
   contain it, and the companion simply retries until it has been written.
@@ -440,9 +457,11 @@ the values it started with, so stop it with `--bridge --stop` after changing the
 `WEB_SEARCH_NEO_ALLOW_PLAIN_HTTP` accepts `1`, `true`, `yes`, or `on`. Without it, plain
 `http://` to a public host is refused for both page fetches and browser `open`, and each
 redirect hop is validated the same way. Loopback, private, and link-local addresses, plus
-`localhost` and hosts ending in `.local`, `.localhost`, `.internal`, or `.home.arpa`, are
-always allowed over plain HTTP, so local services such as ComfyUI or a dev server need no
-configuration change.
+`localhost` and hosts ending in `.local`, `.localhost`, `.internal`, `.home.arpa`, `.lan`,
+`.home`, `.intranet`, `.private`, or `.corp`, are always allowed over plain HTTP — and so is
+any single-label host such as `http://nas/`, because a name with no dot cannot exist on the
+public DNS and testing it by resolution would cost a lookup per URL and per redirect hop. So
+local services such as ComfyUI or a dev server need no configuration change.
 
 ## Troubleshooting
 
@@ -479,9 +498,18 @@ python main.py --bridge --stop
 python main.py --bridge
 ```
 
-A badge that reads `OFF` means no daemon is listening — none has been started since the
-machine booted, the last one exited after its idle window, or it was stopped. That is not a
-fault, but it is no longer what you see between two agent calls. The worker retries with an
+A badge that reads `OFF` means this companion is not connected and authenticated. Usually
+that is because no daemon is listening — none has been started since the machine booted, the
+last one exited after its idle window, or it was stopped. That is not a fault, but it is no
+longer what you see between two agent calls.
+
+Two other cases read `OFF` while the port is held by a perfectly healthy daemon, which is
+why "start a daemon" is not the automatic answer: the daemon refused this companion's token
+(the case above, and the daemon log names it), or a companion running in a *second* Chrome
+profile authenticated later and displaced this one — the bridge holds exactly one companion
+connection and the newest wins. Keep the companion enabled in one profile at a time.
+
+While it is `OFF`, the worker retries with an
 exponential backoff — about 1.5 seconds after the first
 failure, doubling to a ceiling of one minute, and resetting to the floor as soon as a
 handshake verifies. Starting the browser, reloading the extension, and clicking its toolbar
@@ -510,10 +538,13 @@ or when `setup_current_chrome` answered `self_update: "unsupported"` or `"timeou
    companion token yet, run setup_current_chrome` means `chrome-extension/bridge-token.js`
    is missing: start the MCP server from the clone, which writes it, or send a
    `setup_current_chrome` action. `handshake refused (1008) Companion token mismatch` means
-   the file holds a different secret than the bridge does — the usual cause is two clones,
-   or a copied checkout, so start the server from the same directory Chrome loaded and
-   reload the extension again. A daemon that is still running with a secret rotated out from
-   under it says the same thing; `python main.py --bridge --stop` retires it.
+   `chrome-extension/bridge-token.js` holds a different secret than the daemon does, and
+   there is essentially one cause: that file belongs to a *clone*, while the secret it is
+   compared against is per-user and singular. Chrome is loading one checkout and a server is
+   refreshing another, so the copy Chrome reads never catches up. Start the server from the
+   very directory **Load unpacked** points at, then reload the extension. Restarting the
+   daemon does not help and never did after the daemon learned to re-read the token file:
+   it already fetches the current secret from disk before calling anything a mismatch.
 3. Check the card's version. It must read 1.3.2; anything older than 1.3.0 cannot
    authenticate at all, and Chrome only picks up the new manifest on reload.
 4. `%LOCALAPPDATA%\WebSearchNeo\bridge-daemon.log` records the bridge's side: `Rejected a

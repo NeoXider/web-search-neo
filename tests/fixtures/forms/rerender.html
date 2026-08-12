@@ -1,0 +1,34 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Checkout</title></head>
+<body>
+<h1>Checkout</h1>
+<form id="checkout">
+  <label for="coupon">Coupon</label>
+  <div id="coupon-slot"><input id="coupon" name="coupon"></div>
+
+  <label for="promo">Promo</label>
+  <div id="promo-slot"><input id="promo" name="promo"></div>
+
+  <p id="notice"></p>
+</form>
+<script>
+  // The change handler is where a framework re-renders and where a server-side
+  // rule rejects a code. Either way the control the value was typed into is
+  // detached, and whatever it still holds is not what the page will submit.
+  function wireCoupon() {
+    document.getElementById('coupon').addEventListener('change', () => {
+      document.getElementById('coupon-slot').innerHTML =
+        '<input id="coupon" name="coupon">';
+      document.getElementById('notice').textContent = 'Coupon rejected';
+      wireCoupon();
+    });
+  }
+  wireCoupon();
+  // The other kind: the control is not replaced, it is taken away.
+  document.getElementById('promo').addEventListener('change', () => {
+    document.getElementById('promo-slot').textContent = 'Promo codes are closed';
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,29 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Multiple choice</title></head>
+<body>
+<h1>Multiple choice</h1>
+<form id="survey">
+  <label for="langs">Languages</label>
+  <select id="langs" name="langs" multiple size="4">
+    <option value="a">Ada</option>
+    <option value="b">Basic</option>
+    <option value="c">C</option>
+  </select>
+
+  <label for="one">Single</label>
+  <select id="one" name="one">
+    <option value="x">Ex</option>
+    <option value="y">Why</option>
+  </select>
+</form>
+<script>
+  window.selectedLangs = () =>
+    Array.from(document.getElementById('langs').selectedOptions).map(option => option.value);
+  window.changed = [];
+  for (const node of document.querySelectorAll('#survey select')) {
+    node.addEventListener('change', () => window.changed.push(node.id));
+  }
+</script>
+</body>
+</html>

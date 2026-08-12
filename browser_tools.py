@@ -13,7 +13,8 @@ from pathlib import Path
 import re
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from selenium import webdriver
 from selenium.common.exceptions import (
@@ -34,6 +35,7 @@ from chrome_bridge import (
     DEFAULT_TAB_GROUP,
     ChromeBridgeDriver,
     ChromeBridgeError,
+    ChromeBridgeUnavailable,
     get_chrome_bridge,
     list_current_chrome_tabs,
 )
@@ -422,23 +424,69 @@ def _release_claimed_tab(tab_id: int | None) -> None:
         logger.debug("Could not release tab %s: %s", tab_id, exc)
 
 
-def _tab_is_gone(session: BrowserSession) -> bool:
-    """Whether the companion says this session's tab no longer exists.
+def _abandon_driver(driver: Any, *, owns_browser: bool, owns_tab: bool) -> None:
+    """Give back a browser that no session will ever own. Never raises.
 
-    Only an answer counts. A transport failure means the daemon or the companion
-    is down, which says nothing about the tab and would otherwise condemn every
-    session at once the moment Chrome's companion blinked.
+    For the paths where a driver came up but the session around it did not. The
+    tab is closed only if we opened it - a borrowed one goes back to the user
+    exactly as it was found - but the debugger comes off either way, because a
+    tab left attached wears the "is being debugged" banner until the user
+    clears it themselves.
+    """
+    if driver is None:
+        return
+    if owns_tab and hasattr(driver, "close_tab"):
+        try:
+            driver.close_tab()
+        except Exception as exc:
+            logger.warning(
+                "Could not close the tab of a session that never opened: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+    try:
+        if owns_browser:
+            driver.quit()
+        else:
+            driver.service.stop()
+    except Exception as exc:
+        logger.warning(
+            "Could not let go of the browser of a session that never opened: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+
+
+def _tab_still_exists(session: BrowserSession) -> bool | None:
+    """Whether this session's tab is still open; ``None`` when nobody could say.
+
+    Only an answer counts. The companion refusing the question by name ("No tab
+    with id 42") is evidence about the tab; the question never arriving is
+    evidence about the link, and reading the second as the first condemns every
+    session at once the moment Chrome's companion blinks - a service worker
+    eviction, an extension reload, a link that dropped. That is what
+    ``ChromeBridgeUnavailable`` exists to separate, because every one of those
+    transport failures raises ``ChromeBridgeError`` too.
     """
     driver = session.driver
     if not getattr(driver, "is_extension_bridge", False):
-        return False
+        return True
     try:
         driver.bridge.request("tabs.get", {"tabId": driver.tab_id}, timeout=2.0)
+    except ChromeBridgeUnavailable:
+        return None
     except ChromeBridgeError:
-        return True
-    except Exception:
         return False
-    return False
+    except Exception:
+        # A timeout, a socket error: the companion never answered, so it said
+        # nothing about the tab either.
+        return None
+    return True
+
+
+def _tab_is_gone(session: BrowserSession) -> bool:
+    """Whether the companion said, in so many words, that the tab is not there."""
+    return _tab_still_exists(session) is False
 
 
 def _drop_sessions_whose_tab_is_gone() -> None:
@@ -447,6 +495,14 @@ def _drop_sessions_whose_tab_is_gone() -> None:
     Only called at the session cap, because it costs one round trip per session:
     without it, four tabs closed from the tab strip leave a server that refuses
     to open a fifth and cannot say why.
+
+    Every round trip here is made with no lock held. The probe is one trip per
+    session and teardown several more, while every browser tool call goes through
+    ``_get_session``, which wants ``_sessions_lock``: sweeping four wedged
+    sessions inside it stalls the whole server for as long as the companion takes
+    to answer. A session whose own lock is not free is skipped rather than waited
+    for - a thread is mid-action on it, so it is neither idle nor safe to pull
+    the debugger out from under.
     """
     with _sessions_lock:
         candidates = [
@@ -455,21 +511,33 @@ def _drop_sessions_whose_tab_is_gone() -> None:
             if session.profile_mode == "current"
         ]
     for session_id, session in candidates:
-        if not _tab_is_gone(session):
+        if not session.lock.acquire(blocking=False):
             continue
-        with _sessions_lock:
-            if _sessions.get(session_id) is not session:
-                continue
-            del _sessions[session_id]
-        logger.info("Dropped session '%s': its tab is no longer open", session_id)
-        # No page is left to release held input on and no tab to close, so the
-        # full teardown would only collect failures. Give up the debugger
-        # attachment and nothing else - Chrome dropped it with the tab anyway.
         try:
-            session.driver.quit()
-        except Exception:
-            pass
-        _release_claimed_tab(session.current_tab_id)
+            if _browser_run_changed(session) is not None:
+                # Its browser is gone, so its slot is free - but this is a
+                # teardown path too, and it may no more send `debugger.detach`
+                # and a claim release at that tab id than the others: the id
+                # names somebody else's tab now.
+                _discard_stale_session(session_id, session)
+                continue
+            if not _tab_is_gone(session):
+                continue
+            with _sessions_lock:
+                if _sessions.get(session_id) is not session:
+                    continue
+                del _sessions[session_id]
+            logger.info("Dropped session '%s': its tab is no longer open", session_id)
+            # No page is left to release held input on and no tab to close, so the
+            # full teardown would only collect failures. Give up the debugger
+            # attachment and nothing else - Chrome dropped it with the tab anyway.
+            try:
+                session.driver.quit()
+            except Exception:
+                pass
+            _release_claimed_tab(session.current_tab_id)
+        finally:
+            session.lock.release()
 
 
 def _create_session(
@@ -488,75 +556,92 @@ def _create_session(
         session_id, profile_mode, profile_id, debugger_address
     )
     effective_headless = _resolve_headless(mode, headless)
-    with _sessions_condition:
-        while session_id in _pending_sessions:
-            _sessions_condition.wait(timeout=30)
-        existing = _sessions.get(session_id)
-        if existing is not None and _browser_run_changed(existing) is not None:
-            # Its browser is gone, and reopening under the same name is exactly
-            # the right response to that - so drop it here instead of refusing
-            # the call and making the caller close a session that no longer is one.
-            del _sessions[session_id]
-            existing = None
-        if existing is not None:
-            if (
-                (headless is not None and existing.headless != effective_headless)
-                or existing.profile_mode != mode
-                or existing.profile_id != selected_profile
-                or existing.debugger_address != address
-                or (
-                    current_tab_id is not None
-                    and existing.current_tab_id != current_tab_id
+    # The sweep at the cap asks Chrome about every current-mode session, and it
+    # has to do that with the lock down: a wedged companion made an unrelated
+    # `_get_session` on another thread wait the whole sweep out, and every
+    # browser tool call is a `_get_session`. So the loop drops out of the lock to
+    # sweep and comes back round, at most once.
+    swept = False
+    while True:
+        with _sessions_condition:
+            while session_id in _pending_sessions:
+                _sessions_condition.wait(timeout=30)
+            existing = _sessions.get(session_id)
+            if existing is not None and _browser_run_changed(existing) is not None:
+                # Its browser is gone, and reopening under the same name is exactly
+                # the right response to that - so drop it here instead of refusing
+                # the call and making the caller close a session that no longer is one.
+                del _sessions[session_id]
+                existing = None
+            if existing is not None:
+                if (
+                    (headless is not None and existing.headless != effective_headless)
+                    or existing.profile_mode != mode
+                    or existing.profile_id != selected_profile
+                    or existing.debugger_address != address
+                    or (
+                        current_tab_id is not None
+                        and existing.current_tab_id != current_tab_id
+                    )
+                ):
+                    raise ValueError(
+                        "Session already exists with different browser/profile options; close it first"
+                    )
+                return existing
+            at_cap = len(_sessions) + len(_pending_sessions) >= MAX_SESSIONS
+            if not (at_cap and not swept):
+                if at_cap:
+                    oldest = min(
+                        _sessions.values(), key=lambda item: item.last_used, default=None
+                    )
+                    stalest = next(
+                        (name for name, item in _sessions.items() if item is oldest), None
+                    )
+                    raise RuntimeError(
+                        f"Maximum of {MAX_SESSIONS} browser sessions reached; close one first. "
+                        f"Open: {sorted(_sessions)}."
+                        + (f" Least recently used: '{stalest}'." if stalest else "")
+                    )
+                selected_current_tab_id = (
+                    int(current_tab_id)
+                    if mode == "current" and current_tab_id is not None
+                    else None
                 )
-            ):
-                raise ValueError(
-                    "Session already exists with different browser/profile options; close it first"
-                )
-            return existing
-        if len(_sessions) + len(_pending_sessions) >= MAX_SESSIONS:
-            _drop_sessions_whose_tab_is_gone()
-        if len(_sessions) + len(_pending_sessions) >= MAX_SESSIONS:
-            oldest = min(_sessions.values(), key=lambda item: item.last_used, default=None)
-            stalest = next(
-                (name for name, item in _sessions.items() if item is oldest), None
-            )
-            raise RuntimeError(
-                f"Maximum of {MAX_SESSIONS} browser sessions reached; close one first. "
-                f"Open: {sorted(_sessions)}."
-                + (f" Least recently used: '{stalest}'." if stalest else "")
-            )
-        selected_current_tab_id = int(current_tab_id) if mode == "current" and current_tab_id is not None else None
-        if selected_current_tab_id is not None:
-            active_current_tabs = {
-                int(item.current_tab_id)
-                for item in _sessions.values()
-                if item.profile_mode == "current" and item.current_tab_id is not None
-            }
-            if (
-                selected_current_tab_id in active_current_tabs
-                or selected_current_tab_id in _pending_current_tab_ids
-            ):
-                raise RuntimeError(
-                    f"Current Chrome tab {selected_current_tab_id} is already claimed by another session"
-                )
-            _pending_current_tab_ids.add(selected_current_tab_id)
-        if browser_key:
-            active_keys = {
-                (
-                    f"persistent:{item.profile_id}"
-                    if item.profile_mode == "persistent"
-                    else f"attach:{item.debugger_address}"
-                )
-                for item in _sessions.values()
-                if item.profile_mode in {"persistent", "attach"}
-            }
-            if browser_key in active_keys or browser_key in _pending_browser_keys:
-                raise RuntimeError(
-                    "This persistent profile or debugger address is already in use"
-                )
-            _pending_browser_keys.add(browser_key)
-        _pending_sessions.add(session_id)
+                if selected_current_tab_id is not None:
+                    active_current_tabs = {
+                        int(item.current_tab_id)
+                        for item in _sessions.values()
+                        if item.profile_mode == "current" and item.current_tab_id is not None
+                    }
+                    if (
+                        selected_current_tab_id in active_current_tabs
+                        or selected_current_tab_id in _pending_current_tab_ids
+                    ):
+                        raise RuntimeError(
+                            f"Current Chrome tab {selected_current_tab_id} is already claimed by another session"
+                        )
+                    _pending_current_tab_ids.add(selected_current_tab_id)
+                if browser_key:
+                    active_keys = {
+                        (
+                            f"persistent:{item.profile_id}"
+                            if item.profile_mode == "persistent"
+                            else f"attach:{item.debugger_address}"
+                        )
+                        for item in _sessions.values()
+                        if item.profile_mode in {"persistent", "attach"}
+                    }
+                    if browser_key in active_keys or browser_key in _pending_browser_keys:
+                        raise RuntimeError(
+                            "This persistent profile or debugger address is already in use"
+                        )
+                    _pending_browser_keys.add(browser_key)
+                _pending_sessions.add(session_id)
+                break
+        swept = True
+        _drop_sessions_whose_tab_is_gone()
     session: BrowserSession | None = None
+    driver: Any = None
     claim: dict[str, Any] = {}
     claimed_tab: int | None = None
     try:
@@ -603,6 +688,15 @@ def _create_session(
         if session is None:
             # The claim outlives this call only when a session came out of it.
             _release_claimed_tab(claimed_tab)
+            # And so does the browser. A claim refused on a tab we had just
+            # opened used to be raised straight past this point, leaving that tab
+            # open in the user's Chrome with the debugger attached to it, its
+            # banner up and no session that could ever close it.
+            _abandon_driver(
+                driver,
+                owns_browser=mode != "attach",
+                owns_tab=mode == "current" and current_tab_id is None,
+            )
         with _sessions_condition:
             if session is not None:
                 _sessions[session_id] = session
@@ -651,11 +745,27 @@ def _current_browser_run() -> str | None:
 
 
 def _browser_run_changed(session: BrowserSession) -> str | None:
-    """The current run id, but only when it proves the session's tab is gone."""
-    if session.profile_mode != "current" or not session.browser_run:
+    """The current run id, but only when it proves the session's tab is gone.
+
+    A session whose own run is unknown - opened against a companion older than
+    1.3.2, or while the link happened to be down - adopts the first run that
+    becomes knowable instead of staying unknowable for good. Both
+    ``bridge_daemon._adopt_browser_run`` and ``ChromeBridge._apply_state``
+    back-fill the same way and for the same reason: the run in front of us is the
+    one this session has been driving, because a restart in between would have
+    taken its debugger attachment with it. Left unadopted, the session goes on
+    driving "tab 42" across every later Chrome restart, which is the one thing
+    the run id exists to prevent.
+    """
+    if session.profile_mode != "current":
         return None
     current = _current_browser_run()
-    if current is None or current == session.browser_run:
+    if current is None:
+        return None
+    if not session.browser_run:
+        session.browser_run = current
+        return None
+    if current == session.browser_run:
         return None
     return current
 
@@ -752,7 +862,16 @@ const MARKERS = [
 ];
 const found = [];
 const markers = [];
-const budget = {nodes: 0};
+// The walk used to stop after 8000 nodes, which a marketplace listing page eats
+// before the first shadow root is entered - and nothing said it had stopped, so
+// "no captcha here" and "gave up looking" read the same. Walking 60000 elements
+// costs 10ms, and the pages most likely to gate are the ones with that many.
+const NODE_BUDGET = 50000;
+const DEPTH_LIMIT = 8;
+// A widget over the middle of the viewport is only in the way when the layer it
+// sits in seals off enough of the page that there is nothing else to read.
+const BLOCKING_COVER = 0.5;
+const budget = {nodes: 0, truncated: false};
 let blocking = false;
 
 function isVisible(element) {
@@ -779,16 +898,65 @@ function matchedSelector(element, selectors) {
   return null;
 }
 
-function scan(root, where, atCenter, depth) {
-  if (found.length >= 3 || depth > 3 || budget.nodes > 8000) return;
-  const doc = root.ownerDocument || root;
-  const view = doc.defaultView;
-  let centerNode = null;
-  if (atCenter && view) {
+function viewOf(node) {
+  const doc = node.ownerDocument;
+  return (doc && doc.defaultView) || null;
+}
+
+function coverOfRect(rect, view) {
+  const area = view.innerWidth * view.innerHeight;
+  if (area <= 0) return 0;
+  const width = Math.min(rect.right, view.innerWidth) - Math.max(rect.left, 0);
+  const height = Math.min(rect.bottom, view.innerHeight) - Math.max(rect.top, 0);
+  return width <= 0 || height <= 0 ? 0 : (width * height) / area;
+}
+
+function overPoint(rect, x, y) {
+  return rect.left <= x && rect.right >= x && rect.top <= y && rect.bottom >= y;
+}
+
+// Zero unless the widget is over the centre of its own viewport; otherwise the
+// share of that viewport the widget - or the positioned layer it is painted in -
+// covers. It is that layer, the scrim of a modal, that actually stops the page
+// being used; the widget itself is far too small to.
+//
+// Boxes, not a hit test: elementFromPoint retargets shadow content to its host,
+// so a widget inside a web component could never be the node at the centre, and
+// the veil a provider paints over its own widget while it verifies wins that hit
+// test while blocking the page just as thoroughly.
+function coverOverCenter(element) {
+  const view = viewOf(element);
+  if (!view) return 0;
+  const x = view.innerWidth / 2;
+  const y = view.innerHeight / 2;
+  const rect = element.getBoundingClientRect();
+  if (!overPoint(rect, x, y)) return 0;
+  let cover = coverOfRect(rect, view);
+  let node = element;
+  for (let step = 0; step < 40 && node; step += 1) {
+    // parentNode.host is the step out of a shadow tree, which parentElement -
+    // and every hit test - stops dead at.
+    const parent = node.parentElement || (node.parentNode && node.parentNode.host) || null;
+    if (!parent) break;
+    node = parent;
+    let position = '';
+    let ancestorView = null;
     try {
-      centerNode = doc.elementFromPoint(view.innerWidth / 2, view.innerHeight / 2);
-    } catch (error) { centerNode = null; }
+      ancestorView = viewOf(node);
+      position = ancestorView.getComputedStyle(node).position;
+    } catch (error) { position = ''; }
+    if (!ancestorView) break;
+    if (position !== 'fixed' && position !== 'absolute' && position !== 'sticky') continue;
+    const box = node.getBoundingClientRect();
+    if (overPoint(box, x, y)) cover = Math.max(cover, coverOfRect(box, ancestorView));
   }
+  return cover;
+}
+
+function scan(root, where, atCenter, depth, outerCover) {
+  if (found.length >= 3) return;
+  if (depth > DEPTH_LIMIT || budget.nodes > NODE_BUDGET) { budget.truncated = true; return; }
+  const doc = root.ownerDocument || root;
   let matches = [];
   try { matches = Array.from(root.querySelectorAll(WIDGETS.join(','))); } catch (error) { matches = []; }
   for (const element of matches) {
@@ -797,7 +965,8 @@ function scan(root, where, atCenter, depth) {
     if (selector === '[data-sitekey]' && !isCaptchaSitekey(element)) continue;
     if (!isVisible(element)) continue;
     found.push(selector + where);
-    if (centerNode && (element === centerNode || element.contains(centerNode))) blocking = true;
+    const cover = atCenter ? coverOverCenter(element) : 0;
+    if (cover > 0 && Math.max(cover, outerCover) >= BLOCKING_COVER) blocking = true;
     if (found.length >= 3) break;
   }
   try {
@@ -815,21 +984,23 @@ function scan(root, where, atCenter, depth) {
   try { walker = doc.createTreeWalker(root, NodeFilter.SHOW_ELEMENT); } catch (error) { walker = null; }
   while (walker) {
     const element = walker.nextNode();
-    if (!element || found.length >= 3 || ++budget.nodes > 8000) return;
+    if (!element || found.length >= 3) return;
+    if (++budget.nodes > NODE_BUDGET) { budget.truncated = true; return; }
     if (element.shadowRoot) {
-      scan(element.shadowRoot, ' (in shadow DOM)', atCenter, depth + 1);
+      // A shadow tree is painted in its host's layer, so it stands over the page
+      // exactly as far as the host does.
+      scan(element.shadowRoot, ' (in shadow DOM)', atCenter, depth + 1, outerCover);
     } else if (element.tagName === 'IFRAME') {
       let inner = null;
       try { inner = element.contentDocument; } catch (error) { inner = null; }
       if (!inner) continue;
-      const insideCenter = atCenter && !!centerNode &&
-        (element === centerNode || element.contains(centerNode));
-      scan(inner, ' (in a frame)', insideCenter, depth + 1);
+      const frameCover = atCenter ? coverOverCenter(element) : 0;
+      scan(inner, ' (in a frame)', frameCover > 0, depth + 1, Math.max(outerCover, frameCover));
     }
   }
 }
 
-scan(document, '', true, 0);
+scan(document, '', true, 0, 0);
 const heading = (document.title || '') + ' ' +
   Array.from(document.querySelectorAll('h1, h2')).slice(0, 3)
     .map(node => node.innerText || '').join(' ');
@@ -838,6 +1009,7 @@ return {
   widgets: found,
   markers: markers,
   blocking: blocking,
+  truncated: budget.truncated,
   heading: heading.slice(0, 400),
   body: body.slice(0, 2000),
   body_length: body.length
@@ -915,10 +1087,16 @@ def _classify_challenge(probe: dict[str, Any]) -> dict[str, Any]:
 
     A captcha widget is only a *challenge* when it stands between the caller and
     the page: on an interstitial that holds nothing else, or lying over the
-    middle of the viewport. The same widget at the foot of a readable article
+    middle of the viewport in a layer that seals the rest of it off. A dismissible
+    sign-in box is over the centre too and blocks nothing. The same widget at the
+    foot of a readable article
     guards that one form and nothing more, so it is reported in
     ``captcha_widgets`` while ``challenge_detected`` stays false - otherwise the
     agent parks for three minutes waiting for a human it does not need.
+
+    ``captcha_scan_incomplete`` says the page was too large or too deeply nested
+    for the walk to finish, so an empty ``captcha_widgets`` means "nothing found
+    where I looked" rather than "there is nothing here".
     """
     widgets = [str(item) for item in (probe.get("widgets") or [])]
     markers = [str(item) for item in (probe.get("markers") or [])]
@@ -927,6 +1105,7 @@ def _classify_challenge(probe: dict[str, Any]) -> dict[str, Any]:
     interstitial_page = body_length <= _CHALLENGE_BODY_LIMIT
     sparse_body = str(probe.get("body") or "").lower() if interstitial_page else ""
     phrase = _interstitial_phrase(heading, sparse_body)
+    incomplete = bool(probe.get("truncated"))
     seen = widgets + markers
     if seen:
         if bool(probe.get("blocking")) or interstitial_page or phrase:
@@ -936,6 +1115,7 @@ def _classify_challenge(probe: dict[str, Any]) -> dict[str, Any]:
                 "challenge_evidence": seen[:3],
                 "manual_action_required": True,
                 "captcha_widgets": seen,
+                "captcha_scan_incomplete": incomplete,
             }
         return {
             "challenge_detected": False,
@@ -943,6 +1123,7 @@ def _classify_challenge(probe: dict[str, Any]) -> dict[str, Any]:
             "challenge_evidence": [],
             "manual_action_required": False,
             "captcha_widgets": seen,
+            "captcha_scan_incomplete": incomplete,
         }
     if phrase:
         return {
@@ -951,6 +1132,7 @@ def _classify_challenge(probe: dict[str, Any]) -> dict[str, Any]:
             "challenge_evidence": [phrase[1]],
             "manual_action_required": True,
             "captcha_widgets": [],
+            "captcha_scan_incomplete": incomplete,
         }
     return {
         "challenge_detected": False,
@@ -958,6 +1140,7 @@ def _classify_challenge(probe: dict[str, Any]) -> dict[str, Any]:
         "challenge_evidence": [],
         "manual_action_required": False,
         "captcha_widgets": [],
+        "captcha_scan_incomplete": incomplete,
     }
 
 
@@ -1009,13 +1192,28 @@ def _leave_claimed_tab(
     driver = create_driver(
         width, height, session.headless, "current", None, None, None, tab_group
     )
-    if getattr(driver, "tab_id", None) is not None:
-        _claim_tab(int(driver.tab_id))
+    claim: dict[str, Any] = {}
+    try:
+        if getattr(driver, "tab_id", None) is not None:
+            claim = _claim_tab(int(driver.tab_id))
+    except BaseException:
+        # The session is still on the borrowed tab and nothing below has run, so
+        # the tab just opened belongs to nobody: close it here or it stays open
+        # in the user's Chrome with the debugger attached, and the caller's own
+        # cleanup - which closes the session, not this - can never reach it.
+        _abandon_driver(driver, owns_browser=True, owns_tab=True)
+        raise
     session.driver = driver
     session.current_tab_id = getattr(driver, "tab_id", None)
     session.tab_group = getattr(driver, "actual_tab_group", None)
     session.owns_tab = True
-    session.browser_run = _current_browser_run()
+    # The run the claim was granted in, else the one the companion reports, else
+    # the one already held: a companion that blinked at this instant makes the
+    # run unknowable for a moment, and writing that None over a known run turns
+    # the stale check off for this session for good.
+    session.browser_run = (
+        claim.get("browser_run") or _current_browser_run() or session.browser_run
+    )
     # Every buffer below is an account of the borrowed tab. Carrying it into the
     # new one would answer "what did this page do" with another page's history.
     session.console = ConsoleCursor()
@@ -1110,7 +1308,10 @@ def open_page(
             "tab_group": session.tab_group,
             **({"left_claimed_tab": released_tab} if released_tab is not None else {}),
         }
-    except (WebDriverException, ChromeBridgeError, TimeoutError, ConnectionError, OSError):
+    # RuntimeError rather than ChromeBridgeError (which it covers, being its
+    # base): a tab claim refused mid-open raises a plain one, and it used to
+    # escape here, leaving the session registered and half moved.
+    except (WebDriverException, RuntimeError, TimeoutError, ConnectionError, OSError):
         close_session(session_id)
         raise
 
@@ -1405,6 +1606,11 @@ def wait_for_element(
     ``selector`` accepts the same three locator forms as ``fill``: CSS, a ref
     handle, and a piercing path. ``frame_selector`` names the frame a CSS
     selector is looked up in, exactly as it does for ``find`` and ``page_text``.
+
+    The wait is capped at 30 seconds - a two-minute blocking wait inside a tool
+    call is worse than the surprise - and ``timeout_seconds`` in the result is the
+    wait that was really made, not the one asked for. A timeout says the same
+    number, so a wait that was cut short cannot read as one that ran its course.
     """
     if state not in _ELEMENT_STATES:
         raise ValueError("state must be 'present', 'visible', or 'clickable'")
@@ -1423,6 +1629,7 @@ def wait_for_element(
             "selector": selector,
             "state": state,
             "tag": tag,
+            "timeout_seconds": timeout,
             "frame_selector": frame_selector,
         }
 
@@ -1504,6 +1711,7 @@ const readonlyIgnored = ['checkbox', 'radio', 'range', 'color', 'file', 'hidden'
 return {
   tag: element.tagName.toLowerCase(),
   type: type,
+  multiple: !!element.multiple,
   disabled: !!element.disabled,
   readonly: !!element.readOnly && readonlyIgnored.indexOf(type) < 0
 };
@@ -1511,28 +1719,107 @@ return {
 
 # Reading the value back is the only honest report: maxlength truncates, a number
 # input drops text it cannot parse, and an input handler may rewrite the lot.
-# Blurring first both settles those handlers and fires the `change` event that the
-# last field of a fill otherwise never got, because nothing ever moved off it.
-_FIELD_STATE_SCRIPT = """
+_FIELD_READ_BODY = """
+// The control written to is not always the control the page kept: a change
+// handler is free to re-render it away, and reading on through the orphan
+// reports a value the page has already thrown out.
+if (!element.isConnected) return {kind: 'detached'};
+const tag = element.tagName.toLowerCase();
+if (tag === 'select') {
+  const chosen = Array.from(element.selectedOptions);
+  return {
+    kind: 'select',
+    multiple: !!element.multiple,
+    values: chosen.map(option => String(option.value)),
+    texts: chosen.map(option => String(option.text || '').trim()),
+    value: element.value,
+    text: chosen[0] ? String(chosen[0].text || '').trim() : '',
+    disabled: chosen[0] ? !!chosen[0].disabled : false
+  };
+}
+const type = String(element.type || '').toLowerCase();
+if (type === 'checkbox' || type === 'radio') return {kind: 'checked', value: !!element.checked};
+if (element.isContentEditable) return {kind: 'text', type: type, value: element.textContent};
+return {kind: 'text', type: type, value: element.value === undefined ? '' : element.value};
+"""
+
+# Reading without touching anything: what a control that refused a write is left
+# holding, so ``field_values`` answers for every selector it was asked about.
+_FIELD_READ_SCRIPT = "const element = arguments[0];\n" + _FIELD_READ_BODY
+
+# Blurring before the read settles those handlers and fires the `change` event
+# that the last field of a fill otherwise never got, because nothing ever moved
+# off it.
+_FIELD_STATE_SCRIPT = (
+    """
 const element = arguments[0];
 // blur() on a control that never had focus does nothing, so this needs no test
 // for where the focus is - including inside a shadow root, where the document
 // only ever names the host.
 if (element.blur) element.blur();
-const tag = element.tagName.toLowerCase();
-if (tag === 'select') {
-  const option = element.selectedOptions[0];
-  return {
-    kind: 'select',
-    value: element.value,
-    text: option ? String(option.text || '').trim() : '',
-    disabled: option ? !!option.disabled : false
-  };
+"""
+    + _FIELD_READ_BODY
+)
+
+# Typing into these is not something a keyboard can do: send_keys turned
+# '2024-01-15' into '40115-02-20', and clear() on a slider moved it to its default
+# midpoint before the write failed. The value is set on the control instead, and
+# the two events a real edit raises are dispatched by hand - a value set from
+# script never marks the control dirty, so the blur that follows will not fire
+# `change` a second time.
+_JS_VALUE_TYPES = frozenset(
+    {"date", "time", "datetime-local", "month", "week", "range", "color"}
+)
+
+_VALUE_FORMATS = {
+    "date": "YYYY-MM-DD, for example 2024-01-15",
+    "time": "HH:MM or HH:MM:SS, for example 09:30",
+    "datetime-local": "YYYY-MM-DDTHH:MM, for example 2024-01-15T09:30",
+    "month": "YYYY-MM, for example 2024-01",
+    "week": "YYYY-Www, for example 2024-W03",
+    "range": "a number inside the control's own min and max",
+    "color": "#rrggbb, for example #ff8800",
 }
-const type = String(element.type || '').toLowerCase();
-if (type === 'checkbox' || type === 'radio') return {kind: 'checked', value: !!element.checked};
-if (element.isContentEditable) return {kind: 'text', value: element.textContent};
-return {kind: 'text', value: element.value === undefined ? '' : element.value};
+
+# The write is rehearsed on a throwaway control of the same type first, because
+# these controls do not refuse a value they cannot parse - they replace it. A
+# range takes its midpoint, a colour takes black and a date empties itself, so a
+# failed fill used to leave the form holding a plausible wrong answer.
+_SET_VALUE_SCRIPT = """
+const element = arguments[0];
+const wanted = String(arguments[1]);
+const doc = element.ownerDocument || document;
+const probe = doc.createElement('input');
+probe.type = element.type;
+if (element.min) probe.min = element.min;
+if (element.max) probe.max = element.max;
+if (element.step) probe.step = element.step;
+probe.value = wanted;
+const outcome = String(probe.value || '');
+// A control may shorten what it is given - a datetime-local drops the seconds it
+// does not carry - but not answer with something else entirely.
+const usable = outcome !== '' &&
+  wanted.toLowerCase().indexOf(outcome.toLowerCase()) === 0;
+if (!usable) return {taken: false, value: String(element.value || ''), expected: outcome};
+element.value = wanted;
+element.dispatchEvent(new Event('input', {bubbles: true}));
+element.dispatchEvent(new Event('change', {bubbles: true}));
+return {taken: true, value: String(element.value || ''), expected: outcome};
+"""
+
+# select_by_value *adds* to the selection of a <select multiple>, so a second fill
+# left the first option set too and the form submitted both. The whole selection
+# is written at once instead - which is also the only way to ask for exactly one
+# option - and it raises one change event rather than one per option clicked.
+_SELECT_MANY_SCRIPT = """
+const element = arguments[0];
+const wanted = arguments[1];
+for (const option of element.options) {
+  option.selected = wanted.indexOf(String(option.value)) >= 0;
+}
+element.dispatchEvent(new Event('input', {bubbles: true}));
+element.dispatchEvent(new Event('change', {bubbles: true}));
+return Array.from(element.selectedOptions).map(option => String(option.value));
 """
 
 
@@ -1567,11 +1854,65 @@ def _pick_option(driver: Any, element: Any, value: str) -> dict[str, Any]:
     return match
 
 
+def _requested_values(value: Any) -> list[str]:
+    """The list of option values a request names; a scalar names exactly one."""
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [str(item) for item in value]
+    return [str(value)]
+
+
+def _value_taken(actual: str, requested: str) -> bool:
+    """Say whether the control kept what it was given, sanitisation allowed for.
+
+    ``type=email`` and ``type=url`` strip the whitespace around a value by the
+    HTML value sanitisation algorithm, and a change handler is free to trim it or
+    fold its case. The field took the value in every one of those, and calling
+    them refusals left an agent retrying a write that had already worked.
+    """
+    if actual == requested:
+        return True
+    left = actual.replace("\r\n", "\n").replace("\r", "\n").strip()
+    right = requested.replace("\r\n", "\n").replace("\r", "\n").strip()
+    return left == right or left.casefold() == right.casefold()
+
+
+def _quoted(values: list[str]) -> str:
+    return ", ".join(f"'{value}'" for value in values) or "nothing"
+
+
+def _selection_rejection(state: dict[str, Any], requested: Any) -> str | None:
+    """Compare the whole selection, because a <select multiple> holds a list."""
+    values = [str(item) for item in (state.get("values") or [])]
+    texts = [str(item) for item in (state.get("texts") or [])]
+    wanted = _requested_values(requested)
+    unclaimed = list(zip(values, texts))
+    for want in wanted:
+        match = next(
+            (
+                pair
+                for pair in unclaimed
+                if _value_taken(pair[0], want) or _value_taken(pair[1], want)
+            ),
+            None,
+        )
+        if match is None:
+            return f"the selection is {_quoted(values)} instead of {_quoted(wanted)}"
+        unclaimed.remove(match)
+    if unclaimed:
+        return f"the selection is {_quoted(values)} instead of {_quoted(wanted)}"
+    return None
+
+
 def _field_rejection(state: dict[str, Any], requested: Any) -> str | None:
     """Explain why the control does not hold what was asked, or return None."""
     kind = state.get("kind")
     if kind == "checked":
         return None  # The checkbox paths verify their own state as they go.
+    if kind in {"gone", "detached"}:
+        return (
+            "the page took the control away while the value was being committed, "
+            "so there is nothing left holding it"
+        )
     if kind == "select":
         if state.get("disabled"):
             return (
@@ -1579,14 +1920,24 @@ def _field_rejection(state: dict[str, Any], requested: Any) -> str | None:
                 "the selection stayed on "
                 f"'{state.get('value')}'"
             )
+        if state.get("multiple"):
+            return _selection_rejection(state, requested)
         wanted = str(requested)
-        if wanted in {str(state.get("value")), str(state.get("text"))}:
+        if _value_taken(str(state.get("value")), wanted) or _value_taken(
+            str(state.get("text")), wanted
+        ):
             return None
         return f"the selection is '{state.get('value')}' instead of '{wanted}'"
     actual = "" if state.get("value") is None else str(state.get("value"))
-    if actual == str(requested):
+    if _value_taken(actual, str(requested)):
         return None
-    return f"the field holds '{actual}' instead of '{requested}'"
+    rejection = f"the field holds '{actual}' instead of '{requested}'"
+    hint = _VALUE_FORMATS.get(str(state.get("type") or ""))
+    if hint:
+        rejection += f"; a {state.get('type')} input takes {hint}"
+    if state.get("replaced"):
+        rejection += " (the page replaced the control as the value was committed)"
+    return rejection
 
 
 def _brief_error(exc: Exception) -> str:
@@ -1627,6 +1978,90 @@ def _attach_files(driver: Any, element: Any, paths: list[str]) -> list[str]:
     return [str(name) for name in (after.get("names") or [])]
 
 
+def _held_value(state: dict[str, Any]) -> Any:
+    """What ``field_values`` reports for one control.
+
+    A ``<select multiple>`` holds a list, and a control the page took away holds
+    nothing at all - which is not the same as holding an empty string.
+    """
+    kind = state.get("kind")
+    if kind in {"gone", "detached"}:
+        return None
+    if kind == "select" and state.get("multiple"):
+        return [str(item) for item in (state.get("values") or [])]
+    return state.get("value")
+
+
+def _value_left_behind(driver: Any, element: Any) -> Any:
+    """What a control that refused the write is left holding, touching nothing."""
+    if element is None:
+        return None
+    try:
+        return _held_value(driver.execute_script(_FIELD_READ_SCRIPT, element) or {})
+    except Exception:
+        return None
+
+
+def _reread_replaced_control(driver: Any, selector: str) -> dict[str, Any]:
+    """Read the control the page put in the place of the one written to."""
+    try:
+        replacement = _resolve_element(driver, selector)
+    except Exception:
+        return {"kind": "gone"}
+    state = driver.execute_script(_FIELD_READ_SCRIPT, replacement) or {}
+    state["replaced"] = True
+    return state
+
+
+def _write_selection(
+    driver: Any, element: Any, selector: str, control: dict[str, Any], value: Any
+) -> Any:
+    """Leave a select holding exactly the options asked for, and say which.
+
+    A ``<select multiple>`` is written whole: ``select_by_value`` only ever added
+    to what was already selected, so a second fill left the form submitting both
+    options and one option on its own could not be asked for at all.
+    """
+    wanted = _requested_values(value)
+    if not control.get("multiple") and len(wanted) > 1:
+        raise ValueError(
+            "This select holds one option at a time; only a <select multiple> can "
+            "hold several"
+        )
+    options = [_pick_option(driver, element, item) for item in wanted]
+    chosen = [str(option["value"]) for option in options]
+    if control.get("multiple"):
+        driver.execute_script(_SELECT_MANY_SCRIPT, element, chosen)
+        return chosen
+    option = options[0]
+    if hasattr(driver, "select_option"):
+        driver.select_option(selector, option["value"])
+    else:
+        select = Select(element)
+        try:
+            select.select_by_value(option["value"])
+        except Exception:
+            select.select_by_visible_text(option["text"])
+    return value
+
+
+def _write_by_script(driver: Any, element: Any, input_type: str, value: Any) -> Any:
+    """Set a control no keyboard can type into, and refuse rather than damage it.
+
+    Returns the value the control is expected to end up holding, which is not
+    always the one asked for: a datetime-local keeps the minute and drops the
+    seconds, a colour folds its case.
+    """
+    outcome = driver.execute_script(_SET_VALUE_SCRIPT, element, str(value)) or {}
+    if not outcome.get("taken"):
+        hint = _VALUE_FORMATS.get(input_type, "a value of its own kind")
+        raise ValueError(
+            f"A {input_type} control takes {hint}, so '{value}' was refused rather "
+            f"than written; the control still holds '{outcome.get('value', '')}'"
+        )
+    return outcome.get("expected") or value
+
+
 def fill_fields(
     fields: dict[str, Any],
     files: dict[str, str] | None = None,
@@ -1635,11 +2070,19 @@ def fill_fields(
 ) -> dict[str, Any]:
     """Fill controls by CSS selector; file inputs are supplied separately.
 
-    Every write is read back off the control, because a control is free to refuse
-    what it is given: a number input drops text it cannot parse, ``maxlength``
-    truncates, an input handler rewrites. ``field_values`` reports what each
-    control holds afterwards, ``errors`` names the ones that differ from the
-    request, and ``success`` is false unless every control took its value.
+    Every write is read back off the control the page kept - which is not always
+    the control that was written to - because a control is free to refuse what it
+    is given: a number input drops text it cannot parse, ``maxlength`` truncates,
+    an input handler rewrites, a framework re-renders the field away.
+    ``field_values`` answers for every selector asked about, ``errors`` names the
+    ones that differ from the request, and ``success`` is false unless every
+    control took its value. Whitespace and case a field sanitises away are not a
+    refusal: the field took the value.
+
+    A ``<select multiple>`` may be given a list, and ends up holding exactly what
+    the list names and nothing else. Date, time, month, week, range and colour
+    controls are set rather than typed into, and a value they cannot parse is
+    refused instead of replaced with their idea of a default.
 
     ``frame_selector`` names the frame the CSS selectors are looked up in, exactly
     as it does for ``find`` and ``page_text``.
@@ -1655,6 +2098,8 @@ def fill_fields(
         driver = session.driver
         _enter_action_frame(driver, frame_selector, *fields, *(files or {}))
         for selector, value in fields.items():
+            element = None
+            expected: Any = value
             try:
                 element = _resolve_element(driver, selector)
                 control = driver.execute_script(_FIELD_PREPARE_SCRIPT, element) or {}
@@ -1669,6 +2114,11 @@ def fill_fields(
                 if control.get("readonly"):
                     raise ValueError(
                         "The control is readonly, so its value cannot be changed"
+                    )
+                if tag != "select" and isinstance(value, (list, tuple, set, frozenset)):
+                    raise ValueError(
+                        "Only a <select multiple> takes several values; this control "
+                        "takes one"
                     )
                 if input_type == "checkbox":
                     desired = _desired_checked(value)
@@ -1687,27 +2137,30 @@ def fill_fields(
                     if element.is_selected() != desired:
                         raise ValueError("Radio state did not change")
                 elif tag == "select":
-                    option = _pick_option(driver, element, str(value))
-                    if hasattr(driver, "select_option"):
-                        driver.select_option(selector, option["value"])
-                    else:
-                        select = Select(element)
-                        try:
-                            select.select_by_value(option["value"])
-                        except Exception:
-                            select.select_by_visible_text(option["text"])
+                    expected = _write_selection(driver, element, selector, control, value)
+                elif input_type in _JS_VALUE_TYPES:
+                    expected = _write_by_script(driver, element, input_type, value)
                 else:
                     element.clear()
                     element.send_keys(str(value))
                 state = driver.execute_script(_FIELD_STATE_SCRIPT, element) or {}
-                values[selector] = state.get("value")
-                rejection = _field_rejection(state, value)
+                if state.get("kind") == "detached":
+                    # The blur fired `change`, and the page rebuilt the control
+                    # while it ran. Whatever it kept is the answer.
+                    state = _reread_replaced_control(driver, selector)
+                values[selector] = _held_value(state)
+                rejection = _field_rejection(state, expected)
                 if rejection:
                     errors[selector] = f"The control did not take the value: {rejection}"
                 else:
                     filled.append(selector)
             except Exception as exc:  # Return partial progress to the caller.
                 errors[selector] = _brief_error(exc)
+                if selector not in values:
+                    # Every selector asked about is answered for, even the ones
+                    # that refused the write: the caller needs to know what the
+                    # form is left holding, not just that something went wrong.
+                    values[selector] = _value_left_behind(driver, element)
             finally:
                 # A field inside a frame leaves the driver there; the next field
                 # is looked up from the top again. Under a frame_selector every
@@ -1932,6 +2385,25 @@ def _held_slot(session: BrowserSession | _StagedKeys, normalized: str) -> str | 
     return None
 
 
+def _tap_of_held_key(spelling: str, held_id: str) -> ValueError:
+    """Refuse a tap of a key this session already holds down.
+
+    A tap presses and lifts, so tapping a key that is already held ends with the
+    key up in the page while the session still counts it as down: its modifier
+    bit then rides on every later mouse event, and the release meant to lift it
+    is dropped by WebDriver, which knows the key is not pressed any more. In a
+    batch it goes the other way - the tap is staged as a hold, so an already-held
+    key gets no keydown at all and the batch's release tail lifts the hold the
+    caller was relying on. Either way the caller asked for two things that cannot
+    both be true, so they hear about it instead of one of them happening.
+    """
+    return ValueError(
+        f"Key '{spelling}' is already held by this session (as '{held_id}'), so a "
+        "tap of it would leave it up in the page while this session still counted "
+        f"it down. Release '{held_id}' first, or drop the tap."
+    )
+
+
 def _key_event_pair(
     session: BrowserSession | _StagedKeys,
     normalized: list[str],
@@ -2017,50 +2489,68 @@ def press_keys(
     hold = max(0.0, min(float(hold_seconds), 5.0))
     repetitions = max(1, min(int(repeat), 50))
     frames_held = max(1, min(int(hold_frames), 30))
+    _refuse_non_css_frame(frame_selector)
     session = _get_session(session_id)
     with session.lock:
         driver = session.driver
+        if selected_action == "tap":
+            # Before anything is switched, focused or sent: a refusal has to
+            # leave the keys this session holds exactly as they were.
+            for spelling, key in zip(keys, normalized):
+                slot = _held_slot(session, key)
+                if slot is not None:
+                    raise _tap_of_held_key(str(spelling), slot)
         stepping = session.render_mode == "step" and _advance_frame
         driver.switch_to.default_content()
         frames_advanced = 0
         try:
             if frame_selector:
-                WebDriverWait(driver, 10).until(
-                    conditions.frame_to_be_available_and_switch_to_it(
-                        (By.CSS_SELECTOR, frame_selector)
-                    )
-                )
+                # The same resolver the release below uses. Entering through a
+                # looser one meant an ambiguous selector was accepted here and
+                # refused half way through the call, with the keys already down.
+                _select_frame(driver, frame_selector, css_only=True)
             if selected_focus != "none":
                 _focus_target(driver, target_selector, selected_focus)
             runs = repetitions if selected_action == "tap" else 1
-            for _ in range(runs):
-                down_events, up_events = _key_event_pair(
-                    session, normalized, selected_action
-                )
-                if selected_action == "tap" and stepping:
-                    _perform_key_events(driver, down_events)
-                    try:
-                        driver.switch_to.default_content()
-                        _auto_advance_render_after_input(session, frames_held)
-                        frames_advanced += frames_held
-                    finally:
-                        # The key is physically down in the browser from here on.
-                        # A frame advance that fails - a document that reloaded
-                        # and dropped the gate - must not end the call with the
-                        # key still down: a tap records nothing in this session's
-                        # state, so release_inputs could not reach it either.
+            dispatched = False
+            try:
+                for _ in range(runs):
+                    down_events, up_events = _key_event_pair(
+                        session, normalized, selected_action
+                    )
+                    if selected_action == "tap" and stepping:
+                        _perform_key_events(driver, down_events)
                         try:
-                            if frame_selector:
-                                _select_frame(driver, frame_selector)
+                            driver.switch_to.default_content()
+                            _auto_advance_render_after_input(session, frames_held)
+                            frames_advanced += frames_held
                         finally:
-                            _perform_key_events(driver, up_events)
-                else:
-                    events = list(down_events)
-                    if selected_action == "tap" and hold:
-                        events.append({"type": "pause", "seconds": hold})
-                    events.extend(up_events)
-                    _perform_key_events(driver, events)
-            _commit_held_keys(session, key_ids, normalized, selected_action)
+                            # The key is physically down in the browser from here on.
+                            # A frame advance that fails - a document that reloaded
+                            # and dropped the gate - must not end the call with the
+                            # key still down: a tap records nothing in this session's
+                            # state, so release_inputs could not reach it either.
+                            try:
+                                if frame_selector:
+                                    _select_frame(driver, frame_selector, css_only=True)
+                            finally:
+                                _perform_key_events(driver, up_events)
+                    else:
+                        events = list(down_events)
+                        if selected_action == "tap" and hold:
+                            events.append({"type": "pause", "seconds": hold})
+                        events.extend(up_events)
+                        _perform_key_events(driver, events)
+                dispatched = True
+            finally:
+                # A hold whose stream died part way may have pressed some of its
+                # keys, so the session writes them all down: a key it believes it
+                # holds can be lifted by release_inputs, a key it never heard of
+                # cannot. A release is the mirror image - forgetting keys that may
+                # still be down is the one outcome nothing recovers from - so it
+                # is only written off once the events have actually gone.
+                if selected_action == "hold" or dispatched:
+                    _commit_held_keys(session, key_ids, normalized, selected_action)
         finally:
             driver.switch_to.default_content()
         if _advance_frame and not (selected_action == "tap" and stepping):
@@ -2324,10 +2814,16 @@ def _wait_for_locator(driver: Any, locator: str, state: str, timeout: float) -> 
 
     ``expected_conditions`` only speak ``(By, selector)`` tuples, so ref handles and
     piercing paths are polled through ``_resolve_element`` instead.
+
+    The wait it actually did is named in the failure, because the timeout asked
+    for is clamped: "never appeared in 120 seconds" about a wait that lasted 30
+    sends the caller looking for the wrong problem.
     """
+    waited = f"waited {timeout:g}s"
     if page_perception.resolve_locator_expression(locator) is None:
         return WebDriverWait(driver, timeout).until(
-            _ELEMENT_STATES[state]((By.CSS_SELECTOR, locator))
+            _ELEMENT_STATES[state]((By.CSS_SELECTOR, locator)),
+            f"Selector '{locator}' was still not {state} after {timeout:g}s",
         )
     if getattr(driver, "is_extension_bridge", False):
         _resolve_element(driver, locator)  # raises the bridge-specific explanation
@@ -2350,7 +2846,7 @@ def _wait_for_locator(driver: Any, locator: str, state: str, timeout: float) -> 
             # The element may have resolved inside a frame without ever reaching
             # the state; nobody is going to act on it now, so give the driver back.
             _leave_element_frame(driver)
-            raise TimeoutException(failure)
+            raise TimeoutException(f"{failure} ({waited})")
         time.sleep(0.1)
 
 
@@ -2670,24 +3166,52 @@ def _session_modifiers(session: BrowserSession) -> int:
 _VIEWPORT_SCRIPT = "return {width: window.innerWidth, height: window.innerHeight};"
 
 
+def _refuse_non_css_frame(frame_selector: str | None) -> None:
+    """Refuse a frame an input action cannot aim into, before it does anything.
+
+    Every input path has to answer one string the same way. Keys enter a frame
+    through ``_select_frame``, which walks a ref handle or a ``host >>> frame``
+    path as well as CSS; coordinates are mapped through the frame's *box in the
+    top document*, which only a CSS selector names from out here. An ``input``
+    batch that took both would accept the path for its keys and then refuse it
+    for its pointer entries, with half the call already sent. So every input path
+    gives the narrower answer, and gives it before the first event.
+    """
+    if not frame_selector:
+        return
+    # A locator that means to be a ref or a path and cannot address anything
+    # raises here, which is the earliest and most specific answer there is; no
+    # string it raises on is a CSS selector that would have worked instead.
+    if page_perception.resolve_locator_expression(frame_selector) is not None:
+        raise ValueError(
+            f"frame_selector '{frame_selector}' is an element handle or a "
+            "' >>> ' path. Input is aimed by coordinate, which needs the frame's "
+            "own box in the top-level page, and neither form gives one. Pass a "
+            "CSS selector that matches this frame and nothing else."
+        )
+
+
 def _pointer_context(
     driver: webdriver.Chrome, frame_selector: str | None
 ) -> tuple[_FrameMap, dict[str, Any]]:
     """Resolve the frame's page mapping and viewport once, in that document's terms."""
     driver.switch_to.default_content()
-    frame_map = _frame_map(driver, frame_selector)
     if not frame_selector:
+        frame_map = _frame_map(driver, None)
         return frame_map, {
             "width": frame_map.page_width,
             "height": frame_map.page_height,
         }
-    frame = driver.find_element(By.CSS_SELECTOR, frame_selector)
+    # The same strict resolution the keys of a batch get: one frame or none, and
+    # a selector matching two of them is refused with the count rather than
+    # answered with whichever came first.
+    frame = _input_frame(driver, frame_selector)
     driver.switch_to.frame(frame)
     try:
         viewport = driver.execute_script(_VIEWPORT_SCRIPT)
     finally:
         driver.switch_to.default_content()
-    return frame_map, viewport
+    return _frame_map(driver, frame_selector, frame), viewport
 
 
 def _pointer_dispatch(
@@ -2776,9 +3300,14 @@ def _pointer_dispatch(
         finish_x, finish_y = mapping.to_page(local_end_x, local_end_y)
     else:
         start_x, start_y = _page_point(mapping, local_x, local_y, "Pointer position")
-        finish_x, finish_y = _page_point(
-            mapping, local_end_x, local_end_y, "Pointer end position"
-        )
+        if (local_end_x, local_end_y) == (local_x, local_y):
+            # A click has no second point; asking the page about the same one
+            # twice would cost a round trip for an answer already given.
+            finish_x, finish_y = start_x, start_y
+        else:
+            finish_x, finish_y = _page_point(
+                mapping, local_end_x, local_end_y, "Pointer end position"
+            )
     modifiers = _session_modifiers(session)
 
     def dispatch(event_type: str, px: float, py: float, **extra: Any) -> None:
@@ -2969,18 +3498,63 @@ def pointer_action(
 # scrolling and layout only add translation, and that is recovered from the box
 # the browser actually painted, so scale, rotation and skew all come out right.
 # A 3D/perspective chain is not affine and says so instead of being mis-aimed.
+#
+# `transform` is not the whole story. The CSS Transforms 2 individual properties
+# - `rotate`, `scale`, `translate` - never appear in the computed `transform`
+# (Chrome reports `transform: none` for `rotate: 20deg`), and `zoom` is not a
+# transform at all, so a map that reads only `transform` comes out as the
+# identity while the frame is turned and resized on screen. The individual
+# properties are composed in the spec's order - translate, rotate, scale, then
+# `transform` - and `zoom` multiplies in as a scalar, which commutes with the
+# rest so the whole chain's factor can be applied once at the end. `translate`
+# is left out on purpose: it is a pure translation, and every translation in the
+# chain is recovered from the painted box below.
 _FRAME_MAP_SCRIPT = """
 const frame = arguments[0];
+const rotateFunction = value => {
+  const parts = value.trim().split(/\\s+/);
+  const angle = parts.pop();
+  if (!parts.length || parts[0] === 'z') return 'rotate(' + angle + ')';
+  const axis = parts.length === 1 ? {x: '1,0,0', y: '0,1,0'}[parts[0]] : parts.join(',');
+  return axis ? 'rotate3d(' + axis + ',' + angle + ')' : 'rotate(' + angle + ')';
+};
+const scaleFunction = value => {
+  const parts = value.trim().split(/\\s+/);
+  const [sx, sy, sz] = [parts[0], parts[1] || parts[0], parts[2] || '1'];
+  return parseFloat(sz) === 1
+    ? 'scale(' + sx + ',' + sy + ')'
+    : 'scale3d(' + sx + ',' + sy + ',' + sz + ')';
+};
+// `is2D` answers how a matrix was spelled, not what it does: a rotate3d about
+// z is flagged 3D while projecting exactly like a 2D rotation. What matters is
+// whether the x/y projection depends on z, so the numbers are asked directly.
+const projectsFlat = matrix =>
+  !matrix.m13 && !matrix.m14 && !matrix.m23 && !matrix.m24 &&
+  !matrix.m31 && !matrix.m32 && !matrix.m34;
 let linear = new DOMMatrix();
 let flat = true;
+let zoom = 1;
 for (let node = frame; node; node = node.parentElement) {
-  const value = getComputedStyle(node).transform;
-  if (value && value !== 'none') {
-    const step = new DOMMatrix(value);
-    if (!step.is2D) flat = false;
+  const style = getComputedStyle(node);
+  const list = [];
+  if (style.rotate && style.rotate !== 'none') list.push(rotateFunction(style.rotate));
+  if (style.scale && style.scale !== 'none') list.push(scaleFunction(style.scale));
+  if (style.transform && style.transform !== 'none') list.push(style.transform);
+  if (list.length) {
+    // Every entry is Chrome's own computed serialisation, in the same grammar
+    // DOMMatrix parses, so a throw here would mean a spelling nobody knows
+    // about yet - worth hearing about rather than quietly aiming through.
+    const step = new DOMMatrix(list.join(' '));
+    if (!projectsFlat(step)) flat = false;
     linear = step.multiply(linear);
   }
+  // `zoom` is inherited by multiplication rather than by computed value, so the
+  // effective factor is the product of the chain. It is a uniform scale, which
+  // commutes with everything above, so applying it once at the end is exact.
+  const nodeZoom = parseFloat(style.zoom);
+  if (nodeZoom > 0 && nodeZoom !== 1) zoom *= nodeZoom;
 }
+if (zoom !== 1) linear = linear.scale(zoom, zoom);
 linear.e = 0;
 linear.f = 0;
 const width = frame.offsetWidth;
@@ -3007,6 +3581,22 @@ return {
 """
 
 
+# Being inside the window is not the same as being reachable. A frame clipped by
+# an `overflow: hidden` ancestor, or with a fixed header painted over it, answers
+# every question about its own viewport as if it were whole, and the mapped point
+# is a perfectly ordinary page coordinate - it just belongs to something else.
+# Chrome hit-tests the top document before it delivers, so the same question is
+# asked here, and the answer names what is in the way.
+_FRAME_HIT_SCRIPT = """
+const frame = arguments[0];
+const hit = document.elementFromPoint(arguments[1], arguments[2]);
+if (hit && (hit === frame || frame.contains(hit))) return null;
+if (!hit) return 'nothing this document paints';
+const classes = Array.from(hit.classList).map(name => '.' + name).join('');
+return hit.tagName.toLowerCase() + (hit.id ? '#' + hit.id : '') + classes;
+"""
+
+
 @dataclass(frozen=True)
 class _FrameMap:
     """Where a point inside a frame lands in the top-level page CDP aims at.
@@ -3024,6 +3614,11 @@ class _FrameMap:
     page_width: float = 0.0
     page_height: float = 0.0
     flat: bool = True
+    # Asks the top document what it would hit at a page point: None when that is
+    # the frame itself, otherwise a name for whatever is in the way. Only a frame
+    # has one - without a frame selector the caller is aiming at the page, and
+    # whatever is on top there is exactly what they meant to hit.
+    hit_test: Callable[[float, float], str | None] | None = None
 
     def to_page(self, local_x: float, local_y: float) -> tuple[float, float]:
         return (
@@ -3053,16 +3648,36 @@ class _FrameMap:
         return 0 <= page_x < self.page_width and 0 <= page_y < self.page_height
 
 
-def _frame_map(driver: webdriver.Chrome, frame_selector: str | None) -> _FrameMap:
-    """Resolve how the named frame maps onto the page; CDP input is page-absolute."""
+def _input_frame(driver: webdriver.Chrome, frame_selector: str) -> Any:
+    """The one frame an input action names, resolved the way every path resolves it.
+
+    ``_select_frame`` owns what "the one frame" means - it is what refuses two
+    matches with the count - so it is asked here too rather than reimplemented,
+    and the element it agreed on is handed back for the coordinate mapping.
+    """
+    _refuse_non_css_frame(frame_selector)
+    _select_frame(driver, frame_selector, css_only=True)
+    driver.switch_to.default_content()
+    return WebDriverWait(driver, 10).until(
+        conditions.visibility_of_element_located((By.CSS_SELECTOR, frame_selector))
+    )
+
+
+def _frame_map(
+    driver: webdriver.Chrome, frame_selector: str | None, frame: Any = None
+) -> _FrameMap:
+    """Resolve how the named frame maps onto the page; CDP input is page-absolute.
+
+    ``frame`` is the already-resolved element when the caller has one, so a
+    pointer action pays for resolving its frame once rather than twice.
+    """
     if not frame_selector:
         page = driver.execute_script(_VIEWPORT_SCRIPT)
         return _FrameMap(
             page_width=float(page["width"]), page_height=float(page["height"])
         )
-    frame = WebDriverWait(driver, 10).until(
-        conditions.visibility_of_element_located((By.CSS_SELECTOR, frame_selector))
-    )
+    if frame is None:
+        frame = _input_frame(driver, frame_selector)
     mapped = driver.execute_script(_FRAME_MAP_SCRIPT, frame)
     if not mapped["flat"]:
         # A perspective projection is not affine, so this mapping is the best
@@ -3073,6 +3688,15 @@ def _frame_map(driver: webdriver.Chrome, frame_selector: str | None) -> _FrameMa
             "are mapped by their flat approximation and may be a few pixels off",
             frame_selector,
         )
+
+    def hit_test(page_x: float, page_y: float) -> str | None:
+        try:
+            return driver.execute_script(_FRAME_HIT_SCRIPT, frame, page_x, page_y)
+        except WebDriverException:
+            # The document that could answer moved on. Refusing the action over a
+            # question that could not be asked would be worse than sending it.
+            return None
+
     return _FrameMap(
         x=float(mapped["x"]),
         y=float(mapped["y"]),
@@ -3083,18 +3707,26 @@ def _frame_map(driver: webdriver.Chrome, frame_selector: str | None) -> _FrameMa
         page_width=float(mapped["page_width"]),
         page_height=float(mapped["page_height"]),
         flat=bool(mapped["flat"]),
+        hit_test=hit_test,
     )
 
 
 def _page_point(
-    frame_map: _FrameMap, local_x: float, local_y: float, what: str
+    frame_map: _FrameMap,
+    local_x: float,
+    local_y: float,
+    what: str,
+    verify: bool = True,
 ) -> tuple[float, float]:
-    """Map a frame-local point onto the page, refusing one the window cannot reach.
+    """Map a frame-local point onto the page, refusing one the event cannot reach.
 
     A frame scrolled half out of the window still answers questions about its own
     viewport, so the local coordinate looks fine while the page coordinate it maps
     to is off-screen. CDP drops that event without a word, which reads exactly
-    like a game that ignored the click.
+    like a game that ignored the click. A frame clipped by an ancestor or covered
+    by an overlay is worse: the point is a real one, and the event is delivered -
+    to whatever is on top of it. ``verify`` skips the hit test for the
+    intermediate points of a gesture, whose ends have already been checked.
     """
     page_x, page_y = frame_map.to_page(local_x, local_y)
     if not frame_map.on_page(page_x, page_y):
@@ -3104,6 +3736,16 @@ def _page_point(
             f"{frame_map.page_width:g}x{frame_map.page_height:g} window, so no event "
             "would reach it. Scroll the frame into view first."
         )
+    if verify and frame_map.hit_test is not None:
+        blocking = frame_map.hit_test(page_x, page_y)
+        if blocking is not None:
+            raise ValueError(
+                f"{what} ({local_x:g}, {local_y:g}) is inside the frame but lands at "
+                f"({page_x:g}, {page_y:g}) in the page, where the browser would hit "
+                f"{blocking} instead of the frame, so the event would go there and "
+                "not to the frame. The frame is clipped or covered at that point: "
+                "scroll it into view, or aim somewhere nothing is painted over."
+            )
     return page_x, page_y
 
 
@@ -3225,7 +3867,16 @@ def touch_action(
                     f"Touch point ({local_x:g}, {local_y:g}) is outside the selected "
                     f"{float(viewport['width']):g}x{float(viewport['height']):g} viewport"
                 )
-            page_x, page_y = _page_point(frame_map, local_x, local_y, "Touch point")
+            page_x, page_y = _page_point(
+                frame_map,
+                local_x,
+                local_y,
+                "Touch point",
+                # The ends of a gesture are hit-tested; asking the page again for
+                # every interpolated step in between would cost a round trip per
+                # step to answer the same question.
+                verify=progress <= 0.0 or progress >= 1.0,
+            )
             return {
                 "x": page_x,
                 "y": page_y,
@@ -3245,6 +3896,20 @@ def touch_action(
             )
 
         def press(resolved: list[dict[str, Any]]) -> None:
+            for point in resolved:
+                held = session.held_touches.get(point["id"])
+                if held is None:
+                    continue
+                # Chrome drops a touchStart for a finger that is already down
+                # without a word. Recording the new position anyway would leave
+                # every later id-only move or release aiming at a place the page
+                # never had that finger.
+                raise ValueError(
+                    f"Touch point id {point['id']} is already down at "
+                    f"({held['x']:g}, {held['y']:g}) and Chrome ignores a second "
+                    "press of it; use action='move' to move that finger, or "
+                    "'release' to lift it first"
+                )
             dispatch("touchStart", resolved)
             for point in resolved:
                 session.held_touches[point["id"]] = point
@@ -3281,7 +3946,13 @@ def touch_action(
             press(resolved)
             lift(resolved)
         else:
-            press(touch_points(0.0))
+            # The end of the swipe is resolved before the finger goes down: the
+            # lift below is what un-plants it, and a lift that cannot resolve its
+            # own point raises instead of lifting - leaving a finger on the page
+            # under an error that reads as though nothing had happened at all.
+            starting = touch_points(0.0)
+            ending = touch_points(1.0)
+            press(starting)
             try:
                 for step in range(1, interpolation + 1):
                     dispatch("touchMove", touch_points(step / interpolation))
@@ -3290,7 +3961,7 @@ def touch_action(
             finally:
                 # A swipe that dies half way through must not leave the finger
                 # planted on the page for every later gesture to fight with.
-                lift(touch_points(1.0))
+                lift(ending)
         if _advance_frame:
             _auto_advance_render_after_input(session)
         _wait_after_action(driver, wait_seconds)
@@ -3346,6 +4017,9 @@ def pointer_lock(
     if selected_action not in {"acquire", "release", "status"}:
         raise ValueError("action must be 'acquire', 'release', or 'status'")
     timeout = max(0.1, min(float(timeout_seconds), 10.0))
+    # Acquiring sends a real click, which is a coordinate: this call reads the
+    # frame both ways and must not accept a locator only one of them can use.
+    _refuse_non_css_frame(frame_selector)
     session = _get_session(session_id)
     with session.lock:
         driver = session.driver
@@ -3437,6 +4111,9 @@ def input_batch(
         raise ValueError("Provide at least one key action or pointer action")
     if len(selected_keys) > 16 or len(selected_pointers) > 16:
         raise ValueError("A batch accepts at most 16 key and 16 pointer actions")
+    # One frame for the whole batch, decided before any of it is sent: the keys
+    # and the pointer entries must not read the same string two ways.
+    _refuse_non_css_frame(frame_selector)
 
     normalized_keys: list[dict[str, str]] = []
     for item in selected_keys:
@@ -3472,10 +4149,23 @@ def input_batch(
             # keystroke would then carry that phantom modifier.
             staged = _StagedKeys.of(session)
             events: list[dict[str, Any]] = []
+            batch_taps: set[str] = set()
             for item in normalized_keys:
                 key_ids = [item["key"].strip().upper()]
                 normalized = [_normalize_game_key(item["key"])]
                 action = "hold" if item["action"] == "tap" else item["action"]
+                if item["action"] == "tap":
+                    # A tap is staged as a hold, so a key the session already
+                    # held would get no keydown at all and the release tail
+                    # below would lift the caller's hold instead. Two taps of
+                    # one key inside a single batch still collapse into the one
+                    # press the frame can express - only a hold from an earlier
+                    # call is a conflict.
+                    physical = key_table.physical_key(normalized[0])
+                    slot = _held_slot(staged, normalized[0])
+                    if slot is not None and physical not in batch_taps:
+                        raise _tap_of_held_key(item["key"], slot)
+                    batch_taps.add(physical)
                 down, up = _key_event_pair(staged, normalized, action)
                 events.extend(down)
                 events.extend(up)
@@ -3483,9 +4173,20 @@ def input_batch(
             _select_frame(driver, frame_selector)
             try:
                 _focus_target(driver, target_selector, "focus")
-                if events:
-                    _perform_key_events(driver, events)
-                staged.commit_to(session)
+                try:
+                    if events:
+                        _perform_key_events(driver, events)
+                finally:
+                    # Dispatch is not atomic - the bridge sends one event per
+                    # round trip, and ActionChains.perform can die part way
+                    # through as well - so by the time it fails any of these
+                    # keys may be physically down. The books have to assume they
+                    # all are: a key the page holds and the session has
+                    # forgotten cannot be reached by release_inputs or by
+                    # anything else, and every later keystroke carries it. The
+                    # frame switch and the focus above are outside this window
+                    # on purpose: a batch that never got that far sent nothing.
+                    staged.commit_to(session)
             finally:
                 if frame_selector:
                     driver.switch_to.default_content()
@@ -3636,17 +4337,18 @@ def game_probe(
     while booting says so.
     """
     duration = max(0.1, min(float(sample_seconds), 3.0))
+    # The canvas rects this reports are aimed at with the same frame_selector, so
+    # it answers that string exactly the way the input tools do: one frame, named
+    # by CSS, or an error. Reading one of four matching frames and then clicking
+    # in another is the failure this is here to prevent.
+    _refuse_non_css_frame(frame_selector)
     session = _get_session(session_id)
     with session.lock:
         driver = session.driver
         driver.switch_to.default_content()
         try:
             if frame_selector:
-                WebDriverWait(driver, 10).until(
-                    conditions.frame_to_be_available_and_switch_to_it(
-                        (By.CSS_SELECTOR, frame_selector)
-                    )
-                )
+                _select_frame(driver, frame_selector)
             probe = driver.execute_script(_GAME_PROBE_SCRIPT)
             if session.render_mode != "normal":
                 # Frames are released by hand, so both requestAnimationFrame and the
@@ -3781,7 +4483,15 @@ const state = {
     freezeTime: true,
     gateTimers: true,
     clockInstalled: false,
+    clockPatched: false,
     timersInstalled: false,
+    // How far ahead of the native clock the page-visible one has been carried by
+    // stepping. It never shrinks, because a clock that goes backwards is worse
+    // than one that is wrong: see restoreClock.
+    skew: 0,
+    // The last frame timestamp the page was given, which no later one may
+    // undercut: see state.stamp.
+    lastStamp: 0,
     virtualNow: nativePerformanceNow(),
     lastFrame: nativePerformanceNow(),
     lastRealFlush: nativePerformanceNow(),
@@ -3803,21 +4513,68 @@ const state = {
 
 // The page-visible clock. While the gate is engaged it only moves when a frame
 // is released, so a game sees a constant delta no matter how long the agent
-// spent thinking between calls.
-state.now = () => (state.gated() && state.freezeTime ? state.virtualNow : nativePerformanceNow());
+// spent thinking between calls. Off the gate it is the native clock plus the
+// skew stepping has earned, so the two never disagree about which way time runs.
+state.now = () => (
+    state.gated() && state.freezeTime
+      ? state.virtualNow
+      : nativePerformanceNow() + state.skew
+);
 state.gated = () => state.mode !== 'normal';
 
-state.installClock = () => {
-    if (state.clockInstalled) return;
+// Sixty frames of 100ms cost the wall clock a fraction of that, so the frozen
+// clock ends up seconds ahead of the native one. Handing the raw native clock
+// back would drop the page's time by exactly that much: performance.now() falls,
+// the next frame's delta is negative, physics integrates backwards, tweens snap
+// and any timestamp the page stored now sits in the future. Carrying the
+// difference forward as a fixed offset keeps the page's own clock monotonic
+// across every mode change, at the price of it running ahead of wall time -
+// which is what the page was told all along.
+state.carryClock = previousNow => {
+    state.skew = Math.max(state.skew, previousNow - nativePerformanceNow());
+};
+
+// Every frame timestamp the page is given passes through here, and none of them
+// may undercut the last one. Measuring the skew is not enough on its own: a
+// browser dates a frame from when it *began*, so the first native frame after a
+// mode change can carry a stamp from before the moment the skew was read - up to
+// a frame period earlier - and hand the page a small negative delta, which a
+// game reads no differently from a large one. The shortfall is exactly what the
+// skew was missing, so it is added there rather than papered over per frame:
+// the whole page-visible clock moves up with the stamp instead of trailing it.
+state.stamp = value => {
+    if (value < state.lastStamp) {
+      state.skew += state.lastStamp - value;
+      // now() is the same clock as these stamps, so it has to be the moved one.
+      state.patchClock();
+      return state.lastStamp;
+    }
+    state.lastStamp = value;
+    return value;
+};
+
+state.patchClock = () => {
+    if (state.clockPatched) return;
     performance.now = () => state.now();
     Date.now = () => Math.round(epochOffset + state.now());
+    state.clockPatched = true;
+};
+state.installClock = () => {
     state.clockInstalled = true;
+    state.patchClock();
 };
 state.restoreClock = () => {
-    if (!state.clockInstalled) return;
+    state.clockInstalled = false;
+    // Only a page that never gained a skew gets its untouched native clock back;
+    // with one, the wrapper stays in place to keep applying it.
+    if (state.skew) {
+        state.patchClock();
+        return;
+    }
+    if (!state.clockPatched) return;
     performance.now = nativePerformanceNow;
     Date.now = nativeDateNow;
-    state.clockInstalled = false;
+    state.clockPatched = false;
 };
 
 // Timer wrappers are installed once, at bootstrap, and stay pass-through while
@@ -3987,8 +4744,8 @@ state.runDueTimers = (now, spanStart) => {
 state.flush = () => {
     const previous = state.lastFrame;
     if (state.gated() && state.freezeTime) state.virtualNow += state.frameDelta;
-    else state.virtualNow = nativePerformanceNow();
-    const timestamp = state.now();
+    else state.virtualNow = nativePerformanceNow() + state.skew;
+    const timestamp = state.stamp(state.now());
     state.lastFrame = timestamp;
     state.frameCount += 1;
     state.runDueTimers(timestamp, previous);
@@ -4041,7 +4798,11 @@ state.request = callback => {
       const id = state.nativeRequest(timestamp => {
         state.native.delete(id);
         state.nativeIds.delete(id);
-        callback(timestamp);
+        // A frame timestamp is the same clock performance.now() reads, and a
+        // game measures its delta from the last one it was given - which may
+        // well be a stepped one. Handing over the raw native stamp after a
+        // skew has been earned is the backwards jump all over again.
+        callback(state.stamp(timestamp + state.skew));
       });
       state.native.set(id, callback);
       return id;
@@ -4059,7 +4820,9 @@ state.adopt = (id, callback) => {
     const nativeId = state.nativeRequest(timestamp => {
       state.native.delete(id);
       state.nativeIds.delete(id);
-      callback(timestamp);
+      // The stamp this callback was waiting for was going to come off the
+      // stepped clock; see state.request for why it still has to.
+      callback(state.stamp(timestamp + state.skew));
     });
     state.native.set(id, callback);
     state.nativeIds.set(id, nativeId);
@@ -4114,6 +4877,7 @@ state.setMode = (mode, targetFps, options) => {
     state.freezeTime = nextFreeze;
     state.gateTimers = nextGate;
     if (mode === 'normal') {
+      state.carryClock(previousNow);
       state.restoreClock();
       const callbacks = Array.from(state.pending.entries());
       state.pending.clear();
@@ -4128,8 +4892,12 @@ state.setMode = (mode, targetFps, options) => {
       }
       state.native.clear();
       state.nativeIds.clear();
-      state.virtualNow = nativePerformanceNow();
-      if (state.freezeTime) state.installClock(); else state.restoreClock();
+      // Carry on from where the page's clock already is. Reading the native one
+      // here threw away every skew an earlier round of stepping had earned, so
+      // re-entering step mode dropped the clock just as leaving it did.
+      state.virtualNow = previousNow;
+      if (state.freezeTime) state.installClock();
+      else { state.carryClock(previousNow); state.restoreClock(); }
       if (state.gateTimers) {
         state.rebaseTimers(previousNow, state.now());
         state.captureTimers();
@@ -4202,8 +4970,38 @@ state.step(count, done);
 _FRAME_COUNT_SCRIPT = "return document.querySelectorAll(arguments[0]).length;"
 
 
-def _select_frame(driver: webdriver.Chrome, frame_selector: str | None) -> None:
+def _ambiguous_frame_message(frame_selector: str, count: int, *, css_only: bool) -> str:
+    """Say a selector names more than one frame, and what to send instead.
+
+    The advice has to fit the path that raised. The outline's ``frame`` path is
+    verified unique, which makes it the right answer for a reader and a dead end
+    for an input action, which cannot aim through one - a caller that followed it
+    there would earn a second error for taking the first one's advice.
+    """
+    advice = (
+        "Narrow it to a CSS selector that matches exactly one frame - an id, or a "
+        "unique ancestor. The 'frame' path from web_info(topic='page_outline') is "
+        "verified unique, but input cannot aim through it."
+        if css_only
+        else "Use a selector that matches exactly one frame, or the 'frame' path "
+        "from web_info(topic='page_outline'), which is verified unique."
+    )
+    return (
+        f"frame_selector '{frame_selector}' matches {count} elements in this "
+        f"document, so it does not say which one to read. {advice}"
+    )
+
+
+def _select_frame(
+    driver: webdriver.Chrome, frame_selector: str | None, *, css_only: bool = False
+) -> None:
     """Enter the one frame ``frame_selector`` names, or say why it cannot.
+
+    ``css_only`` says the caller is an input path, which changes nothing about
+    what is accepted - ``_refuse_non_css_frame`` has already had its say - and
+    only what an ambiguous selector is told to do instead. Sending a caller to
+    the outline's verified-unique path is good advice for a reader and a dead end
+    for an input action, which cannot aim through one.
 
     A selector that matches two frames used to switch into whichever one came
     first and report success, so the caller read one document believing it was
@@ -4243,10 +5041,7 @@ def _select_frame(driver: webdriver.Chrome, frame_selector: str | None) -> None:
             ) from exc
         if count > 1:
             raise ValueError(
-                f"frame_selector '{frame_selector}' matches {count} elements in this "
-                "document, so it does not say which one to read. Use a selector that "
-                "matches exactly one frame, or the 'frame' path from "
-                "web_info(topic='page_outline'), which is verified unique."
+                _ambiguous_frame_message(frame_selector, count, css_only=css_only)
             )
         if count == 1:
             try:
@@ -4506,25 +5301,47 @@ def release_inputs(session_id: str = "default") -> dict[str, Any]:
 # load, and the token on the window says whether this is still the document the
 # form was submitted from, which is the only way a POST back onto the same URL
 # under the same title can be told apart from nothing happening at all.
+#
+# The listener goes on in the capture phase, because a framework that owns the
+# form calls stopImmediatePropagation in its own handler: every listener added to
+# the form after it was invisible, so a submit that had worked came back as one
+# that never happened, and the caller sent it a second time.
+#
+# Nothing branded is left behind either. The key is this call's own token, read
+# once and removed again, so a site that goes looking for an automation
+# fingerprint finds a random string that is already gone; anything an earlier
+# call could not clean up - its document was replaced before the read - is swept
+# away here.
 _SUBMIT_WATCH_SCRIPT = """
 const form = arguments[0];
 const token = arguments[1];
 const state = {token: token, fired: 0, prevented: false};
-window.__webSearchNeoSubmit = state;
-try { sessionStorage.removeItem('__webSearchNeoSubmit'); } catch (error) { /* denied */ }
+window[token] = state;
+try {
+  for (const key of Object.keys(sessionStorage)) {
+    if (key !== token && /^sf-[0-9]+$/.test(key)) sessionStorage.removeItem(key);
+  }
+} catch (error) { /* denied */ }
 form.addEventListener('submit', (event) => {
   state.fired += 1;
-  try { sessionStorage.setItem('__webSearchNeoSubmit', token); } catch (error) { /* denied */ }
+  try { sessionStorage.setItem(token, '1'); } catch (error) { /* denied */ }
   // defaultPrevented is only final once every listener has run.
   queueMicrotask(() => { state.prevented = event.defaultPrevented; });
-}, {once: true});
+}, {capture: true, once: true});
+// A form that delivers its result somewhere else leaves this document with
+// nothing to say about what happened.
+return String(form.target || '');
 """
 
 _SUBMIT_RESULT_SCRIPT = """
 const token = arguments[0];
-const state = window.__webSearchNeoSubmit;
+const state = window[token];
 let stored = false;
-try { stored = sessionStorage.getItem('__webSearchNeoSubmit') === token; } catch (error) { stored = false; }
+try {
+  stored = sessionStorage.getItem(token) !== null;
+  sessionStorage.removeItem(token);
+} catch (error) { stored = false; }
+try { delete window[token]; } catch (error) { window[token] = undefined; }
 return {
   same_document: !!state && state.token === token,
   fired: !!state && state.fired > 0,
@@ -4532,6 +5349,50 @@ return {
   stored: stored
 };
 """
+
+
+def _window_handle_count(driver: Any) -> int | None:
+    """How many tabs this browser has open, or None when it will not say.
+
+    The companion bridge drives one tab and keeps no list of the others, so a tab
+    a submit opens there is named by the form's own target instead.
+    """
+    try:
+        return len(driver.window_handles)
+    except Exception:
+        return None
+
+
+def _same_origin(first: str, second: str) -> bool:
+    left = urlsplit(first)
+    right = urlsplit(second)
+    return (left.scheme, left.netloc) == (right.scheme, right.netloc)
+
+
+def _submit_evidence(
+    fired: bool, navigated: bool, cross_origin: bool, new_tab: bool
+) -> str:
+    """Say what the verdict rests on, so a missing signal does not read as doubt."""
+    if fired and navigated:
+        parts = ["the form's submit event fired and the document was replaced"]
+    elif fired:
+        parts = ["the form's submit event fired"]
+    elif navigated:
+        parts = ["the document was replaced by the submit"]
+        if cross_origin:
+            parts.append(
+                "the submit event itself could not be read back, because the result "
+                "is on another origin and nothing of this document survives a "
+                "cross-origin load"
+            )
+    else:
+        parts = ["no submit event was raised and no document was replaced"]
+    if new_tab:
+        parts.append(
+            "the result opened in a new tab, so the url and title reported here are "
+            "still this page's"
+        )
+    return "; ".join(parts)
 
 
 def submit_form(
@@ -4550,12 +5411,20 @@ def submit_form(
     the document is tagged, so a load - even one back onto the same URL - is seen
     for what it is.
 
+    ``submit_evidence`` says which of those two signals the verdict rests on, so a
+    cross-origin result - where the event cannot be read back at all - is not left
+    looking like a doubt. ``new_tab_opened`` says the result went somewhere else
+    entirely, and that the url and title reported here are still this page's.
+
     ``frame_selector`` names the frame the form is looked up in, exactly as it
     does for ``find`` and ``page_text``; the submit button is looked for in that
     same document.
     """
     session = _get_session(session_id)
-    token = f"submit-{time.monotonic_ns()}"
+    token = f"sf-{time.monotonic_ns()}"
+    form_target = ""
+    tabs_before = None
+    tabs_after = None
     with session.lock:
         # A form inside a frame is submitted from inside that frame, and so is the
         # submit button, which lives in the same document as the form.
@@ -4575,7 +5444,10 @@ def submit_form(
                 session.driver.execute_script("arguments[0].reportValidity();", form)
             else:
                 before_url = session.driver.current_url
-                session.driver.execute_script(_SUBMIT_WATCH_SCRIPT, form, token)
+                tabs_before = _window_handle_count(session.driver)
+                form_target = str(
+                    session.driver.execute_script(_SUBMIT_WATCH_SCRIPT, form, token) or ""
+                )
                 if submit_selector:
                     button = WebDriverWait(session.driver, 10).until(
                         conditions.element_to_be_clickable((By.CSS_SELECTOR, submit_selector))
@@ -4594,6 +5466,7 @@ def submit_form(
                     # The document being watched is gone, which is itself the
                     # strongest evidence that the form navigated away.
                     outcome = {}
+                tabs_after = _window_handle_count(session.driver)
         finally:
             _release_action_frame(session.driver, frame_selector, form_selector)
         if not validation["valid"]:
@@ -4608,16 +5481,34 @@ def submit_form(
             }
         document_replaced = not bool(outcome.get("same_document"))
         submit_event_fired = bool(outcome.get("fired") or outcome.get("stored"))
-        navigation_observed = document_replaced or before_url != session.driver.current_url
+        after_url = session.driver.current_url
+        navigation_observed = document_replaced or before_url != after_url
         submit_triggered = submit_event_fired or navigation_observed
+        prevented = bool(outcome.get("prevented"))
+        # A result delivered to another tab leaves this document untouched, so the
+        # url and title below describe the page the form was on and nothing that
+        # happened to it. Selenium can count the tabs; the companion bridge cannot,
+        # and there the form's own target is the evidence.
+        opened_tab = (
+            tabs_before is not None and tabs_after is not None and tabs_after > tabs_before
+        ) or (
+            submit_triggered and not prevented and form_target.lower() == "_blank"
+        )
         return {
             **_page_summary(session.driver, session_id),
             "success": bool(validation["valid"] and submit_triggered),
             "validation_passed": bool(validation["valid"]),
             "submit_triggered": submit_triggered,
             "submit_event_fired": submit_event_fired,
-            "submit_default_prevented": bool(outcome.get("prevented")),
+            "submit_default_prevented": prevented,
+            "submit_evidence": _submit_evidence(
+                submit_event_fired,
+                navigation_observed,
+                not _same_origin(before_url, after_url),
+                opened_tab,
+            ),
             "navigation_observed": navigation_observed,
+            "new_tab_opened": bool(opened_tab),
             "url_before": before_url,
             "validation_errors": [],
             "submitted_form": form_selector,
@@ -4663,6 +5554,33 @@ def get_status(session_id: str = "default") -> dict[str, Any]:
     with _sessions_lock:
         session = _sessions.get(session_id)
         active_ids = sorted(_sessions)
+    if session is not None and _browser_run_changed(session) is not None:
+        # The same question every action asks, and it has to be asked here too:
+        # without it status summarised whatever tab now carries this session's
+        # id - one of the user's, in a browser run that never heard of us - and
+        # answered `session_open: true` over the top of it.
+        _discard_stale_session(session_id, session)
+        with _sessions_lock:
+            active_ids = sorted(_sessions)
+        bridge_status = _companion_status()
+        return {
+            "available": bool(bridge_status["connected"] or _browser_available),
+            "availability_error": None,
+            "session_open": False,
+            "session_id": session_id,
+            "active_sessions": active_ids,
+            "engine": "Chrome companion extension",
+            "browser_gone": True,
+            "next": (
+                f"The Chrome session '{session_id}' was opened in is no longer "
+                "running - it was restarted, or the companion updated itself - so "
+                "its tab no longer exists and its id now names a different tab. "
+                "The session has been dropped rather than reported on. Open the "
+                f'page again: web_action [{{"action":"open","url":...,'
+                f'"session_id":"{session_id}"}}].'
+            ),
+            "current_chrome": bridge_status,
+        }
     if session is None:
         bridge_status = _companion_status()
         available = bool(bridge_status["connected"] or _browser_available)
@@ -4847,8 +5765,10 @@ def _reset_session_runtime_state(session: BrowserSession) -> None:
 
 def _shutdown_session(
     session: BrowserSession, close_tab: bool | None = None
-) -> tuple[bool, str | None]:
+) -> dict[str, Any]:
     """Release one session's tab and browser; report what could not be released.
+
+    Returns ``{"tab_closed": bool, "browser_gone": bool, "problem": str | None}``.
 
     Cleanup must never raise - a failed teardown may not take the caller down with
     it - but it must not go quiet either. A debugger left attached keeps the "is
@@ -4857,7 +5777,29 @@ def _shutdown_session(
 
     Each step is attempted on its own: one failure used to skip the two after it,
     which turned a hiccup while releasing held keys into a leaked tab as well.
+
+    The first question is the one ``_get_session`` asks before every action, and
+    for the same reason: teardown sends more to Chrome than any other path, so a
+    session whose browser has been replaced must be forgotten in silence rather
+    than have ``tabs.remove`` aimed at whichever of the user's tabs inherited
+    its number.
     """
+    if _browser_run_changed(session) is not None:
+        # Exactly what _discard_stale_session does, and for the reason its
+        # docstring gives: nothing is sent to Chrome and the claim is not
+        # released either, because the daemon dropped the whole registry when the
+        # run changed and a release aimed at the old id could only hit a claim
+        # made since, in the new run.
+        logger.info(
+            "Session on tab %s was left alone: the Chrome it was opened in is gone",
+            session.current_tab_id,
+        )
+        return {
+            "tab_closed": False,
+            "browser_gone": True,
+            "problem": None,
+        }
+
     problems: list[str] = []
 
     def attempt(step: str, action: Any) -> Any:
@@ -4877,16 +5819,41 @@ def _shutdown_session(
         removed = attempt("closing the tab", session.driver.close_tab)
         tab_closed = bool((removed or {}).get("removed"))
         if not tab_closed:
-            problems.append("the tab is still open")
+            # `removed: false` is the extension's answer whenever
+            # `chrome.tabs.remove` throws, and a tab the user closed by hand is
+            # the commonest way to make it throw - so it does not mean the tab is
+            # still open, and reporting a leak on it made the two most ordinary
+            # teardowns name one that does not exist. Ask.
+            still_there = _tab_still_exists(session)
+            if still_there is True:
+                problems.append("the tab is still open")
+            elif still_there is None:
+                problems.append(
+                    "the tab could not be closed and the companion could not be "
+                    "asked whether it is still open"
+                )
     if session.owns_browser:
-        attempt("detaching from Chrome", session.driver.quit)
+        # ChromeBridgeDriver.quit cannot raise - teardown may not - so `attempt`
+        # can never see a failed detach and the banner would be left on the
+        # user's tab unmentioned. The outcome comes back in the answer instead.
+        detached = attempt("detaching from Chrome", session.driver.quit)
+        detach_error = (detached or {}).get("error") if isinstance(detached, dict) else None
+        if detach_error:
+            problems.append(
+                f"the debugger may still be attached to tab {session.current_tab_id} "
+                f"({detach_error})"
+            )
     else:
         attempt("stopping the driver service", session.driver.service.stop)
     if session.profile_mode == "current":
         # Let another agent have the tab even if the teardown above went badly:
         # a claim outliving the session that made it is a tab nobody can use.
         _release_claimed_tab(session.current_tab_id)
-    return tab_closed, "; ".join(problems) or None
+    return {
+        "tab_closed": tab_closed,
+        "browser_gone": False,
+        "problem": "; ".join(problems) or None,
+    }
 
 
 def close_session(session_id: str = "default", close_tab: bool | None = None) -> dict[str, Any]:
@@ -4901,15 +5868,15 @@ def close_session(session_id: str = "default", close_tab: bool | None = None) ->
         session = _sessions.pop(session_id, None)
         remaining = sorted(_sessions)
     closed = session is not None
-    tab_closed = False
-    problem: str | None = None
+    outcome: dict[str, Any] = {"tab_closed": False, "browser_gone": False, "problem": None}
     if session is not None:
         with session.lock:
-            tab_closed, problem = _shutdown_session(session, close_tab)
+            outcome = _shutdown_session(session, close_tab)
+    problem = outcome["problem"]
     return {
         "session_id": session_id,
         "closed": closed,
-        "tab_closed": tab_closed,
+        "tab_closed": bool(outcome["tab_closed"]),
         "active_sessions": remaining,
         # Closing something that is not there is a no-op rather than a failure,
         # but saying nothing lets a typo in a session id read as a clean close.
@@ -4917,6 +5884,20 @@ def close_session(session_id: str = "default", close_tab: bool | None = None) ->
             {}
             if closed
             else {"note": f"No session named '{session_id}' was open, so nothing was closed."}
+        ),
+        # Nor may "the browser it was opened in is gone" read as a clean close:
+        # no tab was closed because none of ours was there to close.
+        **(
+            {
+                "browser_gone": True,
+                "note": (
+                    f"The Chrome session '{session_id}' was opened in is no longer "
+                    "running, so nothing was sent to the browser: the session's tab "
+                    "id now names a different tab. The session has been dropped."
+                ),
+            }
+            if outcome["browser_gone"]
+            else {}
         ),
         **({"released": False, "warning": problem} if problem else {}),
     }
@@ -4926,25 +5907,42 @@ def close_all_sessions() -> dict[str, Any]:
     """Close every session, including the Chrome tabs the server itself opened.
 
     Reports what would not release, so ``close_all`` can name a leaked tab
-    instead of answering a flat "closed_all: true" over the top of it.
+    instead of answering a flat "closed_all: true" over the top of it - and names
+    the sessions whose browser was already gone, which release cleanly precisely
+    because nothing of ours was left to release.
     """
     with _sessions_lock:
         sessions = sorted(_sessions.items())
         _sessions.clear()
     tabs_closed = 0
     problems: dict[str, str] = {}
+    browsers_gone: list[str] = []
     for session_id, session in sessions:
         with session.lock:
-            tab_closed, problem = _shutdown_session(session)
-        tabs_closed += int(tab_closed)
-        if problem:
-            problems[session_id] = problem
+            outcome = _shutdown_session(session)
+        tabs_closed += int(bool(outcome["tab_closed"]))
+        if outcome["browser_gone"]:
+            browsers_gone.append(session_id)
+        if outcome["problem"]:
+            problems[session_id] = outcome["problem"]
     return {
         "closed_all": not problems,
         "closed_sessions": [session_id for session_id, _ in sessions],
         "tabs_closed": tabs_closed,
         "active_sessions": [],
         **({"warnings": problems} if problems else {}),
+        **(
+            {
+                "browser_gone": browsers_gone,
+                "note": (
+                    "The Chrome these sessions were opened in is no longer running, "
+                    "so nothing was sent to the browser: their tab ids now name "
+                    f"different tabs. Left alone: {browsers_gone}."
+                ),
+            }
+            if browsers_gone
+            else {}
+        ),
     }
 
 

@@ -1,0 +1,24 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Forum - long thread</title></head>
+<body>
+<h1>What did you ship this week?</h1>
+<p id="body-copy"></p>
+<!-- A sign-in box the reader may close. It sits over the middle of the viewport,
+     but it covers a small part of it: the thread around it is readable and every
+     link in it can still be clicked, so nothing here needs a human. -->
+<div id="signin" style="position:fixed;left:50%;top:50%;width:360px;height:300px;
+                        margin:-150px 0 0 -180px;background:#fff;border:1px solid #888;
+                        z-index:50;text-align:center">
+  <button id="close-signin" type="button" onclick="this.parentNode.remove()">Close</button>
+  <p>Sign in to reply</p>
+  <div class="g-recaptcha" data-sitekey="6Lc_bbbb"
+       style="position:absolute;left:50%;top:50%;width:304px;height:78px;
+              margin:-39px 0 0 -152px;background:#eee"></div>
+</div>
+<script>
+  document.getElementById('body-copy').textContent =
+    'Threads, replies and the usual arguments about tabs versus spaces. '.repeat(75);
+</script>
+</body>
+</html>

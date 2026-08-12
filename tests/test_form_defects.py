@@ -293,6 +293,25 @@ def test_the_action_tools_act_inside_the_frame_they_are_given(local_site, tmp_pa
     assert driver.execute_script("return document.title;") == "Application host"
 
 
+def test_wait_reports_the_wait_it_really_made_not_the_one_it_was_asked_for(local_site):
+    """The timeout is clamped to 30s. A caller who asked for 120 and was told
+    nothing read the failure as two minutes of waiting that never happened."""
+    _open_or_skip(_form(local_site, "frame_host.html"), "defect-wait-clamp")
+    waited = browser_tools.wait_for_element(
+        "#host-state", session_id="defect-wait-clamp", state="visible", timeout_seconds=120.0
+    )
+    assert waited["timeout_seconds"] == 30.0
+
+    with pytest.raises(WebDriverException) as failure:
+        browser_tools.wait_for_element(
+            "#nothing-here",
+            session_id="defect-wait-clamp",
+            state="present",
+            timeout_seconds=1.0,
+        )
+    assert "1s" in str(failure.value)  # the wait it made, in the failure itself
+
+
 def test_an_ambiguous_frame_selector_is_refused_by_the_action_tools(local_site):
     _open_or_skip(_form(local_site, "frame_host.html"), "defect-frame-ambiguous")
     with pytest.raises(ValueError, match="matches 2 elements"):
@@ -334,6 +353,10 @@ def test_a_sitekey_that_is_not_a_captcha_is_not_a_challenge(local_site):
 
 def test_a_captcha_lying_over_the_page_blocks_even_when_the_page_is_long(local_site):
     driver = _open_or_skip(_challenge(local_site, "overlay.html"), "defect-challenge-overlay")
+    # The verdict has to come from the widget lying over the page, not from the
+    # page being short or saying "verify you are human": the probe's own flag is
+    # asserted so that this cannot pass on one of the other two rules.
+    assert driver.execute_script(browser_tools._CHALLENGE_WIDGET_SCRIPT)["blocking"] is True
     status = browser_tools._challenge_status(driver)
     assert status["challenge_detected"] is True
     assert status["manual_action_required"] is True
@@ -355,3 +378,285 @@ def test_challenges_the_top_level_query_walked_past(local_site, fixture, evidenc
     assert status["challenge_detected"] is True
     assert status["challenge_type"] == "captcha"
     assert evidence in status["challenge_evidence"]
+
+
+# ---------------------------------------------------------------------------
+# blocking is a property of the whole stack over the page, not of one hit test
+# ---------------------------------------------------------------------------
+
+
+def test_a_captcha_in_a_shadow_root_over_the_page_blocks(local_site):
+    """elementFromPoint retargets shadow content to its host, so the widget in a
+    web component was never the node at the centre and never counted as blocking."""
+    driver = _open_or_skip(_challenge(local_site, "shadow_overlay.html"), "defect-block-shadow")
+    _settle(driver, "document.getElementById('gate').shadowRoot")
+    assert driver.execute_script(browser_tools._CHALLENGE_WIDGET_SCRIPT)["blocking"] is True
+    status = browser_tools._challenge_status(driver)
+    assert status["challenge_detected"] is True
+    assert status["manual_action_required"] is True
+    assert status["captcha_widgets"] == ["div.cf-turnstile (in shadow DOM)"]
+
+
+def test_a_veil_over_the_captcha_does_not_make_the_page_reachable(local_site):
+    """A transparent layer above the widget wins the hit test; it blocks the page
+    just as thoroughly, so the verdict must not depend on what is topmost."""
+    driver = _open_or_skip(_challenge(local_site, "veil.html"), "defect-block-veil")
+    assert driver.execute_script(browser_tools._CHALLENGE_WIDGET_SCRIPT)["blocking"] is True
+    status = browser_tools._challenge_status(driver)
+    assert status["challenge_detected"] is True
+    assert status["manual_action_required"] is True
+
+
+def test_a_dismissible_modal_over_a_readable_page_does_not_block(local_site):
+    """Covering the centre of the viewport is not the same as blocking the page:
+    an optional sign-in box leaves the whole thread readable and clickable."""
+    driver = _open_or_skip(_challenge(local_site, "optional_modal.html"), "defect-block-modal")
+    probe = driver.execute_script(browser_tools._CHALLENGE_WIDGET_SCRIPT)
+    assert probe["body_length"] > 1500  # nothing about this page is an interstitial
+    assert probe["blocking"] is False
+    status = browser_tools._challenge_status(driver)
+    assert status["challenge_detected"] is False
+    assert status["manual_action_required"] is False
+    assert status["captcha_widgets"] == ["div.g-recaptcha"]
+    waited = browser_tools.wait_for_challenge_resolution(
+        session_id="defect-block-modal", timeout_seconds=10.0
+    )
+    assert waited["resolved"] is True
+    assert waited["timed_out"] is False
+    assert waited["waited_seconds"] < 5.0
+
+
+# ---------------------------------------------------------------------------
+# a scan that stopped early must not read as a page with no captcha on it
+# ---------------------------------------------------------------------------
+
+
+def test_a_widget_past_the_old_node_budget_is_still_found(local_site):
+    driver = _open_or_skip(
+        _challenge(local_site, "huge_page.html?nodes=12000"), "defect-scan-budget"
+    )
+    _settle(driver, "window.fillerCount > 12000")
+    status = browser_tools._challenge_status(driver)
+    assert status["captcha_widgets"] == ["div.cf-turnstile (in shadow DOM)"]
+    assert status["captcha_scan_incomplete"] is False
+
+
+def test_a_scan_that_ran_out_of_budget_says_it_stopped_looking(local_site):
+    driver = _open_or_skip(
+        _challenge(local_site, "huge_page.html?nodes=60000"), "defect-scan-truncated"
+    )
+    _settle(driver, "window.fillerCount > 60000", timeout=15.0)
+    status = browser_tools._challenge_status(driver)
+    assert status["captcha_widgets"] == []
+    assert status["captcha_scan_incomplete"] is True
+
+
+def test_a_challenge_five_documents_down_is_found(local_site):
+    driver = _open_or_skip(
+        _challenge(local_site, "deep_frames.html?depth=5"), "defect-scan-depth"
+    )
+    _settle(driver, "window.gateReady()")
+    status = browser_tools._challenge_status(driver)
+    assert status["captcha_widgets"] == ["div.cf-turnstile (in a frame)"]
+    assert status["captcha_scan_incomplete"] is False
+
+
+def test_a_scan_that_ran_out_of_depth_says_it_stopped_looking(local_site):
+    driver = _open_or_skip(
+        _challenge(local_site, "deep_frames.html?depth=14"), "defect-scan-deep"
+    )
+    _settle(driver, "window.gateReady()", timeout=15.0)
+    status = browser_tools._challenge_status(driver)
+    assert status["captcha_widgets"] == []
+    assert status["captcha_scan_incomplete"] is True
+
+
+# ---------------------------------------------------------------------------
+# the value a field is left holding is read off the field the page kept
+# ---------------------------------------------------------------------------
+
+
+def test_a_control_the_page_replaced_while_committing_is_not_reported_as_filled(local_site):
+    """The change the blur fires can re-render the control; the value has to be
+    read off whatever the page kept, not off the orphan left in the script."""
+    driver = _open_or_skip(_form(local_site, "rerender.html"), "defect-fill-rerender")
+    result = browser_tools.fill_fields({"#coupon": "SUMMER"}, session_id="defect-fill-rerender")
+    assert driver.execute_script("return document.getElementById('coupon').value;") == ""
+    assert driver.execute_script("return document.getElementById('notice').textContent;") == (
+        "Coupon rejected"
+    )
+    assert result["success"] is False
+    assert result["filled"] == []
+    assert result["field_values"]["#coupon"] == ""
+    assert "SUMMER" in result["errors"]["#coupon"]
+
+
+def test_a_control_the_page_removed_while_committing_is_reported_gone(local_site):
+    driver = _open_or_skip(_form(local_site, "rerender.html"), "defect-fill-removed")
+    result = browser_tools.fill_fields({"#promo": "SPRING"}, session_id="defect-fill-removed")
+    assert driver.execute_script("return !document.getElementById('promo');") is True
+    assert result["success"] is False
+    assert result["field_values"]["#promo"] is None
+    assert "#promo" in result["errors"]
+
+
+def test_a_multiple_select_holds_exactly_the_option_that_was_asked_for(local_site):
+    """select_by_value adds to the selection, so two fills left both options set -
+    the form would have submitted both - and the read-back named only the first."""
+    driver = _open_or_skip(_form(local_site, "multiselect.html"), "defect-select-multi")
+    first = browser_tools.fill_fields({"#langs": "b"}, session_id="defect-select-multi")
+    assert first["success"] is True
+    assert driver.execute_script("return window.selectedLangs();") == ["b"]
+
+    second = browser_tools.fill_fields({"#langs": "c"}, session_id="defect-select-multi")
+    assert driver.execute_script("return window.selectedLangs();") == ["c"]
+    assert second["success"] is True
+    assert second["field_values"]["#langs"] == ["c"]
+
+
+def test_a_multiple_select_takes_every_value_it_is_given(local_site):
+    driver = _open_or_skip(_form(local_site, "multiselect.html"), "defect-select-list")
+    result = browser_tools.fill_fields({"#langs": ["a", "c"]}, session_id="defect-select-list")
+    assert result["success"] is True
+    assert driver.execute_script("return window.selectedLangs();") == ["a", "c"]
+    assert result["field_values"]["#langs"] == ["a", "c"]
+    assert driver.execute_script("return window.changed;") == ["langs"]
+
+
+def test_a_value_the_field_sanitised_is_not_reported_as_a_refusal(local_site):
+    """type=email and type=url strip the whitespace around a value by the spec's
+    own algorithm, and a change handler may trim or fold case: the field took it."""
+    _open_or_skip(_form(local_site, "picky.html"), "defect-fill-sanitised")
+    result = browser_tools.fill_fields(
+        {
+            "#email": "  ada@example.com  ",
+            "#site": "  https://example.test/  ",
+            "#city": "  Berlin  ",
+        },
+        session_id="defect-fill-sanitised",
+    )
+    assert result["errors"] == {}
+    assert result["success"] is True
+    assert set(result["filled"]) == {"#email", "#site", "#city"}
+    assert result["field_values"]["#email"] == "ada@example.com"
+    assert result["field_values"]["#city"] == "berlin"
+
+
+# ---------------------------------------------------------------------------
+# controls that cannot be typed into
+# ---------------------------------------------------------------------------
+
+
+def test_date_and_dial_controls_take_their_values(local_site):
+    """clear() + send_keys turned '2024-01-15' into '40115-02-20' and left the
+    field holding a date that looks perfectly plausible."""
+    driver = _open_or_skip(_form(local_site, "datetime.html"), "defect-fill-dates")
+    result = browser_tools.fill_fields(
+        {
+            "#day": "2024-01-15",
+            "#at": "09:30",
+            "#when": "2024-01-15T09:30",
+            "#cycle": "2024-01",
+            "#sprint": "2024-W03",
+            "#volume": "35",
+            "#shade": "#ff8800",
+        },
+        session_id="defect-fill-dates",
+    )
+    assert result["errors"] == {}
+    assert result["success"] is True
+    assert driver.execute_script(
+        "return Array.from(document.querySelectorAll('#booking input'))"
+        ".map(node => node.id + '=' + node.value);"
+    ) == [
+        "day=2024-01-15",
+        "at=09:30",
+        "when=2024-01-15T09:30",
+        "cycle=2024-01",
+        "sprint=2024-W03",
+        "volume=35",
+        "shade=#ff8800",
+    ]
+    # One change event each, and the input event the page's own script expects.
+    assert driver.execute_script("return window.changed;") == [
+        "day", "at", "when", "cycle", "sprint", "volume", "shade",
+    ]
+    assert driver.execute_script("return window.inputEvents;") == [
+        "day", "at", "when", "cycle", "sprint", "volume", "shade",
+    ]
+
+
+def test_a_date_in_the_wrong_format_names_the_format_that_works(local_site):
+    driver = _open_or_skip(_form(local_site, "datetime.html"), "defect-fill-date-format")
+    result = browser_tools.fill_fields({"#day": "01/15/2024"}, session_id="defect-fill-date-format")
+    assert result["success"] is False
+    assert "YYYY-MM-DD" in result["errors"]["#day"]
+    # Not left holding a wrong date that reads like a right one.
+    assert driver.execute_script("return document.getElementById('day').value;") == ""
+
+
+def test_a_refused_range_value_does_not_move_the_slider(local_site):
+    driver = _open_or_skip(_form(local_site, "datetime.html"), "defect-fill-range")
+    result = browser_tools.fill_fields({"#volume": "loud"}, session_id="defect-fill-range")
+    assert result["success"] is False
+    assert driver.execute_script("return document.getElementById('volume').value;") == "80"
+
+
+def test_a_control_that_cannot_be_typed_into_still_reports_what_it_holds(local_site):
+    result_session = "defect-fill-custom"
+    _open_or_skip(_form(local_site, "datetime.html"), result_session)
+    result = browser_tools.fill_fields({"#custom": "text"}, session_id=result_session)
+    assert result["success"] is False
+    assert "#custom" in result["errors"]
+    assert result["field_values"]["#custom"] == "preset"
+
+
+# ---------------------------------------------------------------------------
+# submit: what the page did, and where the result went
+# ---------------------------------------------------------------------------
+
+
+def test_a_framework_that_swallows_the_submit_event_still_counts_as_submitted(local_site):
+    """stopImmediatePropagation on the form hid the submit from a listener added
+    after it, so a working submit reported failure and the caller posted twice."""
+    driver = _open_or_skip(_form(local_site, "spa_submit.html"), "defect-submit-spa-swallow")
+    result = browser_tools.submit_form("#signup", session_id="defect-submit-spa-swallow")
+    assert driver.execute_script("return window.spaHandled;") is True
+    assert result["submit_event_fired"] is True
+    assert result["submit_default_prevented"] is True
+    assert result["success"] is True
+
+
+def test_a_submit_that_opens_a_new_tab_says_the_result_is_not_on_this_page(local_site):
+    driver = _open_or_skip(_form(local_site, "submit_blank.html"), "defect-submit-blank")
+    before = len(driver.window_handles)
+    result = browser_tools.submit_form("#preview", session_id="defect-submit-blank")
+    assert len(driver.window_handles) == before + 1
+    assert result["success"] is True
+    assert result["new_tab_opened"] is True
+    assert result["title"] == "Print preview"  # this page, not the result
+
+
+def test_a_cross_origin_submit_explains_why_the_event_could_not_be_read(local_site):
+    _open_or_skip(_form(local_site, "submit_cross_origin.html"), "defect-submit-cross")
+    result = browser_tools.submit_form("#handoff", session_id="defect-submit-cross")
+    assert result["success"] is True
+    assert result["submit_triggered"] is True
+    assert result["submit_event_fired"] is False
+    assert "cross-origin" in result["submit_evidence"]
+
+
+def test_the_submit_probe_leaves_no_trace_of_itself_in_the_page(local_site):
+    """The token was written to sessionStorage under a branded key and never
+    removed: a one-key fingerprint left on exactly the sites that look for one."""
+    driver = _open_or_skip(_form(local_site, "spa_submit.html"), "defect-submit-trace")
+    # WebDriver leaves a global of its own the first time a script is handed an
+    # element; the snapshot is taken after that, so what it compares is ours.
+    driver.execute_script(
+        "return arguments[0].id;", driver.find_element("css selector", "#signup")
+    )
+    before = driver.execute_script("return Object.keys(window);")
+    result = browser_tools.submit_form("#signup", session_id="defect-submit-trace")
+    assert result["submit_event_fired"] is True  # the watcher really did run
+    assert driver.execute_script("return Object.keys(sessionStorage);") == []
+    assert driver.execute_script("return Object.keys(window);") == before
