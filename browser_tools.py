@@ -3524,7 +3524,7 @@ def close_all_sessions() -> None:
 
 
 def start_current_chrome_bridge() -> dict[str, Any]:
-    """Start the loopback listener early so the extension is ready before the first action."""
+    """Link to the bridge daemon early, starting one if needed, so no action waits on it."""
     bridge = get_chrome_bridge()
     bridge.start()
     return bridge.status(0.0)

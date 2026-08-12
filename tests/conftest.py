@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import os
 from pathlib import Path
+import socket
 import sys
 import threading
 import time
@@ -15,6 +17,19 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_ROOT = (PROJECT_ROOT / "tests" / "fixtures").resolve()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+
+def _unused_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
+# A test run must not leave a bridge daemon behind, and it must not walk into the
+# one this machine's own Chrome companion is using: only the tests that mean it
+# start a daemon, and the default port points where nobody is listening.
+os.environ["WEB_SEARCH_NEO_BRIDGE_AUTOSPAWN"] = "0"
+os.environ.setdefault("WEB_SEARCH_NEO_BRIDGE_PORT", str(_unused_port()))
 
 
 @dataclass

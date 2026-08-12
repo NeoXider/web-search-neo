@@ -58,7 +58,12 @@ python main.py
 
 The process waits for MCP messages on stdin and writes responses to stdout, so an apparently idle terminal is expected. Stop it with `Ctrl+C`.
 
-Diagnostic logs are written to `msp_server.log`. The log file is ignored by Git.
+Diagnostic logs are written to `msp_server.log`. The log file is ignored by Git. The
+companion bridge is a separate process and logs separately, to
+`%LOCALAPPDATA%\WebSearchNeo\bridge-daemon.log` on Windows or
+`$XDG_DATA_HOME/WebSearchNeo/bridge-daemon.log` — by default
+`~/.local/share/WebSearchNeo/bridge-daemon.log` — because two processes rotating one file
+collide on Windows. See [The bridge daemon](#the-bridge-daemon).
 
 ## 4. LM Studio configuration
 
@@ -188,28 +193,85 @@ Enable the companion in one Chrome profile at a time. The bridge keeps one compa
 connection, and the newest authenticated one replaces the previous one, so a second profile
 running the companion takes the agent's tabs over from the first.
 
+### The bridge daemon
+
+That listener is not part of the MCP server process. It is a standalone daemon —
+`bridge_daemon.py` — which owns the port, holds the one connection to the companion, and
+relays commands for any number of local MCP clients. You do not install or configure it: an
+MCP server starts it detached as it comes up, if nothing is listening yet, and it then
+outlives that server. Nothing is registered for autostart: no service, no scheduled task, no
+login item.
+
+Two consequences are worth knowing before you troubleshoot anything:
+
+- The badge stays `ON` between agent calls, and while no agent runs at all. It goes `OFF`
+  only when no daemon is listening.
+- Two MCP clients can use the same Chrome at once — Claude Code and LM Studio together, for
+  instance. Both relay through the one daemon.
+
+You can drive it directly from the clone:
+
+```text
+python main.py --bridge
+python main.py --bridge --stop
+```
+
+The first runs the daemon in the foreground, tied to that terminal and stopped with
+`Ctrl+C`; it exits quietly if another daemon already owns the port, because that one serves
+just as well. It prints nothing — its output goes to `bridge-daemon.log` either way, so read
+that file to follow it. The second asks a running daemon to exit and says whether it found
+one; it never starts one.
+
+Left alone with neither a companion nor a client attached, the daemon exits after fifteen
+minutes. A connected companion by itself keeps it up indefinitely, which is the ordinary
+state of a machine with Chrome open. Set `WEB_SEARCH_NEO_BRIDGE_IDLE_SECONDS` to change
+that window, or to `0` to keep the port held; the daemon inherits the environment of the
+server that spawned it, so setting it in your MCP client configuration is enough.
+
+After `git pull`, a daemon started by the previous revision does not keep serving the old
+code: it reports its version during the client handshake, and a server of a different
+version stops it and starts a current one. It does that at most twice; if a third daemon
+still reports the wrong version, the server gives up and repeats an error naming both
+versions instead of restarting the fight. That means another checkout is running against the
+same port — stop it, then restart this server.
+
+`web_info(topic="browser_status")` shows the link under `current_chrome.daemon`: `linked`
+says whether this server currently holds one, while `version` and `pid` identify the daemon
+process from its handshake. `current_chrome.connected` is about the companion itself, so
+`linked: true` with `connected: false` means the bridge is up and Chrome is not.
+
 ### The shared bridge secret
 
 Loopback is reachable by every process running under your account, so the server and the
 companion authenticate each other before any command is executed. Nothing here needs manual
 work; it is documented because the file exists on your disk.
 
-- The MCP server mints a random 32-byte token the first time it starts and stores it at
+- A random 32-byte token is minted on first use — by the daemon as it starts, or by an MCP
+  server as it connects — and stored at
   `%LOCALAPPDATA%\WebSearchNeo\bridge-token` on Windows, or at
   `$XDG_DATA_HOME/WebSearchNeo/bridge-token` — by default
   `~/.local/share/WebSearchNeo/bridge-token` — created with `0600` permissions on POSIX.
 - The token is machine-local and per-user. Never copy it to another machine or into a
-  repository; if it leaks, delete the file, restart the MCP server, and reload the
-  companion, which mints and publishes a new one.
-- The server writes a copy into `chrome-extension/bridge-token.js` whenever it starts and on
-  every `setup_current_chrome` call. That file is in `.gitignore`; a fresh clone does not
-  contain it, and the companion simply retries until the server has written it.
-- The companion sends the token with a nonce; the server answers with
+  repository. If it leaks: delete the file, run `python main.py --bridge --stop`, restart the
+  MCP server, and reload the companion. Stopping the daemon is the part that is easy to
+  forget — it keeps the token it read at startup in memory, so a new secret it never saw
+  would simply be refused.
+- A copy is written into `chrome-extension/bridge-token.js` whenever the bridge comes up and
+  on every `setup_current_chrome` call. That file is in `.gitignore`; a fresh clone does not
+  contain it, and the companion simply retries until it has been written.
+- The companion sends the token with a nonce; the daemon answers with
   `HMAC-SHA256(token, nonce)`; each side stops if the other cannot prove it holds the same
-  secret.
+  secret. An MCP server proves itself to the daemon the same way before it may relay
+  anything, so the relay is not a way around the token.
 - A file-based secret does not protect against a malicious process running as the same user,
   which can read it. It closes the case where any local process that grabs the bridge port
   before the server gains DevTools access to your signed-in tabs.
+- Since the daemon holds the port between agent calls, the bridge is reachable for as long
+  as Chrome keeps the companion attached, rather than only while an agent runs. The
+  authentication and the loopback-only bind are unchanged, and a process running as you
+  could always read the token file, but the reachable window is longer than it was.
+  `python main.py --bridge --stop` closes it at once, and the idle exit closes it fifteen
+  minutes after the last companion and client are gone.
 
 ## 7. Choose an isolated or managed browser mode
 
@@ -308,8 +370,14 @@ git pull --ff-only
 python -m pip install -r requirements.txt
 ```
 
-Restart or toggle the MCP server after updating. Chrome never refreshes an unpacked
-extension by itself, but from 1.3.1 the server no longer needs you to: a
+Restart or toggle the MCP server after updating. The [bridge daemon](#the-bridge-daemon)
+started by the previous revision needs nothing from you: it announces its version to the
+restarted server, which stops it and starts a current one, so pulled code cannot be shadowed
+by a process that predates it. `python main.py --bridge --stop` is the manual equivalent, and
+is worth remembering when a change refuses to take effect.
+
+Chrome never refreshes an unpacked extension by itself, but from 1.3.1 the server no longer
+needs you to: a
 `setup_current_chrome` call that finds a connected companion older than the bundled one
 sends it a `runtime.reload` command, waits for the worker to come back, and reports
 `self_update: "done"` with the `replaced_version`. Reloading is also what makes the worker
@@ -343,9 +411,18 @@ Set these for the MCP server process before it starts.
 | `WEB_SEARCH_NEO_BROWSER_USER_AGENT` | Override the User-Agent of rendered sessions. |
 | `WEB_SEARCH_NEO_PROFILE_ROOT` | Root directory for `persistent` Chrome profiles. |
 | `WEB_SEARCH_NEO_DEBUGGER_ADDRESS` | Default DevTools address for `attach` mode. |
-| `WEB_SEARCH_NEO_BRIDGE_PORT` | Loopback port of the companion bridge, default `8765`. |
+| `WEB_SEARCH_NEO_BRIDGE_PORT` | Loopback port of the companion bridge, default `8765`. Shared by the daemon, every MCP server, and the extension. |
+| `WEB_SEARCH_NEO_BRIDGE_IDLE_SECONDS` | How long the bridge daemon stays up with neither a companion nor a client attached, default `900`. `0` disables the timer. |
+| `WEB_SEARCH_NEO_BRIDGE_AUTOSPAWN` | `0`, `false`, or `no` stops a server from starting a daemon; it then works only if one is already running. |
+| `WEB_SEARCH_NEO_BRIDGE_CONNECT_TIMEOUT` | How long a server keeps trying to reach a daemon, including one it just started, default `12` seconds. |
+| `WEB_SEARCH_NEO_BRIDGE_START_TIMEOUT` | How long startup waits for that first attempt before it continues in the background, default `2` seconds. |
 | `WEB_SEARCH_NEO_ALLOW_PLAIN_HTTP` | Accept unencrypted `http://` to public hosts. |
 | `WEB_SEARCH_NEO_LEGACY_TOOLS` | Advertise the former wide tool list instead of the two compact tools. |
+
+The `WEB_SEARCH_NEO_BRIDGE_*` variables reach the daemon as well: a spawned one inherits the
+environment of the server that started it, and one you run yourself with
+`python main.py --bridge` reads them from that shell. A daemon that is already running keeps
+the values it started with, so stop it with `--bridge --stop` after changing them.
 
 `WEB_SEARCH_NEO_ALLOW_PLAIN_HTTP` accepts `1`, `true`, `yes`, or `on`. Without it, plain
 `http://` to a public host is refused for both page fetches and browser `open`, and each
@@ -374,23 +451,34 @@ Open `http://127.0.0.1:9222/json/version` locally. If it is unavailable, restart
 
 ### Current Chrome companion cannot connect
 
-Call `web_info(topic="browser_status")`. Confirm that the MCP server is still
-running, **Web Search Neo Companion** is enabled at `chrome://extensions`, and the
-toolbar badge shows `ON`. If port 8765 is occupied, stop the other process or set
-the same free `WEB_SEARCH_NEO_BRIDGE_PORT` for the MCP and extension source before
-loading it.
+Call `web_info(topic="browser_status")`. Confirm that **Web Search Neo Companion** is
+enabled at `chrome://extensions`, that the toolbar badge shows `ON`, and that
+`current_chrome.daemon.linked` is `true` — that last one separates "the server cannot reach
+the bridge" from "the bridge cannot reach Chrome". If port 8765 is occupied by something
+that is not our daemon, stop that process, or set the same free `WEB_SEARCH_NEO_BRIDGE_PORT`
+for the MCP and the extension source before loading it. To take the bridge under your own
+control while you reproduce the problem, stop the running one and start it yourself, then
+follow `%LOCALAPPDATA%\WebSearchNeo\bridge-daemon.log` — that is where it writes, foreground
+or not:
 
-A badge that reads `OFF` while no MCP server is running is not a fault: there is nothing to
-connect to. The worker retries with an exponential backoff — about 1.5 seconds after the
-first failure, doubling to a ceiling of one minute, and resetting to the floor as soon as a
+```text
+python main.py --bridge --stop
+python main.py --bridge
+```
+
+A badge that reads `OFF` means no daemon is listening — none has been started since the
+machine booted, the last one exited after its idle window, or it was stopped. That is not a
+fault, but it is no longer what you see between two agent calls. The worker retries with an
+exponential backoff — about 1.5 seconds after the first
+failure, doubling to a ceiling of one minute, and resetting to the floor as soon as a
 handshake verifies. Starting the browser, reloading the extension, and clicking its toolbar
-icon each reset that schedule and retry at once, which is how you say "the server is up now"
+icon each reset that schedule and retry at once, which is how you say "the bridge is up now"
 without waiting out the current delay.
 
 ### The companion card shows a red “Errors” button
 
 Expected on an idle machine, and harmless. Chrome records every refused connection attempt
-to `127.0.0.1:8765` as an extension runtime error, so with no server listening the card
+to `127.0.0.1:8765` as an extension runtime error, so with no daemon listening the card
 collects identical `ERR_CONNECTION_REFUSED` lines. Before 1.3.1 the worker retried every two
 seconds and could bury the page under hundreds of them; the backoff above turns that into
 roughly one line a minute. An extension cannot suppress the entries — Chrome writes them
@@ -409,14 +497,15 @@ or when `setup_current_chrome` answered `self_update: "unsupported"` or `"timeou
    companion token yet, run setup_current_chrome` means `chrome-extension/bridge-token.js`
    is missing: start the MCP server from the clone, which writes it, or send a
    `setup_current_chrome` action. `handshake refused (1008) Companion token mismatch` means
-   the file holds a different secret than the running server — the usual cause is two
-   clones, or a copied checkout, so start the server from the same directory Chrome loaded
-   and reload the extension again.
+   the file holds a different secret than the bridge does — the usual cause is two clones,
+   or a copied checkout, so start the server from the same directory Chrome loaded and
+   reload the extension again. A daemon that is still running with a secret rotated out from
+   under it says the same thing; `python main.py --bridge --stop` retires it.
 3. Check the card's version. It must read 1.3.1; anything older than 1.3.0 cannot
    authenticate at all, and Chrome only picks up the new manifest on reload.
-4. `msp_server.log` records the server's side: `Rejected a bridge client that did not
-   present the companion token` confirms that something did reach the port but could not
-   prove the secret.
+4. `%LOCALAPPDATA%\WebSearchNeo\bridge-daemon.log` records the bridge's side: `Rejected a
+   bridge client that did not present the companion token` confirms that something did reach
+   the port but could not prove the secret.
 
 The companion keeps retrying a refused handshake on its own — starting at about ten seconds
 and slowing to at most two minutes — so once the cause is fixed it reconnects without help.

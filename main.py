@@ -7,6 +7,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
+import sys
 from typing import Any, Literal
 from urllib.parse import urljoin
 
@@ -14,7 +15,9 @@ from bs4 import BeautifulSoup
 from mcp.server.fastmcp import FastMCP, Image
 from pydantic import ValidationError
 
+import bridge_daemon
 import browser_tools
+import chrome_bridge
 import msp_date_time
 import msp_search
 from web_client import request
@@ -1579,7 +1582,29 @@ async def web_action(
     }
 
 
+def stop_bridge_daemon() -> int:
+    """Ask a running daemon to exit; the answer to "why is my edit not live?"."""
+    # Not the shared instance: stopping a daemon must never start one first.
+    bridge = chrome_bridge.ChromeBridge(spawn=False)
+    try:
+        if bridge.stop_daemon("stopped from the command line"):
+            print("The bridge daemon was asked to stop.")
+            return 0
+        print(f"No bridge daemon is listening on {bridge.host}:{bridge.port}.")
+        return 0
+    finally:
+        bridge.shutdown()
+
+
 def main() -> None:
+    arguments = sys.argv[1:]
+    if "--bridge" in arguments:
+        if "--stop" in arguments:
+            raise SystemExit(stop_bridge_daemon())
+        # The daemon behind the companion port, run from the same file every MCP
+        # config already points at. It speaks no MCP and touches no stdio: an
+        # agent's browser calls reach it over the loopback bridge instead.
+        raise SystemExit(bridge_daemon.run_forever(__version__))
     browser_tools.start_current_chrome_bridge()
     active_mcp = (
         legacy_mcp

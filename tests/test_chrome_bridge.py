@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 from pathlib import Path
 import shutil
 import socket
 import subprocess
+import sys
 import threading
+import time
 
 import pytest
 from websockets.exceptions import ConnectionClosed
@@ -13,12 +17,16 @@ from websockets.sync.client import connect
 
 import bridge_auth
 import browser_tools
-from chrome_bridge import CHROME_EXTENSION_ID, ChromeBridge, ChromeBridgeDriver
+import chrome_bridge
+import main
+from bridge_daemon import BridgeDaemon
+from chrome_bridge import CHROME_EXTENSION_ID, ChromeBridge, ChromeBridgeDriver, ChromeBridgeError
 
 
 TEST_TOKEN = "a1" * 32
 OTHER_TOKEN = "b2" * 32
 NODE = shutil.which("node")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXTENSION_DIR = Path(__file__).resolve().parents[1] / "chrome-extension"
 EVENTS_MODULE = (EXTENSION_DIR / "events.js").as_uri()
 SERVICE_WORKER_MODULE = (EXTENSION_DIR / "service-worker.js").as_uri()
@@ -211,109 +219,174 @@ def _companion_socket(port: int):
     )
 
 
-def _hello(token: str | None, nonce: str = "0f" * 16) -> str:
+def _hello(token: str | None, nonce: str = "0f" * 16, role: str | None = None) -> str:
     message: dict = {"type": "hello", "protocol": 1, "browser": {"name": "Test Chrome"}}
+    if role is not None:
+        message["role"] = role
     if token is not None:
         message["token"] = token
         message["nonce"] = nonce
     return json.dumps(message)
 
 
-def test_bridge_round_trip_accepts_extension_protocol() -> None:
-    bridge = ChromeBridge(port=_free_port(), token=TEST_TOKEN)
-    bridge.start()
-    nonce = "1234" * 8
-
-    def extension_client() -> None:
-        with _companion_socket(bridge.port) as websocket:
-            websocket.send(_hello(TEST_TOKEN, nonce))
-            acknowledgement = json.loads(websocket.recv())
-            assert acknowledgement["type"] == "hello_ack"
-            # The ack proves the server knows the same secret, not just the port.
-            assert bridge_auth.verify(TEST_TOKEN, nonce, acknowledgement["proof"])
-            command = json.loads(websocket.recv())
-            websocket.send(
-                json.dumps(
-                    {
-                        "type": "result",
-                        "id": command["id"],
-                        "result": {"method": command["method"]},
-                    }
-                )
-            )
-
-    thread = threading.Thread(target=extension_client)
-    thread.start()
-    assert bridge.wait_connected(2.0)
-    assert bridge.request("tabs.list") == {"method": "tabs.list"}
-    thread.join(timeout=2.0)
-    bridge.shutdown()
-
-
-@pytest.mark.parametrize("token", [None, OTHER_TOKEN, "", "not-a-token"])
-def test_bridge_rejects_a_client_without_the_shared_token(token) -> None:
-    bridge = ChromeBridge(port=_free_port(), token=TEST_TOKEN)
-    bridge.start()
+@contextlib.contextmanager
+def _running_daemon(port: int | None = None, **kwargs):
+    """A daemon on a port of its own, always stopped again."""
+    daemon = BridgeDaemon(port=port or _free_port(), token=TEST_TOKEN, **kwargs)
+    daemon.start()
+    assert daemon.startup_error is None, daemon.startup_error
     try:
-        with _companion_socket(bridge.port) as websocket:
-            websocket.send(_hello(token))
+        yield daemon
+    finally:
+        daemon.shutdown()
+
+
+@contextlib.contextmanager
+def _attached_client(daemon: BridgeDaemon, **kwargs):
+    """An MCP server's side of the bridge, pointed at one daemon that is already up."""
+    kwargs.setdefault("spawn", False)
+    client = ChromeBridge(port=daemon.port, token=TEST_TOKEN, **kwargs)
+    client.start()
+    try:
+        yield client
+    finally:
+        client.shutdown()
+
+
+class _FakeCompanion:
+    """The extension's half of the protocol, driven by a test instead of Chrome."""
+
+    def __init__(self, port: int, nonce: str = "0f" * 16) -> None:
+        self.socket = _companion_socket(port)
+        self.socket.send(_hello(TEST_TOKEN, nonce))
+        acknowledgement = json.loads(self.socket.recv(timeout=5.0))
+        assert acknowledgement["type"] == "hello_ack"
+        # The ack proves the daemon knows the same secret, not just the port.
+        assert bridge_auth.verify(TEST_TOKEN, nonce, acknowledgement["proof"])
+
+    def take_command(self, timeout: float = 5.0) -> dict:
+        return json.loads(self.socket.recv(timeout=timeout))
+
+    def answer(self, command: dict, result) -> None:
+        self.socket.send(
+            json.dumps({"type": "result", "id": command["id"], "result": result})
+        )
+
+    def close(self) -> None:
+        with contextlib.suppress(Exception):
+            self.socket.close()
+
+
+def test_bridge_round_trip_accepts_extension_protocol() -> None:
+    with _running_daemon() as daemon:
+        companion = _FakeCompanion(daemon.port)
+        try:
+            with _attached_client(daemon) as client:
+                assert client.wait_connected(2.0)
+
+                answers: list = []
+                caller = threading.Thread(
+                    target=lambda: answers.append(client.request("tabs.list", timeout=10.0))
+                )
+                caller.start()
+                command = companion.take_command()
+                assert command["type"] == "command" and command["method"] == "tabs.list"
+                companion.answer(command, {"method": command["method"]})
+                caller.join(timeout=5.0)
+                assert answers == [{"method": "tabs.list"}]
+        finally:
+            companion.close()
+
+
+@pytest.mark.parametrize("role", [None, "client"])
+@pytest.mark.parametrize("token", [None, OTHER_TOKEN, "", "not-a-token"])
+def test_bridge_rejects_a_client_without_the_shared_token(token, role) -> None:
+    with _running_daemon() as daemon:
+        with _companion_socket(daemon.port) as websocket:
+            websocket.send(_hello(token, role=role))
             with pytest.raises(ConnectionClosed) as rejection:
                 websocket.recv(timeout=5.0)
         closed = rejection.value.rcvd
         assert closed.code == 1008
         assert "token mismatch" in closed.reason
         assert "chrome://extensions" in closed.reason
-        assert bridge.wait_connected(0.2) is False
+        assert daemon.connected is False
+        assert daemon.client_count == 0
+
+
+def test_a_daemon_that_outlived_a_rotated_secret_accepts_the_new_one(tmp_path, monkeypatch) -> None:
+    """Rotating the token must not require hunting down the running daemon.
+
+    The documented way to retire a secret is to delete the file and let the next
+    start mint another. A daemon caches what it read at startup, so before it
+    learned to re-read, it would refuse every peer for as long as it ran and the
+    only cure was killing it by hand.
+    """
+    token_file = tmp_path / "bridge-token"
+    monkeypatch.setattr(bridge_auth, "token_path", lambda: token_file)
+    monkeypatch.setattr(bridge_auth, "EXTENSION_TOKEN_FILE", tmp_path / "bridge-token.js")
+    token_file.write_text(TEST_TOKEN, encoding="utf-8")
+
+    # token=None makes the daemon own the on-disk secret, as it does in real use.
+    daemon = BridgeDaemon(port=_free_port())
+    daemon.start()
+    assert daemon.startup_error is None, daemon.startup_error
+    try:
+        with _companion_socket(daemon.port) as websocket:
+            websocket.send(_hello(TEST_TOKEN))
+            assert json.loads(websocket.recv(timeout=5.0))["type"] == "hello_ack"
+
+        token_file.write_text(OTHER_TOKEN, encoding="utf-8")
+
+        with _companion_socket(daemon.port) as websocket:
+            websocket.send(_hello(OTHER_TOKEN))
+            assert json.loads(websocket.recv(timeout=5.0))["type"] == "hello_ack"
+
+        # Adopting the newer secret must retire the old one, not widen the door.
+        with _companion_socket(daemon.port) as websocket:
+            websocket.send(_hello(TEST_TOKEN))
+            with pytest.raises(ConnectionClosed) as rejection:
+                websocket.recv(timeout=5.0)
+        assert rejection.value.rcvd.code == 1008
     finally:
-        bridge.shutdown()
+        daemon.shutdown()
 
 
 def test_bridge_rejects_a_hello_without_a_nonce() -> None:
-    bridge = ChromeBridge(port=_free_port(), token=TEST_TOKEN)
-    bridge.start()
-    try:
-        with _companion_socket(bridge.port) as websocket:
+    with _running_daemon() as daemon:
+        with _companion_socket(daemon.port) as websocket:
             websocket.send(json.dumps({"type": "hello", "protocol": 1, "token": TEST_TOKEN}))
             with pytest.raises(ConnectionClosed) as rejection:
                 websocket.recv(timeout=5.0)
         assert rejection.value.rcvd.code == 1008
         assert "nonce" in rejection.value.rcvd.reason
-        assert bridge.wait_connected(0.2) is False
-    finally:
-        bridge.shutdown()
+        assert daemon.connected is False
 
 
 def test_a_newer_authenticated_companion_replaces_the_previous_one() -> None:
-    bridge = ChromeBridge(port=_free_port(), token=TEST_TOKEN)
-    bridge.start()
     answers: list = []
-    try:
-        first = _companion_socket(bridge.port)
+    with _running_daemon() as daemon:
+        first = _companion_socket(daemon.port)
         first.send(_hello(TEST_TOKEN))
         assert json.loads(first.recv(timeout=5.0))["type"] == "hello_ack"
-        assert bridge.wait_connected(2.0)
+        assert daemon.connected
 
-        second_nonce = "abcd" * 8
-        second = _companion_socket(bridge.port)
-        second.send(_hello(TEST_TOKEN, second_nonce))
-        acknowledgement = json.loads(second.recv(timeout=5.0))
-        assert bridge_auth.verify(TEST_TOKEN, second_nonce, acknowledgement["proof"])
-
+        second = _FakeCompanion(daemon.port, nonce="abcd" * 8)
         with pytest.raises(ConnectionClosed):
             first.recv(timeout=5.0)
 
-        caller = threading.Thread(
-            target=lambda: answers.append(bridge.request("tabs.list", timeout=10.0))
-        )
-        caller.start()
-        command = json.loads(second.recv(timeout=5.0))
-        second.send(json.dumps({"type": "result", "id": command["id"], "result": ["second"]}))
-        caller.join(timeout=5.0)
-        assert answers == [["second"]]
+        with _attached_client(daemon) as client:
+            assert client.wait_connected(2.0)
+            caller = threading.Thread(
+                target=lambda: answers.append(client.request("tabs.list", timeout=10.0))
+            )
+            caller.start()
+            command = second.take_command()
+            second.answer(command, ["second"])
+            caller.join(timeout=5.0)
+            assert answers == [["second"]]
         second.close()
         first.close()
-    finally:
-        bridge.shutdown()
 
 
 def test_sign_and_verify_reject_tampering() -> None:
@@ -683,20 +756,266 @@ def test_the_reload_command_answers_before_it_takes_the_worker_down() -> None:
 
 
 def test_a_first_frame_that_is_not_an_object_is_refused_with_a_reason() -> None:
-    bridge = ChromeBridge(port=_free_port(), token=TEST_TOKEN)
-    bridge.start()
-    try:
+    with _running_daemon() as daemon:
         for frame in ("not json at all", "123", "[1, 2]", "null"):
-            with _companion_socket(bridge.port) as websocket:
+            with _companion_socket(daemon.port) as websocket:
                 websocket.send(frame)
                 with pytest.raises(ConnectionClosed) as rejection:
                     websocket.recv(timeout=5.0)
             closed = rejection.value.rcvd
             assert closed.code == 1008, frame
             assert "JSON object" in closed.reason, frame
-        assert bridge.wait_connected(0.2) is False
+        assert daemon.connected is False
+
+
+def test_two_mcp_servers_hold_commands_in_flight_at_the_same_time() -> None:
+    """The whole point of the daemon: a second agent must not be locked out."""
+    with _running_daemon() as daemon:
+        companion = _FakeCompanion(daemon.port)
+        try:
+            with _attached_client(daemon) as first, _attached_client(daemon) as second:
+                assert first.wait_connected(2.0) and second.wait_connected(2.0)
+                assert daemon.client_count == 2
+
+                answers: dict[str, object] = {}
+                callers = [
+                    threading.Thread(
+                        target=lambda name=name, client=client: answers.__setitem__(
+                            name, client.request("tabs.list", timeout=10.0)
+                        )
+                    )
+                    for name, client in (("first", first), ("second", second))
+                ]
+                for caller in callers:
+                    caller.start()
+
+                commands = [companion.take_command(), companion.take_command()]
+                assert commands[0]["id"] != commands[1]["id"], "ids were not mapped per client"
+                # Answering out of order is what proves the daemon routes by the
+                # id it minted rather than by whoever asked last.
+                companion.answer(commands[1], ["for the second caller"])
+                companion.answer(commands[0], ["for the first caller"])
+                for caller in callers:
+                    caller.join(timeout=5.0)
+
+                assert set(answers) == {"first", "second"}
+                assert sorted(str(answer) for answer in answers.values()) == [
+                    "['for the first caller']",
+                    "['for the second caller']",
+                ]
+                assert answers["first"] != answers["second"]
+        finally:
+            companion.close()
+
+
+def test_the_daemon_never_mistakes_a_local_client_for_the_browser() -> None:
+    """An MCP server holding the token must not make the companion look present."""
+    with _running_daemon() as daemon:
+        with _attached_client(daemon) as client:
+            assert client.wait_connected(0.5) is False
+            assert daemon.connected is False
+            assert daemon.status()["clients"] == 1
+            with pytest.raises(ChromeBridgeError) as failure:
+                client.request("tabs.list", timeout=1.0)
+            assert "not connected" in str(failure.value)
+
+
+def test_a_command_in_flight_fails_when_the_daemon_dies_instead_of_hanging() -> None:
+    with _running_daemon() as daemon:
+        companion = _FakeCompanion(daemon.port)
+        try:
+            with _attached_client(daemon) as client:
+                assert client.wait_connected(2.0)
+                failures: list[BaseException] = []
+
+                def ask() -> None:
+                    try:
+                        client.request("tabs.list", timeout=30.0)
+                    except BaseException as exc:  # noqa: BLE001 - the test inspects it
+                        failures.append(exc)
+
+                caller = threading.Thread(target=ask)
+                caller.start()
+                companion.take_command()  # taken and deliberately never answered
+                daemon.shutdown()
+
+                caller.join(timeout=10.0)
+                assert not caller.is_alive(), "the caller waited out its own timeout"
+                assert len(failures) == 1
+                assert isinstance(failures[0], ChromeBridgeError)
+                assert "daemon" in str(failures[0])
+        finally:
+            companion.close()
+
+
+def test_a_daemon_of_the_same_version_is_left_alone() -> None:
+    spawns: list[int] = []
+    with _running_daemon(version="4.5.6") as daemon:
+        with _attached_client(daemon, version="4.5.6", spawn=spawns.append) as client:
+            status = client.status(0.0)
+            assert status["daemon"]["linked"] and status["daemon"]["version"] == "4.5.6"
+            assert spawns == [], "a matching daemon was replaced for no reason"
+            assert daemon.stopped is False
+
+
+def test_a_daemon_running_other_code_is_replaced_before_any_command() -> None:
+    """A daemon spawned before a git pull would keep serving the code it started with."""
+    port = _free_port()
+    replacements: list[BridgeDaemon] = []
+
+    def spawn_current(_port: int) -> None:
+        replacement = BridgeDaemon(port=port, token=TEST_TOKEN, version="9.9.9")
+        replacement.start()
+        replacements.append(replacement)
+
+    stale = BridgeDaemon(port=port, token=TEST_TOKEN, version="0.0.1-stale")
+    stale.start()
+    client = ChromeBridge(
+        port=port, token=TEST_TOKEN, version="9.9.9", spawn=spawn_current, connect_timeout=20.0
+    )
+    try:
+        client.start()
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline and not client.status(0.0)["daemon"]["linked"]:
+            time.sleep(0.1)
+        status = client.status(0.0)
+        assert status["daemon"]["linked"], status
+        assert status["daemon"]["version"] == "9.9.9"
+        assert len(replacements) == 1
+        assert stale.stopped, "the outdated daemon was left running"
     finally:
-        bridge.shutdown()
+        client.shutdown()
+        stale.shutdown()
+        for replacement in replacements:
+            replacement.shutdown()
+
+
+def test_a_replacement_that_is_also_outdated_stops_instead_of_looping() -> None:
+    """Two checkouts fighting over the port must end in one error, not forever."""
+    port = _free_port()
+    spawned: list[BridgeDaemon] = []
+
+    def spawn_stale(_port: int) -> None:
+        replacement = BridgeDaemon(port=port, token=TEST_TOKEN, version="0.0.1-stale")
+        replacement.start()
+        spawned.append(replacement)
+
+    first = BridgeDaemon(port=port, token=TEST_TOKEN, version="0.0.1-stale")
+    first.start()
+    client = ChromeBridge(
+        port=port, token=TEST_TOKEN, version="9.9.9", spawn=spawn_stale, connect_timeout=20.0
+    )
+    try:
+        assert client.wait_connected(1.0) is False
+        deadline = time.monotonic() + 25.0
+        while time.monotonic() < deadline and not client.status(0.0)["startup_error"]:
+            time.sleep(0.1)
+        error = client.status(0.0)["startup_error"] or ""
+        assert "9.9.9" in error and "0.0.1-stale" in error, error
+        assert len(spawned) <= chrome_bridge.MAX_DAEMON_REPLACEMENTS, spawned
+
+        # Latched: further calls report the skew instead of restarting the fight.
+        attempts = len(spawned)
+        with pytest.raises(ChromeBridgeError) as failure:
+            client.request("tabs.list", timeout=1.0)
+        assert "0.0.1-stale" in str(failure.value)
+        assert len(spawned) == attempts
+    finally:
+        client.shutdown()
+        first.shutdown()
+        for daemon in spawned:
+            daemon.shutdown()
+
+
+def test_the_daemon_exits_once_neither_the_browser_nor_a_client_is_left() -> None:
+    """Nothing registers the daemon for autostart, so nothing may leak it either."""
+    with _running_daemon(idle_seconds=0.5) as daemon:
+        companion = _FakeCompanion(daemon.port)
+        try:
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and not daemon.connected:
+                time.sleep(0.05)
+            assert daemon.connected
+            time.sleep(1.0)
+            assert not daemon.stopped, "a connected companion kept nobody alive"
+        finally:
+            companion.close()
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and not daemon.stopped:
+            time.sleep(0.05)
+        assert daemon.stopped, "the idle daemon stayed up"
+
+
+def test_the_command_line_stops_a_daemon_and_says_so_when_there_is_none() -> None:
+    """A daemon outlives the checkout that started it, so it must be stoppable."""
+    port = _free_port()
+    command = [sys.executable, str(PROJECT_ROOT / "main.py"), "--bridge", "--stop"]
+    environment = dict(os.environ, WEB_SEARCH_NEO_BRIDGE_PORT=str(port))
+
+    idle = subprocess.run(
+        command, env=environment, capture_output=True, text=True, timeout=120
+    )
+    assert idle.returncode == 0, idle.stderr
+    assert "No bridge daemon" in idle.stdout
+
+    # The daemon holds the machine secret, because that is the only one the
+    # command line can present: it is started from a plain checkout.
+    daemon = BridgeDaemon(port=port, version=main.__version__)
+    daemon.start()
+    try:
+        stopped = subprocess.run(
+            command, env=environment, capture_output=True, text=True, timeout=120
+        )
+        assert stopped.returncode == 0, stopped.stderr
+        assert "asked to stop" in stopped.stdout
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and not daemon.stopped:
+            time.sleep(0.05)
+        assert daemon.stopped
+    finally:
+        daemon.shutdown()
+
+
+def test_two_servers_starting_together_converge_on_one_daemon() -> None:
+    """The loser of the bind race becomes a client rather than reporting failure."""
+    port = _free_port()
+    clients = [
+        ChromeBridge(port=port, spawn=chrome_bridge.spawn_bridge_daemon, connect_timeout=45.0)
+        for _ in range(2)
+    ]
+    try:
+        starters = [threading.Thread(target=client.start) for client in clients]
+        for starter in starters:
+            starter.start()
+        for starter in starters:
+            starter.join(timeout=60.0)
+
+        deadline = time.monotonic() + 45.0
+        while time.monotonic() < deadline and not all(
+            client.status(0.0)["daemon"]["linked"] for client in clients
+        ):
+            time.sleep(0.2)
+
+        states = [client.status(0.0) for client in clients]
+        assert all(state["daemon"]["linked"] for state in states), states
+        assert states[0]["daemon"]["pid"] == states[1]["daemon"]["pid"], states
+        assert all(state["startup_error"] is None for state in states), states
+    finally:
+        # The second client has to let go first: a client still watching the link
+        # would answer the stop by starting another daemon.
+        for client in clients[1:]:
+            client.shutdown()
+        clients[0].stop_daemon("the test is over")
+        clients[0].shutdown()
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+        with socket.socket() as probe:
+            probe.settimeout(1.0)
+            if probe.connect_ex(("127.0.0.1", port)) != 0:
+                break
+        time.sleep(0.2)
+    else:
+        raise AssertionError("the spawned daemon is still holding the port")
 
 
 class _FakeBridge:

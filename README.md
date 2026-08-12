@@ -34,7 +34,7 @@ Startpage are available as fallbacks.
 - [**Examples**](#examples) — copy-paste calls for the six things people do most
 - [Deep dives: playing games](docs/playing-games.md) · [complex forms](docs/complex-forms.md)
 - [Why Web Search Neo](#why-web-search-neo) — the capability table
-- [Connect your already-open Chrome](#connect-your-already-open-chrome) · [Bridge authentication](#bridge-authentication)
+- [Connect your already-open Chrome](#connect-your-already-open-chrome) · [The bridge daemon](#the-bridge-daemon) · [Bridge authentication](#bridge-authentication)
 - [Search behavior](#search-behavior) · [CAPTCHA and challenge modes](#captcha-and-challenge-modes)
 - [Current Chrome automation](#current-chrome-automation) · [Chrome profile modes](#chrome-profile-modes)
 - [Reading a page](#reading-a-page) · [Locators](#locators)
@@ -59,7 +59,7 @@ python -m pip install -r requirements.txt
 python main.py
 ```
 
-The server uses MCP over stdio. Keep stdout reserved for MCP messages; rotating diagnostic logs are written to `msp_server.log`.
+The server uses MCP over stdio. Keep stdout reserved for MCP messages; rotating diagnostic logs are written to `msp_server.log`. The companion bridge runs as [its own process](#the-bridge-daemon) and keeps a separate rotating log at `%LOCALAPPDATA%\WebSearchNeo\bridge-daemon.log`, or `$XDG_DATA_HOME/WebSearchNeo/bridge-daemon.log` — by default `~/.local/share/WebSearchNeo/bridge-daemon.log` — because two processes rotating one file collide on Windows.
 
 For Linux/macOS activation and detailed setup/troubleshooting, see [INSTALL.md](INSTALL.md).
 
@@ -222,6 +222,7 @@ limits, and worked examples. `web_info(topic="action_schema", params={"action":
 | Your current Chrome by default | New tabs open in the `AI` tab group of the Chrome you already use, so existing logins remain available and every action is visible. |
 | Reusable authorization | List and claim existing tabs, use the current signed-in Chrome, a persistent MCP-owned profile, or a DevTools attach window. |
 | Authenticated companion | Server and extension prove knowledge of a machine-local secret to each other before a single command crosses the loopback bridge. |
+| One bridge, many clients | The companion port belongs to a standalone bridge process, not to whichever agent happens to be running, so Claude Code and LM Studio can drive the same Chrome at the same time and the badge stays `ON` between calls. |
 | Two-tool MCP surface | Models see only `web_info` and `web_action`; detailed action schemas are discovered only when needed. |
 | Self-describing contract | `web_info()` with no arguments returns the actions, recipes, pitfalls, limits, and examples, so an external skill file is optional. |
 | Semantic page reading | `page_outline`, `page_text`, and `find` return roles, accessible names, states, boxes, and `ref:<epoch>:N` handles across open Shadow DOM and same-origin iframes. |
@@ -258,8 +259,10 @@ DevTools port cannot be given one later. So three steps stay with the user:
 3. Select this repository's `chrome-extension` folder.
 
 Keep **Web Search Neo Companion** enabled. Its toolbar badge reads `ON` while the
-MCP is connected and authenticated. Nobody has to create or copy a token: the
-server writes it on every start and on every `setup_current_chrome` call.
+companion is connected and authenticated to the [bridge daemon](#the-bridge-daemon),
+which is between agent calls too, not only while one is running. Nobody has to
+create or copy a token: it is written whenever the bridge comes up and on every
+`setup_current_chrome` call.
 
 Earlier revisions tried to perform those clicks through Windows UI Automation.
 That code is gone: it depended on the interface language, on which window had
@@ -282,14 +285,80 @@ case, because that build cannot even authenticate:
 
 - a service worker from 1.2.0 or older sends no token, so the bridge closes it with code 1008 and the reason `Companion token mismatch; reload the extension on chrome://extensions`;
 - the badge then stays `OFF` and the worker retries on a slow ladder, from about ten seconds up to two minutes;
-- the server records the rejection in `msp_server.log`;
-- a 1.3.0 worker also prints the close code and reason in its own service-worker console; an older one does not, so on a stale install the badge and the server log are the signal.
+- the bridge daemon records the rejection in `%LOCALAPPDATA%\WebSearchNeo\bridge-daemon.log`, not in `msp_server.log`;
+- a 1.3.0 worker also prints the close code and reason in its own service-worker console; an older one does not, so on a stale install the badge and that daemon log are the signal.
 
 The bridge accepts only the fixed bundled extension ID, binds only to loopback, and never reads Chrome profile files, cookies, or saved passwords directly. The extension uses Chrome's standard [tabs](https://developer.chrome.com/docs/extensions/reference/api/tabs), [tab groups](https://developer.chrome.com/docs/extensions/reference/api/tabGroups), and [debugger](https://developer.chrome.com/docs/extensions/reference/api/debugger) APIs, plus `storage` for its own session state and [alarms](https://developer.chrome.com/docs/extensions/reference/api/alarms) for the long waits in its reconnect backoff, with the permissions shown by Chrome.
 
-A badge reading `OFF` while no server is running is the normal idle state, not a fault. The worker retries with an exponential backoff — about 1.5 seconds after the first failure, doubling to a ceiling of one minute, and dropping back to the floor the moment a handshake verifies. Chrome suspends an idle service worker after roughly thirty seconds, which is why the longer waits are `chrome.alarms` rather than timers: a timer that long would die with the worker. Chrome also logs every refused attempt as an extension error of ours and an extension cannot suppress that, so a red **Errors** button on the card of an idle machine is expected; before 1.3.1 the worker retried every two seconds and could fill that page with hundreds of identical `ERR_CONNECTION_REFUSED` lines. Starting the browser, reloading the extension, or clicking its toolbar icon resets the schedule and retries immediately.
+A badge reading `OFF` means nothing is listening on the bridge port: no daemon has been started since the machine booted, the last one exited after its idle window, or it was stopped with `--bridge --stop`. That is the normal state of a machine on which no MCP server has run yet, not a fault — but it is no longer the state between two agent calls, which is what it was when the port lived inside the MCP server. While nothing listens, the worker retries with an exponential backoff — about 1.5 seconds after the first failure, doubling to a ceiling of one minute, and dropping back to the floor the moment a handshake verifies. Chrome suspends an idle service worker after roughly thirty seconds, which is why the longer waits are `chrome.alarms` rather than timers: a timer that long would die with the worker. Chrome also logs every refused attempt as an extension error of ours and an extension cannot suppress that, so a red **Errors** button on the card of an idle machine is expected; before 1.3.1 the worker retried every two seconds and could fill that page with hundreds of identical `ERR_CONNECTION_REFUSED` lines. Starting the browser, reloading the extension, or clicking its toolbar icon resets the schedule and retries immediately.
 
 Keep the companion enabled in one Chrome profile at a time. The bridge holds exactly one companion connection and the most recent authenticated one wins, so a second profile with the companion enabled quietly takes the agent's tabs with it.
+
+### The bridge daemon
+
+The listener the companion dials is not inside the MCP server any more. It is a
+standalone process — `bridge_daemon.py` — that owns `127.0.0.1:8765`, holds the
+single connection to the extension, and relays commands for any number of local
+MCP clients. `ChromeBridge` is now a client of it. Its public surface did not
+change and neither did the frames the extension exchanges, so nothing an agent
+calls looks any different.
+
+Three things follow, and they are why the listener moved out:
+
+- **The badge stays `ON` between calls.** The port used to exist only while an
+  agent was running, so the companion spent most of the day disconnected and
+  reconnected on its own backoff schedule whenever a server appeared.
+- **Two MCP clients can share one Chrome.** Claude Code and LM Studio can now run
+  at the same time; the second server to start used to fail to bind the port with
+  `OSError: [Errno 10048]` and silently lose `profile_mode: "current"`.
+- **The first call after a quiet stretch is not spent waiting.** A freshly started
+  server no longer has to sit out whatever reconnect delay the extension had
+  climbed to.
+
+An MCP server starts the daemon as it comes up, if nothing is listening yet, so
+the companion is connected before the first action rather than during it. It is
+started detached — with no console window on Windows, in its own session
+elsewhere, and never inheriting the stdio that carries MCP — and it outlives the
+server that started it. Nothing is registered for autostart: no service, no
+scheduled task, no login item. It exists once an MCP server has run, or once you
+have run one yourself, and it goes away again on its own.
+
+Two entry points are yours:
+
+```powershell
+python main.py --bridge         # run the daemon in the foreground
+python main.py --bridge --stop  # ask a running daemon to exit
+```
+
+`--bridge` exits quietly if another daemon already owns the port, because that one
+serves just as well. It prints nothing while it runs either: the daemon logs to
+`%LOCALAPPDATA%\WebSearchNeo\bridge-daemon.log`, foreground or not, and never to
+`msp_server.log`, because two processes rotating one file collide on Windows.
+`--bridge --stop` is the one that talks back — it says whether it stopped a daemon
+or found none — and it never starts one.
+
+Left with neither a companion nor a client attached, the daemon exits after
+fifteen minutes. A connected companion on its own keeps it alive indefinitely —
+that is the case where the badge stays on all day. Set
+`WEB_SEARCH_NEO_BRIDGE_IDLE_SECONDS` to change the window, or to `0` to disable it;
+a daemon inherits the environment of the server that spawned it, so setting it in
+the MCP client configuration is enough.
+
+The daemon reports its version during the client handshake. A client whose
+`__version__` differs asks it to exit and starts one of its own, so a daemon
+started before a `git pull` cannot keep serving the old code. It will do that
+twice; if a third daemon still reports the wrong version, it stops instead of
+replacing daemons forever and reports an error naming both versions. That error
+is latched — later calls repeat it rather than restarting the tug-of-war — and it
+means another checkout of Web Search Neo is running against the same port. Stop
+that one, then restart this server.
+
+`web_info(topic="browser_status")` reports the link under `current_chrome.daemon`:
+`linked` says whether this server currently holds one, and `version` and `pid`
+come from the daemon's own handshake, so they identify the process that would be
+replaced. `current_chrome.connected` still means what it always did — the
+companion itself is attached — and a `daemon.linked: true` with
+`connected: false` is exactly the case of a running bridge with Chrome closed.
 
 ### Bridge authentication
 
@@ -300,19 +369,23 @@ either. Before this release, a local process that reached the port first receive
 full companion protocol, including `cdp.send` on any signed-in tab. Both sides now prove
 knowledge of a machine-local secret before a single command is executed:
 
-- the server mints a 32-byte random token — 64 hex characters — on first start and keeps it in
+- a 32-byte random token — 64 hex characters — is minted on first use, by the daemon as it
+  starts or by a server as it connects, and kept in
   `%LOCALAPPDATA%\WebSearchNeo\bridge-token` on Windows, or in
   `$XDG_DATA_HOME/WebSearchNeo/bridge-token` — by default
   `~/.local/share/WebSearchNeo/bridge-token` — created `0600` on POSIX;
-- the same server writes a copy into `chrome-extension/bridge-token.js` before Chrome is
+- the same secret is copied into `chrome-extension/bridge-token.js` before Chrome is
   asked to load the folder, so setup stays hands-free. That file is listed in
   `.gitignore` and is never committed or shared between machines;
-- the companion sends the token and a fresh 16-byte nonce in its `hello`. The server
+- the companion sends the token and a fresh 16-byte nonce in its `hello`. The daemon
   compares the token in constant time and answers `hello_ack` with
   `HMAC-SHA256(token, nonce)`;
 - the companion verifies that proof with WebCrypto and runs nothing until it matches. A
   peer that sends anything other than a valid ack first — a command above all — is closed
-  immediately.
+  immediately;
+- an MCP server authenticates to the daemon with the same hello, marked `role: "client"`,
+  and checks the daemon's proof before relaying anything. Being a relay is not a way
+  around the token: a local process without it is closed on both roles alike.
 
 A newly authenticated connection replaces the previous one, so a companion whose service
 worker Chrome had suspended reclaims the bridge on reconnect instead of finding it held by
@@ -325,6 +398,19 @@ running as you. The real fix is Chrome Native Messaging, where Chrome launches t
 itself and no port is listened on at all — it is tracked in [TODO.md](TODO.md). An
 authenticated peer is also unrestricted: `cdp.send` forwards any DevTools method to a tab,
 with no method allowlist.
+
+The daemon did not move that boundary, but it did change how long the door stands open.
+The listener used to exist only while an agent was running — minutes a day on a normal
+machine, which is the assumption the paragraph above was written under. Now it is held
+by a process that outlives every agent call and stays up for as long as Chrome keeps the
+companion attached, which in practice means the whole working day. Nothing about the
+authentication moved: the bind is still loopback-only, both roles still have to present
+the token, and a process running as you could always read the token file — same-user
+processes were never excluded by any of it. What is larger is simply the share of the day
+during which such a process finds something listening. Close it deliberately with
+`python main.py --bridge --stop`, or quit Chrome and let it close itself: a daemon with
+neither a companion nor a client attached exits after fifteen minutes
+(`WEB_SEARCH_NEO_BRIDGE_IDLE_SECONDS`, `0` disables the timer).
 
 ## Search behavior
 
@@ -725,6 +811,17 @@ $env:WEB_SEARCH_NEO_ALLOW_PLAIN_HTTP = "1"
 python main.py
 ```
 
+The [bridge daemon](#the-bridge-daemon) has five switches of its own. Set them for the MCP
+server process: a daemon inherits the environment of whichever server spawns it.
+
+| Variable | Effect |
+| --- | --- |
+| `WEB_SEARCH_NEO_BRIDGE_PORT` | Loopback port shared by the daemon, the servers, and the extension, default `8765`. Changing it also means editing `BRIDGE_URL` in `chrome-extension/service-worker.js` and reloading the unpacked extension. |
+| `WEB_SEARCH_NEO_BRIDGE_IDLE_SECONDS` | How long a daemon with neither a companion nor a client stays up, default `900`. `0` disables the timer and keeps the port held. |
+| `WEB_SEARCH_NEO_BRIDGE_AUTOSPAWN` | `0`, `false`, or `no` stops a server from starting a daemon; it then uses one only if something else already runs it. |
+| `WEB_SEARCH_NEO_BRIDGE_CONNECT_TIMEOUT` | How long a server keeps trying to reach a daemon, including one it started itself, default `12` seconds. |
+| `WEB_SEARCH_NEO_BRIDGE_START_TIMEOUT` | How long server startup waits for that first attempt before continuing in the background, default `2` seconds. |
+
 Only use a proxy you are authorized to use. HTTP sessions use desktop browser headers, connection pooling, bounded response sizes, and conservative retry/backoff. Rendered pages use the installed Chrome's native matching User-Agent unless explicitly overridden.
 
 ### Transport policy
@@ -743,7 +840,7 @@ python -m pytest
 python -m pytest --cov=. --cov-report=term-missing
 ```
 
-The deterministic suite is 273 tests, grouped by what they protect:
+The deterministic suite is 287 tests, grouped by what they protect:
 
 | Area | Covered |
 | --- | --- |
@@ -754,6 +851,7 @@ The deterministic suite is 273 tests, grouped by what they protect:
 | Locators | The three forms and their escaping, refs that refuse to resolve in another document or after their element was removed, valid CSS that merely contains ` >>> `. |
 | Diagnostics | The companion's console and network buffers with their ring-buffer eviction. |
 | Companion bridge | The handshake — a client without the token, a hello without a nonce, a newer companion evicting an older one, and WebCrypto HMAC agreeing with the Python signature — origin checks, tab grouping, and confirmation-gated Chrome setup that publishes the token before touching Chrome. |
+| Bridge daemon | Two MCP servers with commands in flight at once, two servers starting together converging on one daemon, a client never mistaken for the browser, an in-flight command failing instead of hanging when the daemon dies, a daemon of the same version left alone while an outdated one is replaced, a second outdated replacement reported instead of looped over, the idle exit once neither browser nor client is left, and `--bridge --stop` against a running daemon and against none. |
 | Forms | Multipart upload, form filling, native validation, exact PNG viewport size. |
 | Games and input | Canvas probing, normal/throttled/step rendering, atomic mixed input, held modifiers across a batch, gate and held-input reset on navigation. |
 | Sessions | Sessions that close the tabs they own, concurrent sessions, persistent storage, and a real managed-Chrome attach/detach that leaves Chrome running. |
@@ -775,8 +873,9 @@ It reports the eager tool-schema size and the median and p95 latency of both MCP
 
 - Visible or attached sessions may contain authenticated accounts. The MCP client can act with the permissions of those accounts.
 - The companion declares five permissions: `alarms`, `debugger`, `storage`, `tabs`, and `tabGroups`. It ships no content scripts and asks for no `host_permissions`, but `debugger` is the broad one: it lets the extension attach the Chrome DevTools Protocol to a tab and from there read and modify that page, its console, and its network traffic. Chrome shows a "started debugging this browser" banner whenever it is attached. `alarms` is the narrow one — it only wakes a suspended service worker to retry the bridge, and Chrome shows no extra warning for it. Install the companion only from this repository.
-- The loopback bridge is authenticated in both directions. The extension proves it holds the machine-local token before the server accepts a command, and the server proves the same by returning `HMAC-SHA256(token, nonce)` before the extension executes one. Until 1.3.0 the port accepted any local client that spoke the protocol, and the extension trusted whatever answered on it.
+- The loopback bridge is authenticated in both directions. The extension proves it holds the machine-local token before the bridge accepts a command, and the bridge proves the same by returning `HMAC-SHA256(token, nonce)` before the extension executes one; an MCP server presents the same token before it may relay anything. Until 1.3.0 the port accepted any local client that spoke the protocol, and the extension trusted whatever answered on it.
 - That secret is a file readable by the user account that owns it, so it does not defend against a malicious process already running as you: such a process can read the token and impersonate either side. It removes the race in which any local program that binds `127.0.0.1:8765` before the server inherits DevTools access to every signed-in tab. Chrome Native Messaging, which needs no listening port at all, is the actual fix and is tracked in [TODO.md](TODO.md).
+- The port is now held by a [daemon](#the-bridge-daemon) that outlives each agent call, so it is reachable for as long as Chrome keeps the companion attached rather than only while an agent runs. The authentication is unchanged and same-user processes were never excluded by it, but the window in which one could use the token is wider. Stop the daemon with `python main.py --bridge --stop`, or let its idle exit close the port fifteen minutes after the last companion and client are gone.
 - Authentication is not authorization. An authenticated peer may call `cdp.send` with any DevTools method on any tab the session drives; there is no method allowlist yet.
 - `setup_current_chrome` opens no page, navigates nothing, and reads no browsing data. It publishes the shared secret and returns the steps. The single exception, since 1.3.1, is that it may tell an already-installed companion older than the bundled build to reload itself; *installing* the companion stays a deliberate user action in Chrome's own UI.
 - Plain `http://` to public hosts is refused unless `WEB_SEARCH_NEO_ALLOW_PLAIN_HTTP=1` is set; loopback and private-network addresses are always reachable.

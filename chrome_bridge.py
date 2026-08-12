@@ -1,14 +1,25 @@
-"""Loopback bridge and WebDriver-compatible adapter for the companion Chrome extension."""
+"""Client of the bridge daemon, and the WebDriver-compatible adapter above it.
+
+The listener that the Chrome companion dials lives in its own process now (see
+``bridge_daemon``), so what this module holds is a client of it: ``start()``
+means "make sure a daemon is reachable, spawning one if it is not", and
+``request()`` is relayed through that daemon to the extension. The public surface
+is unchanged, because ``browser_tools`` calls it from everywhere.
+"""
 
 from __future__ import annotations
 
 import atexit
 import base64
+from collections.abc import Callable
 from dataclasses import dataclass
 import json
 import logging
 import os
-import re
+from pathlib import Path
+import secrets
+import subprocess
+import sys
 import threading
 import time
 from typing import Any
@@ -17,6 +28,15 @@ import uuid
 from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
 
 import bridge_auth
+import bridge_daemon
+from bridge_daemon import (
+    CHROME_EXTENSION_ID,
+    DEFAULT_HOST,
+    MAX_FRAME_BYTES,
+    PROTOCOL,
+    TOKEN_MISMATCH_REASON,
+    close_quietly,
+)
 from key_table import MODIFIER_BITS, resolve_key
 
 
@@ -24,9 +44,29 @@ class ChromeBridgeError(RuntimeError):
     """Raised when the companion extension isn't connected or rejects a command."""
 
 
-CHROME_EXTENSION_ID = "ndbmcjhbdjpefojkoljacjhammmcigao"
 LOGGER = logging.getLogger("web_search_neo.bridge")
-TOKEN_MISMATCH_REASON = "Companion token mismatch; reload the extension on chrome://extensions"
+PROJECT_DIR = Path(__file__).resolve().parent
+DAEMON_ENTRY = PROJECT_DIR / "main.py"
+
+# Two daemons of the wrong version in a row means another checkout is fighting us
+# over the port, and replacing each other forever would be worse than saying so.
+MAX_DAEMON_REPLACEMENTS = 2
+
+__all__ = [
+    "CHROME_EXTENSION_ID",
+    "TOKEN_MISMATCH_REASON",
+    "ChromeBridge",
+    "ChromeBridgeDriver",
+    "ChromeBridgeElement",
+    "ChromeBridgeError",
+    "get_chrome_bridge",
+    "list_current_chrome_tabs",
+    "spawn_bridge_daemon",
+]
+
+
+class _VersionConflict(RuntimeError):
+    """The daemon on the port runs other code and would not step aside."""
 
 
 @dataclass
@@ -37,49 +77,137 @@ class _PendingRequest:
     error: str | None = None
 
 
+def spawn_bridge_daemon(port: int) -> None:
+    """Start the bridge daemon detached, so it outlives the process that needs it.
+
+    Detaching matters twice over: the daemon must survive this MCP server, and it
+    must not inherit its stdio, which is the MCP transport itself.
+    """
+    if not sys.executable:
+        LOGGER.warning("No interpreter to start the bridge daemon with")
+        return
+    command = [sys.executable, str(DAEMON_ENTRY), "--bridge"]
+    environment = dict(os.environ, WEB_SEARCH_NEO_BRIDGE_PORT=str(port))
+    detach: dict[str, Any] = {}
+    if os.name == "nt":
+        detach["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW
+    else:
+        detach["start_new_session"] = True
+    try:
+        subprocess.Popen(  # noqa: S603 - fixed command, no shell, no caller input
+            command,
+            cwd=str(PROJECT_DIR),
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            **detach,
+        )
+    except OSError as exc:
+        LOGGER.warning("Could not start the bridge daemon: %s: %s", type(exc).__name__, exc)
+
+
+def _autospawn_enabled() -> bool:
+    return os.getenv("WEB_SEARCH_NEO_BRIDGE_AUTOSPAWN", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+    }
+
+
+def _env_seconds(name: str, fallback: float) -> float:
+    try:
+        return max(0.0, float(os.getenv(name, "")))
+    except ValueError:
+        return fallback
+
+
+def _package_version() -> str:
+    """The server version, read late: main defines it after it imports us."""
+    try:
+        import main
+
+        return str(main.__version__)
+    except Exception:
+        return ""
+
+
 class ChromeBridge:
-    """Small request/response server used by the Web Search Neo Chrome extension."""
+    """Client of the bridge daemon that owns the port the Chrome companion dials.
+
+    ``start()`` connects to that daemon and starts one if nobody answers;
+    everything above this class keeps calling ``request``, ``status``,
+    ``wait_connected`` and ``connected`` exactly as before. What the class no
+    longer does is listen: the daemon outlives this process, which is what keeps
+    the companion's badge on between agent calls and lets two MCP servers share
+    one browser.
+    """
 
     def __init__(
         self,
-        host: str = "127.0.0.1",
+        host: str = DEFAULT_HOST,
         port: int | None = None,
         token: str | None = None,
+        *,
+        version: str | None = None,
+        spawn: bool | Callable[[int], None] | None = None,
+        connect_timeout: float | None = None,
+        start_timeout: float | None = None,
     ) -> None:
         self.host = host
-        self.port = int(port or os.getenv("WEB_SEARCH_NEO_BRIDGE_PORT", "8765"))
+        self.port = int(port or bridge_daemon.bridge_port())
         # An explicit token belongs to the caller (tests); only the default
         # instance owns the on-disk secret and the extension's copy of it.
         self._token: str | None = token
         self._owns_token = token is None
-        self._connection: Any = None
-        self._connection_lock = threading.RLock()
+        self._version = version
+        self._spawn = self._resolve_spawn(spawn)
+        self._connect_timeout = float(
+            connect_timeout if connect_timeout is not None else _env_seconds(
+                "WEB_SEARCH_NEO_BRIDGE_CONNECT_TIMEOUT", 12.0
+            )
+        )
+        self._start_timeout = float(
+            start_timeout if start_timeout is not None else _env_seconds(
+                "WEB_SEARCH_NEO_BRIDGE_START_TIMEOUT", 2.0
+            )
+        )
+        self._state_lock = threading.RLock()
         self._send_lock = threading.Lock()
         self._pending: dict[str, _PendingRequest] = {}
-        self._started = threading.Event()
-        self._connected = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._server: Any = None
-        self._startup_error: str | None = None
+        self._daemon: Any = None
+        self._daemon_version = ""
+        self._daemon_pid: int | None = None
         self._browser_info: dict[str, Any] = {}
+        self._connected = threading.Event()
+        self._attempted = threading.Event()
+        self._wake = threading.Event()
+        self._closing = False
+        self._thread: threading.Thread | None = None
+        self._startup_error: str | None = None
+        self._fatal_error: str | None = None
 
-    def start(self) -> None:
-        if self._thread and self._thread.is_alive():
-            return
-        with self._connection_lock:
-            if self._thread and self._thread.is_alive():
-                return
-            self._thread = threading.Thread(
-                target=self._serve,
-                name="web-search-neo-chrome-bridge",
-                daemon=True,
-            )
-            self._thread.start()
-        self._started.wait(timeout=2.0)
+    @staticmethod
+    def _resolve_spawn(
+        spawn: bool | Callable[[int], None] | None,
+    ) -> Callable[[int], None] | None:
+        if callable(spawn):
+            return spawn
+        if spawn is False:
+            return None
+        if spawn is None and not _autospawn_enabled():
+            return None
+        return spawn_bridge_daemon
+
+    def _expected_version(self) -> str:
+        if self._version is None:
+            self._version = _package_version()
+        return self._version
 
     def _ensure_token(self) -> str:
         """Return the shared secret, publishing it to the extension when we own it."""
-        with self._connection_lock:
+        with self._state_lock:
             if self._token is None:
                 self._token = bridge_auth.load_or_create_token()
             token = self._token
@@ -96,132 +224,286 @@ class ChromeBridge:
                 )
         return token
 
-    def _serve(self) -> None:
-        try:
-            from websockets.sync.server import serve
+    # -- link to the daemon ------------------------------------------------
 
-            self._ensure_token()
-            extension_origin = re.compile(
-                rf"^chrome-extension://{re.escape(CHROME_EXTENSION_ID)}/?$"
-            )
-            with serve(
-                self._handle_connection,
-                self.host,
-                self.port,
-                origins=[extension_origin],
-                ping_interval=20,
-                ping_timeout=20,
-                max_size=64 * 1024 * 1024,
-            ) as server:
-                self._server = server
-                self._started.set()
-                server.serve_forever()
-        except Exception as exc:
-            self._startup_error = f"{type(exc).__name__}: {exc}"
-            self._started.set()
-            self._fail_pending("Chrome bridge stopped")
-
-    @staticmethod
-    def _close_quietly(connection: Any, code: int, reason: str) -> None:
-        try:
-            connection.close(code=code, reason=reason)
-        except Exception as exc:
-            LOGGER.warning(
-                "Closing a Chrome companion socket failed: %s: %s", type(exc).__name__, exc
-            )
-
-    def _handle_connection(self, websocket: Any) -> None:
-        try:
-            try:
-                first = json.loads(websocket.recv(timeout=5.0))
-            except (TypeError, ValueError):
-                first = None
-            if not isinstance(first, dict):
-                # Without this the AttributeError below lands in the catch-all and
-                # the peer only ever sees a bare 1000, with no hint of what broke.
-                LOGGER.warning("Rejected a bridge client whose first frame was not a JSON object")
-                websocket.close(code=1008, reason="Companion hello must be a JSON object")
+    def start(self) -> None:
+        """Make sure a daemon is reachable, without blocking longer than it takes."""
+        with self._state_lock:
+            if self._fatal_error:
                 return
-            if first.get("type") != "hello" or first.get("protocol") != 1:
-                websocket.close(code=1008, reason="Expected Web Search Neo protocol hello")
-                return
-            token = self._ensure_token()
-            nonce = first.get("nonce")
-            if not bridge_auth.token_matches(token, first.get("token")):
-                LOGGER.warning(
-                    "Rejected a bridge client that did not present the companion token "
-                    "(claimed browser: %r)",
-                    dict(first.get("browser") or {}),
-                )
-                websocket.close(code=1008, reason=TOKEN_MISMATCH_REASON)
-                return
-            if not isinstance(nonce, str) or not 1 <= len(nonce) <= 256:
-                LOGGER.warning("Rejected a bridge client whose hello carried no usable nonce")
-                websocket.close(code=1008, reason="Companion hello must carry a nonce")
-                return
-            with self._connection_lock:
-                previous = self._connection
-                self._connection = websocket
-                self._browser_info = dict(first.get("browser") or {})
-                self._connected.set()
-            if previous is not None and previous is not websocket:
-                # The newest authenticated companion wins: a stale socket that
-                # answered first must not be able to hold the bridge hostage.
-                LOGGER.info("A newer Chrome companion replaced the previous connection")
-                self._fail_pending("Chrome companion reconnected", previous)
-                # Closing waits for the peer's close frame, so it must not delay
-                # the ack the fresh companion is blocked on.
-                threading.Thread(
-                    target=self._close_quietly,
-                    args=(previous, 1000, "Replaced by a newer Chrome companion"),
-                    name="web-search-neo-bridge-evict",
+            if self._thread is None or not self._thread.is_alive():
+                self._closing = False
+                self._wake.clear()
+                self._attempted.clear()
+                self._thread = threading.Thread(
+                    target=self._maintain_link,
+                    name="web-search-neo-bridge-client",
                     daemon=True,
-                ).start()
-            websocket.send(
+                )
+                self._thread.start()
+        # The link keeps forming in the background: a caller that needs the
+        # browser waits on wait_connected, not on this.
+        self._attempted.wait(timeout=max(0.0, self._start_timeout))
+
+    def _maintain_link(self) -> None:
+        delay = 0.0
+        while not self._closing:
+            if delay and self._wake.wait(delay):
+                break
+            try:
+                connection = self._establish()
+            except _VersionConflict as exc:
+                # Latched on purpose: retrying would restart the very tug-of-war
+                # over the port that this reports.
+                with self._state_lock:
+                    self._fatal_error = str(exc)
+                    self._startup_error = str(exc)
+                LOGGER.error("%s", exc)
+                self._attempted.set()
+                return
+            except Exception as exc:
+                self._startup_error = f"{type(exc).__name__}: {exc}"
+                LOGGER.warning("No bridge daemon on %s:%s: %s", self.host, self.port, exc)
+                self._attempted.set()
+                delay = min(max(delay * 2, 0.5), 5.0)
+                continue
+            self._startup_error = None
+            delay = 0.5
+            self._attempted.set()
+            self._read_until_closed(connection)
+        self._attempted.set()
+
+    def _establish(self) -> Any:
+        """Connect to the daemon, starting or replacing one when that is needed."""
+        # The generous budget is there to cover a daemon we start ourselves; with
+        # nobody allowed to start one, waiting that long only delays the answer.
+        budget = self._connect_timeout if self._spawn is not None else min(
+            self._connect_timeout, 1.0
+        )
+        deadline = time.monotonic() + budget
+        spawned = False
+        replacements = 0
+        retired: set[Any] = set()
+        while True:
+            if self._closing:
+                raise ChromeBridgeError("The bridge client is shutting down")
+            try:
+                connection = self._dial()
+            except OSError:
+                if not spawned and self._spawn is not None:
+                    LOGGER.info(
+                        "Nothing is listening on %s:%s; starting the bridge daemon",
+                        self.host,
+                        self.port,
+                    )
+                    self._spawn(self.port)
+                    spawned = True
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.15)
+                continue
+            acknowledgement = self._handshake(connection)
+            daemon_version = str(acknowledgement.get("version") or "")
+            expected = self._expected_version()
+            if not expected or not daemon_version or daemon_version == expected:
+                self._remember_daemon(acknowledgement)
+                try:
+                    self._refresh_state(connection)
+                except Exception:
+                    with self._state_lock:
+                        if self._daemon is connection:
+                            self._daemon = None
+                    close_quietly(connection, 1000, "The daemon handshake did not finish")
+                    raise
+                return connection
+            pid = acknowledgement.get("pid")
+            identity = acknowledgement.get("instance") or pid
+            if identity in retired:
+                # The daemon we told to leave has not finished dying yet.
+                close_quietly(connection, 1000, "Waiting for the replaced daemon to exit")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Bridge daemon {pid} did not exit after it was asked to"
+                    )
+                time.sleep(0.2)
+                continue
+            replacements += 1
+            if replacements > MAX_DAEMON_REPLACEMENTS:
+                close_quietly(connection, 1000, "Version mismatch")
+                raise _VersionConflict(
+                    f"The bridge daemon on {self.host}:{self.port} reports version "
+                    f"{daemon_version}, but this server is {expected}, and replacing it "
+                    "did not help. Another checkout of Web Search Neo is running against "
+                    "the same port; stop it, then restart this server."
+                )
+            LOGGER.info(
+                "Bridge daemon %s (pid %s) predates this server (%s); replacing it",
+                daemon_version,
+                pid,
+                expected,
+            )
+            self._retire(connection, expected)
+            retired.add(identity)
+            # The port is about to be free, so the next refusal is ours to answer.
+            spawned = False
+
+    def _dial(self) -> Any:
+        from websockets.sync.client import connect
+
+        return connect(
+            f"ws://{self.host}:{self.port}",
+            open_timeout=5.0,
+            ping_interval=20,
+            ping_timeout=20,
+            max_size=MAX_FRAME_BYTES,
+        )
+
+    def _handshake(self, connection: Any) -> dict[str, Any]:
+        """Prove we hold the machine secret, and make the daemon prove it too."""
+        token = self._ensure_token()
+        nonce = secrets.token_hex(16)
+        connection.send(
+            json.dumps(
+                {
+                    "type": "hello",
+                    "protocol": PROTOCOL,
+                    "role": "client",
+                    "token": token,
+                    "nonce": nonce,
+                    "version": self._expected_version(),
+                    "client": {
+                        "pid": os.getpid(),
+                        "program": Path(sys.argv[0] or "python").name,
+                    },
+                }
+            )
+        )
+        try:
+            acknowledgement = json.loads(connection.recv(timeout=5.0))
+        except (TypeError, ValueError) as exc:
+            close_quietly(connection, 1008, "Bridge daemon hello_ack must be JSON")
+            raise ChromeBridgeError(f"The bridge daemon answered with junk: {exc}") from exc
+        if not isinstance(acknowledgement, dict) or acknowledgement.get("type") != "hello_ack":
+            close_quietly(connection, 1008, "Expected a bridge daemon hello_ack")
+            raise ChromeBridgeError("The peer on the bridge port is not a bridge daemon")
+        if not bridge_auth.verify(token, nonce, acknowledgement.get("proof")):
+            close_quietly(connection, 1008, TOKEN_MISMATCH_REASON)
+            raise ChromeBridgeError(
+                "The peer on the bridge port did not prove it knows the companion token"
+            )
+        return acknowledgement
+
+    def _remember_daemon(self, acknowledgement: dict[str, Any]) -> None:
+        with self._state_lock:
+            self._daemon_version = str(acknowledgement.get("version") or "")
+            self._daemon_pid = acknowledgement.get("pid")
+
+    def _retire(self, connection: Any, expected: str) -> None:
+        try:
+            connection.send(
                 json.dumps(
                     {
-                        "type": "hello_ack",
-                        "protocol": 1,
-                        "proof": bridge_auth.sign(token, nonce),
+                        "type": "control",
+                        "id": uuid.uuid4().hex,
+                        "method": "shutdown",
+                        "reason": f"replaced by version {expected}",
                     }
                 )
             )
-            for raw_message in websocket:
-                try:
-                    message = json.loads(raw_message)
-                except (TypeError, ValueError):
-                    # One malformed frame must not tear down the whole session.
-                    LOGGER.warning("Chrome companion sent a frame that is not JSON")
-                    continue
-                message_type = message.get("type")
-                if message_type == "result":
-                    request_id = str(message.get("id", ""))
-                    with self._connection_lock:
-                        pending = self._pending.get(request_id)
-                    if pending is None:
-                        LOGGER.warning("Dropped a late bridge result for id %s", request_id)
-                        continue
-                    pending.result = message.get("result")
-                    pending.error = message.get("error")
-                    pending.event.set()
-                elif message_type == "ping":
-                    websocket.send(json.dumps({"type": "pong", "at": time.time()}))
-                else:
-                    LOGGER.warning("Ignored unknown bridge frame type %r", message_type)
+            # The daemon acks before it stops; reading it also lets the close
+            # frame arrive before we dial the port again.
+            connection.recv(timeout=5.0)
         except Exception as exc:
             LOGGER.warning(
-                "Chrome companion connection ended: %s: %s", type(exc).__name__, exc
+                "The outdated bridge daemon did not answer the stop request: %s: %s",
+                type(exc).__name__,
+                exc,
             )
+        close_quietly(connection, 1000, "Replaced by a newer server")
+
+    def _refresh_state(self, connection: Any) -> None:
+        """Ask the fresh link what the browser is doing before anyone calls status."""
+        request_id = uuid.uuid4().hex
+        pending = _PendingRequest(event=threading.Event(), connection=connection)
+        with self._state_lock:
+            self._pending[request_id] = pending
+            self._daemon = connection
+        try:
+            connection.send(
+                json.dumps({"type": "control", "id": request_id, "method": "status"})
+            )
+            deadline = time.monotonic() + 5.0
+            while not pending.event.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("The bridge daemon did not report the companion state")
+                frame = json.loads(connection.recv(timeout=remaining))
+                if isinstance(frame, dict):
+                    self._dispatch(frame)
         finally:
-            with self._connection_lock:
-                if self._connection is websocket:
-                    self._connection = None
+            with self._state_lock:
+                self._pending.pop(request_id, None)
+        if pending.error:
+            raise ChromeBridgeError(str(pending.error))
+        self._apply_state(pending.result or {})
+
+    def _read_until_closed(self, connection: Any) -> None:
+        try:
+            for raw_message in connection:
+                try:
+                    frame = json.loads(raw_message)
+                except (TypeError, ValueError):
+                    LOGGER.warning("The bridge daemon sent a frame that is not JSON")
+                    continue
+                if isinstance(frame, dict):
+                    self._dispatch(frame)
+        except Exception as exc:
+            LOGGER.info("Bridge daemon link ended: %s: %s", type(exc).__name__, exc)
+        finally:
+            with self._state_lock:
+                if self._daemon is connection:
+                    self._daemon = None
                     self._browser_info = {}
                     self._connected.clear()
-            self._fail_pending("Chrome companion extension disconnected", websocket)
+            # A caller blocked on an answer that can no longer come must be told
+            # so, rather than sit out its whole timeout.
+            self._fail_pending(
+                "The bridge daemon stopped while the command was in flight", connection
+            )
+
+    def _dispatch(self, frame: dict[str, Any]) -> None:
+        kind = frame.get("type")
+        if kind in {"result", "control_result"}:
+            request_id = str(frame.get("id", ""))
+            with self._state_lock:
+                pending = self._pending.get(request_id)
+            if pending is None:
+                LOGGER.warning("Dropped a late bridge result for id %s", request_id)
+                return
+            pending.result = frame.get("result")
+            pending.error = frame.get("error")
+            pending.event.set()
+        elif kind == "extension":
+            self._apply_state(frame)
+        elif kind == "pong":
+            return
+        else:
+            LOGGER.warning("Ignored unknown bridge daemon frame type %r", kind)
+
+    def _apply_state(self, state: dict[str, Any]) -> None:
+        with self._state_lock:
+            self._browser_info = dict(state.get("browser") or {})
+            if state.get("version") is not None:
+                self._daemon_version = str(state.get("version") or "")
+            if state.get("pid") is not None:
+                self._daemon_pid = state.get("pid")
+            if state.get("connected"):
+                self._connected.set()
+            else:
+                self._connected.clear()
 
     def _fail_pending(self, message: str, connection: Any | None = None) -> None:
-        with self._connection_lock:
+        with self._state_lock:
             pending_items = [
                 item
                 for item in self._pending.values()
@@ -231,9 +513,11 @@ class ChromeBridge:
             pending.error = pending.error or message
             pending.event.set()
 
+    # -- public surface ----------------------------------------------------
+
     def wait_connected(self, timeout: float = 0.0) -> bool:
         self.start()
-        if self._startup_error:
+        if self._fatal_error:
             return False
         return self._connected.wait(max(0.0, timeout))
 
@@ -248,7 +532,7 @@ class ChromeBridge:
 
     @property
     def browser_info(self) -> dict[str, Any]:
-        with self._connection_lock:
+        with self._state_lock:
             return dict(self._browser_info)
 
     def request(
@@ -269,12 +553,12 @@ class ChromeBridge:
                 '"setup_current_chrome"}, which returns the steps to install it.'
             )
         request_id = uuid.uuid4().hex
-        with self._connection_lock:
-            connection = self._connection
+        with self._state_lock:
+            connection = self._daemon
             pending = _PendingRequest(event=threading.Event(), connection=connection)
             self._pending[request_id] = pending
         if connection is None:
-            with self._connection_lock:
+            with self._state_lock:
                 self._pending.pop(request_id, None)
             raise ChromeBridgeError("Chrome companion extension disconnected")
         try:
@@ -287,34 +571,87 @@ class ChromeBridge:
                 },
                 ensure_ascii=False,
             )
-            with self._send_lock:
-                connection.send(payload)
+            try:
+                with self._send_lock:
+                    connection.send(payload)
+            except Exception as exc:
+                # The link can drop between the check above and this send, and a
+                # raw websocket error here would reach the agent as a stack trace.
+                raise ChromeBridgeError(
+                    f"The bridge daemon link dropped while sending '{method}': {exc}"
+                ) from exc
             if not pending.event.wait(max(0.1, timeout)):
                 raise TimeoutError(f"Chrome bridge command '{method}' timed out")
             if pending.error:
                 raise ChromeBridgeError(pending.error)
             return pending.result
         finally:
-            with self._connection_lock:
+            with self._state_lock:
                 self._pending.pop(request_id, None)
 
     def status(self, wait_seconds: float = 0.0) -> dict[str, Any]:
         connected = self.wait_connected(wait_seconds)
+        with self._state_lock:
+            daemon = {
+                "linked": self._daemon is not None,
+                "version": self._daemon_version or None,
+                "pid": self._daemon_pid,
+            }
         return {
             "connected": connected,
             "host": self.host,
             "port": self.port,
             "startup_error": self._startup_error,
             "browser": self.browser_info,
+            "daemon": daemon,
         }
 
+    def stop_daemon(self, reason: str = "requested") -> bool:
+        """Ask the daemon to exit. Only a caller replacing it should want this."""
+        self.start()
+        with self._state_lock:
+            connection = self._daemon
+        if connection is None:
+            return False
+        self._closing = True
+        self._wake.set()
+        request_id = uuid.uuid4().hex
+        pending = _PendingRequest(event=threading.Event(), connection=connection)
+        with self._state_lock:
+            self._pending[request_id] = pending
+        try:
+            with self._send_lock:
+                connection.send(
+                    json.dumps(
+                        {
+                            "type": "control",
+                            "id": request_id,
+                            "method": "shutdown",
+                            "reason": reason,
+                        }
+                    )
+                )
+            return pending.event.wait(5.0) and not pending.error
+        except Exception as exc:
+            LOGGER.warning(
+                "Could not ask the bridge daemon to stop: %s: %s", type(exc).__name__, exc
+            )
+            return False
+        finally:
+            with self._state_lock:
+                self._pending.pop(request_id, None)
+
     def shutdown(self) -> None:
-        server = self._server
-        if server is not None:
-            try:
-                server.shutdown()
-            except Exception as exc:
-                LOGGER.warning("Chrome bridge shutdown failed: %s: %s", type(exc).__name__, exc)
+        """Let go of the daemon. The daemon itself stays up, which is the point."""
+        self._closing = True
+        self._wake.set()
+        with self._state_lock:
+            connection = self._daemon
+            thread = self._thread
+        if connection is not None:
+            close_quietly(connection, 1000, "The MCP server is going away")
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
 
 
 _bridge = ChromeBridge()
