@@ -15,7 +15,19 @@
     "service_worker": "service-worker.js",
     "type": "module"
   },
+  "icons": {
+    "16": "icons/slime-16.png",
+    "32": "icons/slime-32.png",
+    "48": "icons/slime-48.png",
+    "128": "icons/slime-128.png"
+  },
   "action": {
-    "default_title": "Web Search Neo Companion"
+    "default_title": "Web Search Neo Companion",
+    "default_icon": {
+      "16": "icons/slime-16.png",
+      "32": "icons/slime-32.png",
+      "48": "icons/slime-48.png",
+      "128": "icons/slime-128.png"
+    }
   }
 }

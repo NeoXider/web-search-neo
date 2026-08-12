@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -163,3 +164,24 @@ def test_the_ui_automation_helpers_are_gone():
 def test_companion_directory_contains_manifest():
     assert isinstance(chrome_bootstrap.EXTENSION_DIR, Path)
     assert (chrome_bootstrap.EXTENSION_DIR / "manifest.json").is_file()
+
+
+def _png_size(path: Path) -> tuple[int, int]:
+    header = path.read_bytes()[:24]
+    assert header[:8] == b"\x89PNG\r\n\x1a\n", f"{path} is not a PNG"
+    return int.from_bytes(header[16:20], "big"), int.from_bytes(header[20:24], "big")
+
+
+def test_companion_icons_exist_at_the_sizes_the_manifest_promises():
+    # A manifest that points at a missing icon makes Chrome refuse the whole
+    # extension, so the paths are worth checking without launching a browser.
+    manifest = json.loads(
+        (chrome_bootstrap.EXTENSION_DIR / "manifest.json").read_text(encoding="utf-8")
+    )
+    declared = manifest["icons"]
+    assert manifest["action"]["default_icon"] == declared  # toolbar button, not a blank square
+    assert set(declared) == {"16", "32", "48", "128"}
+    for size, relative in declared.items():
+        icon = chrome_bootstrap.EXTENSION_DIR / relative
+        assert icon.is_file(), relative
+        assert _png_size(icon) == (int(size), int(size)), relative
