@@ -17,6 +17,19 @@ import browser_tools
 import main
 
 
+class _OfflineBridge:
+    """A bridge nothing ever connects to, as on a machine with no Chrome."""
+
+    def status(self, wait_seconds: float = 0.0) -> dict:
+        return {
+            "connected": False,
+            "host": "127.0.0.1",
+            "port": 8765,
+            "startup_error": None,
+            "browser": {},
+        }
+
+
 @pytest.fixture
 def no_chrome(monkeypatch):
     """Make driver creation fail the way a machine without Chrome fails."""
@@ -29,6 +42,11 @@ def no_chrome(monkeypatch):
     )
     monkeypatch.setattr(browser_tools, "_browser_available", None, raising=False)
     monkeypatch.setattr(browser_tools, "_browser_error", None, raising=False)
+    # Faking a missing Chrome binary is not enough: the companion route needs no
+    # binary of ours at all. On a developer machine that really has the
+    # extension installed, the live bridge answers this test process and Chrome
+    # looks available again, so the second route has to be absent too.
+    monkeypatch.setattr(browser_tools, "get_chrome_bridge", _OfflineBridge)
     yield
 
 
