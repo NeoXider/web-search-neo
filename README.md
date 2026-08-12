@@ -15,29 +15,35 @@
   <img alt="Chrome automation" src="https://img.shields.io/badge/Chrome-visible_automation-06b6d4?logo=googlechrome&logoColor=white">
 </p>
 
-Web Search Neo gives LM Studio and other MCP clients four complementary capabilities:
+Web Search Neo is an MCP server that gives a model two tools — `web_info` to
+look, `web_action` to act — and behind them four capabilities:
 
-- fast text search with automatic fallback across independent search engines;
-- the user's already-open, signed-in Chrome through a local companion extension, with full page/form/game automation and screenshots;
-- perception and diagnostics for a rendered page: an accessibility outline, readable text, semantic element lookup, the page console, and its HTTP traffic;
-- isolated Selenium profiles when a clean or headless browser is preferable.
-
-DuckDuckGo is the default route. Brave, Mojeek, Yahoo, Bing, and Startpage are available as fallbacks. No paid search API or provider API key is required.
-
-## Why Web Search Neo
-
-| Strength | What it means |
+| Capability | What it is |
 | --- | --- |
-| Free search | Uses public search routes through the maintained [DDGS](https://github.com/deedy5/ddgs) library; no paid search plan or API key. |
-| Resilient fallback | Provider health, cooldowns, bounded retries, caching, and an overall deadline prevent one challenged engine from stalling the agent. |
-| Your current Chrome by default | New tabs open in the `AI` tab group of the Chrome you already use, so existing logins remain available and every action is visible. |
-| Reusable authorization | List and claim existing tabs, use the current signed-in Chrome, a persistent MCP-owned profile, or a DevTools attach window. |
-| Two-tool MCP surface | Models see only `web_info` and `web_action`; detailed action schemas are discovered only when needed. |
-| Self-describing contract | `web_info()` with no arguments returns the actions, recipes, pitfalls, limits, and examples, so an external skill file is optional. |
-| Semantic page reading | `page_outline`, `page_text`, and `find` return roles, accessible names, states, boxes, and reusable `ref:N` handles across open Shadow DOM and same-origin iframes. |
-| Visible failures | The `console` and `network` topics surface console output, uncaught exceptions with stack frames, and every HTTP request with status, type, duration, and size. |
-| Deterministic frames | Gated render modes freeze `performance.now()`/`Date.now()` and queue page timers, so a released frame is a fixed delta instead of the agent's thinking time. |
-| Concurrent work | Search, HTTP fetches, and independent browser sessions run outside the MCP event loop; up to four browser sessions can work in parallel. |
+| **Search** | Text search with automatic fallback across independent engines. No paid API, no provider key. |
+| **Your own Chrome** | The already-open, signed-in browser you are looking at, driven through a local companion extension: tabs, forms, uploads, games, screenshots. |
+| **Perception** | An accessibility outline, readable text, semantic element lookup, the page console, and its HTTP traffic. |
+| **Isolation** | Separate Selenium profiles — temporary, persistent, or attached — when a clean or headless browser is preferable. |
+
+DuckDuckGo is the default search route. Brave, Mojeek, Yahoo, Bing, and
+Startpage are available as fallbacks.
+
+## Contents
+
+- [Quick start](#quick-start) · [Connect to LM Studio](#connect-to-lm-studio)
+- [**Examples**](#examples) — copy-paste calls for the six things people do most
+- [Deep dives: playing games](docs/playing-games.md) · [complex forms](docs/complex-forms.md)
+- [Why Web Search Neo](#why-web-search-neo) — the capability table
+- [Connect your already-open Chrome](#connect-your-already-open-chrome) · [Bridge authentication](#bridge-authentication)
+- [Search behavior](#search-behavior) · [CAPTCHA and challenge modes](#captcha-and-challenge-modes)
+- [Current Chrome automation](#current-chrome-automation) · [Chrome profile modes](#chrome-profile-modes)
+- [Reading a page](#reading-a-page) · [Locators](#locators)
+- [Console and network diagnostics](#console-and-network-diagnostics)
+- [Forms and multi-step flows](#forms-and-multi-step-flows)
+- [Canvas and WebGL games](#canvas-and-webgl-games) · [Render modes](#render-modes) · [Input latency](#input-latency)
+- [Two-tool MCP contract](#two-tool-mcp-contract) · [Optional agent skill](#optional-agent-skill)
+- [Optional configuration](#optional-configuration) · [Transport policy](#transport-policy)
+- [Tests](#tests) · [Safety notes](#safety-notes) · [Contributing](#contributing)
 
 ## Quick start
 
@@ -75,7 +81,155 @@ Open LM Studio's MCP configuration and add:
 
 The Python executable is intentionally resolved through `PATH`, not pinned to a machine-specific absolute interpreter path. Restart or toggle the MCP server after changing the configuration. A ready-to-edit example is included in [mcp_servers.json](mcp_servers.json).
 
-### Connect your already-open Chrome
+## Examples
+
+Every example below is the argument object of one of the two tools:
+`web_action` takes `{"actions": [...]}` and performs 1–32 ordered actions;
+`web_info` takes `{"topic": ..., "params": {...}}` and reads state without
+changing anything. One `session_id` is one page — reuse it across calls.
+
+### 1. Search and read a result
+
+```json
+{
+  "actions": [
+    {"action": "search", "query": "model context protocol servers", "num": 5},
+    {"action": "fetch_text", "url": "https://modelcontextprotocol.io/", "max_chars": 4000}
+  ]
+}
+```
+
+Search first, then read the page you picked. `fetch_text` needs no browser at
+all; `fetch_many` reads up to 16 URLs concurrently.
+
+### 2. Open a page and read it the way the agent does
+
+```json
+{"actions":[{"action":"open","url":"https://example.com","session_id":"demo"}]}
+```
+
+Opens a tab in your own Chrome, in the visible purple `AI` tab group.
+
+```json
+{"topic":"page_outline","params":{"session_id":"demo","limit":60}}
+```
+
+Returns an indented tree of roles, accessible names, states, `ref:<epoch>:N`
+handles, and on-screen boxes — the page as a screen reader sees it, not as HTML.
+
+```json
+{"topic":"find","params":{"session_id":"demo","query":"more information link","role":"link"}}
+```
+
+Ranked matches for a plain-language query when a CSS selector would be a guess.
+
+```json
+{"actions":[{"action":"click","selector":"a[href*='iana.org']","session_id":"demo"}]}
+```
+
+Clicks it. `click` and `wait` also accept a `ref:` handle or a piercing path in
+the Selenium-backed profile modes.
+
+### 3. Fill in a form and submit it
+
+```json
+{
+  "actions": [
+    {"action": "fill", "session_id": "apply",
+     "fields": {"#candidate-name": "Neo Candidate", "#role": "unity", "#remote": true},
+     "files": {"#resume": "C:/docs/resume.pdf"}},
+    {"action": "submit", "session_id": "apply",
+     "form_selector": "#application", "submit_selector": "#submit-button"}
+  ]
+}
+```
+
+Text fields, `<select>` options, checkboxes, and file inputs in one call, then a
+submit that runs native browser validation. `fill` reports `filled` and a
+per-selector `errors` map, so a partial failure is visible rather than silent.
+→ [Complex forms: the long version](docs/complex-forms.md)
+
+### 4. Find out why a page broke
+
+```json
+{"topic":"console","params":{"session_id":"demo","levels":["error"],"limit":20}}
+```
+
+```json
+{"topic":"network","params":{"session_id":"demo","only_errors":true,"limit":20}}
+```
+
+The page's own console — including uncaught exceptions with stack frames — and
+every failed or 4xx/5xx request as `method status type ms size url`. Use
+`output="json"` on `network` to get the request `id`, then read one body with
+the `network_body` topic.
+
+### 5. Play a game frame by frame
+
+With the game already open in session `game`:
+
+```json
+{
+  "actions": [
+    {"action": "render", "mode": "step", "session_id": "game"},
+    {"action": "input", "session_id": "game", "target_selector": "#game",
+     "key_actions": [{"key": "ARROW_RIGHT", "action": "hold"}]},
+    {"action": "step", "frames": 3, "session_id": "game"},
+    {"action": "input", "session_id": "game",
+     "key_actions": [{"key": "SPACE", "action": "tap"}]},
+    {"action": "release_inputs", "session_id": "game"},
+    {"action": "render", "mode": "normal", "session_id": "game"}
+  ]
+}
+```
+
+In `step` mode the page is frozen: page time only advances when a frame is
+released, so the game measures a fixed delta instead of the model's thinking
+time, and a tapped key stays down for the whole frame an engine polls.
+→ [Playing games: the long version](docs/playing-games.md)
+
+### 6. Work in a tab you already have open
+
+```json
+{"topic":"browser_tabs"}
+```
+
+```json
+{"actions":[{"action":"attach_tab","tab_id":123,"session_id":"existing"}]}
+```
+
+Lists the tabs in your Chrome with their ids and group names, then claims one
+without navigating or moving it. `close` later releases the session and leaves
+that tab exactly where it was.
+
+### Where to go next
+
+```json
+{"topic":"capabilities"}
+```
+
+`web_info()` with no arguments returns the whole agent-facing contract: every
+action with its required parameters, the observation topics, recipes, pitfalls,
+limits, and worked examples. `web_info(topic="action_schema", params={"action":
+"input"})` returns one full JSON Schema on demand.
+
+## Why Web Search Neo
+
+| Strength | What it means |
+| --- | --- |
+| Free search | Uses public search routes through the maintained [DDGS](https://github.com/deedy5/ddgs) library; no paid search plan or API key. |
+| Resilient fallback | Provider health, cooldowns, bounded retries, caching, and an overall deadline prevent one challenged engine from stalling the agent. |
+| Your current Chrome by default | New tabs open in the `AI` tab group of the Chrome you already use, so existing logins remain available and every action is visible. |
+| Reusable authorization | List and claim existing tabs, use the current signed-in Chrome, a persistent MCP-owned profile, or a DevTools attach window. |
+| Authenticated companion | Server and extension prove knowledge of a machine-local secret to each other before a single command crosses the loopback bridge. |
+| Two-tool MCP surface | Models see only `web_info` and `web_action`; detailed action schemas are discovered only when needed. |
+| Self-describing contract | `web_info()` with no arguments returns the actions, recipes, pitfalls, limits, and examples, so an external skill file is optional. |
+| Semantic page reading | `page_outline`, `page_text`, and `find` return roles, accessible names, states, boxes, and `ref:<epoch>:N` handles across open Shadow DOM and same-origin iframes. |
+| Visible failures | The `console` and `network` topics surface console output, uncaught exceptions with stack frames, and every HTTP request with status, type, duration, and size. |
+| Deterministic frames | Gated render modes freeze `performance.now()`/`Date.now()` and queue page timers, so a released frame is a fixed delta instead of the agent's thinking time. |
+| Concurrent work | Search, HTTP fetches, and independent browser sessions run outside the MCP event loop; up to four browser sessions can work in parallel. |
+
+## Connect your already-open Chrome
 
 The default browser mode is `current`. It fails with a clear setup error when the
 companion isn't connected; it does not silently open a different browser.
@@ -89,39 +243,75 @@ the exact requested browser change:
 ```
 
 After the user explicitly approves installing the extension, repeat the call with
-`"confirm_install": true`. On Windows this opens `chrome://extensions`, enables
-Developer mode, loads this repository's fixed `chrome-extension` folder, and waits
-for the loopback connection. Chrome deliberately shows the extension and its
-permissions; this isn't a silent extension install.
+`"confirm_install": true`:
+
+```json
+{"actions":[{"action":"setup_current_chrome","confirm_install":true}]}
+```
+
+On Windows this publishes the shared secret into the extension folder, opens
+`chrome://extensions`, enables Developer mode, loads this repository's fixed
+`chrome-extension` folder — reloading the card if one is already there, so a
+stale service worker picks up the current secret — and waits for the loopback
+connection. Chrome deliberately shows the extension and its permissions; this
+isn't a silent extension install. Both calls report `token_ready` and the
+`token_file` they used.
 
 Manual installation remains available:
 
-1. Start or restart the MCP server so its loopback bridge is listening on `127.0.0.1:8765`.
+1. Start or restart the MCP server so its loopback bridge is listening on `127.0.0.1:8765`. Starting the server also writes the shared secret the companion needs.
 2. Open `chrome://extensions`, enable **Developer mode**, and choose **Load unpacked**.
 3. Select this repository's `chrome-extension` folder.
-4. Keep **Web Search Neo Companion** enabled. Its toolbar badge reads `ON` while the MCP is connected.
+4. Keep **Web Search Neo Companion** enabled. Its toolbar badge reads `ON` while the MCP is connected and authenticated.
 
-The bundled companion is version 1.2.0. Chrome does not refresh an unpacked extension by itself, so after pulling a new revision press **Reload** on the companion card at `chrome://extensions`; otherwise the older service worker keeps running and the console, network, and tab-close commands are rejected as unknown methods.
+The bundled companion is version 1.3.0. Chrome does not refresh an unpacked
+extension by itself, so after pulling a new revision press **Reload** on the
+companion card at `chrome://extensions`. Since 1.3.0 this is mandatory rather
+than merely advisable:
+
+- a service worker from 1.2.0 or older sends no token, so the bridge closes it with code 1008 and the reason `Companion token mismatch; reload the extension on chrome://extensions`;
+- the badge then stays `OFF` and the worker retries about every ten seconds;
+- the server records the rejection in `msp_server.log`;
+- a 1.3.0 worker also prints the close code and reason in its own service-worker console; an older one does not, so on a stale install the badge and the server log are the signal.
 
 The bridge accepts only the fixed bundled extension ID, binds only to loopback, and never reads Chrome profile files, cookies, or saved passwords directly. The extension uses Chrome's standard [tabs](https://developer.chrome.com/docs/extensions/reference/api/tabs), [tab groups](https://developer.chrome.com/docs/extensions/reference/api/tabGroups), and [debugger](https://developer.chrome.com/docs/extensions/reference/api/debugger) APIs, plus `storage` for its own session state, with the permissions shown by Chrome.
 
-Keep the companion enabled in one Chrome profile at a time. The MCP accepts one
-companion connection and rejects later profiles instead of silently switching the
-agent to a different signed-in account.
+Keep the companion enabled in one Chrome profile at a time. The bridge holds exactly one companion connection and the most recent authenticated one wins, so a second profile with the companion enabled quietly takes the agent's tabs with it.
 
-## Optional agent skill
+### Bridge authentication
 
-`web_info()` called with no arguments returns the entire agent-facing contract: every action with its required and optional parameters, the observation topics, ready-made recipes, the common mistakes, the hard limits, and runnable examples. An agent that reads it needs no external instructions, so the bundled skill is a convenience, not a requirement.
+Loopback is not a trust boundary: every process running as the same user can open
+`127.0.0.1:8765`, an `Origin` header stops web pages but not local programs, and the
+extension ID is derived from the public `key` in the manifest, so it is not a secret
+either. Before this release, a local process that reached the port first received the
+full companion protocol, including `cdp.send` on any signed-in tab. Both sides now prove
+knowledge of a machine-local secret before a single command is executed:
 
-The repository still includes a short [Web Search Neo skill](skills/web-search-neo/SKILL.md) for clients that prefer a resident description of when to reach for the server at all.
+- the server mints a 32-byte random token — 64 hex characters — on first start and keeps it in
+  `%LOCALAPPDATA%\WebSearchNeo\bridge-token` on Windows, or in
+  `$XDG_DATA_HOME/WebSearchNeo/bridge-token` — by default
+  `~/.local/share/WebSearchNeo/bridge-token` — created `0600` on POSIX;
+- the same server writes a copy into `chrome-extension/bridge-token.js` before Chrome is
+  asked to load the folder, so setup stays hands-free. That file is listed in
+  `.gitignore` and is never committed or shared between machines;
+- the companion sends the token and a fresh 16-byte nonce in its `hello`. The server
+  compares the token in constant time and answers `hello_ack` with
+  `HMAC-SHA256(token, nonce)`;
+- the companion verifies that proof with WebCrypto and runs nothing until it matches. A
+  peer that sends anything other than a valid ack first — a command above all — is closed
+  immediately.
 
-Install it locally by copying `skills/web-search-neo` into your Codex skills directory, then restart Codex:
+A newly authenticated connection replaces the previous one, so a companion whose service
+worker Chrome had suspended reclaims the bridge on reconnect instead of finding it held by
+a stale socket.
 
-```powershell
-Copy-Item -Recurse -Force skills\web-search-neo "$env:USERPROFILE\.codex\skills\web-search-neo"
-```
-
-Invoke it explicitly as `$web-search-neo`, or let its task description trigger it for web search, visible Chrome automation, authorized attach sessions, form work, and browser-game testing.
+The honest limit: the secret is a file owned by the user account, so any process running
+as that same user can read it and impersonate either side. This closes the "whoever binds
+the port first owns the browser" hole; it is not protection against malware already
+running as you. The real fix is Chrome Native Messaging, where Chrome launches the server
+itself and no port is listened on at all — it is tracked in [TODO.md](TODO.md). An
+authenticated peer is also unrestricted: `cdp.send` forwards any DevTools method to a tab,
+with no method allowlist.
 
 ## Search behavior
 
@@ -140,7 +330,17 @@ The normal agent call is:
 }
 ```
 
-Send that object to `web_action`. `web_info(topic="search_status", params={"check_live": true})` reports configured engines, current live availability, latency, cooldown state, and detected challenges. A live probe is a diagnostic: a provider that fails during the probe is not pushed into the cooldown used by real searches, so checking status can no longer degrade the next search. Status checks are cached for five minutes; search results are cached for two minutes.
+Send that object to `web_action`. Search state is readable separately:
+
+```json
+{"topic":"search_status","params":{"check_live":true}}
+```
+
+It reports configured engines, current live availability, latency, cooldown
+state, and detected challenges. A live probe is a diagnostic: a provider that
+fails during the probe is not pushed into the cooldown used by real searches, so
+checking status can no longer degrade the next search. Status checks are cached
+for five minutes; search results are cached for two minutes.
 
 ### CAPTCHA and challenge modes
 
@@ -165,32 +365,21 @@ Yes — the agent can work in your normal already-open Chrome while you watch it
 }
 ```
 
-The agent can inspect with `web_info(topic="page_outline", params={"session_id": "demo"})` or `page_elements`, then send ordered `fill`, `upload`, `click`, and `submit` actions through `web_action` using the same `session_id`. Screenshots are returned by the `screenshot` info topic.
+From there, inspect with `page_outline`, `page_text`, `find`, or `page_elements`,
+then send ordered `fill`, `upload`, `click`, and `submit` actions through
+`web_action` using the same `session_id`. Screenshots are returned by the
+`screenshot` info topic.
 
-Inspect existing Chrome tabs without opening anything:
-
-```json
-{"topic":"browser_tabs"}
-```
-
-Then claim one returned `tab_id` without navigating or moving it:
-
-```json
-{"actions":[{"action":"attach_tab","tab_id":123,"session_id":"existing"}]}
-```
-
-A session tracks whether it owns its tab. `close` removes a tab that the agent opened itself, and leaves a tab claimed through `attach_tab` open and detached, so the `AI` group no longer accumulates abandoned pages. The MCP doesn't read cookies or passwords; the page simply continues using the authorization already present in Chrome.
+A session tracks whether it owns its tab. `close` removes a tab that the agent
+opened itself, and leaves a tab claimed through `attach_tab` open and detached,
+so the `AI` group no longer accumulates abandoned pages. `close_all` — and the
+shutdown hook that runs it — applies the same rule instead of leaving every
+self-opened tab behind. The MCP doesn't read cookies or passwords; the page
+simply continues using the authorization already present in Chrome.
 
 If the companion isn't ready, read `web_info(topic="browser_status")` and run the
 confirmation-gated `setup_current_chrome` action. Use `profile_mode="auto"` only
 when opening a separate visible Selenium window is an acceptable fallback.
-
-For isolated/background work, opt into Selenium explicitly:
-
-- `profile_mode="temporary", headless=false`: clean visible disposable Chrome;
-- `profile_mode="temporary", headless=true`: clean headless Chrome;
-- `profile_mode="persistent"`: separate durable MCP-owned profile;
-- for `attach`, the launcher determines whether the already-running Chrome is visible or headless.
 
 ### Chrome profile modes
 
@@ -201,6 +390,13 @@ For isolated/background work, opt into Selenium explicitly:
 | `temporary` | Clean disposable profile; cookies disappear when the session closes. | Search, scraping, isolated tests. |
 | `persistent` | MCP owns a durable profile under `%LOCALAPPDATA%\WebSearchNeo\profiles\<profile_id>`. | Repeated automation with a separate signed-in profile. |
 | `attach` | MCP connects to a Chrome process that you started with a DevTools port and does not close it on detach. | Watching the agent work in an already authorized managed Chrome window. |
+
+For isolated or background work, opt into Selenium explicitly:
+`profile_mode="temporary"` with `headless=false` gives a clean visible
+disposable Chrome and with `headless=true` a clean headless one;
+`profile_mode="persistent"` keeps a durable MCP-owned profile. For `attach`, the
+launcher — not the `headless` argument — determines whether the already-running
+Chrome is visible or headless.
 
 Start a durable visible Chrome for attach mode (visible is the launcher default):
 
@@ -241,7 +437,7 @@ Four observation topics describe an open session, from semantic structure down t
 
 | Topic | Returns |
 | --- | --- |
-| `page_outline` | An indented tree of roles, accessible names, states, `ref:N` handles, and boxes. `limit=200` nodes, `output="text"` by default; `output="json"` returns one object per node with `rect`, `page_rect`, `center`, `visible`, `in_viewport`, and `occluded`. |
+| `page_outline` | An indented tree of roles, accessible names, states, `ref:<epoch>:N` handles, and boxes. `limit=200` nodes, `output="text"` by default; `output="json"` returns one object per node with `rect`, `page_rect`, `center`, `visible`, `in_viewport`, and `occluded`. |
 | `page_text` | The rendered text, with headings, list items, and table cells preserved. `mode="main"` drops navigation, header, footer, aside, and form chrome; `mode="full"` keeps it. `max_chars=20000`, `include_links=false`. |
 | `find` | Ranked matches for a plain-language `query` such as `"submit application"`, each with a `ref`, role, name, score, and box. `limit=5`, `role` is a soft preference. Sets `low_confidence` when nothing scores well. |
 | `page_elements` | The original flat lists of links, forms, fields with `<select>` options, and buttons, addressed by CSS selector. |
@@ -252,15 +448,38 @@ Four observation topics describe an open session, from semantic structure down t
 
 The outline and `find` walk open shadow roots and same-origin iframes, including nested ones, and translate every box into top-document coordinates so a reported `center` can be clicked or pointed at directly. A cross-origin frame appears as one node with `same_origin: false`; read it by passing its selector as `frame_selector`. Closed shadow roots are counted in `closed_shadow_roots` rather than entered.
 
+`page_text` never answers with a blank page:
+
+- `mode="main"` on a document that is one large form — a sign-up, login, or checkout page — used to drop everything as chrome. An empty result is now retried without the noise filter and reported as `fallback_used: true` with `mode_used: "full"`.
+- With `include_links=true` the link index is paid for out of the same budget, so the response stays inside the requested `max_chars` instead of overshooting it by the size of the listing.
+
 ### Locators
 
 | Form | Example | Notes |
 | --- | --- | --- |
 | CSS selector | `input[name='q']` | Unchanged, and still the only form accepted everywhere. |
-| Ref handle | `ref:12` | Issued by `page_outline` and `find`. Stable while the document lives; both topics also report `dom_epoch`, which changes after a navigation. |
+| Ref handle | `ref:3f9a1c04:12` | Issued by `page_outline` and `find`. The first field is the document epoch, also reported separately as `dom_epoch`; the second is the element number. |
 | Piercing path | `#host >>> .inner` | The separator is a space-padded ` >>> `. Each step enters the element's open shadow root, or its document when the element is a same-origin iframe. Any number of segments may be chained. |
 
-`ref:N` and piercing paths are accepted by `fill` (both its field and its file keys), `upload`, and the `form_selector` of `submit`. `click`, the `submit_selector`, `wait`, and every `frame_selector` still expect a plain CSS selector. Both new forms need a live element handle, so they resolve in the Selenium-backed modes (`temporary`, `persistent`, `attach`); in companion `current` mode they are refused with an explicit message and CSS selectors remain the way to address elements.
+Ref handles carry the document they were read from:
+
+- element numbers restart at 1 in every document, so the earlier `ref:N` form silently resolved to an unrelated element after a navigation — a `ref:1` saved from a search page addressed whatever happened to be the first node of the next page;
+- a handle whose epoch no longer matches now resolves to nothing, and the action fails with an explicit "read the page again with `page_outline`" message. So does a handle whose element has been detached from the DOM;
+- the bare `ref:N` form is still accepted for compatibility, but it carries no document identity, so it is only ever answered from the current document and only while its node is still attached.
+
+Ref handles and piercing paths are accepted by `fill` (both its field and its file keys),
+`upload`, `click`, `wait`, and the `form_selector` of `submit`. `click` and `wait` took
+plain CSS only until 1.3.0, which made the natural `find` → `click` sequence fail with
+`InvalidSelectorException`; they now poll the resolved handle for the requested
+`present`/`visible`/`clickable` state. The `submit_selector` and every `frame_selector`
+still expect a plain CSS selector. Both non-CSS forms need a live element handle, so they
+resolve in the Selenium-backed modes (`temporary`, `persistent`, `attach`); in companion
+`current` mode they are refused with an explicit message and CSS selectors remain the way
+to address elements.
+
+A CSS selector that contains ` >>> ` inside quotes or brackets — `div[data-op='a >>> b']`
+— is no longer mistaken for a piercing path; the separator is only recognised outside
+quoted strings and attribute brackets.
 
 ## Console and network diagnostics
 
@@ -276,20 +495,61 @@ The page's own console and HTTP traffic are readable without leaving the MCP con
 {"topic":"network","params":{"session_id":"demo","only_errors":true}}
 ```
 
+One line per request, for example a form post the server rejected:
+
+```text
+POST 501 Document       4ms 0.5KB http://127.0.0.1:58394/submit
+```
+
 Use `output="json"` on the `network` topic when you need the per-request `id` that `network_body` expects; the default text lines omit it.
 
 Console capture starts when the session attaches to the tab, and network capture starts on the first `network` read, so traffic and logs produced before that are not in the buffer — reload the page to observe a full page load. Each stream keeps up to 500 entries within a shared 512 KB budget and reports how many older records were `dropped`. Both topics work in companion `current` mode and in the Selenium-backed modes; the Selenium path reads Chrome's browser and performance logs instead of the extension's buffer, so field coverage is close but not identical.
 
-## Testing canvas and WebGL games
+## Forms and multi-step flows
+
+The short version: open the page, read it, `fill` everything in one call, attach
+files through `files` or the `upload` action, `submit`, then prove the outcome
+with `page_text` or a screenshot.
+
+```json
+{
+  "actions": [
+    {"action": "fill", "session_id": "apply",
+     "fields": {"#candidate-name": "Neo Candidate", "#role": "unity", "#remote": true}},
+    {"action": "submit", "session_id": "apply", "form_selector": "#application"}
+  ]
+}
+```
+
+- `fill` applies what it can and returns `filled`, `files_uploaded`, and a per-selector `errors` map; `success` is `false` whenever `errors` is non-empty.
+- `submit` runs native validation first and reports `validation_passed` with the offending field ids, then `submit_triggered` from either the fired `submit` event or an observed navigation.
+- A checkbox takes `true`/`false`, a `<select>` takes an option `value` or its visible text, and a file input must go through `files`/`upload`.
+- After any navigation or step change, read `page_outline` again and compare `dom_epoch`: old ref handles are stale by definition.
+
+**[→ Complex forms](docs/complex-forms.md)** covers the rest with worked calls:
+choosing between the three locator forms, finding a field by meaning when
+selectors are generated, partial-failure recovery, multi-step wizards and SPAs,
+fields inside Shadow DOM and same-origin iframes, what to do when
+`challenge_detected` turns true, and how to trace a submit that silently failed
+through `network` and `network_body`.
+
+## Canvas and WebGL games
 
 Browser automation is not limited to DOM forms. The compact contract covers common HTML5 game controls:
 
-- `web_info(topic="game_probe")` reports canvases, 2D/WebGL context, iframe surfaces, document focus, sampled animation FPS, loading time, console issues, and held input;
-- the `input` action mixes per-key `tap/hold/release` with pointer `click`, `double_click`, `hover`, `move`, `drag`, `press`, `release`, and `wheel`, using absolute coordinates, deltas, or unbounded relative motion, up to 16 entries of each kind;
-- `touch` sends `tap`, `press`, `move`, `release`, `swipe`, or `cancel` with up to ten simultaneous points, and `touch_emulation` makes the page report `navigator.maxTouchPoints` and `ontouchstart` so a game's mobile code path actually runs;
-- `pointer_lock` acquires, releases, or reports pointer lock for first-person controls; while locked, `coordinate_mode="relative"` moves without clamping to the viewport, which is what feeds `movementX`/`movementY`;
-- `render`, `step`, and `release_inputs` actions control animation and safely reset held input;
-- `frame_selector` targets a cross-origin game iframe such as the one used by Yandex Games.
+| Call | What it does |
+| --- | --- |
+| `web_info(topic="game_probe")` | Reports canvases, 2D/WebGL context, iframe surfaces, document focus, sampled animation FPS, loading time, console issues, and held input. |
+| `input` | Mixes per-key `tap`/`hold`/`release` with pointer `click`, `double_click`, `hover`, `move`, `drag`, `press`, `release`, and `wheel`, using absolute coordinates, deltas, or unbounded relative motion, up to 16 entries of each kind. |
+| `press_keys` | Keyboard-only shortcut: `keys` plus `key_action` (`tap`, `hold`, `release`), `repeat`, `hold_seconds`, `focus_mode` (`focus`, `click`, `none`), and `hold_frames`, which keeps a tap down across N released frames in `step` mode. |
+| `touch`, `touch_emulation` | `tap`, `press`, `move`, `release`, `swipe`, or `cancel` with up to ten simultaneous points; the emulation makes the page report `navigator.maxTouchPoints` and `ontouchstart` so a game's mobile code path actually runs. |
+| `pointer_lock` | Acquires, releases, or reports pointer lock for first-person controls; while locked, `coordinate_mode="relative"` moves without clamping to the viewport, which is what feeds `movementX`/`movementY`. |
+| `render`, `step`, `release_inputs` | Control the animation gate and safely reset held input. |
+| `frame_selector` | Targets a cross-origin game iframe such as the one used by Yandex Games. |
+
+The verb of each action is namespaced because the dispatcher already owns
+`action`: `key_action`, `pointer_action`, `touch_action`, and `pointer_lock`'s
+`operation`.
 
 Keyboard coverage includes `F1`-`F12`, `NUMPAD0`-`NUMPAD9` with the numeric keypad location, `MULTIPLY`/`ADD`/`SUBTRACT`/`DECIMAL`/`DIVIDE`, `META` (also `WIN`, `CMD`, `COMMAND`), the arrow, navigation, and editing keys, and any single printable character. A key held as `W` is released by `w` as well, and the release dispatches exactly the character that was pressed. A modifier held with `hold` is carried into subsequent mouse and touch events, so `Shift`-click and `Ctrl`-click behave as a user's would. Giving a canvas keyboard focus no longer costs a synthetic click, which used to reach the game as a shot or a jump.
 
@@ -327,6 +587,11 @@ Send the batch to `web_action`; use `web_info(topic="game_probe", params={"sessi
 
 For a top-level canvas application such as `https://redoschool.ru/demo/?auto=true`, omit `frame_selector`. Pointer coordinates are relative to the selected top-level viewport or iframe.
 
+**[→ Playing games](docs/playing-games.md)** is the full walkthrough: a complete
+run from `open` to the win condition, why a tapped key is held across the frame,
+the auto-repeat that keeps a held key alive after a respawn, iframe coordinate
+handling, pointer lock, touch games, and the cleanup that must happen at the end.
+
 ### Render modes
 
 | Mode | Behavior |
@@ -335,7 +600,17 @@ For a top-level canvas application such as `https://redoschool.ru/demo/?auto=tru
 | `throttled` | Continuously releases animation callbacks at no more than `target_fps`, for example 10 FPS. `target_fps` defaults to 10 and is clamped to 1-60. |
 | `step` | Holds queued animation callbacks. The `step` action releases 1-120 frames explicitly; every `input` action also releases exactly one frame. |
 
-While the gate is engaged — in `throttled` as well as in `step` — page time is frozen. `performance.now()` and `Date.now()` advance by exactly one frame delta of 16.667 ms per released frame, and `setTimeout`, `setInterval`, and `requestIdleCallback` are queued against that same virtual clock and run immediately before the frame's animation callbacks. Without this a game reads the agent's thinking time as its `deltaTime`, and a batch of frames released back to back arrives with a delta near zero. Promises and `queueMicrotask` are not gated, and `new Date()` still reports wall-clock time. The MCP `render` action always uses these defaults; the Python API `browser_tools.set_render_control` exposes `frame_delta_ms`, `freeze_time`, and `gate_timers` for callers that need to change them. Queued timers are handed back to the real scheduler when the mode returns to `normal`.
+While the gate is engaged — in `throttled` as well as in `step` — page time is frozen:
+
+- `performance.now()` and `Date.now()` advance by exactly one frame delta of 16.667 ms per released frame;
+- `setTimeout`, `setInterval`, and `requestIdleCallback` are queued against that same virtual clock and run immediately before the frame's animation callbacks. Without this a game reads the agent's thinking time as its `deltaTime`, and a batch of frames released back to back arrives with a delta near zero;
+- promises and `queueMicrotask` are not gated, and `new Date()` still reports wall-clock time;
+- queued timers are handed back to the real scheduler, with their remaining delay intact, when the mode returns to `normal`.
+
+`render` also accepts `frame_delta_ms`, `freeze_time`, and `gate_timers` when an
+engine needs something other than those defaults. One knob stays Python-only:
+`browser_tools.set_render_control(..., key_repeat=False)` disables the auto-repeat
+that keeps a held key alive for games which latch input on `keydown`.
 
 One `input` action can hold one key, release another, tap two more, turn the wheel, and move the pointer by a delta before releasing exactly one frame. A tapped key is pressed together with the rest of the batch, stays down for the whole released frame, and is lifted afterwards, so an engine that polls key state once per frame — Phaser, Godot, a hand-written canvas loop — actually observes the press. In `step` mode the game never observes a partially applied intermediate input state. Outside step mode the actions are still serialized, but the page continues rendering normally.
 
@@ -343,7 +618,33 @@ The gate is installed into every new document of a session, so it survives a pag
 
 The render controller gates JavaScript `requestAnimationFrame`, which covers typical canvas/WebGL and Unity WebGL loops. It does not change video decoding, CSS compositor animations, the monitor refresh rate, or guarantee an exact GPU hardware frame rate on every engine.
 
-`scripts/live_smoke.py` is the only committed check that touches the public internet. It runs a search, opens two pages concurrently, fills and submits a public Selenium test form, uploads a file, and verifies exact screenshot dimensions; it does not cover games. Public game sites change without notice, so the frame gate, input atomicity, and held-input recovery are verified by the deterministic local suite instead.
+While a gate is engaged, `game_probe` does not try to sample FPS. Frames are released by
+hand, so the measurement could only expire against its own script timeout and then report
+a fabricated zero; the probe returns immediately with `fps: null`,
+`animation_suspended: true`, and a `reason` naming the active render mode and the gated
+frame. The probe also no longer consumes Chrome's browser log — `get_log` hands it out
+exactly once, so reading it destroyed the diagnostics that the `console` topic was
+supposed to report. Both readers now draw from one bounded session buffer.
+
+### Input latency
+
+Game control is only useful if a round trip is cheap, so each action reads the page once
+and never sleeps by default. Measured through `web_action` against the bundled platformer
+fixture in step mode on a headless Chrome session, 30 iterations each, median and p95:
+
+| Action | Median | p95 | Same call at the former `wait_seconds=0.2` |
+| --- | --- | --- | --- |
+| `input` with two keys and a pointer entry | 34 ms | 47 ms | 233 ms |
+| `press_keys` single key tap | 25 ms | 26 ms | 230 ms |
+| `pointer` hover | 27 ms | 27 ms | 220 ms |
+| `step` of one frame | 11 ms | 12 ms | — |
+
+The published `wait_seconds` default of every input action dropped from 0.2 to 0.0, which
+is the whole of the last column: the action itself was never the cost. `include_summary`
+is now part of the MCP contract as well as the Python API, and setting it to `false` skips
+the post-action page read: `input` 34 ms → 29 ms, `press_keys` 25 ms → 21 ms, `step`
+11 ms → 8 ms. It saves nothing measurable on `pointer`, whose summary is already the
+cheapest of the four. Absolute numbers depend on the machine; the ratios do not.
 
 ## Two-tool MCP contract
 
@@ -354,7 +655,7 @@ The render controller gates JavaScript `requestAnimationFrame`, which covers typ
 
 Start with `web_info()`. With no arguments it returns `actions` with each action's required and optional parameters, `action_groups`, `info_topics`, `recipes`, `pitfalls`, `limits`, and worked `examples`. Request only the needed, generated JSON Schema with `web_info(topic="action_schema", params={"action": "input"})`, then invoke it through `web_action`. This follows the on-demand Tool Search principle used by [official Unreal MCP](https://dev.epicgames.com/documentation/unreal-engine/unreal-mcp-in-unreal-editor): keep the eager tool list small, disclose schemas only when needed, and dispatch actions through a meta-tool. Web Search Neo combines Unreal's list/describe discovery tools into one `web_info`, so only two tools are advertised.
 
-Measured on the current build, summing each advertised tool's `name`, `description`, and serialized `inputSchema`: the compact surface is 1,029 characters across two tools, against 19,944 characters across the 40 tools of legacy mode.
+Measured on the current build, summing each advertised tool's `name`, `description`, and serialized `inputSchema`: the compact surface is 1,091 characters across two tools, against 22,310 characters across the 40 tools of legacy mode. The self-describing contract behind `web_info()` is 7,120 characters, and it is fetched only when an agent asks for it. Each action in it now lists its required parameter names; optional names, types, and defaults stay in `action_schema`, where they cost nothing until needed.
 
 Every action is declared once in a single registry that also generates its published schema, and arguments are validated against that same model before the handler runs. An unknown or malformed field returns the offending names and the list of allowed parameters instead of an internal `TypeError`:
 
@@ -367,6 +668,20 @@ web_info(topic='action_schema', params={'action': '<name>'}) for the full schema
 Existing direct Python imports remain available. For temporary MCP-client migration only, set `WEB_SEARCH_NEO_LEGACY_TOOLS=1` before starting the server to advertise the former narrow tool list instead of the compact default.
 
 Browser state is keyed by `session_id`. The `open_many` action can create up to four independent sessions concurrently. In isolated Selenium modes, non-full-page screenshots match the requested viewport dimensions exactly. In `current` mode the MCP intentionally preserves the user's existing Chrome viewport and captures it at its actual size.
+
+## Optional agent skill
+
+`web_info()` called with no arguments returns the entire agent-facing contract: every action with its required and optional parameters, the observation topics, ready-made recipes, the common mistakes, the hard limits, and runnable examples. An agent that reads it needs no external instructions, so the bundled skill is a convenience, not a requirement.
+
+The repository still includes a short [Web Search Neo skill](skills/web-search-neo/SKILL.md) for clients that prefer a resident description of when to reach for the server at all.
+
+Install it locally by copying `skills/web-search-neo` into your Codex skills directory, then restart Codex:
+
+```powershell
+Copy-Item -Recurse -Force skills\web-search-neo "$env:USERPROFILE\.codex\skills\web-search-neo"
+```
+
+Invoke it explicitly as `$web-search-neo`, or let its task description trigger it for web search, visible Chrome automation, authorized attach sessions, form work, and browser-game testing.
 
 ## Optional configuration
 
@@ -398,9 +713,22 @@ python -m pytest
 python -m pytest --cov=. --cov-report=term-missing
 ```
 
-The deterministic suite verifies that MCP advertises exactly two tools, performs on-demand action discovery, runs ordered multi-action calls, and retains coverage of search routing, fallback/cooldown/cache, live status probes that leave the real cooldown untouched, accurate Bing challenge detection, HTTP fetches, the plain-HTTP policy and per-hop redirect checks, the accessibility outline including open shadow roots and same-origin frames, page text extraction, semantic `find` ranking, the three locator forms and their escaping, the companion's console and network buffers with their ring-buffer eviction, companion bridge origin checks and tab grouping, confirmation-gated Chrome setup, multipart upload, forms, validation, exact PNG viewport size, canvas probing, normal/throttled/step rendering, atomic mixed input, held modifiers across a batch, gate and held-input reset on navigation, concurrent sessions, manual challenges, persistent storage, and a real managed-Chrome attach/detach that leaves Chrome running.
+The deterministic suite is 231 tests, grouped by what they protect:
 
-Public search engines may rate-limit an IP or region, so live internet smoke checks are kept separate from deterministic tests.
+| Area | Covered |
+| --- | --- |
+| MCP contract | Exactly two advertised tools, on-demand action discovery, ordered multi-action calls. |
+| Search | Routing, fallback, cooldown and cache, live status probes that leave the real cooldown untouched, accurate Bing challenge detection, manual challenges. |
+| HTTP | Fetches, the plain-HTTP policy, and per-hop redirect checks. |
+| Perception | The accessibility outline including open shadow roots and same-origin frames, page text extraction with its non-empty `main` fallback and its link budget, semantic `find` ranking. |
+| Locators | The three forms and their escaping, refs that refuse to resolve in another document or after their element was removed, valid CSS that merely contains ` >>> `. |
+| Diagnostics | The companion's console and network buffers with their ring-buffer eviction. |
+| Companion bridge | The handshake — a client without the token, a hello without a nonce, a newer companion evicting an older one, and WebCrypto HMAC agreeing with the Python signature — origin checks, tab grouping, and confirmation-gated Chrome setup that publishes the token before touching Chrome. |
+| Forms | Multipart upload, form filling, native validation, exact PNG viewport size. |
+| Games and input | Canvas probing, normal/throttled/step rendering, atomic mixed input, held modifiers across a batch, gate and held-input reset on navigation. |
+| Sessions | Sessions that close the tabs they own, concurrent sessions, persistent storage, and a real managed-Chrome attach/detach that leaves Chrome running. |
+
+Public search engines may rate-limit an IP or region, so live internet smoke checks are kept separate from deterministic tests. `scripts/live_smoke.py` is the only committed check that touches the public internet. It runs a search, opens two pages concurrently, fills and submits a public Selenium test form, uploads a file, and verifies exact screenshot dimensions; it does not cover games. Public game sites change without notice, so the frame gate, input atomicity, and held-input recovery are verified by the deterministic local suite instead.
 
 ### End-to-end check with a local model
 
@@ -411,12 +739,15 @@ lms load qwen3.5-4b-mtp --context-length 16384 --parallel 1
 python scripts/live_agent_game.py --model qwen3.5-4b-mtp
 ```
 
-It reports the eager tool-schema size and the median and p95 latency of both MCP tool calls and model turns, so a regression in either is visible immediately. Thinking is disabled through `reasoning_effort: "none"`, because a mechanical control loop pays for it without gaining anything. The script needs Chrome and a running LM Studio server and is not part of `pytest`.
+It reports the eager tool-schema size and the median and p95 latency of both MCP tool calls and model turns, so a regression in either is visible immediately. Thinking is disabled through `reasoning_effort: "none"`, because a mechanical control loop pays for it without gaining anything. The script needs Chrome and a running LM Studio server and is not part of `pytest`. Whether the model finishes the level is a property of the model, not of the server: a 4B does it, but not on every attempt.
 
 ## Safety notes
 
 - Visible or attached sessions may contain authenticated accounts. The MCP client can act with the permissions of those accounts.
-- The companion declares four permissions: `debugger`, `storage`, `tabs`, and `tabGroups`. It ships no content scripts and asks for no `host_permissions`, but `debugger` is the broad one: it lets the extension attach the Chrome DevTools Protocol to a tab and from there read and modify that page, its console, and its network traffic. Chrome shows a "started debugging this browser" banner whenever it is attached. Install the companion only from this repository and keep the local MCP bridge trusted.
+- The companion declares four permissions: `debugger`, `storage`, `tabs`, and `tabGroups`. It ships no content scripts and asks for no `host_permissions`, but `debugger` is the broad one: it lets the extension attach the Chrome DevTools Protocol to a tab and from there read and modify that page, its console, and its network traffic. Chrome shows a "started debugging this browser" banner whenever it is attached. Install the companion only from this repository.
+- The loopback bridge is authenticated in both directions. The extension proves it holds the machine-local token before the server accepts a command, and the server proves the same by returning `HMAC-SHA256(token, nonce)` before the extension executes one. Until 1.3.0 the port accepted any local client that spoke the protocol, and the extension trusted whatever answered on it.
+- That secret is a file readable by the user account that owns it, so it does not defend against a malicious process already running as you: such a process can read the token and impersonate either side. It removes the race in which any local program that binds `127.0.0.1:8765` before the server inherits DevTools access to every signed-in tab. Chrome Native Messaging, which needs no listening port at all, is the actual fix and is tracked in [TODO.md](TODO.md).
+- Authentication is not authorization. An authenticated peer may call `cdp.send` with any DevTools method on any tab the session drives; there is no method allowlist yet.
 - `setup_current_chrome` requires explicit user approval before it changes Chrome's extension state.
 - Plain `http://` to public hosts is refused unless `WEB_SEARCH_NEO_ALLOW_PLAIN_HTTP=1` is set; loopback and private-network addresses are always reachable.
 - File upload tools can upload local paths supplied to the tool. Review agent actions and scope filesystem access appropriately.

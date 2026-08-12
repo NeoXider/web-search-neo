@@ -231,6 +231,12 @@ def _install_with_windows_ui(
 
     desktop = Desktop(backend="uia")
     extension_window, chrome = _select_chrome_window(desktop, window_title)
+    # pywinauto's set_focus does not reliably raise a minimised or background
+    # Chrome, and the keystrokes below go wherever the foreground window is.
+    try:
+        _focus_window(int(extension_window.handle))
+    except Exception:
+        pass
     extension_window.set_focus()
     send_keys("^l")
     send_keys(_escape_send_keys("chrome://extensions/"), with_spaces=True)
