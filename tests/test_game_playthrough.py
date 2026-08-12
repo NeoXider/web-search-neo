@@ -225,6 +225,154 @@ def test_gate_timers_freezes_an_interval_registered_before_step_mode(local_site)
         browser_tools.close_session("legacy-timers")
 
 
+def test_leaving_step_mode_does_not_detonate_the_queued_timers(local_site):
+    """A virtual deadline read against the real clock is always already overdue."""
+    session = _open_fixture(local_site, PLATFORMER, "timer-handover")
+    driver = session.driver
+    try:
+        browser_tools.set_render_control("step", "timer-handover", gate_timers=True)
+        driver.execute_script(
+            "window.__late = 0; setTimeout(() => { window.__late += 1; }, 500);"
+        )
+        time.sleep(1.0)  # real time runs on; the frozen clock does not
+        assert driver.execute_script("return window.__late;") == 0
+
+        browser_tools.set_render_control("normal", "timer-handover")
+        time.sleep(0.15)
+        assert driver.execute_script("return window.__late;") == 0, (
+            "the queued timer fired at once instead of after its remaining 500ms"
+        )
+        time.sleep(0.8)
+        assert driver.execute_script("return window.__late;") == 1
+    finally:
+        browser_tools.close_session("timer-handover")
+
+
+def test_turning_freeze_time_off_does_not_flush_the_queue_on_the_next_frame(local_site):
+    session = _open_fixture(local_site, PLATFORMER, "timer-unfreeze")
+    driver = session.driver
+    try:
+        browser_tools.set_render_control(
+            "step", "timer-unfreeze", gate_timers=True, freeze_time=True
+        )
+        driver.execute_script(
+            "window.__soon = 0; setTimeout(() => { window.__soon += 1; }, 500);"
+        )
+        time.sleep(1.0)
+
+        # The queue keeps its deadlines, but they were written against the frozen
+        # clock; swapping to the real one must rebase them, not expire them.
+        browser_tools.set_render_control(
+            "step", "timer-unfreeze", gate_timers=True, freeze_time=False
+        )
+        browser_tools.render_step(1, "timer-unfreeze")
+        assert driver.execute_script("return window.__soon;") == 0
+        time.sleep(0.8)
+        browser_tools.render_step(1, "timer-unfreeze")
+        assert driver.execute_script("return window.__soon;") == 1
+    finally:
+        browser_tools.close_session("timer-unfreeze")
+
+
+def test_returning_to_normal_keeps_the_frame_ids_the_page_still_holds(local_site):
+    session = _open_fixture(local_site, PLATFORMER, "frame-ids")
+    driver = session.driver
+    try:
+        browser_tools.set_render_control("step", "frame-ids")
+        driver.execute_script(
+            "window.__fired = 0;"
+            "window.__id = requestAnimationFrame(() => { window.__fired += 1; });"
+        )
+        # Lifting the gate and cancelling in one round-trip: a real frame cannot run
+        # between two statements of the same script, so the only thing this can
+        # observe is whether the id the page holds survived the handover.
+        driver.execute_script(
+            "window.__webSearchNeoRenderControl.setMode('normal', 60, {});"
+            "cancelAnimationFrame(window.__id);"
+        )
+        time.sleep(0.3)
+
+        assert driver.execute_script("return window.__fired;") == 0, (
+            "cancelAnimationFrame could not reach a callback that was re-registered "
+            "under a new id when the gate was lifted"
+        )
+        assert browser_tools.set_render_control("normal", "frame-ids")["mode"] == "normal"
+    finally:
+        browser_tools.close_session("frame-ids")
+
+
+def test_game_probe_reports_a_gated_loop_instead_of_waiting_for_frames(local_site):
+    session = _open_fixture(local_site, PLATFORMER, "probe-gated")
+    try:
+        browser_tools.set_render_control("step", "probe-gated")
+        started = time.monotonic()
+        probe = browser_tools.game_probe(
+            "probe-gated", sample_seconds=1.0, include_console=False
+        )
+        elapsed = time.monotonic() - started
+
+        assert probe["animation"]["animation_suspended"] is True
+        assert probe["animation"]["available"] is False
+        assert "manually" in probe["animation"]["reason"]
+        assert elapsed < 5, f"game_probe hung for {elapsed:.1f}s on a gated loop"
+    finally:
+        browser_tools.close_session("probe-gated")
+
+
+def test_game_probe_does_not_report_the_host_fps_for_a_frozen_framed_game(local_site):
+    session = _open_fixture(local_site, IFRAME_HOST, "probe-frame")
+    try:
+        browser_tools.set_render_control(
+            "step", "probe-frame", frame_selector="#game-frame"
+        )
+        idle = _read_game(session, "#game-frame")
+        # Only the frame is gated, so the host document still animates happily.
+        probe = browser_tools.game_probe(
+            "probe-frame", sample_seconds=0.2, include_console=False
+        )
+        assert _read_game(session, "#game-frame")["tick"] == idle["tick"]
+        assert probe["animation"]["animation_suspended"] is True, (
+            "the host document's fps was reported for a frozen game"
+        )
+        assert probe["animation"]["gated_frame_selector"] == "#game-frame"
+    finally:
+        browser_tools.close_session("probe-frame")
+
+
+def test_game_probe_leaves_the_browser_log_for_the_console_topic(local_site):
+    session = _open_fixture(local_site, PLATFORMER, "probe-console")
+    driver = session.driver
+    try:
+        driver.execute_script(
+            "window.__failed = false;"
+            "const image = new Image();"
+            "image.onerror = () => { window.__failed = true; };"
+            "image.src = '/definitely-missing-probe-marker.png';"
+        )
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not driver.execute_script(
+            "return window.__failed;"
+        ):
+            time.sleep(0.05)
+        time.sleep(0.3)  # let Chrome finish writing its own log entry
+
+        probe = browser_tools.game_probe(
+            "probe-console", sample_seconds=0.2, include_console=True
+        )
+        assert any(
+            "definitely-missing-probe-marker" in item["message"]
+            for item in probe["console_messages"]
+        ), "the browser log never reported the failed request"
+
+        console = browser_tools.get_console("probe-console", limit=200)
+        assert any(
+            "definitely-missing-probe-marker" in str(item.get("text") or "")
+            for item in console["entries"]
+        ), "game_probe swallowed the browser log the console topic needs"
+    finally:
+        browser_tools.close_session("probe-console")
+
+
 def test_tapped_key_is_still_held_while_the_frame_runs(local_site):
     session = _open_fixture(local_site, PLATFORMER, "tap-jump")
     try:

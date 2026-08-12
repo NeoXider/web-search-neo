@@ -54,9 +54,11 @@ def test_outline_reports_roles_names_and_usable_refs(local_site):
     try:
         result = page_perception.outline(driver, format="json")
         nodes = _nodes(result)
-        assert result["dom_epoch"]
+        epoch = result["dom_epoch"]
+        assert epoch
         assert result["closed_shadow_roots"] == 0
-        assert all(re.fullmatch(r"ref:\d+", node["ref"]) for node in nodes)
+        assert all(node["ref"].startswith(f"ref:{epoch}:") for node in nodes)
+        assert all(re.fullmatch(r"ref:[0-9a-f]+:\d+", node["ref"]) for node in nodes)
 
         named = {(node["role"], node["name"]) for node in nodes}
         assert ("textbox", "Candidate name") in named
@@ -211,11 +213,20 @@ def test_closed_shadow_roots_are_counted_when_the_registry_boots_early(local_sit
 
 
 def test_resolve_locator_expression_handles_the_three_locator_forms():
-    assert page_perception.resolve_locator_expression("ref:12") == (
-        "window.__wsnRefs.nodes.get(12)"
+    legacy = page_perception.resolve_locator_expression("ref:12")
+    assert "nodes.get(12)" in legacy
+    assert "isConnected" in legacy  # a bare ref may only answer for a live node
+    assert "registry.epoch !==" not in legacy
+    assert page_perception.ref_expression(7) == page_perception.ref_expression("ref:7")
+
+    scoped = page_perception.resolve_locator_expression("ref:a1b2c3d4e5f60718:12")
+    assert 'registry.epoch !== "a1b2c3d4e5f60718"' in scoped
+    assert "nodes.get(12)" in scoped
+    assert page_perception.parse_ref("ref:a1b2c3d4e5f60718:12") == (
+        "a1b2c3d4e5f60718",
+        12,
     )
-    assert page_perception.ref_expression(7) == "window.__wsnRefs.nodes.get(7)"
-    assert page_perception.ref_expression("ref:7") == "window.__wsnRefs.nodes.get(7)"
+    assert page_perception.parse_ref("ref:12") == (None, 12)
 
     piercing = page_perception.resolve_locator_expression("my-app >>> #inner >>> button")
     assert piercing is not None
@@ -264,6 +275,175 @@ def test_outline_descends_into_same_origin_frames_with_page_coordinates(local_si
         assert "platformer fixture" in heading["name"]
     finally:
         browser_tools.close_session("perception-frames")
+
+
+def test_a_ref_from_another_document_never_resolves(local_site):
+    """Ref numbers restart at 1 per document, so an old handle must not resolve."""
+    driver = _driver_or_skip(f"{local_site.base_url}/form", "perception-epoch")
+    try:
+        first = page_perception.outline(driver, format="json")
+        button = next(
+            node for node in _nodes(first) if node.get("name") == "Run action"
+        )
+        assert _evaluate(driver, page_perception.ref_expression(button["ref"])) == (
+            "action-button"
+        )
+
+        driver.get(f"{local_site.base_url}/page")
+        second = page_perception.outline(driver, format="json")
+        assert second["dom_epoch"] != first["dom_epoch"]
+        # The new document happily hands out the very same number.
+        assert any(
+            node["ref"].endswith(":" + button["ref"].rsplit(":", 1)[1])
+            for node in _nodes(second)
+        )
+        assert driver.execute_script(
+            f"return {page_perception.ref_expression(button['ref'])};"
+        ) is None
+
+        with pytest.raises(ValueError, match="stale"):
+            browser_tools._resolve_element(driver, button["ref"])
+    finally:
+        browser_tools.close_session("perception-epoch")
+
+
+def test_a_ref_whose_element_was_removed_reports_instead_of_resolving(local_site):
+    driver = _driver_or_skip(f"{local_site.base_url}/form", "perception-detached")
+    try:
+        found = page_perception.find(driver, "Run action")
+        handle = found["matches"][0]["ref"]
+        assert browser_tools._resolve_element(driver, handle).get_attribute("id") == (
+            "action-button"
+        )
+
+        driver.execute_script("document.getElementById('action-button').remove();")
+        with pytest.raises(ValueError, match="stale"):
+            browser_tools._resolve_element(driver, handle)
+    finally:
+        browser_tools.close_session("perception-detached")
+
+
+def test_the_ref_registry_drops_nodes_the_page_threw_away(local_site):
+    driver = _driver_or_skip(f"{local_site.base_url}/page", "perception-registry")
+    try:
+        for _ in range(4):
+            driver.execute_script(
+                "const host = document.createElement('div');"
+                "host.id = 'ref-batch';"
+                "for (let i = 0; i < 30; i += 1) {"
+                "  const button = document.createElement('button');"
+                "  button.textContent = 'Batch ' + i;"
+                "  host.appendChild(button);"
+                "}"
+                "document.body.appendChild(host);"
+            )
+            page_perception.outline(driver, limit=400, format="json")
+            driver.execute_script("document.getElementById('ref-batch').remove();")
+
+        page_perception.outline(driver, limit=400, format="json")
+        held = driver.execute_script("return window.__wsnRefs.nodes.size;")
+        detached = driver.execute_script(
+            "let count = 0;"
+            "for (const node of window.__wsnRefs.nodes.values()) {"
+            "  if (!node.isConnected) count += 1;"
+            "}"
+            "return count;"
+        )
+        assert detached == 0, f"{detached} detached nodes are still held"
+        assert held < 60, f"the registry kept {held} nodes for a page with a few"
+    finally:
+        browser_tools.close_session("perception-registry")
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [
+        "div[data-op='a >>> b']",
+        '[aria-label="Reports >>> Q4"]',
+        "a[href$='>>>']",
+    ],
+)
+def test_valid_css_containing_the_separator_is_not_a_piercing_path(selector):
+    assert page_perception.resolve_locator_expression(selector) is None
+    assert page_perception.split_piercing_path(selector) is None
+
+
+def test_a_quoted_separator_still_resolves_as_plain_css(local_site):
+    driver = _driver_or_skip(f"{local_site.base_url}/page", "perception-quoted")
+    try:
+        driver.execute_script(
+            "document.body.insertAdjacentHTML('beforeend',"
+            "  '<button id=quoted-target data-op=\"a &gt;&gt;&gt; b\">Quoted</button>');"
+        )
+        selector = 'button[data-op="a >>> b"]'
+        assert driver.find_element("css selector", selector).get_attribute("id") == (
+            "quoted-target"
+        )
+        element = browser_tools._resolve_element(driver, selector)
+        assert element.get_attribute("id") == "quoted-target"
+    finally:
+        browser_tools.close_session("perception-quoted")
+
+
+def test_main_mode_falls_back_instead_of_returning_an_empty_page(local_site):
+    """A registration page is all <form>, which mode='main' treats as chrome."""
+    driver = _driver_or_skip(f"{local_site.base_url}/form?session=fallback", "perception-form")
+    try:
+        driver.execute_script(
+            "document.querySelectorAll('a, p, button:not(#submit-button)')"
+            "  .forEach(node => node.remove());"
+        )
+        full = page_perception.page_text(driver, mode="full")
+        assert "Candidate name" in full["text"]
+        assert full["fallback_used"] is False
+        assert full["mode_used"] == "full"
+
+        main = page_perception.page_text(driver, mode="main")
+        assert main["chars"] > 0, "mode='main' returned an empty page with no error"
+        assert "Candidate name" in main["text"]
+        assert main["fallback_used"] is True
+        assert main["mode_used"] == "full"
+        assert main["mode"] == "main"
+    finally:
+        browser_tools.close_session("perception-form")
+
+
+def test_page_text_keeps_links_inside_its_own_budget(local_site):
+    driver = _driver_or_skip(f"{local_site.base_url}/page", "perception-budget")
+    try:
+        driver.execute_script(
+            "for (let i = 0; i < 40; i += 1) {"
+            "  document.body.insertAdjacentHTML('beforeend',"
+            "    '<p><a href=\"/target-number-' + i + '\">Link number ' + i + '</a></p>');"
+            "}"
+        )
+        result = page_perception.page_text(driver, max_chars=400, include_links=True)
+        assert len(result["text"]) <= 400
+        assert result["chars"] == len(result["text"])
+        assert result["truncated"] is True
+        # Every marker left in the text still has its URL listed, and nothing else.
+        assert result["links"]
+        markers = {int(item) for item in re.findall(r"\[(\d+)\]", result["text"])}
+        listed = {int(link["index"]) for link in result["links"]}
+        assert listed == markers
+    finally:
+        browser_tools.close_session("perception-budget")
+
+
+def test_page_text_does_not_repeat_slotted_content(local_site):
+    driver = _driver_or_skip(f"{local_site.base_url}/page", "perception-slot")
+    try:
+        driver.execute_script(
+            "const host = document.createElement('div');"
+            "host.innerHTML = '<span>SLOTTED-MARKER-ONCE</span>';"
+            "document.body.appendChild(host);"
+            "host.attachShadow({mode: 'open'}).innerHTML ="
+            "  '<section><slot></slot></section>';"
+        )
+        text = page_perception.page_text(driver, mode="full")["text"]
+        assert text.count("SLOTTED-MARKER-ONCE") == 1, text
+    finally:
+        browser_tools.close_session("perception-slot")
 
 
 @pytest.mark.parametrize("bad_format", ["html", "yaml"])

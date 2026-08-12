@@ -16,6 +16,7 @@ import uuid
 
 from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
 
+import bridge_auth
 from key_table import MODIFIER_BITS, resolve_key
 
 
@@ -25,6 +26,7 @@ class ChromeBridgeError(RuntimeError):
 
 CHROME_EXTENSION_ID = "ndbmcjhbdjpefojkoljacjhammmcigao"
 LOGGER = logging.getLogger("web_search_neo.bridge")
+TOKEN_MISMATCH_REASON = "Companion token mismatch; reload the extension on chrome://extensions"
 
 
 @dataclass
@@ -38,9 +40,18 @@ class _PendingRequest:
 class ChromeBridge:
     """Small request/response server used by the Web Search Neo Chrome extension."""
 
-    def __init__(self, host: str = "127.0.0.1", port: int | None = None) -> None:
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int | None = None,
+        token: str | None = None,
+    ) -> None:
         self.host = host
         self.port = int(port or os.getenv("WEB_SEARCH_NEO_BRIDGE_PORT", "8765"))
+        # An explicit token belongs to the caller (tests); only the default
+        # instance owns the on-disk secret and the extension's copy of it.
+        self._token: str | None = token
+        self._owns_token = token is None
         self._connection: Any = None
         self._connection_lock = threading.RLock()
         self._send_lock = threading.Lock()
@@ -66,10 +77,30 @@ class ChromeBridge:
             self._thread.start()
         self._started.wait(timeout=2.0)
 
+    def _ensure_token(self) -> str:
+        """Return the shared secret, publishing it to the extension when we own it."""
+        with self._connection_lock:
+            if self._token is None:
+                self._token = bridge_auth.load_or_create_token()
+            token = self._token
+            owns = self._owns_token
+        if owns:
+            try:
+                bridge_auth.write_extension_token(token)
+            except OSError as exc:
+                # A read-only checkout still works if the companion copy is current.
+                LOGGER.warning(
+                    "Could not refresh the companion token file: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+        return token
+
     def _serve(self) -> None:
         try:
             from websockets.sync.server import serve
 
+            self._ensure_token()
             extension_origin = re.compile(
                 rf"^chrome-extension://{re.escape(CHROME_EXTENSION_ID)}/?$"
             )
@@ -90,24 +121,62 @@ class ChromeBridge:
             self._started.set()
             self._fail_pending("Chrome bridge stopped")
 
+    @staticmethod
+    def _close_quietly(connection: Any, code: int, reason: str) -> None:
+        try:
+            connection.close(code=code, reason=reason)
+        except Exception as exc:
+            LOGGER.warning(
+                "Closing a Chrome companion socket failed: %s: %s", type(exc).__name__, exc
+            )
+
     def _handle_connection(self, websocket: Any) -> None:
         try:
             first = json.loads(websocket.recv(timeout=5.0))
             if first.get("type") != "hello" or first.get("protocol") != 1:
                 websocket.close(code=1008, reason="Expected Web Search Neo protocol hello")
                 return
+            token = self._ensure_token()
+            nonce = first.get("nonce")
+            if not bridge_auth.token_matches(token, first.get("token")):
+                LOGGER.warning(
+                    "Rejected a bridge client that did not present the companion token "
+                    "(claimed browser: %r)",
+                    dict(first.get("browser") or {}),
+                )
+                websocket.close(code=1008, reason=TOKEN_MISMATCH_REASON)
+                return
+            if not isinstance(nonce, str) or not 1 <= len(nonce) <= 256:
+                LOGGER.warning("Rejected a bridge client whose hello carried no usable nonce")
+                websocket.close(code=1008, reason="Companion hello must carry a nonce")
+                return
             with self._connection_lock:
                 previous = self._connection
-                if previous is not None and previous is not websocket:
-                    websocket.close(
-                        code=1008,
-                        reason="Another Chrome companion is already connected",
-                    )
-                    return
                 self._connection = websocket
                 self._browser_info = dict(first.get("browser") or {})
                 self._connected.set()
-            websocket.send(json.dumps({"type": "hello_ack", "protocol": 1}))
+            if previous is not None and previous is not websocket:
+                # The newest authenticated companion wins: a stale socket that
+                # answered first must not be able to hold the bridge hostage.
+                LOGGER.info("A newer Chrome companion replaced the previous connection")
+                self._fail_pending("Chrome companion reconnected", previous)
+                # Closing waits for the peer's close frame, so it must not delay
+                # the ack the fresh companion is blocked on.
+                threading.Thread(
+                    target=self._close_quietly,
+                    args=(previous, 1000, "Replaced by a newer Chrome companion"),
+                    name="web-search-neo-bridge-evict",
+                    daemon=True,
+                ).start()
+            websocket.send(
+                json.dumps(
+                    {
+                        "type": "hello_ack",
+                        "protocol": 1,
+                        "proof": bridge_auth.sign(token, nonce),
+                    }
+                )
+            )
             for raw_message in websocket:
                 try:
                     message = json.loads(raw_message)
@@ -181,9 +250,14 @@ class ChromeBridge:
     ) -> Any:
         if not self.wait_connected(min(max(timeout, 0.0), 3.0)):
             detail = f" ({self._startup_error})" if self._startup_error else ""
+            # Telling a caller to click through chrome://extensions is useless to
+            # an agent: name the two calls it can actually make instead.
             raise ChromeBridgeError(
-                "Chrome companion extension is not connected. Load chrome-extension/ "
-                f"in chrome://extensions and keep Chrome open{detail}."
+                "Chrome companion extension is not connected, so profile_mode "
+                f"'current' cannot be used{detail}. Either retry with "
+                '{"action": "open", "url": "...", "profile_mode": "temporary"}, '
+                'which needs no extension, or send {"action": '
+                '"setup_current_chrome"} and follow the confirmation it returns.'
             )
         request_id = uuid.uuid4().hex
         with self._connection_lock:

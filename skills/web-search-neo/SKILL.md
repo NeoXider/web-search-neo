@@ -15,8 +15,11 @@ One `session_id` is one page — reuse it.
 
 ## Observation topics
 
-- `page_outline`: roles, accessible names, states, `ref:N` handles, and boxes. Start here.
-- `page_text`: readable rendered text; `mode="main"` drops navigation and chrome.
+- `page_outline`: roles, accessible names, states, `ref:<epoch>:N` handles, and boxes. Start
+  here.
+- `page_text`: readable rendered text; `mode="main"` drops navigation and chrome. On a page
+  that is one big form, `main` would be empty, so the reader falls back to the full page and
+  says so with `fallback_used` and `mode_used`.
 - `find`: `params.query="submit application"` returns ranked refs instead of a whole page.
 - `page_elements`: flat CSS selectors, `<select>` options, and form metadata.
 - `console`: console output and uncaught errors with stack frames.
@@ -29,11 +32,18 @@ is a stub, so pass its selector as `frame_selector` to read it.
 
 ## Locators
 
-Plain CSS works everywhere and stays the default. `fill`, `upload`, and the `form_selector`
-of `submit` also accept `ref:12` from the outline, and a piercing path such as
-`#host >>> .inner` that steps through an open shadow root or a same-origin iframe per
-segment. Those two forms need a live element handle, so they resolve in `temporary`,
-`persistent`, and `attach` sessions, not in companion `current` mode.
+Plain CSS works everywhere and stays the default. `fill`, `upload`, `click`, `wait`, and the
+`form_selector` of `submit` also accept a ref handle such as `ref:3f9a1c04:12` from the
+outline or `find`, and a piercing path such as `#host >>> .inner` that steps through an open
+shadow root or a same-origin iframe per segment. `submit_selector` and every
+`frame_selector` still need plain CSS. Those two forms need a live element handle, so they
+resolve in `temporary`, `persistent`, and `attach` sessions, not in companion `current`
+mode.
+
+Pass a ref back exactly as it was returned: the first field is the document it came from, so
+a handle from a page you have since navigated away from resolves to nothing and the action
+tells you to read `page_outline` again, instead of silently acting on a different element.
+Re-read after any navigation or re-render.
 
 ## Search and fetch
 
@@ -49,7 +59,8 @@ stay reachable, so local services work unchanged.
 
 - `current` (default) drives the user's signed-in Chrome through the companion extension.
   New tabs enter group `AI`; `attach_tab` claims an existing `tab_id` without moving it.
-  `close` removes a tab the agent opened and leaves a claimed tab open.
+  `close` removes a tab the agent opened and leaves a claimed tab open; `close_all` follows
+  the same rule for every session at once.
 - If the companion is disconnected, read `browser_status` and call `setup_current_chrome`
   without confirmation. Only after the user explicitly approves may you repeat it with
   `confirm_install=true`.
@@ -95,9 +106,18 @@ lifts a key held as `W`.
 }
 ```
 
-Other input actions: `touch` for tap, swipe, and multi-finger press/move/release;
-`touch_emulation` so a game's mobile code path runs at all; `pointer_lock` for first-person
-controls.
+Other input actions: `press_keys` for keyboard-only work — `keys` plus `key_action`
+(`tap|hold|release`), with `repeat`, `hold_seconds`, `focus_mode`, and `hold_frames`, which
+keeps a tap down across N released frames in step mode; `touch` for tap, swipe, and
+multi-finger press/move/release; `touch_emulation` so a game's mobile code path runs at all;
+`pointer_lock` for first-person controls. The keyboard verb is `key_action`, the pointer
+verb `pointer_action`, the touch verb `touch_action`, and pointer lock's is `operation`,
+because the dispatcher itself owns `action`.
+
+`input`, `press_keys`, `pointer`, `touch`, and `step` all accept `include_summary=false`,
+which skips the page read and returns only the action result; `wait_seconds` already
+defaults to `0`. Use both while driving a game frame by frame, and read the page explicitly
+when you actually want to look at it.
 
 Render modes:
 
@@ -112,7 +132,8 @@ released frame, which is what engines that poll key state per frame need.
 
 Always `release_inputs` after holding input and restore `render` to `normal` before handoff
 or close. Take a screenshot or read `game_probe` between batches; in step mode a screenshot
-taken before the first frame still shows the old frame.
+taken before the first frame still shows the old frame, and `game_probe` reports
+`animation_suspended` with `fps: null` instead of measuring a gate you are driving by hand.
 
 ## Batch results
 

@@ -7,6 +7,7 @@ import base64
 from dataclasses import dataclass, field
 from http.client import HTTPConnection
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -42,8 +43,12 @@ import page_perception
 from web_client import validate_http_url
 
 
+logger = logging.getLogger(__name__)
+
 MAX_SESSIONS = 4
 _SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+# Chrome hands out its browser log exactly once, so the session keeps a bounded copy.
+_BROWSER_LOG_LIMIT = 500
 
 
 @dataclass
@@ -60,6 +65,8 @@ class BrowserSession:
     held_buttons: set[str] = field(default_factory=set)
     pointer_x: float = 0.0
     pointer_y: float = 0.0
+    # (0, 0) is a legitimate pointer position, so "never moved" needs its own flag.
+    pointer_initialized: bool = False
     render_mode: str = "normal"
     key_repeat: bool = True
     render_target_fps: float | None = None
@@ -77,6 +84,8 @@ class BrowserSession:
     touch_enabled: bool = False
     fresh_keys: set[str] = field(default_factory=set)
     console_cursor: int = 0
+    browser_log: list[dict[str, Any]] = field(default_factory=list)
+    browser_log_cursor: int = 0
     network_pending: dict[str, dict[str, Any]] = field(default_factory=dict)
     network_rows: list[dict[str, Any]] = field(default_factory=list)
     network_subscribed: bool = False
@@ -895,20 +904,17 @@ def wait_for_element(
     state: str = "visible",
     timeout_seconds: float = 10.0,
 ) -> dict[str, Any]:
-    """Wait for a dynamic element to be present, visible, or clickable."""
-    conditions_by_state = {
-        "present": conditions.presence_of_element_located,
-        "visible": conditions.visibility_of_element_located,
-        "clickable": conditions.element_to_be_clickable,
-    }
-    if state not in conditions_by_state:
+    """Wait for a dynamic element to be present, visible, or clickable.
+
+    ``selector`` accepts the same three locator forms as ``fill``: CSS, a ref
+    handle, and a piercing path.
+    """
+    if state not in _ELEMENT_STATES:
         raise ValueError("state must be 'present', 'visible', or 'clickable'")
     timeout = max(0.1, min(float(timeout_seconds), 30.0))
     session = _get_session(session_id)
     with session.lock:
-        element = WebDriverWait(session.driver, timeout).until(
-            conditions_by_state[state]((By.CSS_SELECTOR, selector))
-        )
+        element = _wait_for_locator(session.driver, selector, state, timeout)
         return {
             **_page_summary(session.driver, session_id),
             "success": True,
@@ -1058,12 +1064,10 @@ def click(
     session_id: str = "default",
     wait_seconds: float = 0.5,
 ) -> dict[str, Any]:
-    """Click a rendered element by CSS selector."""
+    """Click a rendered element by CSS selector, ref handle, or piercing path."""
     session = _get_session(session_id)
     with session.lock:
-        element = WebDriverWait(session.driver, 10).until(
-            conditions.element_to_be_clickable((By.CSS_SELECTOR, selector))
-        )
+        element = _wait_for_locator(session.driver, selector, "clickable", 10.0)
         session.driver.execute_script(
             "arguments[0].scrollIntoView({block: 'center'});", element
         )
@@ -1137,7 +1141,11 @@ def _perform_key_events(driver: Any, events: list[dict[str, Any]]) -> None:
 
 
 def _normalize_game_key(key: str) -> str:
-    value = str(key).strip()
+    raw = str(key)
+    if raw == " ":
+        # A literal space is the spacebar, but strip() would turn it into "".
+        return _KEY_ALIASES["SPACE"]
+    value = raw.strip()
     if len(value) == 1 and value.isprintable():
         return value
     alias = value.upper().replace("-", "_").replace(" ", "_")
@@ -1320,9 +1328,9 @@ def press_keys(
 
 
 def _resolve_element(driver: Any, locator: str) -> Any:
-    """Find one element from a CSS selector, a ``ref:N``, or a piercing path.
+    """Find one element from a CSS selector, a ``ref:<epoch>:N``, or a piercing path.
 
-    Plain CSS keeps working exactly as before; ``ref:N`` and ``a >>> b`` are new
+    Plain CSS keeps working exactly as before; ref handles and ``a >>> b`` are new
     forms that survive shadow roots and unstable DOM structure.
     """
     expression = page_perception.resolve_locator_expression(locator)
@@ -1336,10 +1344,55 @@ def _resolve_element(driver: Any, locator: str) -> Any:
     element = driver.execute_script(f"return {expression};")
     if element is None:
         raise ValueError(
-            f"Locator '{locator}' matched nothing. Refs die when the document "
-            "changes - call web_info(topic='page_outline') again."
+            f"Locator '{locator}' resolves to nothing in this document. A ref is only "
+            "valid for the page it was read from and only while its element is still "
+            "attached, so this one is stale - read the page again with "
+            "web_info(topic='page_outline') and use the ref it reports now."
         )
     return element
+
+
+_ELEMENT_STATES = {
+    "present": conditions.presence_of_element_located,
+    "visible": conditions.visibility_of_element_located,
+    "clickable": conditions.element_to_be_clickable,
+}
+
+
+def _element_reached_state(element: Any, state: str) -> bool:
+    if state == "present":
+        return True
+    if not element.is_displayed():
+        return False
+    return state != "clickable" or bool(element.is_enabled())
+
+
+def _wait_for_locator(driver: Any, locator: str, state: str, timeout: float) -> Any:
+    """Wait for any supported locator form to reach ``present``/``visible``/``clickable``.
+
+    ``expected_conditions`` only speak ``(By, selector)`` tuples, so ref handles and
+    piercing paths are polled through ``_resolve_element`` instead.
+    """
+    if page_perception.resolve_locator_expression(locator) is None:
+        return WebDriverWait(driver, timeout).until(
+            _ELEMENT_STATES[state]((By.CSS_SELECTOR, locator))
+        )
+    if getattr(driver, "is_extension_bridge", False):
+        _resolve_element(driver, locator)  # raises the bridge-specific explanation
+    deadline = time.monotonic() + timeout
+    failure = f"Locator '{locator}' never became {state}"
+    while True:
+        try:
+            element = _resolve_element(driver, locator)
+            if _element_reached_state(element, state):
+                return element
+        except ValueError as exc:
+            failure = str(exc)
+        except WebDriverException as exc:
+            failure = f"{type(exc).__name__}: {exc}"
+        if time.monotonic() >= deadline:
+            raise TimeoutException(failure)
+        time.sleep(0.1)
 
 
 def get_page_outline(
@@ -1409,6 +1462,21 @@ def find_elements(
         return {**result, "session_id": session_id, "frame_selector": frame_selector}
 
 
+def _drain_browser_log(session: BrowserSession) -> list[dict[str, Any]]:
+    """Move Chrome's browser log into the session buffer.
+
+    ``get_log('browser')`` empties the log, so whoever reads it first destroys it
+    for everyone else. Draining into one buffer keeps ``game_probe`` from eating
+    the diagnostics the console topic is supposed to report.
+    """
+    session.browser_log.extend(diagnostics.selenium_browser_log(session.driver))
+    overflow = len(session.browser_log) - _BROWSER_LOG_LIMIT
+    if overflow > 0:
+        del session.browser_log[:overflow]
+        session.browser_log_cursor = max(0, session.browser_log_cursor - overflow)
+    return session.browser_log
+
+
 def get_console(
     session_id: str = "default",
     levels: list[str] | None = None,
@@ -1443,7 +1511,12 @@ def get_console(
             )
             entries = list(payload.get("entries") or [])
             session.console_cursor = int(payload.get("next_seq") or session.console_cursor)
-            entries.extend(diagnostics.selenium_browser_log(driver))
+            buffered = _drain_browser_log(session)
+            entries.extend(buffered[session.browser_log_cursor :])
+            session.browser_log_cursor = len(buffered)
+            if clear:
+                session.browser_log.clear()
+                session.browser_log_cursor = 0
             dropped = payload.get("dropped")
         entries.sort(key=lambda item: (item.get("ts") or 0, item.get("seq") or 0))
         entries = diagnostics.dedupe_console(entries)
@@ -1614,7 +1687,7 @@ def _pointer_dispatch(
     unbounded = selected_coordinate_mode == "relative"
     current_local_x = session.pointer_x - offset_x
     current_local_y = session.pointer_y - offset_y
-    if unbounded and not session.pointer_x and not session.pointer_y:
+    if unbounded and not session.pointer_initialized:
         # Start a relative run from the middle so small deltas stay on screen.
         current_local_x = float(viewport["width"]) / 2
         current_local_y = float(viewport["height"]) / 2
@@ -1746,12 +1819,15 @@ def _pointer_dispatch(
         )
     session.pointer_x = finish_x if selected_action == "drag" else start_x
     session.pointer_y = finish_y if selected_action == "drag" else start_y
+    session.pointer_initialized = True
     if unbounded and (
         abs(session.pointer_x) > 100_000 or abs(session.pointer_y) > 100_000
     ):
-        # Relative runs never clamp, so recentre before the numbers get silly.
+        # Relative runs never clamp, so recentre before the numbers get silly:
+        # dropping the flag makes the next one start from the viewport middle again.
         session.pointer_x = 0.0
         session.pointer_y = 0.0
+        session.pointer_initialized = False
     return {
         "success": True,
         "action": requested_action,
@@ -2297,27 +2373,51 @@ def game_probe(
                     )
                 )
             probe = driver.execute_script(_GAME_PROBE_SCRIPT)
-            try:
-                animation = driver.execute_async_script(
-                    "const duration=arguments[0]*1000, done=arguments[arguments.length-1];"
-                    "let frames=0, start=performance.now(), finished=false;"
-                    "function finish(now,suspended){if(finished)return;finished=true;clearTimeout(fallback);"
-                    "const elapsed=Math.max(1,now-start);done({frames,elapsed_ms:Math.round(elapsed),"
-                    "fps:Math.round(frames*10000/elapsed)/10,available:frames>0,animation_suspended:suspended});}"
-                    "function tick(now){frames++;if(now-start>=duration)finish(now,false);"
-                    "else requestAnimationFrame(tick);}"
-                    "const fallback=setTimeout(()=>finish(performance.now(),true),duration+2000);"
-                    "requestAnimationFrame(tick);",
-                    duration,
-                )
-            except TimeoutException:
+            if session.render_mode != "normal":
+                # Frames are released by hand, so both requestAnimationFrame and the
+                # safety setTimeout are gated: measuring would just burn the script
+                # timeout and then report a fabricated zero. The gate may also live
+                # in another document than the one probed, and reporting that
+                # document's healthy fps would describe a frozen game as running.
                 animation = {
                     "frames": 0,
-                    "elapsed_ms": round(duration * 1000),
-                    "fps": 0.0,
+                    "elapsed_ms": 0,
+                    "fps": None,
                     "available": False,
                     "animation_suspended": True,
+                    "reason": (
+                        f"render mode '{session.render_mode}' releases frames manually"
+                        + (
+                            f" in {session.render_frame_selector}"
+                            if session.render_frame_selector
+                            else ""
+                        )
+                        + "; FPS is not measured while the gate is engaged."
+                    ),
+                    "gated_frame_selector": session.render_frame_selector,
                 }
+            else:
+                try:
+                    animation = driver.execute_async_script(
+                        "const duration=arguments[0]*1000, done=arguments[arguments.length-1];"
+                        "let frames=0, start=performance.now(), finished=false;"
+                        "function finish(now,suspended){if(finished)return;finished=true;clearTimeout(fallback);"
+                        "const elapsed=Math.max(1,now-start);done({frames,elapsed_ms:Math.round(elapsed),"
+                        "fps:Math.round(frames*10000/elapsed)/10,available:frames>0,animation_suspended:suspended});}"
+                        "function tick(now){frames++;if(now-start>=duration)finish(now,false);"
+                        "else requestAnimationFrame(tick);}"
+                        "const fallback=setTimeout(()=>finish(performance.now(),true),duration+2000);"
+                        "requestAnimationFrame(tick);",
+                        duration,
+                    )
+                except TimeoutException:
+                    animation = {
+                        "frames": 0,
+                        "elapsed_ms": round(duration * 1000),
+                        "fps": 0.0,
+                        "available": False,
+                        "animation_suspended": True,
+                    }
         finally:
             driver.switch_to.default_content()
         console_messages: list[dict[str, Any]] = []
@@ -2327,11 +2427,11 @@ def game_probe(
                 console_messages = [
                     {
                         "level": item.get("level"),
-                        "message": str(item.get("message", ""))[:2000],
-                        "timestamp": item.get("timestamp"),
+                        "message": str(item.get("text", ""))[:2000],
+                        "timestamp": item.get("ts"),
                     }
-                    for item in driver.get_log("browser")[-100:]
-                    if item.get("level") in {"WARNING", "SEVERE"}
+                    for item in _drain_browser_log(session)[-100:]
+                    if item.get("level") in {"warn", "error"}
                 ]
             except Exception as exc:
                 console_error = f"{type(exc).__name__}: {exc}"
@@ -2391,6 +2491,7 @@ const state = {
     nextTimerId: -1,
     pending: new Map(),
     native: new Map(),
+    nativeIds: new Map(),
     timers: new Map(),
     liveTimers: new Map(),
     timer: null,
@@ -2496,16 +2597,28 @@ state.captureTimers = () => {
     state.liveTimers.clear();
 };
 
+// Rebase virtual deadlines onto another clock. Turning freeze_time off swaps the
+// clock underneath the queue, and a deadline read against the wrong one is
+// already in the past, so the whole queue would detonate on the next frame.
+state.rebaseTimers = (fromNow, toNow) => {
+    for (const entry of state.timers.values()) {
+      entry.due = toNow + Math.max(0, entry.due - fromNow);
+    }
+};
+
 // Give the queue back to the real scheduler, keeping ids valid for clearTimeout.
-state.releaseTimers = () => {
+// `referenceNow` is the clock the deadlines were written against; the caller has
+// to pass it whenever the mode is about to change.
+state.releaseTimers = referenceNow => {
     const queued = Array.from(state.timers.entries());
     state.timers.clear();
     const real = nativePerformanceNow();
+    const now = referenceNow === undefined ? state.now() : referenceNow;
     for (const [id, entry] of queued) {
       const fire = entry.interval === null
         ? (...inner) => { state.liveTimers.delete(id); entry.callback(...inner); }
         : entry.callback;
-      const wait = entry.interval === null ? Math.max(0, entry.due - state.now()) : entry.interval;
+      const wait = entry.interval === null ? Math.max(0, entry.due - now) : entry.interval;
       const nativeId = entry.interval === null
         ? nativeSetTimeout(fire, wait, ...entry.args)
         : nativeSetInterval(fire, wait, ...entry.args);
@@ -2569,6 +2682,7 @@ state.request = callback => {
     if (state.mode === 'normal') {
       const id = state.nativeRequest(timestamp => {
         state.native.delete(id);
+        state.nativeIds.delete(id);
         callback(timestamp);
       });
       state.native.set(id, callback);
@@ -2579,10 +2693,26 @@ state.request = callback => {
     state.schedule();
     return id;
 };
+
+// Hand a callback back to the real scheduler under the id the page already holds:
+// re-registering it under a fresh id would make the page's cancelAnimationFrame
+// silently miss, and the frame it thought it cancelled still runs.
+state.adopt = (id, callback) => {
+    const nativeId = state.nativeRequest(timestamp => {
+      state.native.delete(id);
+      state.nativeIds.delete(id);
+      callback(timestamp);
+    });
+    state.native.set(id, callback);
+    state.nativeIds.set(id, nativeId);
+};
+
 state.cancel = id => {
     if (state.pending.delete(id)) return;
+    const adopted = state.nativeIds.get(id);
+    state.nativeIds.delete(id);
     state.native.delete(id);
-    state.nativeCancel(id);
+    state.nativeCancel(adopted === undefined ? id : adopted);
 };
 
 // Release `count` frames, yielding to the real task queue between them so that
@@ -2609,29 +2739,41 @@ state.setMode = (mode, targetFps, options) => {
     const settings = options || {};
     if (state.timer !== null) nativeClearTimeout(state.timer);
     state.timer = null;
+    // Everything queued so far carries a deadline written against the clock that
+    // is live right now. It has to be read before that clock is swapped.
+    const previousNow = state.now();
+    const nextFreeze = settings.freeze_time !== undefined
+      ? !!settings.freeze_time : state.freezeTime;
+    const nextGate = settings.gate_timers !== undefined
+      ? !!settings.gate_timers : state.gateTimers;
+    if (mode === 'normal' || !nextGate) state.releaseTimers(previousNow);
     state.mode = mode;
     state.targetFps = mode === 'throttled' ? targetFps : null;
     state.interval = 1000 / targetFps;
     if (settings.frame_delta_ms) state.frameDelta = settings.frame_delta_ms;
-    if (settings.freeze_time !== undefined) state.freezeTime = !!settings.freeze_time;
-    if (settings.gate_timers !== undefined) state.gateTimers = !!settings.gate_timers;
+    state.freezeTime = nextFreeze;
+    state.gateTimers = nextGate;
     if (mode === 'normal') {
-      state.releaseTimers();
       state.restoreClock();
-      const callbacks = Array.from(state.pending.values());
+      const callbacks = Array.from(state.pending.entries());
       state.pending.clear();
-      for (const callback of callbacks) state.request(callback);
+      for (const [id, callback] of callbacks) state.adopt(id, callback);
     } else {
       // Reclaim frames the real scheduler still owes, keeping their ids valid
       // so a later cancelAnimationFrame still finds them.
       for (const [id, callback] of state.native) {
-        state.nativeCancel(id);
+        const adopted = state.nativeIds.get(id);
+        state.nativeCancel(adopted === undefined ? id : adopted);
         state.pending.set(id, callback);
       }
       state.native.clear();
+      state.nativeIds.clear();
       state.virtualNow = nativePerformanceNow();
       if (state.freezeTime) state.installClock(); else state.restoreClock();
-      if (state.gateTimers) state.captureTimers(); else state.releaseTimers();
+      if (state.gateTimers) {
+        state.rebaseTimers(previousNow, state.now());
+        state.captureTimers();
+      }
       state.schedule();
     }
 };
@@ -3186,6 +3328,30 @@ def _reset_session_runtime_state(session: BrowserSession) -> None:
             pass
 
 
+def _shutdown_session(session: BrowserSession, close_tab: bool | None = None) -> bool:
+    """Release one session's tab and browser; report whether the tab was closed.
+
+    Cleanup must never raise - a failed teardown may not take the caller down with
+    it - but a silent failure leaks a tab or a whole Chrome process, so the reason
+    is logged instead of being swallowed.
+    """
+    tab_closed = False
+    should_close_tab = session.owns_tab if close_tab is None else bool(close_tab)
+    try:
+        _reset_session_runtime_state(session)
+        if should_close_tab and hasattr(session.driver, "close_tab"):
+            tab_closed = bool(session.driver.close_tab().get("removed"))
+        if session.owns_browser:
+            session.driver.quit()
+        else:
+            session.driver.service.stop()
+    except Exception as exc:
+        logger.warning(
+            "Browser session cleanup failed: %s: %s", type(exc).__name__, exc
+        )
+    return tab_closed
+
+
 def close_session(session_id: str = "default", close_tab: bool | None = None) -> dict[str, Any]:
     """Close one browser session and release Chrome resources.
 
@@ -3201,17 +3367,7 @@ def close_session(session_id: str = "default", close_tab: bool | None = None) ->
     tab_closed = False
     if session is not None:
         with session.lock:
-            should_close_tab = session.owns_tab if close_tab is None else bool(close_tab)
-            try:
-                _reset_session_runtime_state(session)
-                if should_close_tab and hasattr(session.driver, "close_tab"):
-                    tab_closed = bool(session.driver.close_tab().get("removed"))
-                if session.owns_browser:
-                    session.driver.quit()
-                else:
-                    session.driver.service.stop()
-            except Exception:
-                pass
+            tab_closed = _shutdown_session(session, close_tab)
     return {
         "session_id": session_id,
         "closed": closed,
@@ -3221,19 +3377,13 @@ def close_session(session_id: str = "default", close_tab: bool | None = None) ->
 
 
 def close_all_sessions() -> None:
+    """Close every session, including the Chrome tabs the server itself opened."""
     with _sessions_lock:
         sessions = list(_sessions.values())
         _sessions.clear()
     for session in sessions:
         with session.lock:
-            try:
-                _reset_session_runtime_state(session)
-                if session.owns_browser:
-                    session.driver.quit()
-                else:
-                    session.driver.service.stop()
-            except Exception:
-                pass
+            _shutdown_session(session)
 
 
 def start_current_chrome_bridge() -> dict[str, Any]:

@@ -7,6 +7,7 @@ import platform
 import time
 from typing import Any
 
+import bridge_auth
 from chrome_bridge import CHROME_EXTENSION_ID, get_chrome_bridge
 
 
@@ -299,6 +300,15 @@ def _install_with_windows_ui(
     }
 
 
+def prepare_bridge_token() -> dict[str, Any]:
+    """Make sure the shared secret exists on disk and inside the extension folder."""
+    try:
+        token = bridge_auth.load_or_create_token()
+        return {"token_ready": True, "token_file": str(bridge_auth.write_extension_token(token))}
+    except Exception as exc:
+        return {"token_ready": False, "token_error": f"{type(exc).__name__}: {exc}"}
+
+
 def expected_extension_version() -> str:
     try:
         import json
@@ -315,6 +325,9 @@ def setup_current_chrome(
 ) -> dict[str, Any]:
     """Install/enable the companion in the current Chrome after explicit consent."""
     timeout = max(5.0, min(float(timeout_seconds), 120.0))
+    # The companion refuses to talk to the bridge without the shared secret, so
+    # the token has to be on disk before Chrome ever loads the folder.
+    token_info = prepare_bridge_token()
     bridge = get_chrome_bridge()
     bridge.start()
     status = bridge.status(1.0)
@@ -329,6 +342,7 @@ def setup_current_chrome(
             "extension_directory": str(EXTENSION_DIR),
             "extension_version": expected_version,
             "current_chrome": status,
+            **token_info,
         }
 
     if not confirm_install:
@@ -346,6 +360,7 @@ def setup_current_chrome(
             "connected_version": connected_version or None,
             "update_required": bool(status["connected"] and not version_current),
             "current_chrome": status,
+            **token_info,
         }
 
     if platform.system() != "Windows":
@@ -357,6 +372,7 @@ def setup_current_chrome(
             "error": "Automatic companion setup is currently supported only on Windows",
             "extension_directory": str(EXTENSION_DIR),
             "current_chrome": status,
+            **token_info,
         }
     if not (EXTENSION_DIR / "manifest.json").is_file():
         raise FileNotFoundError(f"Companion manifest is missing: {EXTENSION_DIR}")
@@ -366,7 +382,9 @@ def setup_current_chrome(
             EXTENSION_DIR,
             timeout,
             window_title,
-            reload_existing=bool(status["connected"] and not version_current),
+            # We only get here when the expected build is not connected, and an
+            # already-enabled card re-reads bridge-token.js only on reload.
+            reload_existing=True,
         )
         connected = bridge.wait_connected(timeout)
         final_status = bridge.status(0.0)
@@ -382,6 +400,7 @@ def setup_current_chrome(
             "manual_install_required": not ready,
             "extension_directory": str(EXTENSION_DIR),
             "current_chrome": final_status,
+            **token_info,
             **ui_result,
             **(
                 {}
@@ -405,4 +424,5 @@ def setup_current_chrome(
             "extension_directory": str(EXTENSION_DIR),
             "current_chrome": bridge.status(0.0),
             "error": f"{type(exc).__name__}: {exc}",
+            **token_info,
         }

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Web Search Neo Companion",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Lets the local Web Search Neo MCP control tabs in your already-open Chrome.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzySkD6fHfUI9/4mcG28TXLwQQDALIXb4bLrpwXiR4TYqNuoTtGtgZ5glzUzFt9BFy3hi8Vjv8dBtT8eBQezyNvqieOGlxV4HIGt+AXb9KRYoD04OcISaYDVmY+YAPwB/t9w0WoltJuSLkRBCTz3pyD7p/NNGm5jVwWjeSZ21GkNmGWxpJTSNaNExwOvf0+bqEBWGn5vaylDRUtK9gE1Y1EZIkcx7mnBUGSlDrAiWHQqXVxn0qoQAZZZvkDFAf+yWnTqGDmF0VOtG9ctZEQMOMiNylopUY5FtagpO1QFOEL1dMLQlWPqz8xJBjHS/fxyZxYXzvgEe3oMPo2gtVI6TgQIDAQAB",
   "minimum_chrome_version": "116",

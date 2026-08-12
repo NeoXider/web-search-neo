@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import json
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -13,7 +14,7 @@ import time
 from urllib.request import urlopen
 
 import pytest
-from selenium.common.exceptions import WebDriverException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 
 import browser_tools
 import main
@@ -271,6 +272,131 @@ def test_wait_for_dynamic_element(local_site):
     assert result["selector"] == "#dynamic-button"
     assert result["state"] == "clickable"
     assert result["tag"] == "button"
+
+
+def test_click_and_wait_accept_ref_handles_and_piercing_paths(local_site):
+    """find -> click is the natural sequence; it must not die on the locator form."""
+    _open_or_skip(f"{local_site.base_url}/form?session=ref-click", "ref-click")
+    session = browser_tools._get_session("ref-click")
+
+    found = browser_tools.find_elements("Run action", "ref-click", role="button")
+    handle = found["matches"][0]["ref"]
+
+    waited = browser_tools.wait_for_element(
+        handle, "ref-click", state="clickable", timeout_seconds=5
+    )
+    assert waited["success"] is True
+    assert waited["tag"] == "button"
+
+    clicked = browser_tools.click(handle, "ref-click", wait_seconds=0)
+    assert clicked["success"] is True
+    assert clicked["clicked"] == handle
+    assert session.driver.find_element("css selector", "#click-state").text == "clicked"
+
+    session.driver.execute_script(
+        "const host = document.createElement('div');"
+        "host.id = 'pierce-host';"
+        "document.body.appendChild(host);"
+        "host.attachShadow({mode: 'open'}).innerHTML ="
+        "  '<button id=deep>Deep</button><p id=deep-state>idle</p>';"
+        "host.shadowRoot.getElementById('deep').addEventListener('click', () => {"
+        "  host.shadowRoot.getElementById('deep-state').textContent = 'deep clicked';"
+        "});"
+    )
+    path = "#pierce-host >>> #deep"
+    assert browser_tools.wait_for_element(path, "ref-click", timeout_seconds=5)["tag"] == (
+        "button"
+    )
+    assert browser_tools.click(path, "ref-click", wait_seconds=0)["success"] is True
+    assert session.driver.execute_script(
+        "return document.getElementById('pierce-host').shadowRoot"
+        "  .getElementById('deep-state').textContent;"
+    ) == "deep clicked"
+
+
+def test_wait_for_a_stale_ref_reports_the_ref_instead_of_an_invalid_selector(local_site):
+    _open_or_skip(f"{local_site.base_url}/form", "ref-stale")
+    session = browser_tools._get_session("ref-stale")
+    found = browser_tools.find_elements("Run action", "ref-stale", role="button")
+    handle = found["matches"][0]["ref"]
+    session.driver.execute_script("document.getElementById('action-button').remove();")
+
+    with pytest.raises(TimeoutException, match="page_outline"):
+        browser_tools.wait_for_element(handle, "ref-stale", timeout_seconds=0.5)
+    with pytest.raises(TimeoutException, match="page_outline"):
+        browser_tools.click(handle, "ref-stale", wait_seconds=0)
+
+
+def test_close_all_sessions_closes_the_tabs_it_owns(caplog):
+    class _RecordingDriver:
+        def __init__(self, fail: bool = False) -> None:
+            self.closed_tabs = 0
+            self.quit_calls = 0
+            self._fail = fail
+
+        def close_tab(self) -> dict:
+            self.closed_tabs += 1
+            return {"removed": True}
+
+        def quit(self) -> None:
+            self.quit_calls += 1
+            if self._fail:
+                raise RuntimeError("chrome went away")
+
+    owned = _RecordingDriver()
+    borrowed = _RecordingDriver()
+    broken = _RecordingDriver(fail=True)
+    browser_tools._sessions["fake-owned"] = browser_tools.BrowserSession(
+        driver=owned, headless=False, profile_mode="current", owns_tab=True
+    )
+    browser_tools._sessions["fake-borrowed"] = browser_tools.BrowserSession(
+        driver=borrowed, headless=False, profile_mode="current", owns_tab=False
+    )
+    browser_tools._sessions["fake-broken"] = browser_tools.BrowserSession(
+        driver=broken, headless=False, profile_mode="current", owns_tab=True
+    )
+
+    with caplog.at_level(logging.WARNING, logger="browser_tools"):
+        browser_tools.close_all_sessions()
+
+    assert owned.closed_tabs == 1, "close_all left a tab behind in the user's Chrome"
+    assert owned.quit_calls == 1
+    assert borrowed.closed_tabs == 0  # a claimed tab belongs to the user
+    assert broken.closed_tabs == 1
+    # A cleanup failure must not raise, but it must not be silent either.
+    assert any("chrome went away" in record.getMessage() for record in caplog.records)
+
+
+def test_a_relative_pointer_run_starts_from_a_real_zero_position(local_site):
+    _open_or_skip(f"{local_site.base_url}/game", "pointer-origin")
+    browser_tools.pointer_action("move", 0, 0, "pointer-origin", wait_seconds=0)
+    session = browser_tools._get_session("pointer-origin")
+    assert (session.pointer_x, session.pointer_y) == (0.0, 0.0)
+
+    moved = browser_tools.pointer_action(
+        "move", 5, 7, "pointer-origin", coordinate_mode="relative", wait_seconds=0
+    )
+    assert (moved["x"], moved["y"]) == (5.0, 7.0), (
+        "position (0, 0) was mistaken for an uninitialised pointer"
+    )
+
+
+def test_a_literal_space_is_accepted_as_the_spacebar(local_site):
+    _open_or_skip(f"{local_site.base_url}/game", "space-key")
+    assert browser_tools._normalize_game_key(" ") == browser_tools._KEY_ALIASES["SPACE"]
+    pressed = browser_tools.press_keys(
+        [" "],
+        "space-key",
+        target_selector="#game-canvas",
+        hold_seconds=0.01,
+        wait_seconds=0,
+    )
+    assert pressed["success"] is True
+    session = browser_tools._get_session("space-key")
+    events = session.driver.execute_script("return window.gameEvents")
+    assert any(
+        event["type"] == "keydown" and event.get("code") == "Space" for event in events
+    )
 
 
 def test_wait_for_manual_challenge_resolution(local_site):

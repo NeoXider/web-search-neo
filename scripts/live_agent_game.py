@@ -45,11 +45,9 @@ Setup, once:
 3. web_action input, session_id "game", key_actions [{"key":"ARROW_RIGHT","action":"hold"}]
 
 Then repeat, reading x from the status line you get after every turn:
-- x below 170: web_action step, frames 10
-- x from 170 to 199: web_action step, frames 2
-- x at 200 or above and onGround true: web_action input, session_id "game",
-  key_actions [{"key":"SPACE","action":"tap"}]
-- right after a jump: web_action step, frames 10 until won=true
+- if onGround is true and x is 200 or more: jump with web_action input,
+  session_id "game", key_actions [{"key":"SPACE","action":"tap"}]
+- otherwise: web_action step, session_id "game", frames 3
 
 A pit spans x 240 to 340. Jumping at x 200-235 clears it; walking into it kills you.
 After a death x resets to 40 and you run the same loop again.

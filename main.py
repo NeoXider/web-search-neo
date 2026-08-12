@@ -20,7 +20,7 @@ import msp_search
 from web_client import request
 
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 PROJECT_DIR = Path(__file__).resolve().parent
 log = logging.getLogger("web_search_neo")
@@ -670,12 +670,16 @@ async def browser_press_keys(
     frame_selector: str | None = None,
     hold_seconds: float = 0.05,
     repeat: int = 1,
-    wait_seconds: float = 0.2,
-    action: Literal["tap", "hold", "release"] = "tap",
+    wait_seconds: float = 0.0,
+    key_action: Literal["tap", "hold", "release"] = "tap",
     hold_frames: int = 1,
     focus_mode: Literal["focus", "click", "none"] = "focus",
+    include_summary: bool = True,
 ) -> dict[str, Any]:
-    """Tap, hold, or release one or more keys as a single input batch."""
+    """Tap, hold, or release one or more keys as a single input batch.
+
+    ``key_action`` is the keyboard verb; the dispatcher already owns ``action``.
+    """
     return await asyncio.to_thread(
         functools.partial(
             browser_tools.press_keys,
@@ -686,9 +690,10 @@ async def browser_press_keys(
             hold_seconds=hold_seconds,
             repeat=repeat,
             wait_seconds=wait_seconds,
-            action=action,
+            action=key_action,
             hold_frames=hold_frames,
             focus_mode=focus_mode,
+            include_summary=include_summary,
         )
     )
 
@@ -706,10 +711,11 @@ async def browser_pointer(
     button: Literal["left", "right", "middle"] = "left",
     duration_seconds: float = 0.3,
     frame_selector: str | None = None,
-    wait_seconds: float = 0.2,
+    wait_seconds: float = 0.0,
     coordinate_mode: Literal["absolute", "delta", "relative"] = "absolute",
     delta_x: float = 0.0,
     delta_y: float = 0.0,
+    include_summary: bool = True,
 ) -> dict[str, Any]:
     """Click, hover, drag, scroll the wheel, or hold a mouse button.
 
@@ -732,6 +738,7 @@ async def browser_pointer(
             coordinate_mode=coordinate_mode,
             delta_x=delta_x,
             delta_y=delta_y,
+            include_summary=include_summary,
         )
     )
 
@@ -744,7 +751,8 @@ async def browser_touch(
     frame_selector: str | None = None,
     steps: int = 8,
     duration_seconds: float = 0.2,
-    wait_seconds: float = 0.2,
+    wait_seconds: float = 0.0,
+    include_summary: bool = True,
 ) -> dict[str, Any]:
     """Send touch input: tap, multi-finger press/move/release, or a swipe."""
     return await asyncio.to_thread(
@@ -757,6 +765,7 @@ async def browser_touch(
             steps=steps,
             duration_seconds=duration_seconds,
             wait_seconds=wait_seconds,
+            include_summary=include_summary,
         )
     )
 
@@ -808,17 +817,21 @@ async def browser_input_batch(
     session_id: str = "default",
     target_selector: str | None = None,
     frame_selector: str | None = None,
-    wait_seconds: float = 0.2,
+    wait_seconds: float = 0.0,
+    include_summary: bool = True,
 ) -> dict[str, Any]:
     """Mix per-key and pointer actions, then advance exactly one step-mode frame."""
     return await asyncio.to_thread(
-        browser_tools.input_batch,
-        key_actions,
-        pointer_actions,
-        session_id,
-        target_selector,
-        frame_selector,
-        wait_seconds,
+        functools.partial(
+            browser_tools.input_batch,
+            key_actions=key_actions,
+            pointer_actions=pointer_actions,
+            session_id=session_id,
+            target_selector=target_selector,
+            frame_selector=frame_selector,
+            wait_seconds=wait_seconds,
+            include_summary=include_summary,
+        )
     )
 
 
@@ -877,9 +890,17 @@ async def browser_render_control(
 async def browser_render_step(
     frames: int = 1,
     session_id: str = "default",
+    include_summary: bool = True,
 ) -> dict[str, Any]:
     """Advance an active step-mode game by an exact bounded number of animation frames."""
-    return await asyncio.to_thread(browser_tools.render_step, frames, session_id)
+    return await asyncio.to_thread(
+        functools.partial(
+            browser_tools.render_step,
+            frames,
+            session_id=session_id,
+            include_summary=include_summary,
+        )
+    )
 
 
 @mcp.tool()
@@ -1016,6 +1037,12 @@ _ACTIONS: dict[str, ActionSpec] = {
             "Apply mixed keyboard and pointer input atomically; releases one frame in step mode.",
         ),
         _action(
+            "press_keys",
+            browser_press_keys,
+            "game",
+            "Keyboard-only input: tap, hold, or release keys, optionally across N frames.",
+        ),
+        _action(
             "pointer",
             browser_pointer,
             "game",
@@ -1145,6 +1172,12 @@ _INFO_TOPICS = {
     "time": "Current local date, time, and UTC offset.",
 }
 
+# Repeated verbatim on every hot-path action, because a model reads one schema.
+_HOT_PATH_SPEED = (
+    "wait_seconds=0 (the default) and include_summary=false skip the post-action "
+    "page read; both matter when you drive a game frame by frame."
+)
+
 _ACTION_NOTES = {
     "input": {
         "key_action": {"key": "W|SPACE|ARROW_LEFT|F5|NUMPAD1|...", "action": "tap|hold|release"},
@@ -1154,6 +1187,13 @@ _ACTION_NOTES = {
             "wheel": "pass delta_x/delta_y; x/y is where the wheel is scrolled",
         },
         "atomicity": "Every change lands before the single released frame; taps stay down for it.",
+        "speed": _HOT_PATH_SPEED,
+    },
+    "press_keys": {
+        "key_action": "tap|hold|release",
+        "note": "The dispatcher key is 'action'; the keyboard verb is 'key_action'.",
+        "hold_frames": "With key_action='tap' in render=step, the key stays down for N released frames.",
+        "speed": _HOT_PATH_SPEED,
     },
     "render": {
         "modes": ["normal", "throttled", "step"],
@@ -1166,6 +1206,7 @@ _ACTION_NOTES = {
     "pointer": {
         "pointer_action": "click|double_click|hover|move|drag|press|release|wheel",
         "note": "The dispatcher key is 'action'; the pointer verb is 'pointer_action'.",
+        "speed": _HOT_PATH_SPEED,
     },
     "pointer_lock": {
         "operation": "acquire|release|status",
@@ -1174,6 +1215,10 @@ _ACTION_NOTES = {
     "touch": {
         "touch_action": "tap|press|move|release|swipe|cancel",
         "points": [{"x": 0, "y": 0, "id": 0, "end_x": 0, "end_y": 0}],
+        "speed": _HOT_PATH_SPEED,
+    },
+    "step": {
+        "speed": _HOT_PATH_SPEED,
     },
     "open": {
         "profile_mode": {
@@ -1209,6 +1254,7 @@ _RECIPES = {
 _PITFALLS = [
     "web_action success=true is not task success: check failure_count and every results[i].success.",
     "Selectors die when the document changes; re-read page_elements after navigation.",
+    "A ref: id belongs to the page_outline you just read; after navigation or a re-render, read page_outline again.",
     "challenge_detected means a CAPTCHA: use wait_challenge or let search fall back, never hammer clicks.",
     "profile_mode=current drives the user's real Chrome; close frees the session and leaves their tab open.",
     "In render=step nothing moves until input or step runs, so a screenshot taken first shows the old frame.",
@@ -1267,6 +1313,22 @@ _EXAMPLES = {
         ]
     },
 }
+
+
+def _action_index() -> dict[str, dict[str, Any]]:
+    """Summaries plus required parameter names, which is what a caller must guess.
+
+    Optional names stay out on purpose: they would double the contract, and the
+    caller has one reliable place for them, topic=action_schema.
+    """
+    index: dict[str, dict[str, Any]] = {}
+    for name, spec in _ACTIONS.items():
+        required, _ = _parameter_names(spec.tool_name)
+        entry: dict[str, Any] = {"summary": spec.summary}
+        if required:
+            entry["required"] = required
+        index[name] = entry
+    return index
 
 
 def _action_documentation() -> dict[str, dict[str, Any]]:
@@ -1330,7 +1392,7 @@ def _capabilities(action_name: str | None = None) -> dict[str, Any]:
             "is the whole contract; no external skill is required."
         ),
         "info_topics": _INFO_TOPICS,
-        "actions": {name: spec.summary for name, spec in _ACTIONS.items()},
+        "actions": _action_index(),
         "action_groups": groups,
         "recipes": _RECIPES,
         "pitfalls": _PITFALLS,
@@ -1347,6 +1409,10 @@ def _capabilities(action_name: str | None = None) -> dict[str, Any]:
             "topic": "action_schema",
             "params_example": {"action": "input"},
             "note": "Describe only the action you need, then call it through web_action.",
+            "parameters": (
+                "actions[name].required is the full list of parameters you must send; "
+                "optional names, types, and defaults exist only in action_schema."
+            ),
         },
     }
 

@@ -15,7 +15,9 @@ import re
 from typing import Any
 
 
-REF_PATTERN = re.compile(r"^ref:(\d+)$")
+# ``ref:<epoch>:<N>`` is the current handle; ``ref:N`` is still accepted because
+# older transcripts and callers carry it, but it can only ever mean "this document".
+REF_PATTERN = re.compile(r"^ref:(?:([0-9a-fA-F]{8,64}):)?(\d+)$")
 _PIERCING_SEPARATOR = " >>> "
 _MAX_OUTLINE_NODES = 1000
 _MAX_FIND_MATCHES = 25
@@ -65,18 +67,50 @@ REF_REGISTRY_SCRIPT = r"""
 """
 
 
-def ref_expression(ref_id: int | str) -> str:
-    """Return the JS expression that resolves a ``ref:N`` handle back to its element."""
+def parse_ref(ref_id: int | str) -> tuple[str | None, int]:
+    """Split a ``ref:<epoch>:<N>`` handle - or a legacy ``ref:N`` - into its parts."""
     if isinstance(ref_id, bool):
-        raise ValueError("ref_id must be an integer or a 'ref:N' string")
+        raise ValueError("ref_id must be an integer or a 'ref:<epoch>:N' string")
     if isinstance(ref_id, str):
         match = REF_PATTERN.match(ref_id.strip())
-        number = int(match.group(1)) if match else int(ref_id.strip())
+        if match:
+            epoch, number = match.group(1), int(match.group(2))
+        else:
+            epoch, number = None, int(ref_id.strip())
     else:
-        number = int(ref_id)
+        epoch, number = None, int(ref_id)
     if number < 1:
         raise ValueError("ref_id must be a positive integer")
-    return f"window.__wsnRefs.nodes.get({number})"
+    return epoch, number
+
+
+def ref_expression(ref_id: int | str) -> str:
+    """Return the JS expression that resolves a ref handle back to its element.
+
+    Ref numbers restart at 1 in every document, so the epoch carried by the handle
+    is compared with the live registry before the lookup: a handle minted on a page
+    that has since been replaced resolves to ``null`` instead of to whatever element
+    now happens to hold that number. A legacy handle without an epoch carries no
+    document identity at all, so it is only ever answered from the current registry
+    and only while its node is still attached.
+    """
+    epoch, number = parse_ref(ref_id)
+    epoch_guard = (
+        f"if (registry.epoch !== {json.dumps(epoch, ensure_ascii=True)}) return null;"
+        if epoch
+        else ""
+    )
+    return (
+        "(() => {"
+        "const registry = window.__wsnRefs;"
+        "if (!registry || !registry.nodes) return null;"
+        f"{epoch_guard}"
+        f"const node = registry.nodes.get({number});"
+        # A ref outlives its element; a detached node would accept actions that no
+        # user could ever perform on the page they are looking at.
+        "return node && node.isConnected ? node : null;"
+        "})()"
+    )
 
 
 def register_ref_registry(driver: Any) -> dict[str, Any]:
@@ -408,12 +442,25 @@ function wsnFrameOffset(el, rect) {
 
 function wsnRefFor(el, registry) {
   const existing = registry.byNode.get(el);
-  if (existing) return existing;
+  if (existing && registry.nodes.get(existing) === el) return existing;
   const id = registry.next;
   registry.next = id + 1;
   registry.nodes.set(id, el);
   registry.byNode.set(el, id);
   return id;
+}
+
+function wsnHandle(el, registry) {
+  return 'ref:' + registry.epoch + ':' + wsnRefFor(el, registry);
+}
+
+function wsnPruneRegistry(registry) {
+  // The registry holds strong references, so a page that rebuilds its DOM would
+  // pile up detached nodes forever. Every fresh read drops what is already gone.
+  for (const entry of Array.from(registry.nodes)) {
+    const node = entry[1];
+    if (!node || node.isConnected === false) registry.nodes.delete(entry[0]);
+  }
 }
 
 function wsnNorm(value) {
@@ -493,6 +540,7 @@ _OUTLINE_SCRIPT = _JS_LIB + r"""
 const limit = arguments[0];
 const includeOcclusion = arguments[1];
 const registry = wsnRegistry();
+wsnPruneRegistry(registry);
 
 const ctx = {
   out: [],
@@ -672,7 +720,7 @@ function wsnEmit(el, role, depth, context) {
   const node = {
     kind: 'node',
     depth: depth,
-    ref: 'ref:' + wsnRefFor(el, context.registry),
+    ref: wsnHandle(el, context.registry),
     tag: tag,
     role: role,
     name: wsnName(el, role),
@@ -858,7 +906,7 @@ def outline(
 # ---------------------------------------------------------------------------
 
 _PAGE_TEXT_SCRIPT = _JS_LIB + r"""
-const mainOnly = arguments[0];
+let mainOnly = arguments[0];
 const includeLinks = arguments[1];
 
 const WSN_NOISE_SELECTOR = 'nav, header, footer, aside, form, [role="navigation"], '
@@ -960,15 +1008,13 @@ function wsnTextWalk(el, budget) {
   else if (tag === 'TD' || tag === 'TH') chunks.push(' | ');
   else if (WSN_BLOCK_TAGS.has(tag)) chunks.push('\n\n');
   const linkStart = chunks.length;
-  for (const child of wsnChildNodes(el)) {
+  // A host with a shadow root renders only what the shadow tree lays out, and
+  // slotted light-DOM nodes are reached through <slot>. Walking both roots emits
+  // every slotted node twice.
+  const source = el.shadowRoot ? el.shadowRoot : el;
+  for (const child of wsnChildNodes(source)) {
     if (child.nodeType === 3) wsnEmitText(child, el);
     else if (child.nodeType === 1) wsnTextWalk(child, budget);
-  }
-  if (el.shadowRoot) {
-    for (const child of wsnChildNodes(el.shadowRoot)) {
-      if (child.nodeType === 3) wsnEmitText(child, el);
-      else if (child.nodeType === 1) wsnTextWalk(child, budget);
-    }
   }
   if (includeLinks && tag === 'A' && el.getAttribute('href')) {
     const label = wsnClean(chunks.slice(linkStart).join(' '), WSN_VALUE_LIMIT);
@@ -984,11 +1030,16 @@ function wsnTextWalk(el, budget) {
 const picked = wsnPickRoot(document);
 let root = picked.root;
 let reason = picked.reason;
+let fallbackUsed = false;
 if (root) wsnTextWalk(root, {nodes: 0});
-if (!chunks.join('').trim() && document.body && root !== document.body) {
-  // An over-eager root guess must never cost the caller the whole page.
+// Emptiness is the only reliable signal: on a page that is one big <form> the
+// noise list eats everything, and an over-eager root guess does the same. Either
+// way the caller must not be handed a blank page with no way to tell why.
+if (!chunks.join('').trim() && document.body && (mainOnly || root !== document.body)) {
   chunks.length = 0;
   links.length = 0;
+  fallbackUsed = true;
+  mainOnly = false;
   root = document.body;
   reason = 'body-fallback';
   wsnTextWalk(root, {nodes: 0});
@@ -1000,6 +1051,7 @@ return {
   root_tag: root ? root.tagName.toLowerCase() : '',
   root_selector: root ? wsnSelector(root) : '',
   root_reason: reason,
+  fallback_used: fallbackUsed,
   text: chunks.join(''),
   links: links
 };
@@ -1022,6 +1074,29 @@ def _normalize_text(text: str) -> str:
     return text.strip()
 
 
+def _clip_on_boundary(text: str, limit: int) -> tuple[str, bool]:
+    """Cut at a paragraph boundary so the tail is never half a sentence."""
+    if len(text) <= limit:
+        return text, False
+    window = text[:limit]
+    boundary = window.rfind("\n\n")
+    return (window[:boundary].rstrip() if boundary > limit // 4 else window.rstrip()), True
+
+
+def _link_listing(text: str, links: list[Any]) -> tuple[str, list[dict[str, Any]]]:
+    kept = {int(marker) for marker in _MARKER_PATTERN.findall(text)}
+    selected = [
+        link
+        for link in links
+        if isinstance(link, dict) and int(link.get("index", 0)) in kept
+    ]
+    listing = "\n".join(
+        f"[{link['index']}] {link.get('text') or ''} -> {link.get('url') or ''}"
+        for link in selected
+    )
+    return listing, selected
+
+
 def page_text(
     driver: Any,
     *,
@@ -1032,8 +1107,9 @@ def page_text(
     """Extract the readable text of the rendered page, keeping block structure.
 
     ``mode='main'`` also drops navigation, header, footer, aside and form chrome;
-    ``mode='full'`` keeps everything that is visible. Truncation happens on a
-    paragraph boundary so the tail is never a half sentence.
+    ``mode='full'`` keeps everything that is visible. A page whose whole content is
+    chrome - a login or checkout form - would come back empty, so an empty result
+    is retried without the noise list and reported as ``fallback_used``.
     """
     selected_mode = str(mode or "main").strip().lower()
     if selected_mode not in {"main", "full"}:
@@ -1044,17 +1120,40 @@ def page_text(
     )
     if not isinstance(raw, dict):
         raise RuntimeError("Page text script returned an unexpected result")
-    text = _normalize_text(str(raw.get("text") or ""))
-    total = len(text)
-    truncated = total > limit
-    if truncated:
-        window = text[:limit]
-        boundary = window.rfind("\n\n")
-        text = window[:boundary].rstrip() if boundary > limit // 4 else window.rstrip()
-    result = {
+    full_text = _normalize_text(str(raw.get("text") or ""))
+    total = len(full_text)
+    fallback_used = bool(raw.get("fallback_used"))
+    text, truncated = _clip_on_boundary(full_text, limit)
+    links: list[dict[str, Any]] = []
+    if include_links:
+        # The link index is part of what the caller receives, so it has to be paid
+        # for out of the same budget instead of silently overflowing it. Both the
+        # kept text and its index grow with the text budget, so the largest budget
+        # that still fits is found by bisection.
+        listing = ""
+        low, high = 0, limit
+        text = ""
+        while low <= high:
+            middle = (low + high) // 2
+            candidate, _ = _clip_on_boundary(full_text, middle)
+            candidate_listing, candidate_links = _link_listing(
+                candidate, raw.get("links") or []
+            )
+            spent = len(candidate) + (len(candidate_listing) + 2 if candidate_listing else 0)
+            if spent <= limit:
+                text, listing, links = candidate, candidate_listing, candidate_links
+                low = middle + 1
+            else:
+                high = middle - 1
+        truncated = text != full_text
+        if listing:
+            text = f"{text}\n\n{listing}"
+    return {
         "url": raw.get("url", ""),
         "title": raw.get("title", ""),
         "mode": selected_mode,
+        "mode_used": "full" if fallback_used else selected_mode,
+        "fallback_used": fallback_used,
         "root_tag": raw.get("root_tag", ""),
         "root_selector": raw.get("root_selector", ""),
         "root_reason": raw.get("root_reason", ""),
@@ -1063,23 +1162,8 @@ def page_text(
         "total_chars": total,
         "truncated": truncated,
         "max_chars": limit,
+        **({"links": links} if include_links else {}),
     }
-    if include_links:
-        kept = {int(marker) for marker in _MARKER_PATTERN.findall(text)}
-        links = [
-            link
-            for link in raw.get("links") or []
-            if isinstance(link, dict) and int(link.get("index", 0)) in kept
-        ]
-        if links:
-            listing = "\n".join(
-                f"[{link['index']}] {link.get('text') or ''} -> {link.get('url') or ''}"
-                for link in links
-            )
-            result["text"] = f"{result['text']}\n\n{listing}"
-            result["chars"] = len(result["text"])
-        result["links"] = links
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1093,6 +1177,7 @@ const limit = arguments[2];
 const visibleOnly = arguments[3];
 const includeOcclusion = arguments[4];
 const registry = wsnRegistry();
+wsnPruneRegistry(registry);
 
 const WSN_ROLE_SYNONYMS = {
   button: ['button', 'knopka', 'кнопка', 'нажать', 'submit', 'apply'],
@@ -1261,7 +1346,7 @@ if (!selected.length) {
 }
 
 const matches = selected.map(item => ({
-  ref: 'ref:' + wsnRefFor(item.el, registry),
+  ref: wsnHandle(item.el, registry),
   role: item.role,
   name: item.name,
   score: item.score,
@@ -1322,26 +1407,76 @@ def find(
 # ---------------------------------------------------------------------------
 
 
+def split_piercing_path(selector: str) -> list[str] | None:
+    """Split on `` ' >>> ' `` only where it is a separator, not selector payload.
+
+    ``div[data-op='a >>> b']`` is a perfectly valid CSS selector, so the scan has to
+    ignore the separator inside quotes and inside attribute brackets. Returns
+    ``None`` when the string is not a piercing path at all.
+    """
+    parts: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    depth = 0
+    index = 0
+    length = len(selector)
+    while index < length:
+        character = selector[index]
+        if character == "\\" and index + 1 < length:
+            current.append(character)
+            current.append(selector[index + 1])
+            index += 2
+            continue
+        if quote:
+            current.append(character)
+            if character == quote:
+                quote = None
+            index += 1
+            continue
+        if character in "\"'":
+            quote = character
+            current.append(character)
+            index += 1
+            continue
+        if character == "[":
+            depth += 1
+        elif character == "]":
+            depth = max(0, depth - 1)
+        if depth == 0 and selector.startswith(_PIERCING_SEPARATOR, index):
+            parts.append("".join(current))
+            current = []
+            index += len(_PIERCING_SEPARATOR)
+            continue
+        current.append(character)
+        index += 1
+    parts.append("".join(current))
+    if quote or depth:
+        # Unbalanced input is not valid CSS either way, so the separator is taken
+        # at face value rather than swallowing the whole locator into one part.
+        parts = selector.split(_PIERCING_SEPARATOR)
+    parts = [part.strip() for part in parts]
+    parts = [part for part in parts if part]
+    return parts if len(parts) > 1 else None
+
+
 def resolve_locator_expression(locator: str) -> str | None:
-    """Translate a ``ref:N`` handle or a ``a >>> b`` piercing path into a JS expression.
+    """Translate a ref handle or a ``a >>> b`` piercing path into a JS expression.
 
     Returns ``None`` for plain CSS selectors so the caller keeps its existing
-    ``find_element`` path. Neither ``ref:12`` nor `` ' >>> ' `` is valid CSS, so the
-    two new forms cannot collide with selectors that already work today.
+    ``find_element`` path. ``ref:12`` is not valid CSS, and `` ' >>> ' `` is only
+    treated as a separator outside quotes and brackets, so neither form can steal a
+    selector that already works today.
     """
     if not isinstance(locator, str):
         return None
     candidate = locator.strip()
     if not candidate:
         return None
-    reference = REF_PATTERN.match(candidate)
-    if reference:
-        number = int(reference.group(1))
-        return ref_expression(number) if number >= 1 else None
+    if REF_PATTERN.match(candidate):
+        return ref_expression(candidate)
     if _PIERCING_SEPARATOR not in candidate:
         return None
-    parts = [part.strip() for part in candidate.split(_PIERCING_SEPARATOR)]
-    parts = [part for part in parts if part]
+    parts = split_piercing_path(candidate)
     if not parts:
         return None
     encoded = json.dumps(parts, ensure_ascii=True)

@@ -143,11 +143,31 @@ def _performance_messages(driver: Any) -> list[dict[str, Any]]:
     return messages
 
 
+PENDING_REQUEST_LIMIT = 500
+
+
+def _evict_pending(pending: dict[str, dict[str, Any]]) -> None:
+    """Bound the partial-row map, dropping the oldest starts first.
+
+    Server-sent events, websockets, long polls, and requests cut short by a
+    navigation never produce a finishing event, so without a cap this map is the
+    one structure in the capture path that grows for as long as the session runs.
+    """
+    excess = len(pending) - PENDING_REQUEST_LIMIT
+    if excess <= 0:
+        return
+    oldest = sorted(pending, key=lambda key: pending[key].get("started", 0.0))[:excess]
+    for key in oldest:
+        pending.pop(key, None)
+
+
 def selenium_network_rows(driver: Any, pending: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     """Fold Chrome's performance log into finished request rows.
 
     ``pending`` carries partial rows between calls, because a request's start,
-    response, and completion arrive as three separate log entries.
+    response, and completion arrive as three separate log entries. It is capped
+    at ``PENDING_REQUEST_LIMIT`` entries; unfinished requests are evicted oldest
+    first.
     """
     finished: list[dict[str, Any]] = []
     for message in _performance_messages(driver):
@@ -171,6 +191,7 @@ def selenium_network_rows(driver: Any, pending: dict[str, dict[str, Any]]) -> li
                 "status": None,
                 "done": False,
             }
+            _evict_pending(pending)
         elif method == "Network.responseReceived":
             row = pending.get(request_id)
             if row is None:
@@ -211,24 +232,57 @@ def selenium_network_rows(driver: Any, pending: dict[str, dict[str, Any]]) -> li
     return finished
 
 
+_WHITESPACE = re.compile(r"\s+")
+
+
+def _collapse(text: str) -> str:
+    return _WHITESPACE.sub(" ", text).strip()
+
+
+def _unquote(text: str) -> str:
+    """Turn a JSON string literal back into the string it encodes.
+
+    Anything that is not one whole literal is returned untouched, so a partial
+    quote never turns into a mangled key that matches the wrong message.
+    """
+    if len(text) >= 2 and text.startswith('"') and text.endswith('"'):
+        try:
+            decoded = json.loads(text)
+        except ValueError:
+            return text
+        if isinstance(decoded, str):
+            return decoded
+    return text
+
+
+def _console_key(entry: dict[str, Any]) -> tuple[str, str]:
+    """Key one message so both capture paths agree on it.
+
+    Chrome's browser log carries console arguments JSON-quoted (``"boom"``, and
+    ``"a" "b"`` for several of them) while the in-page hook keeps them raw, so
+    the untouched texts never compare equal.
+    """
+    text = _collapse(str(entry.get("text", "")))
+    text = _collapse(_unquote(text))  # one whole literal: "boom"
+    if '"' in text:  # several quoted arguments: "a" "b"
+        text = _collapse(" ".join(_unquote(part) for part in text.split(" ")))
+    return str(entry.get("level")), text
+
+
 def dedupe_console(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Drop browser-log copies of messages the in-page hook already captured.
 
     Chrome reports the same ``console.error`` through both channels, and showing
-    it twice makes an agent think it happened twice.
+    it twice makes an agent think it happened twice. The channel is the ``kind``:
+    Chrome labels its own browser-log copy ``source: "console-api"`` as well, so
+    the source cannot tell the two apart.
     """
     hooked = {
-        (str(entry.get("level")), str(entry.get("text", "")).strip())
-        for entry in entries
-        if entry.get("source") == "console-api"
+        _console_key(entry) for entry in entries if entry.get("kind") != "browser"
     }
     result = []
     for entry in entries:
-        if entry.get("source") == "console-api":
-            result.append(entry)
-            continue
-        key = (str(entry.get("level")), str(entry.get("text", "")).strip())
-        if key in hooked:
+        if entry.get("kind") == "browser" and _console_key(entry) in hooked:
             continue
         result.append(entry)
     return result

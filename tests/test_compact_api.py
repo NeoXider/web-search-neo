@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 from selenium.common.exceptions import WebDriverException
 
 import main
+
+
+INPUT_ACTIONS = ("input", "press_keys", "pointer", "touch")
+
+
+def _published_properties(action: str) -> dict:
+    schema = asyncio.run(main.web_info("action_schema", {"action": action}))
+    return schema["input_schema"]["properties"]
 
 
 def test_compact_web_action_runs_ordered_game_workflow(local_site):
@@ -72,6 +81,128 @@ def test_compact_web_action_runs_ordered_game_workflow(local_site):
     assert result["results"][4]["data"]["frames"] == 2
     assert result["results"][5]["data"]["held_keys"] == []
     assert result["results"][7]["data"]["closed"] is True
+
+
+def test_input_actions_publish_the_fast_defaults_models_actually_send():
+    # A default that only exists inside browser_tools is a default nobody uses:
+    # the model sends what the published schema shows.
+    for action in INPUT_ACTIONS:
+        properties = _published_properties(action)
+        assert properties["wait_seconds"]["default"] == 0.0, action
+        assert properties["include_summary"]["default"] is True, action
+    assert _published_properties("step")["include_summary"]["default"] is True
+
+
+def test_input_actions_accept_include_summary_over_the_dispatcher(local_site):
+    async def exercise():
+        return await main.web_action(
+            [
+                {
+                    "action": "open",
+                    "url": f"{local_site.base_url}/game",
+                    "session_id": "compact-summary",
+                    "headless": True,
+                    "profile_mode": "temporary",
+                },
+                {"action": "render", "mode": "step", "session_id": "compact-summary"},
+                {
+                    "action": "input",
+                    "session_id": "compact-summary",
+                    "key_actions": [{"key": "W", "action": "tap"}],
+                    "include_summary": False,
+                },
+                {
+                    "action": "pointer",
+                    "session_id": "compact-summary",
+                    "pointer_action": "move",
+                    "x": 100,
+                    "y": 90,
+                    "include_summary": False,
+                },
+                {"action": "step", "frames": 1, "session_id": "compact-summary", "include_summary": False},
+                {"action": "close", "session_id": "compact-summary"},
+            ]
+        )
+
+    try:
+        result = asyncio.run(exercise())
+    except WebDriverException as exc:
+        pytest.skip(f"Chrome/Selenium is unavailable: {exc}")
+    assert result["success"] is True, result
+    quiet = result["results"][2]["data"]
+    assert quiet["success"] is True
+    # Skipping the page read is the whole point: no summary fields come back.
+    assert "url" not in quiet and "title" not in quiet
+    assert result["results"][3]["data"]["success"] is True
+
+
+def test_press_keys_is_reachable_from_the_compact_surface(local_site):
+    properties = _published_properties("press_keys")
+    assert properties["action"]["const"] == "press_keys"  # the dispatcher key stays free
+    assert properties["key_action"]["enum"] == ["tap", "hold", "release"]
+    assert properties["hold_frames"]["default"] == 1
+    assert properties["focus_mode"]["enum"] == ["focus", "click", "none"]
+
+    async def exercise():
+        return await main.web_action(
+            [
+                {
+                    "action": "open",
+                    "url": f"{local_site.base_url}/game",
+                    "session_id": "compact-keys",
+                    "headless": True,
+                    "profile_mode": "temporary",
+                },
+                {"action": "render", "mode": "step", "session_id": "compact-keys"},
+                {
+                    "action": "press_keys",
+                    "session_id": "compact-keys",
+                    "keys": ["SPACE"],
+                    "target_selector": "#game-canvas",
+                    "key_action": "tap",
+                    "hold_frames": 3,
+                },
+                {
+                    "action": "press_keys",
+                    "session_id": "compact-keys",
+                    "keys": ["W"],
+                    "key_action": "hold",
+                },
+                {"action": "release_inputs", "session_id": "compact-keys"},
+                {"action": "close", "session_id": "compact-keys"},
+            ]
+        )
+
+    try:
+        result = asyncio.run(exercise())
+    except WebDriverException as exc:
+        pytest.skip(f"Chrome/Selenium is unavailable: {exc}")
+    assert result["success"] is True, result
+    tapped = result["results"][2]["data"]
+    assert tapped["action"] == "tap"
+    assert tapped["hold_frames"] == 3
+    assert tapped["frames_advanced"] == 3  # the tap survived three released frames
+    assert result["results"][3]["data"]["held_keys"] == ["W"]
+    assert result["results"][4]["data"]["held_keys"] == []
+
+
+def test_capabilities_names_required_parameters_and_where_the_rest_live():
+    document = main._capabilities()
+    actions = document["actions"]
+    assert set(actions) == set(main._ACTIONS)
+    assert actions["open"]["required"] == ["url"]
+    assert actions["pointer"]["required"] == ["pointer_action", "x", "y"]
+    assert actions["press_keys"]["required"] == ["keys"]
+    assert "required" not in actions["close_all"]  # nothing to send at all
+    assert all(entry["summary"] for entry in actions.values())
+    # Optional names are deliberately absent, so the document must say so.
+    assert "action_schema" in document["discovery"]["parameters"]
+    assert not any("include_summary" in json.dumps(entry) for entry in actions.values())
+    assert len(json.dumps(document)) < 8_000
+
+    assert any(
+        "ref:" in pitfall and "page_outline" in pitfall for pitfall in document["pitfalls"]
+    )
 
 
 def test_compact_web_action_reports_and_controls_failures(monkeypatch):

@@ -2,6 +2,10 @@
 
 This guide installs the MCP server from source and connects it to LM Studio or another stdio-compatible MCP client.
 
+It describes version 1.3.0. The Python package, the server, and the bundled Chrome
+companion carry that same version, and the bridge only accepts a companion able to complete
+the 1.3.0 handshake — see [Updating](#updating) if an older one is already installed.
+
 ## 1. Requirements
 
 - Python 3.10, 3.11, 3.12, or 3.13 available as `python` on `PATH`.
@@ -142,25 +146,29 @@ approves installing the extension, send:
 }
 ```
 
-On Windows the action opens `chrome://extensions`, enables Developer mode, loads
-the repository's `chrome-extension` folder, and waits for the companion. Chrome
-still displays the unpacked extension and its permissions. If UI Automation isn't
-available, install manually:
+On Windows the action first writes the shared bridge secret into the extension folder, then
+opens `chrome://extensions`, enables Developer mode, loads the repository's
+`chrome-extension` folder — reloading the card when one is already present — and waits for
+the companion. Chrome still displays the unpacked extension and its permissions. The result
+carries `token_ready` and the `token_file` that was used. If UI Automation isn't available,
+install manually:
 
-1. Open `chrome://extensions`.
-2. Enable **Developer mode**.
-3. Choose **Load unpacked** and select the repository's `chrome-extension` folder.
-4. Leave **Web Search Neo Companion** enabled and restart/toggle the MCP server.
+1. Start the MCP server at least once from the clone, so it writes
+   `chrome-extension/bridge-token.js`.
+2. Open `chrome://extensions`.
+3. Enable **Developer mode**.
+4. Choose **Load unpacked** and select the repository's `chrome-extension` folder.
+5. Leave **Web Search Neo Companion** enabled and restart/toggle the MCP server.
 
-The bundled companion is version 1.2.0 and declares four permissions: `debugger`, `storage`,
-`tabs`, and `tabGroups`. `storage` is new in 1.2.0 and holds the extension's own session
-state. There are no content scripts and no `host_permissions`; page access comes from
-`debugger`, which attaches the Chrome DevTools Protocol to the tabs the agent drives.
+The bundled companion is version 1.3.0 and declares four permissions: `debugger`, `storage`,
+`tabs`, and `tabGroups`. There are no content scripts and no `host_permissions`; page access
+comes from `debugger`, which attaches the Chrome DevTools Protocol to the tabs the agent
+drives.
 
 If the companion was already installed from an earlier revision, Chrome keeps running the
 old service worker until you press **Reload** on its card at `chrome://extensions`. Do that
-after every `git pull`. Without it the new console, network, and tab-close bridge commands
-come back as unknown methods.
+after every `git pull`. From 1.3.0 onwards it is not optional: an older worker knows nothing
+about the handshake below, so the bridge rejects it and the badge never turns `ON`.
 
 Verify it with `web_info(topic="browser_status")`; `current_chrome.connected`
 should be `true`. List tabs with `web_info(topic="browser_tabs")`, then claim an
@@ -172,9 +180,32 @@ ID. If that port conflicts, change `WEB_SEARCH_NEO_BRIDGE_PORT` for the MCP and 
 `BRIDGE_URL` constant in `chrome-extension/service-worker.js`, then reload the
 unpacked extension.
 
-Enable the companion in one Chrome profile at a time. The first connected profile
-is retained; additional companion connections are rejected so the MCP cannot
-silently jump to another signed-in account.
+Enable the companion in one Chrome profile at a time. The bridge keeps one companion
+connection, and the newest authenticated one replaces the previous one, so a second profile
+running the companion takes the agent's tabs over from the first.
+
+### The shared bridge secret
+
+Loopback is reachable by every process running under your account, so the server and the
+companion authenticate each other before any command is executed. Nothing here needs manual
+work; it is documented because the file exists on your disk.
+
+- The MCP server mints a random 32-byte token the first time it starts and stores it at
+  `%LOCALAPPDATA%\WebSearchNeo\bridge-token` on Windows, or at
+  `$XDG_DATA_HOME/WebSearchNeo/bridge-token` — by default
+  `~/.local/share/WebSearchNeo/bridge-token` — created with `0600` permissions on POSIX.
+- The token is machine-local and per-user. Never copy it to another machine or into a
+  repository; if it leaks, delete the file, restart the MCP server, and reload the
+  companion, which mints and publishes a new one.
+- The server writes a copy into `chrome-extension/bridge-token.js` whenever it starts and
+  before `setup_current_chrome` touches Chrome. That file is in `.gitignore`; a fresh clone
+  does not contain it, and the companion simply retries until the server has written it.
+- The companion sends the token with a nonce; the server answers with
+  `HMAC-SHA256(token, nonce)`; each side stops if the other cannot prove it holds the same
+  secret.
+- A file-based secret does not protect against a malicious process running as the same user,
+  which can read it. It closes the case where any local process that grabs the bridge port
+  before the server gains DevTools access to your signed-in tabs.
 
 ## 7. Choose an isolated or managed browser mode
 
@@ -273,9 +304,16 @@ git pull --ff-only
 python -m pip install -r requirements.txt
 ```
 
-Restart or toggle the MCP server after updating. If you use the companion extension, also
-open `chrome://extensions` and press **Reload** on **Web Search Neo Companion**, so Chrome
-picks up the new unpacked source instead of keeping the previously loaded service worker.
+Restart or toggle the MCP server after updating. If you use the companion extension, you
+must then open `chrome://extensions` and press **Reload** on **Web Search Neo Companion**.
+Chrome keeps running the service worker it loaded earlier, and a worker older than 1.3.0
+does not authenticate against the bridge, so without the reload the companion stays
+disconnected — the badge shows `OFF` and every `current`-mode action fails with a setup
+error. Reloading also makes the worker re-read `chrome-extension/bridge-token.js`, which is
+how a rotated secret reaches it.
+
+Confirm with `web_info(topic="browser_status")` that `current_chrome.connected` is `true`
+before continuing.
 
 ## Optional environment variables
 
@@ -324,6 +362,29 @@ running, **Web Search Neo Companion** is enabled at `chrome://extensions`, and t
 toolbar badge shows `ON`. If port 8765 is occupied, stop the other process or set
 the same free `WEB_SEARCH_NEO_BRIDGE_PORT` for the MCP and extension source before
 loading it.
+
+### The companion stopped connecting after an update
+
+This is the expected symptom of an unreloaded extension, and it is the first thing to check
+after any `git pull` that crosses 1.3.0.
+
+1. Open `chrome://extensions` and press **Reload** on **Web Search Neo Companion**. The
+   badge should turn `ON` within a few seconds.
+2. If it stays `OFF`, open the card's **service worker** link and read its console. `no
+   companion token yet, run setup_current_chrome` means `chrome-extension/bridge-token.js`
+   is missing: start the MCP server from the clone, which writes it, or send a
+   `setup_current_chrome` action. `handshake refused (1008) Companion token mismatch` means
+   the file holds a different secret than the running server — the usual cause is two
+   clones, or a copied checkout, so start the server from the same directory Chrome loaded
+   and reload the extension again.
+3. Check the card's version. It must read 1.3.0; anything older cannot authenticate at all,
+   and Chrome only picks up the new manifest on reload.
+4. `msp_server.log` records the server's side: `Rejected a bridge client that did not
+   present the companion token` confirms that something did reach the port but could not
+   prove the secret.
+
+The companion retries roughly every ten seconds after a refused handshake, so once the
+cause is fixed it reconnects on its own.
 
 ### A canvas/WebGL game loads but cannot be controlled
 

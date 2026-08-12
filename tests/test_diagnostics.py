@@ -136,13 +136,19 @@ def _perf(method: str, params: dict) -> dict:
     return {"message": json.dumps({"message": {"method": method, "params": params}})}
 
 
-def _will_be_sent(request_id: str, url: str, method: str = "GET", kind: str = "Document") -> dict:
+def _will_be_sent(
+    request_id: str,
+    url: str,
+    method: str = "GET",
+    kind: str = "Document",
+    timestamp: float = 100.0,
+) -> dict:
     return _perf(
         "Network.requestWillBeSent",
         {
             "requestId": request_id,
             "wallTime": 1_700_000_000.5,
-            "timestamp": 100.0,
+            "timestamp": timestamp,
             "type": kind,
             "documentURL": url,
             "initiator": {"type": "parser"},
@@ -280,6 +286,40 @@ def test_selenium_network_rows_ignores_unusable_messages():
     assert pending == {}
 
 
+def test_selenium_network_rows_caps_the_pending_map_and_evicts_the_oldest():
+    # SSE, websockets, long polls, and navigation-cancelled requests never send a
+    # finishing event, so an uncapped map is an unbounded leak in a long session.
+    limit = diagnostics.PENDING_REQUEST_LIMIT
+    total = limit + 50
+    driver = _FakeLogDriver(
+        [
+            [
+                _will_be_sent(f"REQ-{index}", f"http://host/{index}", timestamp=float(index))
+                for index in range(total)
+            ]
+        ]
+    )
+    pending: dict = {}
+    assert diagnostics.selenium_network_rows(driver, pending) == []
+    assert len(pending) == limit
+    assert "REQ-0" not in pending  # the earliest starts are the ones dropped
+    assert f"REQ-{total - 1}" in pending
+
+    # Eviction must not corrupt the rows that survived: the newest still finishes.
+    driver.batches.append(
+        [
+            _perf(
+                "Network.loadingFinished",
+                {"requestId": f"REQ-{total - 1}", "timestamp": float(total), "encodedDataLength": 7},
+            )
+        ]
+    )
+    rows = diagnostics.selenium_network_rows(driver, pending)
+    assert [row["id"] for row in rows] == [f"REQ-{total - 1}"]
+    assert rows[0]["ms"] == 1000
+    assert len(pending) == limit - 1
+
+
 def test_selenium_network_rows_survives_a_driver_without_a_performance_log():
     class _NoLogDriver:
         def get_log(self, name: str):
@@ -321,6 +361,48 @@ def test_selenium_browser_log_splits_the_location_prefix():
     assert entries[1]["text"] == "deprecated api"
     assert entries[1]["url"] is None
     assert entries[1]["source"] == "other"
+
+
+def _hook_entry(level: str, text: str, kind: str = "console") -> dict:
+    return {"seq": 1, "ts": 10, "kind": kind, "level": level, "source": "console-api", "text": text}
+
+
+def _browser_entry(level: str, text: str) -> dict:
+    # Chrome labels its own copy console-api too, so only the kind separates them.
+    return {"seq": 0, "ts": 10, "kind": "browser", "level": level, "source": "console-api", "text": text}
+
+
+def test_dedupe_console_drops_the_json_quoted_browser_copy():
+    entries = [_hook_entry("error", "marker-once"), _browser_entry("error", '"marker-once"')]
+    assert [item["kind"] for item in diagnostics.dedupe_console(entries)] == ["console"]
+
+    # console.error('a', 'b') reaches the browser log as two quoted arguments.
+    several = [_hook_entry("error", "a b"), _browser_entry("error", '"a" "b"')]
+    assert [item["kind"] for item in diagnostics.dedupe_console(several)] == ["console"]
+
+    escaped = [
+        _hook_entry("warn", 'say "hi"\nagain'),
+        _browser_entry("warn", '"say \\"hi\\"\\nagain"'),
+    ]
+    assert [item["kind"] for item in diagnostics.dedupe_console(escaped)] == ["console"]
+
+
+def test_dedupe_console_keeps_everything_the_hook_did_not_capture():
+    entries = [
+        _hook_entry("error", "marker-once"),
+        _browser_entry("error", '"marker-twice"'),  # a different message
+        _browser_entry("warn", '"marker-once"'),  # same text, other level
+        _browser_entry("error", "Failed to load resource: 404"),  # no hook copy exists
+        _hook_entry("error", "Uncaught Error: boom", kind="exception"),
+    ]
+    assert [item["text"] for item in diagnostics.dedupe_console(entries)] == [
+        "marker-once",
+        '"marker-twice"',
+        '"marker-once"',
+        "Failed to load resource: 404",
+        "Uncaught Error: boom",
+    ]
+    assert diagnostics.dedupe_console([]) == []
 
 
 def test_read_page_console_installs_the_hook_when_it_is_missing():
@@ -423,6 +505,36 @@ def test_console_level_filter_drops_everything_below_error(local_site):
         assert payload["returned"] == len(payload["entries"])
     finally:
         browser_tools.close_session("console-filter")
+
+
+def test_one_console_error_is_reported_once_by_a_live_chrome(local_site):
+    _open_or_skip(f"{local_site.base_url}/page", "console-dedupe")
+    driver = browser_tools._get_session("console-dedupe").driver
+    try:
+        diagnostics.read_page_console(driver)  # install the hook
+        diagnostics.selenium_browser_log(driver)  # drop load-time noise
+        driver.execute_script("console.error('marker-once');")
+
+        entries: list[dict] = []
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            entries.extend(diagnostics.read_page_console(driver)["entries"])
+            entries.extend(diagnostics.selenium_browser_log(driver))
+            if len([item for item in entries if "marker-once" in item["text"]]) >= 2:
+                break
+            time.sleep(0.1)
+
+        marked = [item for item in entries if "marker-once" in item["text"]]
+        if len(marked) < 2:
+            pytest.skip("Chrome's browser log never delivered its copy of the message")
+        # Both channels really do report it, and the texts really do differ.
+        assert {item["text"] for item in marked} == {"marker-once", '"marker-once"'}
+        deduped = diagnostics.dedupe_console(entries)
+        assert [item["text"] for item in deduped if "marker-once" in item["text"]] == [
+            "marker-once"
+        ]
+    finally:
+        browser_tools.close_session("console-dedupe")
 
 
 def test_network_lists_the_document_and_isolates_the_failing_request(local_site):

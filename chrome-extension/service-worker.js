@@ -22,6 +22,10 @@ import {
 const BRIDGE_URL = "ws://127.0.0.1:8765";
 const PROTOCOL_VERSION = 1;
 const RECONNECT_MS = 2000;
+// A rejected handshake means the operator has to reload this extension, so
+// retrying is nearly pointless; the delay stays under the worker idle timeout
+// so the badge keeps updating instead of the worker dying unrecoverably.
+const AUTH_RETRY_MS = 10000;
 const KEEPALIVE_MS = 20000;
 const DEBUGGER_VERSION = "1.3";
 const STATE_KEY = "bridge_state";
@@ -33,6 +37,8 @@ const NETWORK_BUFFER_LIMITS = {
 };
 
 let socket = null;
+let verified = false;
+let connecting = false;
 let reconnectTimer = null;
 let keepaliveTimer = null;
 const attachedTabs = new Set();
@@ -582,28 +588,101 @@ async function handleCommand(message) {
   }
 }
 
-function scheduleReconnect() {
-  clearTimeout(reconnectTimer);
-  reconnectTimer = setTimeout(connect, RECONNECT_MS);
+function setBadge(online) {
+  chrome.action.setBadgeBackgroundColor({color: online ? "#16a34a" : "#dc2626"});
+  chrome.action.setBadgeText({text: online ? "ON" : "OFF"});
 }
 
-function connect() {
+function scheduleReconnect(delayMs = RECONNECT_MS) {
+  clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(startConnect, delayMs);
+}
+
+// connect() is async, so every entry point funnels through here to keep a
+// rejected promise from silently stopping the reconnect chain.
+function startConnect() {
+  connect().catch(error => {
+    connecting = false;
+    console.warn("bridge: connect attempt failed", error);
+    setBadge(false);
+    scheduleReconnect(AUTH_RETRY_MS);
+  });
+}
+
+function bytesToHex(bytes) {
+  return [...new Uint8Array(bytes)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function hexToBytes(hex) {
+  const bytes = new Uint8Array(hex.length >> 1);
+  for (let index = 0; index < bytes.length; index += 1) {
+    bytes[index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+function timingSafeEqual(left, right) {
+  if (left.length !== right.length) return false;
+  let difference = 0;
+  for (let index = 0; index < left.length; index += 1) difference |= left[index] ^ right[index];
+  return difference === 0;
+}
+
+// bridge-token.js is written by the Python side and is absent in a fresh clone.
+// The module graph caches this import, so a rotated token is only picked up
+// after the extension is reloaded — which is exactly what setup does.
+async function loadBridgeToken() {
+  const module = await import("./bridge-token.js");
+  const token = String(module?.BRIDGE_TOKEN || "");
+  if (!/^[0-9a-f]{64}$/.test(token)) throw new Error("bridge-token.js holds no usable token");
+  return token;
+}
+
+async function hmacSha256(token, message) {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(token),
+    {name: "HMAC", hash: "SHA-256"},
+    false,
+    ["sign"],
+  );
+  return new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(message)));
+}
+
+async function connect() {
+  if (connecting) return;
   if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
+  connecting = true;
+  let token = null;
+  let nonce = null;
+  let expectedProof = null;
+  try {
+    token = await loadBridgeToken();
+    nonce = bytesToHex(crypto.getRandomValues(new Uint8Array(16)));
+    expectedProof = await hmacSha256(token, nonce);
+  } catch (error) {
+    console.warn("bridge: no companion token yet, run setup_current_chrome", error);
+    connecting = false;
+    setBadge(false);
+    scheduleReconnect(AUTH_RETRY_MS);
+    return;
+  }
+
+  verified = false;
+  let handshakeStarted = false;
   socket = new WebSocket(BRIDGE_URL);
+  connecting = false;
+  const active = socket;
   socket.onopen = () => {
-    chrome.action.setBadgeBackgroundColor({color: "#16a34a"});
-    chrome.action.setBadgeText({text: "ON"});
-    socket.send(JSON.stringify({
+    handshakeStarted = true;
+    active.send(JSON.stringify({
       type: "hello",
       protocol: PROTOCOL_VERSION,
+      token,
+      nonce,
       browser: {name: "Chrome", extension_version: chrome.runtime.getManifest().version},
     }));
-    clearInterval(keepaliveTimer);
-    keepaliveTimer = setInterval(() => {
-      if (socket?.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({type: "ping", at: Date.now()}));
-      }
-    }, KEEPALIVE_MS);
   };
   socket.onmessage = event => {
     let message = null;
@@ -613,27 +692,70 @@ function connect() {
       console.warn("bridge: dropped a frame that is not JSON", error);
       return;
     }
-    if (!message || message.type !== "command") return;
+    if (!message) return;
+    if (!verified) {
+      // Anything other than a valid ack — a command above all — means the peer
+      // is not the local server we share a secret with.
+      if (message.type !== "hello_ack") {
+        console.warn(`bridge: closing an unverified peer that sent ${message.type}`);
+        active.close();
+        return;
+      }
+      completeHandshake(active, message, expectedProof);
+      return;
+    }
+    if (message.type !== "command") return;
     const {id, method} = message;
     if (typeof id !== "string" && typeof id !== "number") return;
     if (typeof method !== "string") {
-      socket?.send(JSON.stringify({type: "result", id, error: "Error: method must be a string"}));
+      active.send(JSON.stringify({type: "result", id, error: "Error: method must be a string"}));
       return;
     }
     handleCommand(message);
   };
-  socket.onclose = () => {
-    chrome.action.setBadgeBackgroundColor({color: "#dc2626"});
-    chrome.action.setBadgeText({text: "OFF"});
+  socket.onclose = event => {
+    const rejected = handshakeStarted && !verified;
+    if (rejected) console.warn(`bridge: handshake refused (${event.code}) ${event.reason || ""}`);
+    // A socket the module already replaced must not clear the live one's state.
+    if (socket !== active) return;
+    setBadge(false);
     clearInterval(keepaliveTimer);
+    verified = false;
     socket = null;
-    scheduleReconnect();
+    scheduleReconnect(rejected ? AUTH_RETRY_MS : RECONNECT_MS);
   };
-  socket.onerror = () => socket?.close();
+  socket.onerror = () => active.close();
 }
 
-chrome.runtime.onInstalled.addListener(connect);
-chrome.runtime.onStartup.addListener(connect);
-chrome.action.onClicked.addListener(connect);
+function completeHandshake(connection, message, expectedProof) {
+  let accepted = false;
+  try {
+    const proof = typeof message.proof === "string" ? message.proof : "";
+    accepted =
+      message.protocol === PROTOCOL_VERSION &&
+      /^[0-9a-f]{64}$/.test(proof) &&
+      timingSafeEqual(hexToBytes(proof), expectedProof);
+  } catch (error) {
+    console.warn("bridge: could not check the server proof", error);
+  }
+  if (!accepted) {
+    console.warn("bridge: the server did not prove it knows the companion token");
+    connection.close();
+    return;
+  }
+  if (connection !== socket || connection.readyState !== WebSocket.OPEN) return;
+  verified = true;
+  setBadge(true);
+  clearInterval(keepaliveTimer);
+  keepaliveTimer = setInterval(() => {
+    if (socket?.readyState === WebSocket.OPEN && verified) {
+      socket.send(JSON.stringify({type: "ping", at: Date.now()}));
+    }
+  }, KEEPALIVE_MS);
+}
+
+chrome.runtime.onInstalled.addListener(startConnect);
+chrome.runtime.onStartup.addListener(startConnect);
+chrome.action.onClicked.addListener(startConnect);
 restoreState();
-connect();
+startConnect();

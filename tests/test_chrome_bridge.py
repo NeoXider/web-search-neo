@@ -8,12 +8,16 @@ import subprocess
 import threading
 
 import pytest
+from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect
 
+import bridge_auth
 import browser_tools
 from chrome_bridge import CHROME_EXTENSION_ID, ChromeBridge, ChromeBridgeDriver
 
 
+TEST_TOKEN = "a1" * 32
+OTHER_TOKEN = "b2" * 32
 NODE = shutil.which("node")
 EVENTS_MODULE = (
     Path(__file__).resolve().parents[1] / "chrome-extension" / "events.js"
@@ -47,25 +51,33 @@ def _free_port() -> int:
         return int(candidate.getsockname()[1])
 
 
+def _companion_socket(port: int):
+    return connect(
+        f"ws://127.0.0.1:{port}",
+        origin=f"chrome-extension://{CHROME_EXTENSION_ID}",
+    )
+
+
+def _hello(token: str | None, nonce: str = "0f" * 16) -> str:
+    message: dict = {"type": "hello", "protocol": 1, "browser": {"name": "Test Chrome"}}
+    if token is not None:
+        message["token"] = token
+        message["nonce"] = nonce
+    return json.dumps(message)
+
+
 def test_bridge_round_trip_accepts_extension_protocol() -> None:
-    bridge = ChromeBridge(port=_free_port())
+    bridge = ChromeBridge(port=_free_port(), token=TEST_TOKEN)
     bridge.start()
+    nonce = "1234" * 8
 
     def extension_client() -> None:
-        with connect(
-            f"ws://127.0.0.1:{bridge.port}",
-            origin=f"chrome-extension://{CHROME_EXTENSION_ID}",
-        ) as websocket:
-            websocket.send(
-                json.dumps(
-                    {
-                        "type": "hello",
-                        "protocol": 1,
-                        "browser": {"name": "Test Chrome"},
-                    }
-                )
-            )
-            assert json.loads(websocket.recv())["type"] == "hello_ack"
+        with _companion_socket(bridge.port) as websocket:
+            websocket.send(_hello(TEST_TOKEN, nonce))
+            acknowledgement = json.loads(websocket.recv())
+            assert acknowledgement["type"] == "hello_ack"
+            # The ack proves the server knows the same secret, not just the port.
+            assert bridge_auth.verify(TEST_TOKEN, nonce, acknowledgement["proof"])
             command = json.loads(websocket.recv())
             websocket.send(
                 json.dumps(
@@ -83,6 +95,125 @@ def test_bridge_round_trip_accepts_extension_protocol() -> None:
     assert bridge.request("tabs.list") == {"method": "tabs.list"}
     thread.join(timeout=2.0)
     bridge.shutdown()
+
+
+@pytest.mark.parametrize("token", [None, OTHER_TOKEN, "", "not-a-token"])
+def test_bridge_rejects_a_client_without_the_shared_token(token) -> None:
+    bridge = ChromeBridge(port=_free_port(), token=TEST_TOKEN)
+    bridge.start()
+    try:
+        with _companion_socket(bridge.port) as websocket:
+            websocket.send(_hello(token))
+            with pytest.raises(ConnectionClosed) as rejection:
+                websocket.recv(timeout=5.0)
+        closed = rejection.value.rcvd
+        assert closed.code == 1008
+        assert "token mismatch" in closed.reason
+        assert "chrome://extensions" in closed.reason
+        assert bridge.wait_connected(0.2) is False
+    finally:
+        bridge.shutdown()
+
+
+def test_bridge_rejects_a_hello_without_a_nonce() -> None:
+    bridge = ChromeBridge(port=_free_port(), token=TEST_TOKEN)
+    bridge.start()
+    try:
+        with _companion_socket(bridge.port) as websocket:
+            websocket.send(json.dumps({"type": "hello", "protocol": 1, "token": TEST_TOKEN}))
+            with pytest.raises(ConnectionClosed) as rejection:
+                websocket.recv(timeout=5.0)
+        assert rejection.value.rcvd.code == 1008
+        assert "nonce" in rejection.value.rcvd.reason
+        assert bridge.wait_connected(0.2) is False
+    finally:
+        bridge.shutdown()
+
+
+def test_a_newer_authenticated_companion_replaces_the_previous_one() -> None:
+    bridge = ChromeBridge(port=_free_port(), token=TEST_TOKEN)
+    bridge.start()
+    answers: list = []
+    try:
+        first = _companion_socket(bridge.port)
+        first.send(_hello(TEST_TOKEN))
+        assert json.loads(first.recv(timeout=5.0))["type"] == "hello_ack"
+        assert bridge.wait_connected(2.0)
+
+        second_nonce = "abcd" * 8
+        second = _companion_socket(bridge.port)
+        second.send(_hello(TEST_TOKEN, second_nonce))
+        acknowledgement = json.loads(second.recv(timeout=5.0))
+        assert bridge_auth.verify(TEST_TOKEN, second_nonce, acknowledgement["proof"])
+
+        with pytest.raises(ConnectionClosed):
+            first.recv(timeout=5.0)
+
+        caller = threading.Thread(
+            target=lambda: answers.append(bridge.request("tabs.list", timeout=10.0))
+        )
+        caller.start()
+        command = json.loads(second.recv(timeout=5.0))
+        second.send(json.dumps({"type": "result", "id": command["id"], "result": ["second"]}))
+        caller.join(timeout=5.0)
+        assert answers == [["second"]]
+        second.close()
+        first.close()
+    finally:
+        bridge.shutdown()
+
+
+def test_sign_and_verify_reject_tampering() -> None:
+    proof = bridge_auth.sign(TEST_TOKEN, "nonce-1")
+    assert bridge_auth.verify(TEST_TOKEN, "nonce-1", proof)
+    assert not bridge_auth.verify(TEST_TOKEN, "nonce-2", proof)
+    assert not bridge_auth.verify(OTHER_TOKEN, "nonce-1", proof)
+    assert not bridge_auth.verify(TEST_TOKEN, "nonce-1", proof[:-1] + ("0" if proof[-1] != "0" else "1"))
+    assert not bridge_auth.verify(TEST_TOKEN, "nonce-1", proof.upper())
+    assert not bridge_auth.verify(TEST_TOKEN, "nonce-1", None)
+    assert not bridge_auth.verify(TEST_TOKEN, "nonce-1", "proof-é")
+    assert bridge_auth.token_matches(TEST_TOKEN, TEST_TOKEN)
+    assert not bridge_auth.token_matches(TEST_TOKEN, OTHER_TOKEN)
+    assert not bridge_auth.token_matches(TEST_TOKEN, None)
+
+
+def test_load_or_create_token_is_stable_across_calls(tmp_path, monkeypatch) -> None:
+    target = tmp_path / "bridge-token"
+    monkeypatch.setattr(bridge_auth, "token_path", lambda: target)
+
+    minted = bridge_auth.load_or_create_token()
+    assert bridge_auth.is_token(minted)
+    assert bridge_auth.load_or_create_token() == minted
+    assert target.read_text(encoding="utf-8").strip() == minted
+
+    target.write_text("truncated-secret", encoding="utf-8")
+    replaced = bridge_auth.load_or_create_token()
+    assert bridge_auth.is_token(replaced) and replaced != minted
+
+
+def test_write_extension_token_emits_a_module_and_refuses_junk(tmp_path, monkeypatch) -> None:
+    target = tmp_path / "extension" / "bridge-token.js"
+    monkeypatch.setattr(bridge_auth, "EXTENSION_TOKEN_FILE", target)
+
+    assert bridge_auth.write_extension_token(TEST_TOKEN) == target
+    assert target.read_text(encoding="utf-8") == f'export const BRIDGE_TOKEN = "{TEST_TOKEN}";\n'
+    with pytest.raises(ValueError):
+        bridge_auth.write_extension_token('"; fetch("http://evil.test"); //')
+
+
+@requires_node
+def test_web_crypto_hmac_matches_the_python_signature() -> None:
+    token, nonce = TEST_TOKEN, "0123456789abcdef" * 2
+    digest = _node_eval(
+        f"""
+        const encoder = new TextEncoder();
+        const key = await crypto.subtle.importKey("raw", encoder.encode({json.dumps(token)}),
+          {{name: "HMAC", hash: "SHA-256"}}, false, ["sign"]);
+        const signed = await crypto.subtle.sign("HMAC", key, encoder.encode({json.dumps(nonce)}));
+        return [...new Uint8Array(signed)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+        """
+    )
+    assert digest == bridge_auth.sign(token, nonce)
 
 
 class _FakeBridge:
