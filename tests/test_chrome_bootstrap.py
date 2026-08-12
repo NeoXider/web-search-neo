@@ -19,7 +19,7 @@ class _ConnectedBridge(_DisconnectedBridge):
             "connected": True,
             "host": "127.0.0.1",
             "port": 8765,
-            "browser": {"extension_version": chrome_bootstrap._expected_extension_version()},
+            "browser": {"extension_version": chrome_bootstrap.expected_extension_version()},
         }
 
 

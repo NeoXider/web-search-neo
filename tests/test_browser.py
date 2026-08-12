@@ -133,7 +133,12 @@ def test_browser_full_form_upload_click_submit_and_screenshot(local_site, tmp_pa
     assert status["available"] is True
     assert status["session_open"] is True
     closed = browser_tools.close_session("full-flow")
-    assert closed == {"session_id": "full-flow", "closed": True, "active_sessions": []}
+    assert closed == {
+        "session_id": "full-flow",
+        "closed": True,
+        "tab_closed": False,
+        "active_sessions": [],
+    }
     assert browser_tools.get_status("full-flow")["session_open"] is False
 
 
@@ -215,7 +220,7 @@ def test_session_id_is_validated(session_id):
 
 
 def test_browser_requires_open_session_before_actions():
-    with pytest.raises(ValueError, match="call browser_open_page first"):
+    with pytest.raises(ValueError, match=r"does not exist\. Open one first"):
         browser_tools.get_page_elements("missing")
 
 
@@ -639,7 +644,20 @@ def test_mixed_key_and_pointer_batch_is_atomic_in_step_mode(local_site):
         if event["type"] in {"keydown", "keyup", "pointermove"}
     ]
     assert relevant
-    assert {event["frame"] for event in relevant} == {before}
+    # Every change lands before the released frame. A tapped key is the one
+    # exception: it stays down across that frame and lifts afterwards, because an
+    # engine that polls key state cannot see a press that was already released.
+    pressed_during_frame = [
+        event for event in relevant if event["type"] != "keyup" or event.get("code") == "KeyS"
+    ]
+    assert {event["frame"] for event in pressed_during_frame} == {before}
+    tap_releases = [
+        event
+        for event in relevant
+        if event["type"] == "keyup" and event.get("code") in {"Space", "KeyE"}
+    ]
+    assert tap_releases
+    assert {event["frame"] for event in tap_releases} == {before + 1}
     keyboard = {(event["type"], event["code"]) for event in relevant if "code" in event}
     assert {
         ("keydown", "KeyW"),
@@ -708,7 +726,7 @@ def test_release_inputs_clears_every_held_key_and_button(local_site):
     assert session.held_buttons == set()
 
 
-def test_navigation_resets_render_gate_and_held_inputs(local_site):
+def test_navigation_releases_held_inputs_and_rearms_the_gate(local_site):
     _open_or_skip(f"{local_site.base_url}/game", "navigation-reset")
     browser_tools.set_render_control("step", "navigation-reset")
     browser_tools.press_keys(
@@ -731,7 +749,20 @@ def test_navigation_resets_render_gate_and_held_inputs(local_site):
 
     session = browser_tools._get_session("navigation-reset")
     assert result["title"] == "Form navigation-reset"
-    assert session.render_mode == "normal"
-    assert session.render_frame_selector is None
+    # Held input belongs to the old document and must not survive it.
     assert session.held_keys == {}
     assert session.held_buttons == set()
+    # The gate does survive: a session asked for step mode stays stepped, and
+    # the caller is told, instead of silently getting a free-running page.
+    assert session.render_mode == "step"
+    assert result["render_mode"] == "step"
+    assert result["render_mode_restored"] is True
+    before = session.driver.execute_script(
+        "window.__ticks = 0;"
+        "(function loop(){ window.__ticks += 1; requestAnimationFrame(loop); })();"
+        "return window.__ticks;"
+    )
+    time.sleep(0.3)
+    assert session.driver.execute_script("return window.__ticks") == before
+    browser_tools.render_step(frames=3, session_id="navigation-reset")
+    assert session.driver.execute_script("return window.__ticks") == before + 3

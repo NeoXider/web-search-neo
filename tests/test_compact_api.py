@@ -97,10 +97,18 @@ def test_compact_web_action_reports_and_controls_failures(monkeypatch):
     assert continued["completed_count"] == 2
     assert continued["failure_count"] == 1
 
-    async def soft_failure():
+    @main.legacy_mcp.tool()
+    async def soft_failure() -> dict:
+        """Test-only action that reports a soft failure."""
         return {"success": False, "reason": "native validation blocked submission"}
 
-    monkeypatch.setitem(main._ACTION_HANDLERS, "soft_failure", soft_failure)
+    monkeypatch.setitem(
+        main._ACTIONS,
+        "soft_failure",
+        main.ActionSpec(
+            "soft_failure", soft_failure, "soft_failure", "page", "test double"
+        ),
+    )
     reported = asyncio.run(
         main.web_action(
             [

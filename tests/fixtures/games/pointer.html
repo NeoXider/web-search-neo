@@ -1,0 +1,446 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixture: pointer / wheel / touch / keyboard harness</title>
+<link rel="icon" href="data:,">
+
+<style>
+  body { margin: 0; padding: 12px; background: #10131a; color: #d7dde8;
+         font: 13px/1.4 monospace; }
+  h1 { font-size: 14px; margin: 0 0 8px; }
+  #pad {
+    width: 480px; height: 280px; background: #1b2130; border: 1px solid #3a4560;
+    position: relative; user-select: none; touch-action: none; overflow: hidden;
+    cursor: crosshair;
+  }
+  #pad.hot { background: #232c40; }
+  #marker { position: absolute; width: 10px; height: 10px; margin: -5px 0 0 -5px;
+            border-radius: 50%; background: #4da3ff; pointer-events: none; }
+  #controls { margin: 8px 0; }
+  button { font: inherit; background: #2b3448; color: #d7dde8;
+           border: 1px solid #3a4560; padding: 4px 10px; cursor: pointer; }
+  #hud { margin: 8px 0 0; white-space: pre-wrap; font-size: 12px; }
+  #keyfield { width: 480px; box-sizing: border-box; background: #1b2130;
+              color: #d7dde8; border: 1px solid #3a4560; padding: 4px; font: inherit; }
+</style>
+</head>
+<body>
+<h1>pointer fixture &mdash; every counter is mirrored into window.__input</h1>
+
+<div id="pad"><div id="marker" style="left:-20px; top:-20px"></div></div>
+
+<div id="controls">
+  <button id="lock" type="button">Lock</button>
+  <button id="reset" type="button">Reset</button>
+  <input id="keyfield" type="text" placeholder="focus me and type (keyboard events are recorded globally too)">
+</div>
+
+<p id="hud">booting…</p>
+
+<script>
+(function () {
+  'use strict';
+
+  var pad = document.getElementById('pad');
+  var marker = document.getElementById('marker');
+  var lockBtn = document.getElementById('lock');
+  var resetBtn = document.getElementById('reset');
+  var hud = document.getElementById('hud');
+
+  var MAX_PATH = 500;
+  var MAX_KEYS = 200;
+  var MAX_EVENTS = 500;
+
+  // Flat, directly assertable state. Every field below is written by a real
+  // DOM event handler; nothing is synthesised.
+  function blankState() {
+    return {
+      // --- mouse buttons -------------------------------------------------
+      leftClicks: 0, rightClicks: 0, middleClicks: 0, totalClicks: 0,
+      dblClicks: 0, clickCount: 0, lastClickCount: 0,
+      contextMenus: 0, auxClicks: 0,
+      mouseDowns: 0, mouseUps: 0, lastButton: null, lastButtons: 0,
+
+      // --- position (relative to #pad unless noted) ----------------------
+      lastX: 0, lastY: 0, lastClientX: 0, lastClientY: 0,
+      lastPageX: 0, lastPageY: 0, lastScreenX: 0, lastScreenY: 0,
+      lastClickX: 0, lastClickY: 0,
+      moves: 0, hoverEnters: 0, hoverLeaves: 0, hovering: false,
+
+      // --- wheel ---------------------------------------------------------
+      wheelEvents: 0, wheelDeltaX: 0, wheelDeltaY: 0, wheelMode: 0, zoom: 1,
+
+      // --- drag (pointerdown -> pointermove -> pointerup) -----------------
+      pointerDowns: 0, pointerUps: 0, pointerMoves: 0, pointerCancels: 0,
+      lastPointerType: null, lastPointerId: null,
+      dragging: false, drags: 0,
+      dragStartX: 0, dragStartY: 0, dragEndX: 0, dragEndY: 0,
+      dragDistance: 0, dragSteps: 0,
+      dragPath: [],          // [{x, y}] relative to #pad, drag in progress
+      // Snapshot of the last *completed* drag. Survives any later stray
+      // pointerdown (e.g. a tap), so an assertion can run after other input.
+      lastDragStartX: 0, lastDragStartY: 0, lastDragEndX: 0, lastDragEndY: 0,
+      lastDragDistance: 0, lastDragSteps: 0, lastDragPath: [],
+      lastDragPointerType: null,
+
+      // --- pointer lock ---------------------------------------------------
+      locked: false, lockRequests: 0, lockChanges: 0, lockMoves: 0,
+      lockDelta: { x: 0, y: 0 }, lockError: null,
+
+      // --- touch ----------------------------------------------------------
+      touchStarts: 0, touchMoves: 0, touchEnds: 0, touchCancels: 0,
+      taps: 0, activeTouches: 0, maxTouchPoints: 0,
+      maxDeviceTouchPoints: (navigator.maxTouchPoints || 0),
+      touchPath: [],         // [{x, y, id}] relative to #pad
+
+      // --- keyboard ---------------------------------------------------------
+      keyDowns: 0, keyUps: 0, keyPresses: 0,
+      keys: [],              // [{type, key, code, keyCode, location, repeat, ctrl, shift, alt, meta}]
+      lastKey: null,
+      modCtrl: false, modShift: false, modAlt: false, modMeta: false,
+
+      // --- gamepad ----------------------------------------------------------
+      gamepads: [], gamepadPolls: 0, gamepadConnects: 0,
+
+      // --- rAF driver --------------------------------------------------------
+      frames: 0,
+
+      // --- generic log ------------------------------------------------------
+      events: []             // [{t, type, ...}] capped ring
+    };
+  }
+
+  var S = blankState();
+  window.__input = S;
+
+  function log(type, extra) {
+    var rec = { t: S.events.length, type: type };
+    if (extra) {
+      for (var k in extra) {
+        if (Object.prototype.hasOwnProperty.call(extra, k)) rec[k] = extra[k];
+      }
+    }
+    S.events.push(rec);
+    if (S.events.length > MAX_EVENTS) S.events.shift();
+  }
+
+  function rel(e) {
+    var r = pad.getBoundingClientRect();
+    return { x: Math.round((e.clientX - r.left) * 100) / 100,
+             y: Math.round((e.clientY - r.top) * 100) / 100 };
+  }
+
+  function mods(e) {
+    return { ctrl: !!e.ctrlKey, shift: !!e.shiftKey, alt: !!e.altKey, meta: !!e.metaKey };
+  }
+
+  // ------------------------------------------------------------ mouse buttons
+  pad.addEventListener('mousedown', function (e) {
+    S.mouseDowns += 1;
+    S.lastButton = e.button;
+    S.lastButtons = e.buttons;
+    log('mousedown', { button: e.button, buttons: e.buttons });
+  });
+
+  // Button counters live on `mouseup` only. Chrome raises `click` for the
+  // primary button but `auxclick` + `contextmenu` for the others, so counting
+  // in those handlers would double count a single right click.
+  pad.addEventListener('mouseup', function (e) {
+    S.mouseUps += 1;
+    S.lastButton = e.button;
+    S.totalClicks += 1;
+    if (e.button === 0) S.leftClicks += 1;
+    else if (e.button === 1) S.middleClicks += 1;
+    else if (e.button === 2) S.rightClicks += 1;
+    log('mouseup', { button: e.button });
+  });
+
+  pad.addEventListener('click', function (e) {
+    var p = rel(e);
+    S.lastClickCount = e.detail;
+    if (e.detail > S.clickCount) S.clickCount = e.detail;
+    S.lastClickX = p.x; S.lastClickY = p.y;
+    S.lastButton = e.button;
+    var m = mods(e);
+    S.modCtrl = m.ctrl; S.modShift = m.shift; S.modAlt = m.alt; S.modMeta = m.meta;
+    log('click', { button: e.button, detail: e.detail, x: p.x, y: p.y,
+                   ctrl: m.ctrl, shift: m.shift, alt: m.alt, meta: m.meta });
+  });
+
+  // Non-primary buttons surface as `auxclick`; kept as a separate signal.
+  pad.addEventListener('auxclick', function (e) {
+    S.auxClicks += 1;
+    if (e.detail > S.clickCount) S.clickCount = e.detail;
+    log('auxclick', { button: e.button, detail: e.detail });
+  });
+
+  pad.addEventListener('dblclick', function (e) {
+    var p = rel(e);
+    S.dblClicks += 1;
+    if (e.detail > S.clickCount) S.clickCount = e.detail;
+    log('dblclick', { detail: e.detail, x: p.x, y: p.y });
+  });
+
+  pad.addEventListener('contextmenu', function (e) {
+    e.preventDefault();            // keep the native menu out of the way
+    S.contextMenus += 1;
+    var p = rel(e);
+    log('contextmenu', { x: p.x, y: p.y });
+  });
+
+  // --------------------------------------------------------------- hover/move
+  pad.addEventListener('mouseenter', function () {
+    S.hoverEnters += 1; S.hovering = true; pad.classList.add('hot'); log('mouseenter');
+  });
+  pad.addEventListener('mouseleave', function () {
+    S.hoverLeaves += 1; S.hovering = false; pad.classList.remove('hot'); log('mouseleave');
+  });
+  pad.addEventListener('mousemove', function (e) {
+    var p = rel(e);
+    S.moves += 1;
+    S.lastX = p.x; S.lastY = p.y;
+    S.lastClientX = e.clientX; S.lastClientY = e.clientY;
+    S.lastPageX = e.pageX; S.lastPageY = e.pageY;
+    S.lastScreenX = e.screenX; S.lastScreenY = e.screenY;
+    marker.style.left = p.x + 'px';
+    marker.style.top = p.y + 'px';
+  });
+
+  // -------------------------------------------------------------------- wheel
+  pad.addEventListener('wheel', function (e) {
+    e.preventDefault();
+    S.wheelEvents += 1;
+    S.wheelDeltaX += e.deltaX;
+    S.wheelDeltaY += e.deltaY;
+    S.wheelMode = e.deltaMode;
+    // Simple zoom model so tests have a derived, monotonic value to assert.
+    S.zoom = Math.max(0.2, Math.min(5, S.zoom * (e.deltaY < 0 ? 1.1 : (e.deltaY > 0 ? 1 / 1.1 : 1))));
+    S.zoom = Math.round(S.zoom * 1000) / 1000;
+    log('wheel', { deltaX: e.deltaX, deltaY: e.deltaY, mode: e.deltaMode, zoom: S.zoom });
+  }, { passive: false });
+
+  // --------------------------------------------------------------------- drag
+  pad.addEventListener('pointerdown', function (e) {
+    var p = rel(e);
+    S.pointerDowns += 1;
+    S.lastPointerType = e.pointerType;
+    S.lastPointerId = e.pointerId;
+    S.dragging = true;
+    S.dragStartX = p.x; S.dragStartY = p.y;
+    S.dragEndX = p.x; S.dragEndY = p.y;
+    S.dragDistance = 0; S.dragSteps = 0;
+    S.dragPath = [{ x: p.x, y: p.y }];
+    if (pad.setPointerCapture) { try { pad.setPointerCapture(e.pointerId); } catch (err) {} }
+    log('pointerdown', { x: p.x, y: p.y, pointerType: e.pointerType, button: e.button });
+  });
+
+  pad.addEventListener('pointermove', function (e) {
+    var p = rel(e);
+    S.pointerMoves += 1;
+    S.lastPointerType = e.pointerType;
+    if (!S.dragging) return;
+    var last = S.dragPath[S.dragPath.length - 1];
+    if (last) {
+      var dx = p.x - last.x, dy = p.y - last.y;
+      S.dragDistance = Math.round((S.dragDistance + Math.sqrt(dx * dx + dy * dy)) * 100) / 100;
+    }
+    S.dragSteps += 1;
+    S.dragEndX = p.x; S.dragEndY = p.y;
+    if (S.dragPath.length < MAX_PATH) S.dragPath.push({ x: p.x, y: p.y });
+  });
+
+  pad.addEventListener('pointerup', function (e) {
+    var p = rel(e);
+    S.pointerUps += 1;
+    if (S.dragging) {
+      S.dragging = false;
+      S.dragEndX = p.x; S.dragEndY = p.y;
+      if (S.dragPath.length < MAX_PATH) S.dragPath.push({ x: p.x, y: p.y });
+      if (S.dragSteps > 0) {
+        S.drags += 1;
+        S.lastDragStartX = S.dragStartX; S.lastDragStartY = S.dragStartY;
+        S.lastDragEndX = S.dragEndX; S.lastDragEndY = S.dragEndY;
+        S.lastDragDistance = S.dragDistance; S.lastDragSteps = S.dragSteps;
+        S.lastDragPath = S.dragPath.slice();
+        S.lastDragPointerType = e.pointerType;
+      }
+      log('pointerup', { x: p.x, y: p.y, steps: S.dragSteps, distance: S.dragDistance });
+    }
+    if (pad.releasePointerCapture) { try { pad.releasePointerCapture(e.pointerId); } catch (err) {} }
+  });
+
+  pad.addEventListener('pointercancel', function () {
+    S.pointerCancels += 1; S.dragging = false; log('pointercancel');
+  });
+
+  // ------------------------------------------------------------- pointer lock
+  lockBtn.addEventListener('click', function () {
+    S.lockRequests += 1;
+    try {
+      var req = pad.requestPointerLock && pad.requestPointerLock();
+      if (req && typeof req.catch === 'function') {
+        req.catch(function (err) { S.lockError = String(err && err.message || err); });
+      }
+    } catch (err) {
+      S.lockError = String(err && err.message || err);
+    }
+    log('lockRequest');
+  });
+
+  document.addEventListener('pointerlockchange', function () {
+    S.lockChanges += 1;
+    S.locked = (document.pointerLockElement === pad);
+    log('pointerlockchange', { locked: S.locked });
+  });
+  document.addEventListener('pointerlockerror', function () {
+    S.lockError = 'pointerlockerror';
+    log('pointerlockerror');
+  });
+
+  // Raw movement deltas only make sense while locked.
+  document.addEventListener('mousemove', function (e) {
+    if (!S.locked) return;
+    S.lockMoves += 1;
+    S.lockDelta.x += (e.movementX || 0);
+    S.lockDelta.y += (e.movementY || 0);
+  });
+
+  // -------------------------------------------------------------------- touch
+  var tapStart = 0, tapMoved = false;
+
+  function trackTouches(e) {
+    S.activeTouches = e.touches ? e.touches.length : 0;
+    if (S.activeTouches > S.maxTouchPoints) S.maxTouchPoints = S.activeTouches;
+  }
+
+  pad.addEventListener('touchstart', function (e) {
+    e.preventDefault();
+    S.touchStarts += 1;
+    trackTouches(e);
+    tapStart = S.touchStarts; tapMoved = false;
+    var r = pad.getBoundingClientRect();
+    for (var i = 0; i < e.changedTouches.length; i++) {
+      var t = e.changedTouches[i];
+      if (S.touchPath.length < MAX_PATH) {
+        S.touchPath.push({ x: Math.round(t.clientX - r.left), y: Math.round(t.clientY - r.top), id: t.identifier });
+      }
+    }
+    log('touchstart', { touches: S.activeTouches });
+  }, { passive: false });
+
+  pad.addEventListener('touchmove', function (e) {
+    e.preventDefault();
+    S.touchMoves += 1;
+    tapMoved = true;
+    trackTouches(e);
+    var r = pad.getBoundingClientRect();
+    for (var i = 0; i < e.changedTouches.length; i++) {
+      var t = e.changedTouches[i];
+      if (S.touchPath.length < MAX_PATH) {
+        S.touchPath.push({ x: Math.round(t.clientX - r.left), y: Math.round(t.clientY - r.top), id: t.identifier });
+      }
+    }
+  }, { passive: false });
+
+  pad.addEventListener('touchend', function (e) {
+    e.preventDefault();
+    S.touchEnds += 1;
+    trackTouches(e);
+    if (!tapMoved && tapStart > 0) S.taps += 1;
+    log('touchend', { touches: S.activeTouches, taps: S.taps });
+  }, { passive: false });
+
+  pad.addEventListener('touchcancel', function (e) {
+    S.touchCancels += 1; trackTouches(e); log('touchcancel');
+  });
+
+  // ----------------------------------------------------------------- keyboard
+  function recordKey(type, e) {
+    var m = mods(e);
+    var rec = {
+      type: type, key: e.key, code: e.code, keyCode: e.keyCode,
+      location: e.location, repeat: !!e.repeat,
+      ctrl: m.ctrl, shift: m.shift, alt: m.alt, meta: m.meta
+    };
+    S.keys.push(rec);
+    if (S.keys.length > MAX_KEYS) S.keys.shift();
+    S.lastKey = rec;
+    S.modCtrl = m.ctrl; S.modShift = m.shift; S.modAlt = m.alt; S.modMeta = m.meta;
+    log(type, { key: e.key, code: e.code, keyCode: e.keyCode,
+                location: e.location, repeat: !!e.repeat,
+                ctrl: m.ctrl, shift: m.shift, alt: m.alt, meta: m.meta });
+  }
+
+  window.addEventListener('keydown', function (e) { S.keyDowns += 1; recordKey('keydown', e); }, true);
+  window.addEventListener('keyup', function (e) { S.keyUps += 1; recordKey('keyup', e); }, true);
+  window.addEventListener('keypress', function (e) { S.keyPresses += 1; recordKey('keypress', e); }, true);
+
+  // ------------------------------------------------------------------ gamepad
+  window.addEventListener('gamepadconnected', function (e) {
+    S.gamepadConnects += 1;
+    log('gamepadconnected', { id: e.gamepad && e.gamepad.id });
+  });
+
+  function pollGamepads() {
+    if (!navigator.getGamepads) return;
+    var list;
+    try { list = navigator.getGamepads(); } catch (err) { return; }
+    if (!list) return;
+    S.gamepadPolls += 1;
+    var out = [];
+    for (var i = 0; i < list.length; i++) {
+      var g = list[i];
+      if (!g) continue;
+      out.push({
+        index: g.index, id: g.id, connected: !!g.connected,
+        axes: Array.prototype.slice.call(g.axes || []),
+        buttons: Array.prototype.map.call(g.buttons || [], function (b) {
+          return { pressed: !!b.pressed, value: b.value };
+        })
+      });
+    }
+    // Only publish when something is actually attached.
+    if (out.length) S.gamepads = out;
+  }
+
+  // ------------------------------------------------------------------- reset
+  resetBtn.addEventListener('click', function () {
+    var fresh = blankState();
+    for (var k in fresh) {
+      if (Object.prototype.hasOwnProperty.call(fresh, k)) S[k] = fresh[k];
+    }
+    frames = 0;
+  });
+
+  // -------------------------------------------------------------- rAF driver
+  // rAF only, no timers: gamepad polling and the HUD must stay frame gated.
+  var frames = 0;
+  function frame() {
+    frames += 1;
+    S.frames = frames;
+    pollGamepads();
+    hud.textContent =
+      'clicks L/M/R=' + S.leftClicks + '/' + S.middleClicks + '/' + S.rightClicks +
+      ' total=' + S.totalClicks + ' dbl=' + S.dblClicks + ' clickCount=' + S.clickCount +
+      '\nmove=' + S.moves + ' at (' + S.lastX + ',' + S.lastY + ') hover=' + S.hovering +
+      ' enters=' + S.hoverEnters + ' leaves=' + S.hoverLeaves +
+      '\nwheel n=' + S.wheelEvents + ' dx=' + S.wheelDeltaX.toFixed(1) +
+      ' dy=' + S.wheelDeltaY.toFixed(1) + ' zoom=' + S.zoom +
+      '\ndrag n=' + S.drags + ' active=' + S.dragging + ' steps=' + S.dragSteps +
+      ' dist=' + S.dragDistance + ' path=' + S.dragPath.length +
+      '\nlock locked=' + S.locked + ' delta=(' + S.lockDelta.x + ',' + S.lockDelta.y +
+      ') moves=' + S.lockMoves +
+      '\ntouch start/move/end=' + S.touchStarts + '/' + S.touchMoves + '/' + S.touchEnds +
+      ' taps=' + S.taps + ' maxPoints=' + S.maxTouchPoints +
+      '\nkeys down/up=' + S.keyDowns + '/' + S.keyUps +
+      ' last=' + (S.lastKey ? S.lastKey.key + ' (' + S.lastKey.code + '/' + S.lastKey.keyCode + ')' : '-') +
+      '\ngamepads=' + S.gamepads.length + ' frames=' + frames;
+    requestAnimationFrame(frame);
+  }
+  S.frames = 0;
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -267,8 +267,18 @@ def _cooldown_remaining(name: str) -> int:
 
 
 def _call_provider(
-    name: str, query: str, num: int, timeout_seconds: float
+    name: str,
+    query: str,
+    num: int,
+    timeout_seconds: float,
+    record_state: bool = True,
 ) -> list[SearchResult]:
+    """Query one provider.
+
+    Diagnostic probes pass ``record_state=False`` so that a status check neither
+    puts a healthy provider into cooldown nor clears a cooldown that a real
+    search just set.
+    """
     provider = SEARCH_PROVIDERS[name]
     lock = _provider_locks[name]
     with lock:
@@ -279,9 +289,11 @@ def _call_provider(
         try:
             results = provider.search(query, num, timeout_seconds)
         except Exception as exc:
-            _set_provider_result(name, exc)
+            if record_state:
+                _set_provider_result(name, exc)
             raise
-        _set_provider_result(name, None)
+        if record_state:
+            _set_provider_result(name, None)
         return results
 
 
@@ -321,7 +333,7 @@ def _probe_engine(name: str, timeout_seconds: float, force: bool) -> dict:
             "error": state.get("last_error"),
         }
     try:
-        results = _call_provider(name, "python", 1, timeout_seconds)
+        results = _call_provider(name, "python", 1, timeout_seconds, record_state=False)
         return {
             "name": name,
             "available": bool(results),

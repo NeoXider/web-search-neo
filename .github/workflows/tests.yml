@@ -10,11 +10,19 @@ permissions:
 
 jobs:
   pytest:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.13"]
+        # Windows carries the companion bootstrap and the PowerShell launcher, so
+        # a green Linux-only run says nothing about the flagship path.
+        include:
+          - os: ubuntu-latest
+            python-version: "3.10"
+          - os: ubuntu-latest
+            python-version: "3.13"
+          - os: windows-latest
+            python-version: "3.13"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -23,4 +31,19 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements-dev.txt
-      - run: python -m pytest -q
+      - name: Run tests
+        run: python -m pytest -q --junit-xml=results.xml
+      - name: Fail if the browser suite silently skipped
+        shell: python
+        run: |
+          import sys
+          import xml.etree.ElementTree as ElementTree
+
+          suite = ElementTree.parse("results.xml").getroot().find("testsuite")
+          skipped = int(suite.get("skipped", "0"))
+          total = int(suite.get("tests", "0"))
+          print(f"{total} tests, {skipped} skipped")
+          # Every browser test skips itself when Chrome is missing, which would
+          # otherwise leave the suite green with no browser coverage at all.
+          if skipped > total // 4:
+              sys.exit(f"{skipped}/{total} tests skipped; Chrome was probably unavailable")

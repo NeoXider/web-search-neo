@@ -6,6 +6,7 @@ import atexit
 import base64
 from dataclasses import dataclass
 import json
+import logging
 import os
 import re
 import threading
@@ -15,12 +16,15 @@ import uuid
 
 from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
 
+from key_table import MODIFIER_BITS, resolve_key
+
 
 class ChromeBridgeError(RuntimeError):
     """Raised when the companion extension isn't connected or rejects a command."""
 
 
 CHROME_EXTENSION_ID = "ndbmcjhbdjpefojkoljacjhammmcigao"
+LOGGER = logging.getLogger("web_search_neo.bridge")
 
 
 @dataclass
@@ -105,20 +109,31 @@ class ChromeBridge:
                 self._connected.set()
             websocket.send(json.dumps({"type": "hello_ack", "protocol": 1}))
             for raw_message in websocket:
-                message = json.loads(raw_message)
+                try:
+                    message = json.loads(raw_message)
+                except (TypeError, ValueError):
+                    # One malformed frame must not tear down the whole session.
+                    LOGGER.warning("Chrome companion sent a frame that is not JSON")
+                    continue
                 message_type = message.get("type")
                 if message_type == "result":
                     request_id = str(message.get("id", ""))
                     with self._connection_lock:
                         pending = self._pending.get(request_id)
-                    if pending:
-                        pending.result = message.get("result")
-                        pending.error = message.get("error")
-                        pending.event.set()
+                    if pending is None:
+                        LOGGER.warning("Dropped a late bridge result for id %s", request_id)
+                        continue
+                    pending.result = message.get("result")
+                    pending.error = message.get("error")
+                    pending.event.set()
                 elif message_type == "ping":
                     websocket.send(json.dumps({"type": "pong", "at": time.time()}))
-        except Exception:
-            pass
+                else:
+                    LOGGER.warning("Ignored unknown bridge frame type %r", message_type)
+        except Exception as exc:
+            LOGGER.warning(
+                "Chrome companion connection ended: %s: %s", type(exc).__name__, exc
+            )
         finally:
             with self._connection_lock:
                 if self._connection is websocket:
@@ -215,8 +230,8 @@ class ChromeBridge:
         if server is not None:
             try:
                 server.shutdown()
-            except Exception:
-                pass
+            except Exception as exc:
+                LOGGER.warning("Chrome bridge shutdown failed: %s: %s", type(exc).__name__, exc)
 
 
 _bridge = ChromeBridge()
@@ -515,39 +530,15 @@ class ChromeBridgeDriver:
         )
 
     def perform_key_events(self, events: list[dict[str, Any]]) -> None:
-        aliases = {
-            "\ue007": ("Enter", "Enter", 13),
-            "\ue006": ("Enter", "Enter", 13),
-            "\ue00c": ("Escape", "Escape", 27),
-            "\ue004": ("Tab", "Tab", 9),
-            "\ue003": ("Backspace", "Backspace", 8),
-            "\ue017": ("Delete", "Delete", 46),
-            "\ue011": ("Home", "Home", 36),
-            "\ue010": ("End", "End", 35),
-            "\ue00e": ("PageUp", "PageUp", 33),
-            "\ue00f": ("PageDown", "PageDown", 34),
-            "\ue013": ("ArrowUp", "ArrowUp", 38),
-            "\ue015": ("ArrowDown", "ArrowDown", 40),
-            "\ue012": ("ArrowLeft", "ArrowLeft", 37),
-            "\ue014": ("ArrowRight", "ArrowRight", 39),
-            "\ue008": ("Shift", "ShiftLeft", 16),
-            "\ue009": ("Control", "ControlLeft", 17),
-            "\ue00a": ("Alt", "AltLeft", 18),
-            "\ue00d": (" ", "Space", 32),
-        }
-        modifier_bits = {"Shift": 8, "Control": 2, "Alt": 1}
         modifiers = self._modifier_mask
         for event in events:
             if event["type"] == "pause":
                 time.sleep(max(0.0, float(event.get("seconds", 0.0))))
                 continue
-            raw = str(event["key"])
-            key, code, key_code = aliases.get(
-                raw,
-                (raw, f"Key{raw.upper()}" if len(raw) == 1 and raw.isalpha() else raw, ord(raw.upper()) if len(raw) == 1 else 0),
-            )
+            shifted = bool(modifiers & MODIFIER_BITS["Shift"])
+            key, code, key_code, location = resolve_key(str(event["key"]), shifted=shifted)
             event_type = "keyDown" if event["type"] == "down" else "keyUp"
-            bit = modifier_bits.get(key, 0)
+            bit = MODIFIER_BITS.get(key, 0)
             if event_type == "keyDown":
                 modifiers |= bit
             params = {
@@ -557,8 +548,11 @@ class ChromeBridgeDriver:
                 "windowsVirtualKeyCode": key_code,
                 "nativeVirtualKeyCode": key_code,
                 "modifiers": modifiers,
+                "location": location,
+                "autoRepeat": bool(event.get("repeat", False)),
             }
             if event_type == "keyDown" and len(key) == 1 and not (modifiers & 3):
+                # Only a printable keypress carries text; Ctrl/Alt chords never do.
                 params["text"] = key
             self.execute_cdp_cmd("Input.dispatchKeyEvent", params)
             if event_type == "keyUp":
@@ -576,11 +570,109 @@ class ChromeBridgeDriver:
             self.bridge.request("console.get", {"tabId": self.tab_id}, timeout=5.0) or []
         )
 
+    def subscribe_events(
+        self,
+        domains: list[str] | tuple[str, ...] = ("console",),
+        *,
+        include_headers: bool = False,
+        limits: dict[str, int] | None = None,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        """Turn on console and/or network capture for this tab."""
+        params: dict[str, Any] = {
+            "tabId": self.tab_id,
+            "domains": [str(domain).lower() for domain in domains],
+            "include_headers": bool(include_headers),
+        }
+        if limits:
+            params["limits"] = {str(key): int(value) for key, value in limits.items()}
+        return dict(self.bridge.request("events.subscribe", params, timeout=timeout) or {})
+
+    def get_events(
+        self,
+        *,
+        kinds: list[str] | tuple[str, ...] | None = None,
+        since_seq: int = 0,
+        limit: int = 200,
+        level: str | list[str] | None = None,
+        contains: str | None = None,
+        url_pattern: str | None = None,
+        types: list[str] | tuple[str, ...] | None = None,
+        only_errors: bool = False,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        """Drain captured events; filtering happens inside the extension."""
+        params: dict[str, Any] = {
+            "tabId": self.tab_id,
+            "since_seq": int(since_seq),
+            "limit": int(limit),
+            "only_errors": bool(only_errors),
+        }
+        if kinds:
+            params["kinds"] = [str(kind).lower() for kind in kinds]
+        if level:
+            params["level"] = level if isinstance(level, str) else [str(item) for item in level]
+        if contains:
+            params["contains"] = str(contains)
+        if url_pattern:
+            params["url_pattern"] = str(url_pattern)
+        if types:
+            params["types"] = [str(item) for item in types]
+        return dict(self.bridge.request("events.get", params, timeout=timeout) or {})
+
+    def clear_events(
+        self,
+        kinds: list[str] | tuple[str, ...] | None = None,
+        *,
+        timeout: float = 5.0,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"tabId": self.tab_id}
+        if kinds:
+            params["kinds"] = [str(kind).lower() for kind in kinds]
+        return dict(self.bridge.request("events.clear", params, timeout=timeout) or {})
+
+    def unsubscribe_events(
+        self,
+        domains: list[str] | tuple[str, ...] | None = None,
+        *,
+        timeout: float = 5.0,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"tabId": self.tab_id}
+        if domains:
+            params["domains"] = [str(domain).lower() for domain in domains]
+        return dict(self.bridge.request("events.unsubscribe", params, timeout=timeout) or {})
+
+    def get_network_body(self, request_id: str, *, timeout: float = 15.0) -> dict[str, Any]:
+        """Fetch one response body; binary payloads come back as metadata only."""
+        return dict(
+            self.bridge.request(
+                "network.body",
+                {"tabId": self.tab_id, "requestId": str(request_id)},
+                timeout=timeout,
+            )
+            or {}
+        )
+
+    def close_tab(self, *, timeout: float = 5.0) -> dict[str, Any]:
+        """Detach and close the tab this driver owns."""
+        try:
+            return dict(
+                self.bridge.request("tabs.remove", {"tabId": self.tab_id}, timeout=timeout) or {}
+            )
+        except Exception as exc:
+            LOGGER.warning("Closing tab %s failed: %s: %s", self.tab_id, type(exc).__name__, exc)
+            return {"removed": False, "id": self.tab_id}
+
     def quit(self) -> None:
         try:
             self.bridge.request("debugger.detach", {"tabId": self.tab_id}, timeout=5.0)
-        except Exception:
-            pass
+        except Exception as exc:
+            LOGGER.warning(
+                "Detaching the debugger from tab %s failed: %s: %s",
+                self.tab_id,
+                type(exc).__name__,
+                exc,
+            )
 
 
 def list_current_chrome_tabs(wait_seconds: float = 1.0) -> dict[str, Any]:

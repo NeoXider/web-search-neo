@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixture: deterministic canvas platformer</title>
+<link rel="icon" href="data:,">
+
+<style>
+  body { margin: 0; padding: 12px; background: #10131a; color: #d7dde8;
+         font: 13px/1.4 monospace; }
+  h1 { font-size: 14px; margin: 0 0 8px; }
+  #game { background: #1b2130; border: 1px solid #3a4560; display: block; outline: none; }
+  #game:focus { box-shadow: 0 0 0 2px #4da3ff; }
+  #hud { margin: 8px 0 0; white-space: pre; }
+</style>
+</head>
+<body>
+<h1>platformer fixture &mdash; one requestAnimationFrame callback = exactly one physics tick</h1>
+<canvas id="game" tabindex="0" width="640" height="360"></canvas>
+<p id="hud">booting…</p>
+
+<script>
+(function () {
+  'use strict';
+
+  // ---------------------------------------------------------------- geometry
+  // All units are canvas pixels. Nothing here depends on real elapsed time.
+  var W = 640, H = 360;
+  var PLAYER_W = 20, PLAYER_H = 24;
+  var GROUND_Y = 300;                     // top surface of both platforms
+
+  var PLATFORMS = [
+    { x: 0,   y: GROUND_Y, w: 240 },      // start platform
+    { x: 340, y: GROUND_Y, w: 300 }       // landing platform, holds the finish
+  ];
+  // The pit sits between the two platforms. It cannot be walked across and it
+  // cannot be cleared by a standing jump: the player must hold "right" while
+  // jumping so horizontal speed carries it over the 100px gap.
+  var PIT = { x: 240, y: GROUND_Y, w: 100 };
+  var FINISH = { x: 520, y: GROUND_Y - 60, w: 40, h: 60 };
+  var START = { x: 40, y: GROUND_Y - PLAYER_H };
+
+  // ------------------------------------------------------- physics constants
+  // Per tick, never per millisecond. A tick is one rAF callback.
+  var SPEED = 5;        // px/tick while a horizontal key is held
+  var GRAVITY = 0.6;    // px/tick^2
+  var JUMP_V = -11;     // px/tick, applied once on the jump keypress
+  var KILL_Y = H + 40;  // falling past this respawns the player
+  var MAX_EVENTS = 400;
+  var MAX_DELTAS = 1000;
+
+  // Derived, for reference: apex = 11^2 / (2*0.6) ~= 100px,
+  // airtime ~= 2*11/0.6 ~= 37 ticks, horizontal reach ~= 37*5 = 185px > 100px pit.
+
+  var canvas = document.getElementById('game');
+  var ctx = canvas.getContext('2d');
+  var hud = document.getElementById('hud');
+
+  // ------------------------------------------------------------ public state
+  var game = {
+    frame: 0,          // rAF callbacks served
+    tick: 0,           // physics ticks executed (always === frame)
+    x: START.x,
+    y: START.y,
+    onGround: true,
+    won: false,
+    deaths: 0,
+    keysDown: [],      // raw key identifiers currently held
+    realDeltas: [],    // real wall-clock deltas in ms, diagnostics only
+    events: []         // [{ tick, type, ... }]
+  };
+  window.__game = game;
+
+  // ------------------------------------------------------------ input plumbing
+  var held = { left: false, right: false, jump: false };
+  var jumpQueued = false;   // edge trigger: set on keydown, consumed by one tick
+  var downIds = [];         // ordered list of held key identifiers
+
+  function actionFor(e) {
+    var k = e.key, c = e.code;
+    if (k === 'ArrowLeft' || c === 'ArrowLeft' || k === 'a' || k === 'A' || c === 'KeyA') return 'left';
+    if (k === 'ArrowRight' || c === 'ArrowRight' || k === 'd' || k === 'D' || c === 'KeyD') return 'right';
+    if (k === ' ' || k === 'Spacebar' || c === 'Space' ||
+        k === 'ArrowUp' || c === 'ArrowUp' || k === 'w' || k === 'W' || c === 'KeyW') return 'jump';
+    return null;
+  }
+
+  function idOf(e) { return e.code || e.key; }
+
+  function logEvent(type, extra) {
+    var rec = { tick: game.tick, type: type };
+    if (extra) { for (var k in extra) { if (Object.prototype.hasOwnProperty.call(extra, k)) rec[k] = extra[k]; } }
+    game.events.push(rec);
+    if (game.events.length > MAX_EVENTS) game.events.shift();
+  }
+
+  function onKeyDown(e) {
+    var action = actionFor(e);
+    var id = idOf(e);
+    if (downIds.indexOf(id) === -1) downIds.push(id);
+    game.keysDown = downIds.slice();
+    if (!action) return;
+    e.preventDefault();
+    if (action === 'jump') {
+      // Edge triggered: holding the key does not re-arm the jump.
+      if (!held.jump && !e.repeat) jumpQueued = true;
+      held.jump = true;
+    } else {
+      held[action] = true;
+    }
+    logEvent('keydown', { key: e.key, code: e.code, action: action, repeat: !!e.repeat });
+  }
+
+  function onKeyUp(e) {
+    var action = actionFor(e);
+    var id = idOf(e);
+    var i = downIds.indexOf(id);
+    if (i !== -1) downIds.splice(i, 1);
+    game.keysDown = downIds.slice();
+    if (!action) return;
+    e.preventDefault();
+    held[action] = false;
+    logEvent('keyup', { key: e.key, code: e.code, action: action });
+  }
+
+  // Listen on the canvas (it owns focus) and on window as a fallback so that
+  // synthetic events dispatched at document/body level are honoured too.
+  canvas.addEventListener('keydown', onKeyDown);
+  canvas.addEventListener('keyup', onKeyUp);
+  window.addEventListener('keydown', function (e) { if (e.target !== canvas) onKeyDown(e); });
+  window.addEventListener('keyup', function (e) { if (e.target !== canvas) onKeyUp(e); });
+  canvas.addEventListener('mousedown', function () { canvas.focus(); });
+
+  // ------------------------------------------------------------------ physics
+  var p = { x: START.x, y: START.y, vy: 0, onGround: true };
+  var wasOnGround = true;
+
+  function respawn() {
+    p.x = START.x; p.y = START.y; p.vy = 0; p.onGround = true;
+    held.left = held.right = false;   // clear latched movement on death
+    jumpQueued = false;
+  }
+
+  function step() {
+    game.tick += 1;
+
+    // 1. horizontal movement (also applies mid-air, so a running jump works)
+    if (held.left) p.x -= SPEED;
+    if (held.right) p.x += SPEED;
+    if (p.x < 0) p.x = 0;
+    if (p.x > W - PLAYER_W) p.x = W - PLAYER_W;
+
+    // 2. jump, only from the ground and only on the press edge
+    if (jumpQueued) {
+      if (p.onGround) { p.vy = JUMP_V; p.onGround = false; logEvent('jump', { x: p.x }); }
+      jumpQueued = false;
+    }
+
+    // 3. gravity + vertical integration (fixed step, delta is ignored)
+    var prevBottom = p.y + PLAYER_H;
+    p.vy += GRAVITY;
+    p.y += p.vy;
+    var bottom = p.y + PLAYER_H;
+
+    // 4. one-way platform landing: only while falling and only from above
+    p.onGround = false;
+    if (p.vy >= 0) {
+      for (var i = 0; i < PLATFORMS.length; i++) {
+        var pl = PLATFORMS[i];
+        var overlaps = (p.x + PLAYER_W > pl.x) && (p.x < pl.x + pl.w);
+        if (overlaps && prevBottom <= pl.y && bottom >= pl.y) {
+          p.y = pl.y - PLAYER_H;
+          p.vy = 0;
+          p.onGround = true;
+          break;
+        }
+      }
+    }
+    if (p.onGround && !wasOnGround) logEvent('land', { x: p.x });
+    wasOnGround = p.onGround;
+
+    // 5. pit / out of bounds
+    if (p.y > KILL_Y) {
+      game.deaths += 1;
+      logEvent('death', { x: p.x, deaths: game.deaths });
+      respawn();
+      wasOnGround = true;
+    }
+
+    // 6. finish line
+    if (!game.won && p.x + PLAYER_W >= FINISH.x) {
+      game.won = true;
+      logEvent('win', { x: p.x, tick: game.tick });
+    }
+
+    game.x = p.x;
+    game.y = p.y;
+    game.onGround = p.onGround;
+  }
+
+  // ------------------------------------------------------------------ drawing
+  function draw() {
+    ctx.fillStyle = '#1b2130';
+    ctx.fillRect(0, 0, W, H);
+
+    // pit
+    ctx.fillStyle = '#0a0d14';
+    ctx.fillRect(PIT.x, PIT.y, PIT.w, H - PIT.y);
+
+    // platforms
+    ctx.fillStyle = '#3d4c66';
+    for (var i = 0; i < PLATFORMS.length; i++) {
+      var pl = PLATFORMS[i];
+      ctx.fillRect(pl.x, pl.y, pl.w, H - pl.y);
+    }
+
+    // finish zone
+    ctx.fillStyle = game.won ? '#4ade80' : '#facc15';
+    ctx.fillRect(FINISH.x, FINISH.y, FINISH.w, FINISH.h);
+
+    // player
+    ctx.fillStyle = '#4da3ff';
+    ctx.fillRect(p.x, p.y, PLAYER_W, PLAYER_H);
+
+    ctx.fillStyle = '#d7dde8';
+    ctx.font = '12px monospace';
+    ctx.fillText('tick ' + game.tick + '  x ' + p.x.toFixed(0) + '  y ' + p.y.toFixed(0) +
+                 '  ground ' + (p.onGround ? 1 : 0) + '  deaths ' + game.deaths +
+                 (game.won ? '  WON' : ''), 8, 18);
+  }
+
+  // -------------------------------------------------------------- rAF driver
+  // Exactly one physics tick per rAF callback. The real timestamp delta is
+  // recorded but never fed into the simulation, so stepping frames manually
+  // (CDP frame gating) reproduces the same trajectory every run.
+  var lastTs = null;
+  function frame(ts) {
+    game.frame += 1;
+    if (typeof ts === 'number') {
+      if (lastTs !== null) {
+        game.realDeltas.push(ts - lastTs);
+        if (game.realDeltas.length > MAX_DELTAS) game.realDeltas.shift();
+      }
+      lastTs = ts;
+    }
+    step();
+    draw();
+    hud.textContent = 'frame=' + game.frame + ' tick=' + game.tick +
+                      ' x=' + game.x.toFixed(1) + ' y=' + game.y.toFixed(1) +
+                      ' onGround=' + game.onGround + ' won=' + game.won +
+                      ' deaths=' + game.deaths + ' keys=[' + game.keysDown.join(',') + ']';
+    requestAnimationFrame(frame);
+  }
+
+  draw();
+  canvas.focus();
+  window.addEventListener('load', function () { canvas.focus(); });
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

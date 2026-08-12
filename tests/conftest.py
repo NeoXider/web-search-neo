@@ -12,6 +12,7 @@ import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+FIXTURE_ROOT = (PROJECT_ROOT / "tests" / "fixtures").resolve()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -49,8 +50,44 @@ def local_site() -> LocalSite:
             self.end_headers()
             self.wfile.write(payload)
 
+        def _send_file(self, relative: str) -> None:
+            candidate = (FIXTURE_ROOT / relative).resolve()
+            if not candidate.is_file() or FIXTURE_ROOT not in candidate.parents:
+                self._send_html("<html><body>fixture not found</body></html>", status=404)
+                return
+            payload = candidate.read_bytes()
+            content_type = {
+                ".html": "text/html; charset=utf-8",
+                ".js": "text/javascript; charset=utf-8",
+                ".css": "text/css; charset=utf-8",
+            }.get(candidate.suffix, "application/octet-stream")
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def _send_redirect(self, location: str, status: int) -> None:
+            self.send_response(status)
+            self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
             parsed = urlparse(self.path)
+            if parsed.path.startswith("/fixtures/"):
+                self._send_file(parsed.path[len("/fixtures/") :])
+                return
+            if parsed.path == "/redirect-loop":
+                self._send_redirect("/redirect-loop", 302)
+                return
+            if parsed.path == "/redirect":
+                query = parse_qs(parsed.query)
+                self._send_redirect(
+                    query.get("to", ["/relative"])[0],
+                    int(query.get("status", ["302"])[0]),
+                )
+                return
             if parsed.path == "/page":
                 self._send_html(
                     """<!doctype html>

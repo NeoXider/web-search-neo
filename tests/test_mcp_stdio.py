@@ -42,11 +42,19 @@ def test_stdio_server_exposes_compact_discovery_and_action_tools(local_site):
                 assert capabilities["public_tools"] == ["web_info", "web_action"]
                 assert capabilities["action_groups"]["game"] == [
                     "input",
+                    "pointer",
+                    "touch",
+                    "touch_emulation",
+                    "pointer_lock",
                     "render",
                     "step",
                     "release_inputs",
                 ]
                 assert "action_types" not in capabilities
+                # The contract must stand alone, with no external skill file.
+                assert capabilities["recipes"]["game"]
+                assert capabilities["pitfalls"]
+                assert capabilities["actions"]["input"]
 
                 input_schema = unpack(
                     await session.call_tool(

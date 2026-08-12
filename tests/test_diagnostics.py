@@ -1,0 +1,480 @@
+"""Console and network capture: the pure filters and the live Chrome path."""
+
+from __future__ import annotations
+
+import json
+import time
+
+import pytest
+from selenium.common.exceptions import WebDriverException
+
+import browser_tools
+import diagnostics
+
+
+def _open_or_skip(url: str, session_id: str, **kwargs):
+    # Keep the deterministic suite in the background while production defaults visible.
+    kwargs.setdefault("headless", True)
+    kwargs.setdefault("profile_mode", "temporary")
+    try:
+        return browser_tools.open_page(url, session_id=session_id, **kwargs)
+    except WebDriverException as exc:
+        pytest.skip(f"Chrome/Selenium is unavailable: {exc}")
+
+
+def _console_entry(seq: int, level: str, text: str, kind: str = "console", url: str | None = None):
+    return {"seq": seq, "ts": seq, "kind": kind, "level": level, "text": text, "url": url}
+
+
+CONSOLE_SAMPLE = [
+    _console_entry(1, "debug", "starting up"),
+    _console_entry(2, "info", "loaded level one"),
+    _console_entry(3, "warn", "texture missing"),
+    _console_entry(4, "error", "Uncaught TypeError: boom", kind="exception"),
+    _console_entry(5, "error", "failed to load", kind="browser", url="http://host/sprite.png"),
+    _console_entry(6, "info", "level one complete"),
+]
+
+
+def test_filter_console_selects_by_level():
+    selected = diagnostics.filter_console(CONSOLE_SAMPLE, levels=["error"])
+    assert [item["seq"] for item in selected] == [4, 5]
+    assert [item["seq"] for item in diagnostics.filter_console(CONSOLE_SAMPLE, levels=["ERROR", "warn"])] == [3, 4, 5]
+    assert diagnostics.filter_console(CONSOLE_SAMPLE, levels=["nothing"]) == []
+
+
+def test_filter_console_selects_by_kind_and_substring():
+    assert [
+        item["seq"] for item in diagnostics.filter_console(CONSOLE_SAMPLE, kinds=["exception"])
+    ] == [4]
+    assert [
+        item["seq"] for item in diagnostics.filter_console(CONSOLE_SAMPLE, kinds=["console", "browser"])
+    ] == [1, 2, 3, 5, 6]  # input order is preserved, nothing is re-sorted
+    # `contains` is case insensitive and also searches the url of an entry.
+    assert [item["seq"] for item in diagnostics.filter_console(CONSOLE_SAMPLE, contains="LEVEL ONE")] == [2, 6]
+    assert [item["seq"] for item in diagnostics.filter_console(CONSOLE_SAMPLE, contains="sprite.png")] == [5]
+    assert diagnostics.filter_console(CONSOLE_SAMPLE, contains="nothing at all") == []
+
+
+def test_filter_console_combines_filters_and_keeps_the_newest_entries():
+    assert [
+        item["seq"]
+        for item in diagnostics.filter_console(CONSOLE_SAMPLE, levels=["error"], kinds=["browser"])
+    ] == [5]
+    assert [item["seq"] for item in diagnostics.filter_console(CONSOLE_SAMPLE, limit=2)] == [5, 6]
+    assert [item["seq"] for item in diagnostics.filter_console(CONSOLE_SAMPLE, limit=0)] == [6]
+    assert len(diagnostics.filter_console(CONSOLE_SAMPLE, limit=99)) == len(CONSOLE_SAMPLE)
+
+
+NETWORK_SAMPLE = [
+    {"id": "1", "method": "GET", "url": "http://host/index.html", "type": "Document",
+     "status": 200, "ms": 12, "size": 2048},
+    {"id": "2", "method": "GET", "url": "http://host/app.js", "type": "Script",
+     "status": 304, "ms": 3, "size": 0},
+    {"id": "3", "method": "POST", "url": "http://host/api/save", "type": "XHR",
+     "status": 500, "ms": 40, "size": 120},
+    {"id": "4", "method": "GET", "url": "http://host/sprite.png", "type": "Image",
+     "status": 404, "ms": 7, "size": 30},
+    {"id": "5", "method": "GET", "url": "http://cdn.host/track.js", "type": "Script",
+     "status": None, "ms": 9, "failed": True, "error": "net::ERR_BLOCKED_BY_CLIENT"},
+]
+
+
+def test_filter_network_keeps_only_failures_and_bad_statuses():
+    selected = diagnostics.filter_network(NETWORK_SAMPLE, only_errors=True)
+    assert [item["id"] for item in selected] == ["3", "4", "5"]
+    assert [item["id"] for item in diagnostics.filter_network(NETWORK_SAMPLE)] == [
+        "1", "2", "3", "4", "5"
+    ]
+
+
+def test_filter_network_matches_urls_types_and_status_ranges():
+    assert [item["id"] for item in diagnostics.filter_network(NETWORK_SAMPLE, url_pattern=r"\.js$")] == ["2", "5"]
+    assert [item["id"] for item in diagnostics.filter_network(NETWORK_SAMPLE, url_pattern="CDN.HOST")] == ["5"]
+    # An unusable regex must degrade to a literal search, never raise.
+    assert diagnostics.filter_network(NETWORK_SAMPLE, url_pattern="api/save[") == []
+    assert [item["id"] for item in diagnostics.filter_network(NETWORK_SAMPLE, types=["script"])] == ["2", "5"]
+    assert [item["id"] for item in diagnostics.filter_network(NETWORK_SAMPLE, types=["Image", "XHR"])] == ["3", "4"]
+    assert [item["id"] for item in diagnostics.filter_network(NETWORK_SAMPLE, status_min=400)] == ["3", "4"]
+    assert [item["id"] for item in diagnostics.filter_network(NETWORK_SAMPLE, status_min=200, status_max=399)] == ["1", "2"]
+    assert [
+        item["id"]
+        for item in diagnostics.filter_network(NETWORK_SAMPLE, types=["XHR"], only_errors=True, limit=1)
+    ] == ["3"]
+
+
+def test_format_network_renders_one_compact_line_per_request():
+    lines = diagnostics.format_network(NETWORK_SAMPLE)
+    assert len(lines) == len(NETWORK_SAMPLE)
+    assert lines[0].split() == ["GET", "200", "Document", "12ms", "2.0KB", "http://host/index.html"]
+    # A zero-byte response drops the size column instead of printing "0KB".
+    assert lines[1].split() == ["GET", "304", "Script", "3ms", "http://host/app.js"]
+    assert lines[3].split() == ["GET", "404", "Image", "7ms", "0.0KB", "http://host/sprite.png"]
+    # A failure has no status, so the column reads ERR and carries the reason.
+    assert lines[4].split() == [
+        "GET", "ERR", "Script", "9ms", "net::ERR_BLOCKED_BY_CLIENT", "http://cdn.host/track.js"
+    ]
+    assert diagnostics.format_network([]) == []
+
+
+class _FakeLogDriver:
+    """Serves one canned ``get_log`` batch per call, like ChromeDriver does."""
+
+    def __init__(self, batches: list[list[dict]], log_name: str = "performance"):
+        self.batches = list(batches)
+        self.log_name = log_name
+        self.requested: list[str] = []
+
+    def get_log(self, name: str) -> list[dict]:
+        self.requested.append(name)
+        if name != self.log_name:
+            return []
+        return self.batches.pop(0) if self.batches else []
+
+
+def _perf(method: str, params: dict) -> dict:
+    return {"message": json.dumps({"message": {"method": method, "params": params}})}
+
+
+def _will_be_sent(request_id: str, url: str, method: str = "GET", kind: str = "Document") -> dict:
+    return _perf(
+        "Network.requestWillBeSent",
+        {
+            "requestId": request_id,
+            "wallTime": 1_700_000_000.5,
+            "timestamp": 100.0,
+            "type": kind,
+            "documentURL": url,
+            "initiator": {"type": "parser"},
+            "request": {"method": method, "url": url},
+        },
+    )
+
+
+def test_selenium_network_rows_folds_three_events_into_one_row():
+    driver = _FakeLogDriver(
+        [
+            [
+                _will_be_sent("REQ-1", "http://host/index.html"),
+                _perf(
+                    "Network.responseReceived",
+                    {
+                        "requestId": "REQ-1",
+                        "type": "Document",
+                        "response": {
+                            "status": 200,
+                            "mimeType": "text/html",
+                            "remoteIPAddress": "127.0.0.1",
+                            "fromDiskCache": False,
+                        },
+                    },
+                ),
+                _perf(
+                    "Network.loadingFinished",
+                    {"requestId": "REQ-1", "timestamp": 100.25, "encodedDataLength": 4096},
+                ),
+            ]
+        ]
+    )
+    pending: dict = {}
+    rows = diagnostics.selenium_network_rows(driver, pending)
+
+    assert driver.requested == ["performance"]
+    assert pending == {}  # a finished request leaves nothing behind
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["kind"] == "network"
+    assert row["id"] == "REQ-1"
+    assert row["method"] == "GET"
+    assert row["url"] == "http://host/index.html"
+    assert row["type"] == "Document"
+    assert row["status"] == 200
+    assert row["mime"] == "text/html"
+    assert row["remote"] == "127.0.0.1"
+    assert row["from_cache"] is False
+    assert row["initiator"] == "parser"
+    assert row["size"] == 4096
+    assert row["ms"] == 250
+    assert row["ts"] == 1_700_000_000_500
+    assert row["done"] is True
+    assert row["level"] == "info"
+    assert row["text"] == "GET 200 http://host/index.html"
+
+
+def test_selenium_network_rows_carries_partial_rows_between_calls():
+    driver = _FakeLogDriver(
+        [
+            [_will_be_sent("REQ-2", "http://host/api", method="POST", kind="XHR")],
+            [
+                _perf(
+                    "Network.responseReceived",
+                    {"requestId": "REQ-2", "type": "XHR", "response": {"status": 503}},
+                ),
+                _perf(
+                    "Network.loadingFinished",
+                    {"requestId": "REQ-2", "timestamp": 100.05, "encodedDataLength": 12},
+                ),
+            ],
+        ]
+    )
+    pending: dict = {}
+
+    assert diagnostics.selenium_network_rows(driver, pending) == []
+    assert list(pending) == ["REQ-2"]  # the start survives until the request ends
+
+    rows = diagnostics.selenium_network_rows(driver, pending)
+    assert pending == {}
+    assert [(row["method"], row["status"], row["level"], row["ms"]) for row in rows] == [
+        ("POST", 503, "error", 50)
+    ]
+
+
+def test_selenium_network_rows_reports_a_failed_request():
+    driver = _FakeLogDriver(
+        [
+            [
+                _will_be_sent("REQ-3", "http://cdn/track.js", kind="Script"),
+                _perf(
+                    "Network.loadingFailed",
+                    {
+                        "requestId": "REQ-3",
+                        "timestamp": 100.01,
+                        "errorText": "net::ERR_BLOCKED_BY_CLIENT",
+                        "canceled": False,
+                        "blockedReason": "other",
+                    },
+                ),
+            ]
+        ]
+    )
+    rows = diagnostics.selenium_network_rows(driver, {})
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["failed"] is True
+    assert row["done"] is True
+    assert row["status"] is None
+    assert row["error"] == "net::ERR_BLOCKED_BY_CLIENT"
+    assert row["canceled"] is False
+    assert row["blocked_reason"] == "other"
+    assert row["level"] == "error"
+    assert row["text"] == "GET --- http://cdn/track.js"
+    assert diagnostics.format_network(rows)[0].endswith(
+        "net::ERR_BLOCKED_BY_CLIENT http://cdn/track.js"
+    )
+
+
+def test_selenium_network_rows_ignores_unusable_messages():
+    driver = _FakeLogDriver(
+        [
+            [
+                {"message": "not json at all"},
+                {"nothing": "useful"},
+                _perf("Page.frameNavigated", {"requestId": "REQ-4"}),
+                _perf("Network.loadingFinished", {"requestId": "unknown", "timestamp": 1.0}),
+                _perf("Network.responseReceived", {"requestId": "unknown", "response": {}}),
+            ]
+        ]
+    )
+    pending: dict = {}
+    assert diagnostics.selenium_network_rows(driver, pending) == []
+    assert pending == {}
+
+
+def test_selenium_network_rows_survives_a_driver_without_a_performance_log():
+    class _NoLogDriver:
+        def get_log(self, name: str):
+            raise WebDriverException("performance log is not enabled")
+
+    assert diagnostics.selenium_network_rows(_NoLogDriver(), {}) == []
+
+
+def test_selenium_browser_log_splits_the_location_prefix():
+    driver = _FakeLogDriver(
+        [
+            [
+                {
+                    "level": "SEVERE",
+                    "timestamp": 1700,
+                    "source": "javascript",
+                    "message": "http://host/app.js 12:34 Uncaught Error: boom",
+                },
+                {"level": "WARNING", "timestamp": 1701, "message": "deprecated api"},
+            ]
+        ],
+        log_name="browser",
+    )
+    entries = diagnostics.selenium_browser_log(driver)
+    assert entries[0] == {
+        "seq": 0,
+        "ts": 1700,
+        "kind": "browser",
+        "level": "error",
+        "source": "javascript",
+        "text": "Uncaught Error: boom",
+        "url": "http://host/app.js",
+        "line": 12,
+        "col": 34,
+        "args": [],
+        "stack": [],
+    }
+    assert entries[1]["level"] == "warn"
+    assert entries[1]["text"] == "deprecated api"
+    assert entries[1]["url"] is None
+    assert entries[1]["source"] == "other"
+
+
+def test_read_page_console_installs_the_hook_when_it_is_missing():
+    class _HookDriver:
+        def __init__(self):
+            self.scripts: list[str] = []
+            self.installed = False
+
+        def execute_script(self, script: str, *args):
+            self.scripts.append(script)
+            if script is diagnostics.CONSOLE_HOOK_SCRIPT:
+                self.installed = True
+                return None
+            if not self.installed:
+                return {"entries": [], "next_seq": 0, "dropped": 0, "installed": False}
+            return {
+                "entries": [{"seq": 7, "level": "info", "text": "hello"}],
+                "next_seq": 7,
+                "dropped": 2,
+                "installed": True,
+            }
+
+    driver = _HookDriver()
+    assert diagnostics.read_page_console(driver) == {"entries": [], "next_seq": 0, "dropped": 0}
+    assert driver.scripts[-1] is diagnostics.CONSOLE_HOOK_SCRIPT
+
+    payload = diagnostics.read_page_console(driver, since_seq=3, clear=True)
+    assert payload["entries"][0]["text"] == "hello"
+    assert payload["next_seq"] == 7
+    assert payload["dropped"] == 2
+
+
+def test_console_reports_logs_errors_and_uncaught_exceptions(local_site):
+    # No step mode here: gated timers would hold the setTimeout that throws.
+    _open_or_skip(f"{local_site.base_url}/page", "console-live")
+    driver = browser_tools._get_session("console-live").driver
+    try:
+        driver.execute_script(
+            "console.log('hello-info-marker', 42);"
+            "console.warn('careful-warn-marker');"
+            "console.error('boom-error-marker');"
+        )
+        # Raised from an inline page script so the error event keeps its message
+        # instead of collapsing into an opaque cross-origin "Script error.".
+        driver.execute_script(
+            "const script = document.createElement('script');"
+            "script.textContent = \"setTimeout(function () {"
+            " throw new Error('uncaught-marker'); }, 0);\";"
+            "document.body.appendChild(script);"
+        )
+
+        entries: list[dict] = []
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            payload = browser_tools.get_console("console-live", limit=200)
+            assert payload["success"] is True
+            entries.extend(payload["entries"])
+            if any(item.get("kind") == "exception" for item in entries):
+                break
+            time.sleep(0.05)
+
+        by_kind = {item["kind"] for item in entries}
+        assert "console" in by_kind
+        hooked = [item for item in entries if item["kind"] == "console"]
+        levels = {item["text"]: item["level"] for item in hooked}
+        assert levels["hello-info-marker 42"] == "info"
+        assert levels["careful-warn-marker"] == "warn"
+        assert levels["boom-error-marker"] == "error"
+        assert [item for item in hooked if item["text"].startswith("hello")][0]["args"] == [
+            "hello-info-marker",
+            "42",
+        ]
+
+        crashes = [item for item in entries if item["kind"] == "exception"]
+        assert crashes, "the uncaught exception never reached the console buffer"
+        assert crashes[0]["level"] == "error"
+        assert crashes[0]["source"] == "javascript"
+        assert "uncaught-marker" in crashes[0]["text"]
+    finally:
+        browser_tools.close_session("console-live")
+
+
+def test_console_level_filter_drops_everything_below_error(local_site):
+    _open_or_skip(f"{local_site.base_url}/page", "console-filter")
+    driver = browser_tools._get_session("console-filter").driver
+    try:
+        browser_tools.get_console("console-filter", limit=200)  # move the cursor past the load
+        driver.execute_script(
+            "console.log('quiet-info-marker');"
+            "console.info('another-info-marker');"
+            "console.error('loud-error-marker');"
+        )
+        payload = browser_tools.get_console("console-filter", levels=["error"], limit=50)
+        assert payload["levels"] == ["error"]
+        texts = " | ".join(item["text"] for item in payload["entries"])
+        assert "loud-error-marker" in texts
+        assert "quiet-info-marker" not in texts
+        assert "another-info-marker" not in texts
+        assert {item["level"] for item in payload["entries"]} == {"error"}
+        assert payload["returned"] == len(payload["entries"])
+    finally:
+        browser_tools.close_session("console-filter")
+
+
+def test_network_lists_the_document_and_isolates_the_failing_request(local_site):
+    _open_or_skip(f"{local_site.base_url}/page", "network-live")
+    driver = browser_tools._get_session("network-live").driver
+    try:
+        driver.execute_script(
+            "window.__done = 0;"
+            "fetch('/definitely-missing-path').then(r => r.text())"
+            " .then(() => { window.__done += 1; });"
+            "const image = new Image();"
+            "image.onerror = image.onload = () => { window.__done += 1; };"
+            "image.src = '/missing-image.png';"
+        )
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and driver.execute_script("return window.__done;") < 2:
+            time.sleep(0.05)
+        assert driver.execute_script("return window.__done;") == 2
+
+        rows: list[dict] = []
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            rows = browser_tools.get_network("network-live", output="json", limit=100)["requests"]
+            if len(rows) >= 3:
+                break
+            time.sleep(0.1)
+
+        by_url = {row["url"].rsplit("/", 1)[-1]: row for row in rows}
+        document = by_url["page"]
+        assert document["method"] == "GET"
+        assert document["status"] == 200
+        assert document["type"] == "Document"
+        assert document["level"] == "info"
+        assert document["size"] > 0
+        assert document["done"] is True
+        assert by_url["definitely-missing-path"]["status"] == 404
+        assert by_url["definitely-missing-path"]["level"] == "error"
+
+        failures = browser_tools.get_network("network-live", only_errors=True, limit=50)
+        assert failures["only_errors"] is True
+        assert failures["format"] == "method status type ms size url"
+        assert failures["returned"] == len(failures["requests"])
+        assert failures["requests"]  # the 404s, and only those
+        assert all("404" in line for line in failures["requests"])
+        assert all("/page" not in line for line in failures["requests"])
+        assert any("definitely-missing-path" in line for line in failures["requests"])
+        assert any("missing-image.png" in line for line in failures["requests"])
+
+        documents = browser_tools.get_network("network-live", types=["Document"], output="json")
+        assert [row["url"] for row in documents["requests"]] == [document["url"]]
+        assert browser_tools.get_network(
+            "network-live", url_pattern="never-requested", output="json"
+        )["requests"] == []
+    finally:
+        browser_tools.close_session("network-live")

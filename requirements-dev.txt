@@ -1,3 +1,5 @@
 -r requirements.txt
 pytest>=9,<10
 pytest-cov>=7,<8
+# A hung browser session would otherwise stall CI until the job time limit.
+pytest-timeout>=2.4,<3

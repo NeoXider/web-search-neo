@@ -1,6 +1,28 @@
+[project]
+name = "web-search-neo"
+version = "1.2.0"
+description = "Free API-keyless web search and visible Chrome automation for AI agents over MCP."
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+license = { text = "MIT" }
+dependencies = [
+    "mcp>=1.29,<1.30",
+    "pydantic-settings>=2.14,<2.15",
+    "ddgs>=9.14,<10",
+    "requests>=2.32,<3",
+    "beautifulsoup4>=4.13,<5",
+    "selenium>=4.34,<5",
+    "websockets>=15,<18",
+    "pywinauto>=0.6.9,<0.7; platform_system == 'Windows'",
+]
+
+[project.urls]
+Homepage = "https://github.com/NeoXider/web-search-neo"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+# No single test needs two minutes; anything longer is a hung browser session.
+addopts = "-ra --strict-markers --timeout=120"
 markers = [
-    "live: tests that call public internet services",
+    "live: tests that call public internet services or a local model server",
 ]

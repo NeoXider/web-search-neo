@@ -266,6 +266,45 @@ def test_live_status_probes_providers_concurrently_and_caches(monkeypatch):
     assert sorted(calls) == sorted(names)
 
 
+def test_live_status_probe_does_not_cool_down_the_real_search_path(monkeypatch):
+    """A diagnostic status check must never disable a provider for real searches."""
+    names = ["duckduckgo", "brave"]
+    monkeypatch.setattr(msp_search, "ENGINE_ORDER", names)
+    monkeypatch.setattr(msp_search, "_provider_locks", {name: threading.Lock() for name in names})
+    attempts = []
+
+    def challenged(_query, _num, _timeout):
+        attempts.append("duckduckgo")
+        if len(attempts) == 1:
+            raise msp_search.SearchProviderError("CAPTCHA", "challenge")
+        return RESULT
+
+    monkeypatch.setitem(msp_search.SEARCH_PROVIDERS, "duckduckgo", _provider("duckduckgo", challenged))
+    monkeypatch.setitem(msp_search.SEARCH_PROVIDERS, "brave", _provider("brave", lambda *_a: RESULT))
+
+    status = msp_search.get_search_engines_status(force_refresh=True)
+    challenged_engine = next(item for item in status["engines"] if item["name"] == "duckduckgo")
+    assert challenged_engine["state"] == "challenge"
+    assert challenged_engine["cooldown_seconds"] == 0
+    assert msp_search._cooldown_remaining("duckduckgo") == 0
+
+    response = msp_search.search_web("query", engine="duckduckgo", fallback=False)
+    assert response["engine_used"] == "duckduckgo"
+    assert len(attempts) == 2
+
+
+def test_real_search_challenge_still_records_cooldown(monkeypatch):
+    monkeypatch.setattr(msp_search, "ENGINE_ORDER", ["duckduckgo"])
+    monkeypatch.setattr(msp_search, "_provider_locks", {"duckduckgo": threading.Lock()})
+
+    def blocked(*_args):
+        raise msp_search.SearchProviderError("CAPTCHA", "challenge")
+
+    monkeypatch.setitem(msp_search.SEARCH_PROVIDERS, "duckduckgo", _provider("duckduckgo", blocked))
+    msp_search.search_web("query", engine="duckduckgo", fallback=False)
+    assert msp_search._cooldown_remaining("duckduckgo") > 0
+
+
 def test_new_provider_registration_updates_dispatch_and_invalidates_status(monkeypatch):
     monkeypatch.setattr(msp_search, "SEARCH_PROVIDERS", dict(msp_search.SEARCH_PROVIDERS))
     monkeypatch.setattr(msp_search, "ENGINE_ORDER", list(msp_search.ENGINE_ORDER))

@@ -83,6 +83,10 @@ If an older prompt or client still requires the previous individual tool names, 
 
 ### Optional Codex-compatible skill
 
+The server describes itself: `web_info()` with no arguments returns every action with its
+parameters, the observation topics, recipes, pitfalls, limits, and examples. Installing the
+skill is therefore optional.
+
 Copy the bundled skill to the local Codex skill directory and restart Codex:
 
 ```powershell
@@ -147,6 +151,16 @@ available, install manually:
 2. Enable **Developer mode**.
 3. Choose **Load unpacked** and select the repository's `chrome-extension` folder.
 4. Leave **Web Search Neo Companion** enabled and restart/toggle the MCP server.
+
+The bundled companion is version 1.2.0 and declares four permissions: `debugger`, `storage`,
+`tabs`, and `tabGroups`. `storage` is new in 1.2.0 and holds the extension's own session
+state. There are no content scripts and no `host_permissions`; page access comes from
+`debugger`, which attaches the Chrome DevTools Protocol to the tabs the agent drives.
+
+If the companion was already installed from an earlier revision, Chrome keeps running the
+old service worker until you press **Reload** on its card at `chrome://extensions`. Do that
+after every `git pull`. Without it the new console, network, and tab-close bridge commands
+come back as unknown methods.
 
 Verify it with `web_info(topic="browser_status")`; `current_chrome.connected`
 should be `true`. List tabs with `web_info(topic="browser_tabs")`, then claim an
@@ -259,7 +273,31 @@ git pull --ff-only
 python -m pip install -r requirements.txt
 ```
 
-Restart or toggle the MCP server after updating.
+Restart or toggle the MCP server after updating. If you use the companion extension, also
+open `chrome://extensions` and press **Reload** on **Web Search Neo Companion**, so Chrome
+picks up the new unpacked source instead of keeping the previously loaded service worker.
+
+## Optional environment variables
+
+Set these for the MCP server process before it starts.
+
+| Variable | Effect |
+| --- | --- |
+| `WEB_SEARCH_NEO_REGION` | DDGS region for search, default `us-en`. |
+| `WEB_SEARCH_NEO_PROXY` | Proxy for HTTP fetches, search, and browser sessions. |
+| `WEB_SEARCH_NEO_BROWSER_USER_AGENT` | Override the User-Agent of rendered sessions. |
+| `WEB_SEARCH_NEO_PROFILE_ROOT` | Root directory for `persistent` Chrome profiles. |
+| `WEB_SEARCH_NEO_DEBUGGER_ADDRESS` | Default DevTools address for `attach` mode. |
+| `WEB_SEARCH_NEO_BRIDGE_PORT` | Loopback port of the companion bridge, default `8765`. |
+| `WEB_SEARCH_NEO_ALLOW_PLAIN_HTTP` | Accept unencrypted `http://` to public hosts. |
+| `WEB_SEARCH_NEO_LEGACY_TOOLS` | Advertise the former wide tool list instead of the two compact tools. |
+
+`WEB_SEARCH_NEO_ALLOW_PLAIN_HTTP` accepts `1`, `true`, `yes`, or `on`. Without it, plain
+`http://` to a public host is refused for both page fetches and browser `open`, and each
+redirect hop is validated the same way. Loopback, private, and link-local addresses, plus
+`localhost` and hosts ending in `.local`, `.localhost`, `.internal`, or `.home.arpa`, are
+always allowed over plain HTTP, so local services such as ComfyUI or a dev server need no
+configuration change.
 
 ## Troubleshooting
 
@@ -293,7 +331,26 @@ Call `web_info(topic="game_probe")` first. If it reports a game iframe, reuse it
 
 To slow a typical canvas/WebGL loop continuously, send `{"action":"render","mode":"throttled","target_fps":10}` through `web_action`. For exact input states use `mode="step"`; each `input` action advances one frame, while the `step` action advances explicitly. Always restore `mode="normal"` when finished. Closing the MCP session also releases held input and restores normal rendering.
 
-Use one `input` action when different inputs must land in the same step-mode frame: each key entry has its own `tap`, `hold`, or `release`, while pointer entries support `hover`, `move`, button actions, absolute coordinates, or `coordinate_mode="delta"`. Send `release_inputs` as an emergency release for every held key and mouse button. If the contract is not in context, call `web_info(topic="action_schema", params={"action":"input"})` first.
+Both gated modes also freeze page time: `performance.now()` and `Date.now()` move by one
+fixed frame delta per released frame, and `setTimeout`, `setInterval`, and
+`requestIdleCallback` are queued against the same virtual clock. A game therefore sees a
+constant `deltaTime` instead of the time the agent spent thinking. The gate is reinstalled
+automatically when the page or the game iframe reloads.
+
+Use one `input` action when different inputs must land in the same step-mode frame: each key entry has its own `tap`, `hold`, or `release`, while pointer entries support `hover`, `move`, `wheel`, button actions, absolute coordinates, `coordinate_mode="delta"`, or `coordinate_mode="relative"` under pointer lock. A tapped key stays down for the whole released frame, so engines that poll key state once per frame observe it. Send `release_inputs` as an emergency release for every held key and mouse button. If the contract is not in context, call `web_info(topic="action_schema", params={"action":"input"})` first.
+
+### A page or a local service cannot be opened over http
+
+Plain `http://` to a public host is refused; the error names the host and the override. Use
+`https://`, or set `WEB_SEARCH_NEO_ALLOW_PLAIN_HTTP=1` for the server process. Loopback and
+private addresses are unaffected and never need the override.
+
+### The console or network topic returns nothing
+
+Console capture begins when the session attaches to the tab and network capture begins on
+the first `network` read, so anything that happened earlier is not buffered. Re-open or
+reload the page and read again. If the companion was updated in place, reload it at
+`chrome://extensions` first.
 
 ### Search provider is challenged
 

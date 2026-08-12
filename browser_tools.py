@@ -25,12 +25,20 @@ from selenium.webdriver.support import expected_conditions as conditions
 from selenium.webdriver.support.ui import Select, WebDriverWait
 
 from chrome_bridge import (
+    CHROME_EXTENSION_ID,
     ChromeBridgeDriver,
     ChromeBridgeError,
     get_chrome_bridge,
     list_current_chrome_tabs,
 )
-from chrome_bootstrap import setup_current_chrome
+from chrome_bootstrap import (
+    EXTENSION_DIR,
+    expected_extension_version,
+    setup_current_chrome,
+)
+import diagnostics
+import key_table
+import page_perception
 from web_client import validate_http_url
 
 
@@ -53,9 +61,25 @@ class BrowserSession:
     pointer_x: float = 0.0
     pointer_y: float = 0.0
     render_mode: str = "normal"
+    key_repeat: bool = True
     render_target_fps: float | None = None
     render_frame_selector: str | None = None
     render_bootstrap_registered: bool = False
+    render_options: dict[str, Any] = field(
+        default_factory=lambda: {
+            "frame_delta_ms": 1000 / 60,
+            "freeze_time": True,
+            "gate_timers": True,
+        }
+    )
+    owns_tab: bool = False
+    pointer_locked: bool = False
+    touch_enabled: bool = False
+    fresh_keys: set[str] = field(default_factory=set)
+    console_cursor: int = 0
+    network_pending: dict[str, dict[str, Any]] = field(default_factory=dict)
+    network_rows: list[dict[str, Any]] = field(default_factory=list)
+    network_subscribed: bool = False
     lock: threading.RLock = field(default_factory=threading.RLock)
     last_used: float = field(default_factory=time.monotonic)
 
@@ -241,6 +265,9 @@ def create_driver(
         "driver", resolved_mode, profile_id, debugger_address
     )
     options = Options()
+    # Selenium cannot subscribe to CDP events, so console and network history are
+    # recovered from Chrome's own logs instead.
+    options.set_capability("goog:loggingPrefs", {"browser": "ALL", "performance": "ALL"})
     browser_user_agent = None
     if mode == "attach":
         options.debugger_address = address
@@ -404,6 +431,8 @@ def _create_session(
             current_tab_id=getattr(driver, "tab_id", None),
             tab_group=(getattr(driver, "actual_tab_group", None) if mode == "current" else None),
             owns_browser=mode != "attach",
+            # A tab we created is ours to clean up; a claimed one belongs to the user.
+            owns_tab=mode == "current" and current_tab_id is None,
         )
     finally:
         with _sessions_condition:
@@ -424,9 +453,14 @@ def _get_session(session_id: str) -> BrowserSession:
     _validate_session_id(session_id)
     with _sessions_lock:
         session = _sessions.get(session_id)
+        open_sessions = sorted(_sessions)
     if session is None:
+        # Name the call the caller actually has. Pointing at an internal helper
+        # leaves a small model stuck with no way to recover.
         raise ValueError(
-            f"Browser session '{session_id}' does not exist; call browser_open_page first"
+            f"Browser session '{session_id}' does not exist. Open one first: "
+            f'web_action [{{"action":"open","url":...,"session_id":"{session_id}"}}]. '
+            f"Open sessions: {open_sessions}."
         )
     session.last_used = time.monotonic()
     return session
@@ -455,62 +489,151 @@ def _set_viewport(driver: Any, width: int, height: int) -> None:
     )
 
 
-def _challenge_status(driver: webdriver.Chrome) -> dict[str, Any]:
-    url = driver.current_url.lower()
-    title = driver.title.lower()
-    try:
-        body = str(
-            driver.execute_script(
-                "return (document.body && document.body.innerText || '').slice(0, 8000);"
-            )
-            or ""
-        ).lower()
-    except Exception:
-        body = ""
-    markers = {
-        "captcha": ("captcha", "smartcaptcha", "recaptcha"),
-        "human_verification": (
-            "verify you are human",
-            "checking your browser",
-            "подтвердите, что вы человек",
-            "подтвердите, что вы не робот",
-            "я не робот",
-        ),
-        "access_challenge": (
-            "unusual traffic",
-            "access denied",
-            "are you a robot",
-            "необычный трафик",
-        ),
-    }
-    haystacks = (url, title, body)
-    for challenge_type, phrases in markers.items():
-        if any(phrase in haystack for phrase in phrases for haystack in haystacks):
+# A challenge is a live widget, not the word "captcha" in prose. Matching text
+# alone flags every article about CAPTCHAs and every search result for the word,
+# and then the agent waits three minutes for a human who is not needed.
+_CHALLENGE_WIDGET_SCRIPT = """
+const selectors = [
+  'iframe[src*="recaptcha/api2"]', 'iframe[src*="recaptcha/enterprise"]',
+  'iframe[src*="hcaptcha.com"]', 'iframe[src*="challenges.cloudflare.com"]',
+  'iframe[src*="captcha-api.yandex"]', 'iframe[title*="captcha" i]',
+  'div.g-recaptcha', 'div.h-captcha', 'div.cf-turnstile', 'div#cf-challenge-running',
+  'form#challenge-form', '[data-sitekey]', '#px-captcha', '.smart-captcha'
+];
+const found = [];
+for (const selector of selectors) {
+  const element = document.querySelector(selector);
+  if (!element) continue;
+  const rect = element.getBoundingClientRect();
+  if (rect.width < 20 || rect.height < 20) continue;
+  found.push(selector);
+}
+const heading = (document.title || '') + ' ' +
+  Array.from(document.querySelectorAll('h1, h2')).slice(0, 3)
+    .map(node => node.innerText || '').join(' ');
+const body = (document.body && document.body.innerText) || '';
+return {
+  widgets: found,
+  heading: heading.slice(0, 400),
+  body: body.slice(0, 2000),
+  body_length: body.length
+};
+"""
+
+# A challenge interstitial carries almost no content. Requiring a short page
+# before trusting body text keeps an article about CAPTCHAs from being mistaken
+# for one.
+_CHALLENGE_BODY_LIMIT = 1500
+
+# How far into the body text an interstitial phrase may sit and still count.
+_CHALLENGE_LEAD_LIMIT = 200
+
+_CHALLENGE_HEADINGS = {
+    "human_verification": (
+        "verify you are human",
+        "checking your browser",
+        "just a moment",
+        "подтвердите, что вы человек",
+        "подтвердите, что вы не робот",
+        "я не робот",
+    ),
+    "access_challenge": (
+        "unusual traffic",
+        "access denied",
+        "are you a robot",
+        "необычный трафик",
+    ),
+}
+
+
+# Everything an action reports about the page, in one script. Reading url, title
+# and dimensions separately costs three round-trips per action, and over the
+# companion bridge each one is a full WebSocket exchange.
+_PAGE_SUMMARY_SCRIPT = (
+    """
+let challenge = {};
+try { challenge = (() => {"""
+    + _CHALLENGE_WIDGET_SCRIPT
+    + """})(); } catch (error) { challenge = {}; }
+return {
+  url: location.href,
+  title: document.title || '',
+  viewport_width: window.innerWidth,
+  viewport_height: window.innerHeight,
+  page_width: document.documentElement.scrollWidth,
+  page_height: document.documentElement.scrollHeight,
+  ready_state: document.readyState,
+  challenge: challenge
+};
+"""
+)
+
+
+def _classify_challenge(probe: dict[str, Any]) -> dict[str, Any]:
+    """Turn raw page markers into a challenge verdict."""
+    widgets = probe.get("widgets") or []
+    if widgets:
+        return {
+            "challenge_detected": True,
+            "challenge_type": "captcha",
+            "challenge_evidence": widgets[:3],
+            "manual_action_required": True,
+        }
+    heading = str(probe.get("heading") or "").lower()
+    sparse_body = (
+        str(probe.get("body") or "").lower()
+        if int(probe.get("body_length") or 0) <= _CHALLENGE_BODY_LIMIT
+        else ""
+    )
+    for challenge_type, phrases in _CHALLENGE_HEADINGS.items():
+        for phrase in phrases:
+            if phrase in heading:
+                evidence = "page heading"
+            elif sparse_body and 0 <= sparse_body.find(phrase) <= _CHALLENGE_LEAD_LIMIT:
+                # An interstitial opens with the phrase; an article about
+                # captchas mentions it somewhere in the middle of a paragraph.
+                evidence = "interstitial text"
+            else:
+                continue
             return {
                 "challenge_detected": True,
                 "challenge_type": challenge_type,
+                "challenge_evidence": [evidence],
                 "manual_action_required": True,
             }
     return {
         "challenge_detected": False,
         "challenge_type": None,
+        "challenge_evidence": [],
         "manual_action_required": False,
     }
 
 
+def _challenge_status(driver: webdriver.Chrome) -> dict[str, Any]:
+    """Detect an interactive challenge by its widget, not by page prose."""
+    try:
+        probe = driver.execute_script(_CHALLENGE_WIDGET_SCRIPT) or {}
+    except Exception:
+        probe = {}
+    return _classify_challenge(probe)
+
+
+def _action_summary(
+    driver: webdriver.Chrome, session_id: str, include_summary: bool
+) -> dict[str, Any]:
+    """Dropping the summary saves a whole round-trip on the hot input paths."""
+    if not include_summary:
+        return {"session_id": session_id}
+    return _page_summary(driver, session_id)
+
+
 def _page_summary(driver: webdriver.Chrome, session_id: str) -> dict[str, Any]:
-    dimensions = driver.execute_script(
-        "return {viewport_width: window.innerWidth, viewport_height: window.innerHeight, "
-        "page_width: document.documentElement.scrollWidth, "
-        "page_height: document.documentElement.scrollHeight, "
-        "ready_state: document.readyState};"
-    )
+    probe = driver.execute_script(_PAGE_SUMMARY_SCRIPT) or {}
+    challenge = probe.pop("challenge", None) or {}
     return {
         "session_id": session_id,
-        "url": driver.current_url,
-        "title": driver.title,
-        **_challenge_status(driver),
-        **dimensions,
+        **probe,
+        **_classify_challenge(challenge),
     }
 
 
@@ -544,13 +667,34 @@ def open_page(
     )
     try:
         with session.lock:
+            previous_mode = session.render_mode
+            previous_frame = session.render_frame_selector
             _reset_session_runtime_state(session)
             _set_viewport(session.driver, width, height)
             _register_render_bootstrap(session)
             session.driver.get(normalized)
             _wait_until_ready(session.driver, timeout_seconds)
+            # A new document drops the gate. Re-arm it, because a caller that
+            # asked this session for step mode expects the next page to be
+            # frozen too, not to run free while they wonder why nothing steps.
+            restored = previous_mode != "normal"
+            if restored:
+                state = _apply_render_mode(
+                    session.driver,
+                    previous_frame,
+                    previous_mode,
+                    session.render_target_fps or 60.0,
+                    session.render_options,
+                )
+                if not state.get("error"):
+                    session.render_mode = previous_mode
+                    session.render_frame_selector = previous_frame
+                else:
+                    restored = False
         return {
             **_page_summary(session.driver, session_id),
+            "render_mode": session.render_mode,
+            "render_mode_restored": restored,
             "headless": session.headless,
             "window_mode": "headless" if session.headless else "visible",
             "profile_mode": session.profile_mode,
@@ -562,6 +706,41 @@ def open_page(
     except (WebDriverException, ChromeBridgeError, TimeoutError, ConnectionError, OSError):
         close_session(session_id)
         raise
+
+
+def _companion_status() -> dict[str, Any]:
+    """Report the companion in terms a caller can act on.
+
+    ``connected: false`` on its own says nothing about what to do next, so the
+    expected and running extension versions, its folder, and the exact next call
+    are reported alongside it.
+    """
+    status = dict(get_chrome_bridge().status(0.0))
+    expected = expected_extension_version()
+    running = str((status.get("browser") or {}).get("extension_version") or "")
+    status.update(
+        extension_id=CHROME_EXTENSION_ID,
+        extension_directory=str(EXTENSION_DIR),
+        expected_version=expected,
+        running_version=running or None,
+        outdated=bool(running and expected and running != expected),
+    )
+    if not status["connected"]:
+        status["next"] = (
+            'Not connected. Send {"action": "setup_current_chrome"} to see the exact '
+            "change it would make, then repeat it with confirm_install=true once the "
+            "user approves. Selenium modes (profile_mode temporary/persistent) need "
+            "no extension."
+        )
+    elif status["outdated"]:
+        status["next"] = (
+            f"The connected companion is {running} but this server ships {expected}. "
+            "Reload it on chrome://extensions, or run setup_current_chrome with "
+            "confirm_install=true."
+        )
+    else:
+        status["next"] = None
+    return status
 
 
 def get_current_tabs(wait_seconds: float = 1.0) -> dict[str, Any]:
@@ -799,7 +978,7 @@ def fill_fields(
     with session.lock:
         for selector, value in fields.items():
             try:
-                element = session.driver.find_element(By.CSS_SELECTOR, selector)
+                element = _resolve_element(session.driver, selector)
                 tag = element.tag_name.lower()
                 input_type = (element.get_attribute("type") or "").lower()
                 session.driver.execute_script(
@@ -844,7 +1023,7 @@ def fill_fields(
                 path = Path(file_path).expanduser().resolve(strict=True)
                 if not path.is_file():
                     raise ValueError("Upload path is not a file")
-                element = session.driver.find_element(By.CSS_SELECTOR, selector)
+                element = _resolve_element(session.driver, selector)
                 if (element.get_attribute("type") or "").lower() != "file":
                     raise ValueError("Selector does not point to an input[type=file]")
                 element.send_keys(str(path))
@@ -863,10 +1042,13 @@ def fill_fields(
 
 def _wait_after_action(driver: webdriver.Chrome, wait_seconds: float) -> None:
     delay = max(0.0, min(float(wait_seconds), 5.0))
-    if delay:
-        time.sleep(delay)
+    if not delay:
+        # Game input has nothing to settle, so even the readyState probe is a
+        # round-trip spent for nothing.
+        return
+    time.sleep(delay)
     try:
-        _wait_until_ready(driver, max(1.0, delay or 1.0))
+        _wait_until_ready(driver, max(1.0, delay))
     except Exception:
         pass
 
@@ -920,6 +1102,20 @@ _KEY_ALIASES = {
     "CONTROL": Keys.CONTROL,
     "CTRL": Keys.CONTROL,
     "ALT": Keys.ALT,
+    "META": key_table.SELENIUM_KEYS["META"],
+    "WIN": key_table.SELENIUM_KEYS["META"],
+    "CMD": key_table.SELENIUM_KEYS["META"],
+    "COMMAND": key_table.SELENIUM_KEYS["META"],
+    "MULTIPLY": key_table.SELENIUM_KEYS["MULTIPLY"],
+    "ADD": key_table.SELENIUM_KEYS["ADD"],
+    "SUBTRACT": key_table.SELENIUM_KEYS["SUBTRACT"],
+    "DECIMAL": key_table.SELENIUM_KEYS["DECIMAL"],
+    "DIVIDE": key_table.SELENIUM_KEYS["DIVIDE"],
+    **{f"F{index}": key_table.SELENIUM_KEYS[f"F{index}"] for index in range(1, 13)},
+    **{
+        f"NUMPAD{digit}": key_table.SELENIUM_KEYS[f"NUMPAD{digit}"]
+        for digit in range(10)
+    },
 }
 
 
@@ -952,6 +1148,87 @@ def _normalize_game_key(key: str) -> str:
     )
 
 
+_FOCUS_SCRIPT = """
+const element = arguments[0];
+if (!element) { window.focus(); return {focused: false}; }
+element.scrollIntoView({block: 'center', inline: 'center'});
+if (!element.hasAttribute('tabindex') && element.tabIndex < 0) {
+  element.setAttribute('tabindex', '-1');
+}
+window.focus();
+element.focus({preventScroll: true});
+return {focused: document.activeElement === element};
+"""
+
+
+def _focus_target(
+    driver: webdriver.Chrome, target_selector: str | None, focus_mode: str
+) -> None:
+    """Give the keyboard target focus without synthesising a stray click.
+
+    Clicking to focus a canvas fires a real click in the game, which reads as a
+    shot or a jump. Focusing directly avoids that phantom input.
+    """
+    if not target_selector:
+        driver.execute_script("window.focus();")
+        return
+    target = WebDriverWait(driver, 10).until(
+        conditions.visibility_of_element_located((By.CSS_SELECTOR, target_selector))
+    )
+    if focus_mode == "click":
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center', inline: 'center'});", target
+        )
+        target.click()
+        return
+    driver.execute_script(_FOCUS_SCRIPT, target)
+
+
+def _key_event_pair(
+    session: BrowserSession,
+    key_ids: list[str],
+    normalized: list[str],
+    selected_action: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Build the down/up streams for one key action against the held-key state."""
+    down_events: list[dict[str, Any]] = []
+    up_events: list[dict[str, Any]] = []
+    if selected_action in {"tap", "hold"}:
+        for key_id, key in zip(key_ids, normalized):
+            if selected_action == "tap" or key_id not in session.held_keys:
+                down_events.append({"type": "down", "key": key})
+    if selected_action in {"tap", "release"}:
+        for key_id, key in reversed(list(zip(key_ids, normalized))):
+            if selected_action == "tap":
+                up_events.append({"type": "up", "key": key})
+            elif key_id in session.held_keys:
+                # Release exactly what was pressed: a hold("w") that is released
+                # as "W" must still lift the same key.
+                up_events.append({"type": "up", "key": session.held_keys[key_id]})
+    return down_events, up_events
+
+
+def _commit_held_keys(
+    session: BrowserSession,
+    key_ids: list[str],
+    normalized: list[str],
+    selected_action: str,
+) -> None:
+    if selected_action == "hold":
+        # A real keyboard waits before it repeats, so a key pressed for this very
+        # frame must not also arrive as a repeat inside it. A key that was
+        # already down got no keydown here, so it stays eligible to repeat -
+        # otherwise re-holding it would silence the repeat forever.
+        session.fresh_keys.update(
+            key_id for key_id in key_ids if key_id not in session.held_keys
+        )
+        session.held_keys.update(dict(zip(key_ids, normalized)))
+    elif selected_action == "release":
+        for key_id in key_ids:
+            session.held_keys.pop(key_id, None)
+            session.fresh_keys.discard(key_id)
+
+
 def press_keys(
     keys: list[str],
     session_id: str = "default",
@@ -959,80 +1236,544 @@ def press_keys(
     frame_selector: str | None = None,
     hold_seconds: float = 0.05,
     repeat: int = 1,
-    wait_seconds: float = 0.2,
+    wait_seconds: float = 0.0,
     action: str = "tap",
+    hold_frames: int = 1,
+    focus_mode: str = "focus",
+    include_summary: bool = True,
     _advance_frame: bool = True,
 ) -> dict[str, Any]:
-    """Tap, hold, or release a key combination on a page, canvas, or iframe game."""
+    """Tap, hold, or release a key combination on a page, canvas, or iframe game.
+
+    In step mode a tap keeps the key down across ``hold_frames`` released frames
+    before lifting it, because an engine that polls key state in its loop cannot
+    observe a press that was already released before the frame ran.
+    """
     if not keys or len(keys) > 8:
         raise ValueError("Provide 1-8 keys")
     selected_action = action.strip().lower()
     if selected_action not in {"tap", "hold", "release"}:
         raise ValueError("action must be 'tap', 'hold', or 'release'")
+    selected_focus = focus_mode.strip().lower()
+    if selected_focus not in {"focus", "click", "none"}:
+        raise ValueError("focus_mode must be 'focus', 'click', or 'none'")
     normalized = [_normalize_game_key(key) for key in keys]
     key_ids = [str(key).strip().upper() for key in keys]
     hold = max(0.0, min(float(hold_seconds), 5.0))
     repetitions = max(1, min(int(repeat), 50))
+    frames_held = max(1, min(int(hold_frames), 30))
     session = _get_session(session_id)
     with session.lock:
         driver = session.driver
+        stepping = session.render_mode == "step" and _advance_frame
         driver.switch_to.default_content()
+        frames_advanced = 0
         try:
             if frame_selector:
-                frame = WebDriverWait(driver, 10).until(
+                WebDriverWait(driver, 10).until(
                     conditions.frame_to_be_available_and_switch_to_it(
                         (By.CSS_SELECTOR, frame_selector)
                     )
                 )
-                del frame
-            if target_selector:
-                target = WebDriverWait(driver, 10).until(
-                    conditions.visibility_of_element_located(
-                        (By.CSS_SELECTOR, target_selector)
-                    )
-                )
-                driver.execute_script(
-                    "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
-                    target,
-                )
-                target.click()
-            else:
-                driver.execute_script("window.focus();")
+            if selected_focus != "none":
+                _focus_target(driver, target_selector, selected_focus)
             runs = repetitions if selected_action == "tap" else 1
             for _ in range(runs):
-                events: list[dict[str, Any]] = []
-                if selected_action in {"tap", "hold"}:
-                    for key_id, key in zip(key_ids, normalized):
-                        if selected_action == "tap" or key_id not in session.held_keys:
-                            events.append({"type": "down", "key": key})
+                down_events, up_events = _key_event_pair(
+                    session, key_ids, normalized, selected_action
+                )
+                if selected_action == "tap" and stepping:
+                    _perform_key_events(driver, down_events)
+                    driver.switch_to.default_content()
+                    _auto_advance_render_after_input(session, frames_held)
+                    frames_advanced += frames_held
+                    if frame_selector:
+                        _select_frame(driver, frame_selector)
+                    _perform_key_events(driver, up_events)
+                else:
+                    events = list(down_events)
                     if selected_action == "tap" and hold:
                         events.append({"type": "pause", "seconds": hold})
-                if selected_action in {"tap", "release"}:
-                    for key_id, key in reversed(list(zip(key_ids, normalized))):
-                        if selected_action == "tap" or key_id in session.held_keys:
-                            events.append({"type": "up", "key": key})
-                _perform_key_events(driver, events)
-            if selected_action == "hold":
-                session.held_keys.update(dict(zip(key_ids, normalized)))
-            elif selected_action == "release":
-                for key_id in key_ids:
-                    session.held_keys.pop(key_id, None)
+                    events.extend(up_events)
+                    _perform_key_events(driver, events)
+            _commit_held_keys(session, key_ids, normalized, selected_action)
         finally:
             driver.switch_to.default_content()
-        if _advance_frame:
+        if _advance_frame and not (selected_action == "tap" and stepping):
             _auto_advance_render_after_input(session)
+            frames_advanced += 1
         _wait_after_action(driver, wait_seconds)
         return {
-            **_page_summary(driver, session_id),
+            **_action_summary(driver, session_id, include_summary),
             "success": True,
             "action": selected_action,
             "keys": [str(key) for key in keys],
             "repeat": runs,
             "hold_seconds": hold,
+            "hold_frames": frames_held if selected_action == "tap" else None,
+            "frames_advanced": frames_advanced,
+            "render_mode": session.render_mode,
             "held_keys": sorted(session.held_keys),
             "target_selector": target_selector,
             "frame_selector": frame_selector,
         }
+
+
+def _resolve_element(driver: Any, locator: str) -> Any:
+    """Find one element from a CSS selector, a ``ref:N``, or a piercing path.
+
+    Plain CSS keeps working exactly as before; ``ref:N`` and ``a >>> b`` are new
+    forms that survive shadow roots and unstable DOM structure.
+    """
+    expression = page_perception.resolve_locator_expression(locator)
+    if expression is None:
+        return driver.find_element(By.CSS_SELECTOR, locator)
+    if getattr(driver, "is_extension_bridge", False):
+        raise ValueError(
+            f"Locator '{locator}' needs a live element handle, which the companion "
+            "bridge cannot return. Use a CSS selector in current-Chrome mode."
+        )
+    element = driver.execute_script(f"return {expression};")
+    if element is None:
+        raise ValueError(
+            f"Locator '{locator}' matched nothing. Refs die when the document "
+            "changes - call web_info(topic='page_outline') again."
+        )
+    return element
+
+
+def get_page_outline(
+    session_id: str = "default",
+    limit: int = 200,
+    include_occlusion: bool = True,
+    output: str = "text",
+    frame_selector: str | None = None,
+) -> dict[str, Any]:
+    """Return the accessibility outline: roles, names, states, refs, and boxes."""
+    session = _get_session(session_id)
+    with session.lock:
+        driver = session.driver
+        _select_frame(driver, frame_selector)
+        try:
+            result = page_perception.outline(
+                driver,
+                limit=limit,
+                include_occlusion=include_occlusion,
+                format=output,
+            )
+        finally:
+            driver.switch_to.default_content()
+        return {**result, "session_id": session_id, "frame_selector": frame_selector}
+
+
+def get_page_text(
+    session_id: str = "default",
+    max_chars: int = 20_000,
+    mode: str = "main",
+    include_links: bool = False,
+    frame_selector: str | None = None,
+) -> dict[str, Any]:
+    """Return the readable text of the rendered page, not of its HTML source."""
+    session = _get_session(session_id)
+    with session.lock:
+        driver = session.driver
+        _select_frame(driver, frame_selector)
+        try:
+            result = page_perception.page_text(
+                driver, max_chars=max_chars, mode=mode, include_links=include_links
+            )
+        finally:
+            driver.switch_to.default_content()
+        return {**result, "session_id": session_id, "frame_selector": frame_selector}
+
+
+def find_elements(
+    query: str,
+    session_id: str = "default",
+    role: str | None = None,
+    limit: int = 5,
+    visible_only: bool = True,
+    frame_selector: str | None = None,
+) -> dict[str, Any]:
+    """Find elements by meaning instead of dumping the whole page to the model."""
+    session = _get_session(session_id)
+    with session.lock:
+        driver = session.driver
+        _select_frame(driver, frame_selector)
+        try:
+            result = page_perception.find(
+                driver, query, role=role, limit=limit, visible_only=visible_only
+            )
+        finally:
+            driver.switch_to.default_content()
+        return {**result, "session_id": session_id, "frame_selector": frame_selector}
+
+
+def get_console(
+    session_id: str = "default",
+    levels: list[str] | None = None,
+    contains: str | None = None,
+    kinds: list[str] | None = None,
+    limit: int = 50,
+    since_seq: int = 0,
+    clear: bool = False,
+) -> dict[str, Any]:
+    """Read page console output, uncaught errors, and browser log entries.
+
+    ``console.log`` never reaches Chrome's browser log, so this merges the
+    in-page hook with the browser log rather than reporting one of them.
+    """
+    session = _get_session(session_id)
+    with session.lock:
+        driver = session.driver
+        entries: list[dict[str, Any]] = []
+        if hasattr(driver, "get_events"):
+            payload = driver.get_events(
+                kinds=["console"], since_seq=since_seq or session.console_cursor, limit=500
+            )
+            entries = list(payload.get("entries") or [])
+            session.console_cursor = int(payload.get("next_seq") or session.console_cursor)
+            dropped = payload.get("dropped")
+            if clear:
+                driver.clear_events(kinds=["console"])
+                session.console_cursor = 0
+        else:
+            payload = diagnostics.read_page_console(
+                driver, since_seq or session.console_cursor, clear
+            )
+            entries = list(payload.get("entries") or [])
+            session.console_cursor = int(payload.get("next_seq") or session.console_cursor)
+            entries.extend(diagnostics.selenium_browser_log(driver))
+            dropped = payload.get("dropped")
+        entries.sort(key=lambda item: (item.get("ts") or 0, item.get("seq") or 0))
+        entries = diagnostics.dedupe_console(entries)
+        selected = diagnostics.filter_console(entries, levels, contains, kinds, limit)
+        return {
+            "success": True,
+            "session_id": session_id,
+            "entries": selected,
+            "returned": len(selected),
+            "next_seq": session.console_cursor,
+            "dropped": dropped,
+            "levels": levels or list(diagnostics.LEVELS),
+            "note": (
+                "The buffer starts when the session connects; reload the page to "
+                "capture load-time output."
+            ),
+        }
+
+
+def get_network(
+    session_id: str = "default",
+    url_pattern: str | None = None,
+    types: list[str] | None = None,
+    status_min: int | None = None,
+    status_max: int | None = None,
+    only_errors: bool = False,
+    limit: int = 50,
+    output: str = "text",
+) -> dict[str, Any]:
+    """List finished HTTP requests made by the page."""
+    session = _get_session(session_id)
+    with session.lock:
+        driver = session.driver
+        if hasattr(driver, "get_events"):
+            if not session.network_subscribed:
+                driver.subscribe_events(["console", "network"])
+                session.network_subscribed = True
+            payload = driver.get_events(kinds=["network"], since_seq=0, limit=500)
+            rows = list(payload.get("entries") or [])
+        else:
+            session.network_rows.extend(
+                diagnostics.selenium_network_rows(driver, session.network_pending)
+            )
+            session.network_rows = session.network_rows[-500:]
+            rows = list(session.network_rows)
+        selected = diagnostics.filter_network(
+            rows, url_pattern, types, status_min, status_max, only_errors, limit
+        )
+        response = {
+            "success": True,
+            "session_id": session_id,
+            "returned": len(selected),
+            "only_errors": bool(only_errors),
+        }
+        if output == "json":
+            response["requests"] = selected
+        else:
+            response["requests"] = diagnostics.format_network(selected)
+            response["format"] = "method status type ms size url"
+        return response
+
+
+def get_network_body(
+    request_id: str,
+    session_id: str = "default",
+    max_chars: int = 20_000,
+) -> dict[str, Any]:
+    """Return one response body by the request_id reported by the network topic."""
+    session = _get_session(session_id)
+    with session.lock:
+        driver = session.driver
+        if hasattr(driver, "get_network_body"):
+            payload = driver.get_network_body(str(request_id))
+        else:
+            payload = driver.execute_cdp_cmd(
+                "Network.getResponseBody", {"requestId": str(request_id)}
+            )
+        body = str(payload.get("body") or "")
+        limit = max(256, min(int(max_chars), 500_000))
+        return {
+            "success": True,
+            "request_id": request_id,
+            "session_id": session_id,
+            "binary": bool(payload.get("binary") or payload.get("base64Encoded")),
+            "truncated": len(body) > limit,
+            "body": body[:limit],
+        }
+
+
+def _session_modifiers(session: BrowserSession) -> int:
+    """Build the CDP modifier mask from the keys this session is holding.
+
+    Without this a held Shift or Ctrl is invisible to mouse events, so
+    Shift-click and Ctrl-click cannot be expressed at all.
+    """
+    mask = 0
+    for held in session.held_keys.values():
+        name = key_table.resolve_key(held)[0]
+        mask |= key_table.MODIFIER_BITS.get(name, 0)
+    return mask
+
+
+_VIEWPORT_SCRIPT = "return {width: window.innerWidth, height: window.innerHeight};"
+
+
+def _pointer_context(
+    driver: webdriver.Chrome, frame_selector: str | None
+) -> tuple[float, float, dict[str, Any]]:
+    """Resolve the frame offset and viewport once, because CDP input is page-absolute."""
+    driver.switch_to.default_content()
+    if not frame_selector:
+        return 0.0, 0.0, driver.execute_script(_VIEWPORT_SCRIPT)
+    frame = WebDriverWait(driver, 10).until(
+        conditions.visibility_of_element_located((By.CSS_SELECTOR, frame_selector))
+    )
+    rect = driver.execute_script(_FRAME_ORIGIN_SCRIPT, frame)
+    driver.switch_to.frame(frame)
+    try:
+        viewport = driver.execute_script(_VIEWPORT_SCRIPT)
+    finally:
+        driver.switch_to.default_content()
+    return float(rect["x"]), float(rect["y"]), viewport
+
+
+def _pointer_dispatch(
+    session: BrowserSession,
+    action: str,
+    x: float,
+    y: float,
+    viewport: dict[str, Any],
+    offset_x: float = 0.0,
+    offset_y: float = 0.0,
+    end_x: float | None = None,
+    end_y: float | None = None,
+    button: str = "left",
+    duration_seconds: float = 0.3,
+    coordinate_mode: str = "absolute",
+    delta_x: float = 0.0,
+    delta_y: float = 0.0,
+) -> dict[str, Any]:
+    """Validate and dispatch one pointer action against an already-resolved frame."""
+    driver = session.driver
+    requested_action = action.strip().lower()
+    allowed_actions = {
+        "click",
+        "double_click",
+        "move",
+        "hover",
+        "drag",
+        "press",
+        "release",
+        "wheel",
+    }
+    if requested_action not in allowed_actions:
+        raise ValueError(
+            "action must be 'click', 'double_click', 'move', 'hover', 'drag', "
+            "'press', 'release', or 'wheel'"
+        )
+    selected_action = "move" if requested_action == "hover" else requested_action
+    selected_coordinate_mode = coordinate_mode.strip().lower()
+    if selected_coordinate_mode not in {"absolute", "delta", "relative"}:
+        raise ValueError("coordinate_mode must be 'absolute', 'delta', or 'relative'")
+    selected_button = button.strip().lower()
+    button_bits = {"left": 1, "right": 2, "middle": 4}
+    if selected_button not in button_bits:
+        raise ValueError("button must be 'left', 'right', or 'middle'")
+    duration = max(0.0, min(float(duration_seconds), 5.0))
+    unbounded = selected_coordinate_mode == "relative"
+    current_local_x = session.pointer_x - offset_x
+    current_local_y = session.pointer_y - offset_y
+    if unbounded and not session.pointer_x and not session.pointer_y:
+        # Start a relative run from the middle so small deltas stay on screen.
+        current_local_x = float(viewport["width"]) / 2
+        current_local_y = float(viewport["height"]) / 2
+    if selected_coordinate_mode in {"delta", "relative"}:
+        local_x = current_local_x + float(x)
+        local_y = current_local_y + float(y)
+    else:
+        local_x = float(x)
+        local_y = float(y)
+    if not unbounded and (
+        not 0 <= local_x < float(viewport["width"])
+        or not 0 <= local_y < float(viewport["height"])
+    ):
+        raise ValueError("Pointer coordinates must be inside the selected viewport")
+    if selected_coordinate_mode in {"delta", "relative"}:
+        local_end_x = local_x + (float(end_x) if end_x is not None else 0.0)
+        local_end_y = local_y + (float(end_y) if end_y is not None else 0.0)
+    else:
+        local_end_x = float(end_x) if end_x is not None else local_x
+        local_end_y = float(end_y) if end_y is not None else local_y
+    if selected_action == "drag" and (end_x is None or end_y is None):
+        raise ValueError("drag requires end_x and end_y")
+    if not unbounded and (
+        not 0 <= local_end_x < float(viewport["width"])
+        or not 0 <= local_end_y < float(viewport["height"])
+    ):
+        raise ValueError("Pointer end coordinates must be inside the selected viewport")
+
+    start_x = local_x + offset_x
+    start_y = local_y + offset_y
+    finish_x = local_end_x + offset_x
+    finish_y = local_end_y + offset_y
+    modifiers = _session_modifiers(session)
+
+    def dispatch(event_type: str, px: float, py: float, **extra: Any) -> None:
+        driver.execute_cdp_cmd(
+            "Input.dispatchMouseEvent",
+            {
+                "type": event_type,
+                "x": px,
+                "y": py,
+                "button": extra.pop("button", "none"),
+                "modifiers": modifiers,
+                **extra,
+            },
+        )
+
+    held_mask = sum(button_bits[item] for item in session.held_buttons)
+    if selected_action == "wheel":
+        dispatch(
+            "mouseWheel",
+            start_x,
+            start_y,
+            buttons=held_mask,
+            deltaX=float(delta_x),
+            deltaY=float(delta_y),
+        )
+    else:
+        dispatch("mouseMoved", start_x, start_y, buttons=held_mask)
+    if selected_action in {"move", "wheel"}:
+        pass
+    elif selected_action == "press":
+        session.held_buttons.add(selected_button)
+        dispatch(
+            "mousePressed",
+            start_x,
+            start_y,
+            button=selected_button,
+            buttons=sum(button_bits[item] for item in session.held_buttons),
+            clickCount=1,
+        )
+    elif selected_action == "release":
+        session.held_buttons.discard(selected_button)
+        dispatch(
+            "mouseReleased",
+            start_x,
+            start_y,
+            button=selected_button,
+            buttons=sum(button_bits[item] for item in session.held_buttons),
+            clickCount=1,
+        )
+    elif selected_action in {"click", "double_click"}:
+        count = 2 if selected_action == "double_click" else 1
+        for click_count in range(1, count + 1):
+            dispatch(
+                "mousePressed",
+                start_x,
+                start_y,
+                button=selected_button,
+                buttons=held_mask | button_bits[selected_button],
+                clickCount=click_count,
+            )
+            dispatch(
+                "mouseReleased",
+                start_x,
+                start_y,
+                button=selected_button,
+                buttons=held_mask,
+                clickCount=click_count,
+            )
+    else:
+        dispatch(
+            "mousePressed",
+            start_x,
+            start_y,
+            button=selected_button,
+            buttons=held_mask | button_bits[selected_button],
+            clickCount=1,
+        )
+        steps = max(2, min(30, int(duration * 30) or 2))
+        for step in range(1, steps + 1):
+            ratio = step / steps
+            dispatch(
+                "mouseMoved",
+                start_x + (finish_x - start_x) * ratio,
+                start_y + (finish_y - start_y) * ratio,
+                button=selected_button,
+                buttons=held_mask | button_bits[selected_button],
+            )
+            if duration:
+                time.sleep(duration / steps)
+        dispatch(
+            "mouseReleased",
+            finish_x,
+            finish_y,
+            button=selected_button,
+            buttons=held_mask,
+            clickCount=1,
+        )
+    session.pointer_x = finish_x if selected_action == "drag" else start_x
+    session.pointer_y = finish_y if selected_action == "drag" else start_y
+    if unbounded and (
+        abs(session.pointer_x) > 100_000 or abs(session.pointer_y) > 100_000
+    ):
+        # Relative runs never clamp, so recentre before the numbers get silly.
+        session.pointer_x = 0.0
+        session.pointer_y = 0.0
+    return {
+        "success": True,
+        "action": requested_action,
+        "button": selected_button,
+        "x": local_x,
+        "y": local_y,
+        "coordinate_mode": selected_coordinate_mode,
+        "delta_x": (
+            float(delta_x)
+            if selected_action == "wheel"
+            else (float(x) if selected_coordinate_mode != "absolute" else None)
+        ),
+        "delta_y": (
+            float(delta_y)
+            if selected_action == "wheel"
+            else (float(y) if selected_coordinate_mode != "absolute" else None)
+        ),
+        "end_x": local_end_x if selected_action == "drag" else None,
+        "end_y": local_end_y if selected_action == "drag" else None,
+        "modifiers": modifiers,
+        "held_buttons": sorted(session.held_buttons),
+    }
 
 
 def pointer_action(
@@ -1045,194 +1786,330 @@ def pointer_action(
     button: str = "left",
     duration_seconds: float = 0.3,
     frame_selector: str | None = None,
-    wait_seconds: float = 0.2,
+    wait_seconds: float = 0.0,
     coordinate_mode: str = "absolute",
+    delta_x: float = 0.0,
+    delta_y: float = 0.0,
+    include_summary: bool = True,
     _advance_frame: bool = True,
 ) -> dict[str, Any]:
-    """Dispatch absolute/relative pointer movement, taps, drag, or held buttons."""
-    requested_action = action.strip().lower()
-    allowed_actions = {
-        "click",
-        "double_click",
-        "move",
-        "hover",
-        "drag",
-        "press",
-        "release",
-    }
-    if requested_action not in allowed_actions:
-        raise ValueError(
-            "action must be 'click', 'double_click', 'move', 'hover', 'drag', "
-            "'press', or 'release'"
+    """Dispatch pointer movement, taps, drag, wheel, or held buttons.
+
+    ``coordinate_mode='relative'`` skips the viewport bounds check and moves the
+    pointer by a delta without clamping, which is what a pointer-locked game
+    needs: the cursor never moves, only ``movementX``/``movementY`` matter.
+    """
+    session = _get_session(session_id)
+    with session.lock:
+        driver = session.driver
+        offset_x, offset_y, viewport = _pointer_context(driver, frame_selector)
+        result = _pointer_dispatch(
+            session,
+            action,
+            x,
+            y,
+            viewport,
+            offset_x=offset_x,
+            offset_y=offset_y,
+            end_x=end_x,
+            end_y=end_y,
+            button=button,
+            duration_seconds=duration_seconds,
+            coordinate_mode=coordinate_mode,
+            delta_x=delta_x,
+            delta_y=delta_y,
         )
-    selected_action = "move" if requested_action == "hover" else requested_action
-    selected_coordinate_mode = coordinate_mode.strip().lower()
-    if selected_coordinate_mode not in {"absolute", "delta"}:
-        raise ValueError("coordinate_mode must be 'absolute' or 'delta'")
-    selected_button = button.strip().lower()
-    button_bits = {"left": 1, "right": 2, "middle": 4}
-    if selected_button not in button_bits:
-        raise ValueError("button must be 'left', 'right', or 'middle'")
+        if _advance_frame:
+            _auto_advance_render_after_input(session)
+        _wait_after_action(driver, wait_seconds)
+        return {
+            **_action_summary(driver, session_id, include_summary),
+            **result,
+            "frame_selector": frame_selector,
+        }
+
+
+
+# CDP input is addressed in top-level page pixels, so a frame's offset must be
+# the origin of its *content* box. Using the border box misses by exactly the
+# border and padding, which silently skews every click inside a framed game.
+_FRAME_ORIGIN_SCRIPT = """
+const frame = arguments[0];
+const rect = frame.getBoundingClientRect();
+const style = getComputedStyle(frame);
+return {
+  x: rect.x + parseFloat(style.borderLeftWidth || 0) + parseFloat(style.paddingLeft || 0),
+  y: rect.y + parseFloat(style.borderTopWidth || 0) + parseFloat(style.paddingTop || 0)
+};
+"""
+
+
+def _frame_offset(driver: webdriver.Chrome, frame_selector: str | None) -> tuple[float, float]:
+    """Return the top-level offset of a frame; CDP input is always page-absolute."""
+    if not frame_selector:
+        return 0.0, 0.0
+    frame = WebDriverWait(driver, 10).until(
+        conditions.visibility_of_element_located((By.CSS_SELECTOR, frame_selector))
+    )
+    rect = driver.execute_script(_FRAME_ORIGIN_SCRIPT, frame)
+    return float(rect["x"]), float(rect["y"])
+
+
+def set_touch_emulation(
+    session_id: str = "default",
+    enabled: bool = True,
+    max_touch_points: int = 5,
+    reload_page: bool = True,
+) -> dict[str, Any]:
+    """Turn the page into a touch device so mobile branches actually run.
+
+    Without this ``navigator.maxTouchPoints`` is 0 and ``'ontouchstart' in
+    window`` is false, so a game that feature-detects touch stays on its desktop
+    code path and ignores every touch event sent to it. ``'ontouchstart'`` is
+    decided while the document loads, so the page is reloaded by default.
+    """
+    points = max(1, min(int(max_touch_points), 10))
+    session = _get_session(session_id)
+    with session.lock:
+        driver = session.driver
+        driver.execute_cdp_cmd(
+            "Emulation.setTouchEmulationEnabled",
+            {"enabled": bool(enabled), "maxTouchPoints": points},
+        )
+        for command, params in (
+            ("Emulation.setEmitTouchEventsForMouse", {"enabled": False, "configuration": "mobile"}),
+        ):
+            try:
+                driver.execute_cdp_cmd(command, params)
+            except WebDriverException:
+                pass
+        if reload_page:
+            driver.refresh()
+            session.held_keys.clear()
+            session.held_buttons.clear()
+            session.render_mode = "normal"
+            session.render_frame_selector = None
+            session.pointer_locked = False
+        session.touch_enabled = bool(enabled)
+        detected = driver.execute_script(
+            "return {ontouchstart: 'ontouchstart' in window,"
+            " max_touch_points: navigator.maxTouchPoints};"
+        )
+        return {
+            **_page_summary(driver, session_id),
+            "success": True,
+            "touch_enabled": session.touch_enabled,
+            "max_touch_points": points if enabled else 0,
+            "reloaded": bool(reload_page),
+            **detected,
+            "note": (
+                None
+                if reload_page or not enabled
+                else "'ontouchstart' in window only flips after a reload; "
+                "pass reload_page=true or reload before feature detection."
+            ),
+        }
+
+
+def touch_action(
+    action: str,
+    points: list[dict[str, Any]] | None = None,
+    session_id: str = "default",
+    frame_selector: str | None = None,
+    steps: int = 8,
+    duration_seconds: float = 0.2,
+    wait_seconds: float = 0.0,
+    include_summary: bool = True,
+    _advance_frame: bool = True,
+) -> dict[str, Any]:
+    """Dispatch touch input: tap, multi-finger press/move/release, or a swipe.
+
+    ``points`` carries one entry per finger as ``{"x":.., "y":.., "id":..}``;
+    ``swipe`` additionally reads ``end_x``/``end_y`` from each entry.
+    """
+    selected_action = action.strip().lower()
+    if selected_action not in {"tap", "press", "move", "release", "swipe", "cancel"}:
+        raise ValueError(
+            "action must be 'tap', 'press', 'move', 'release', 'swipe', or 'cancel'"
+        )
+    entries = list(points or [])
+    if selected_action not in {"cancel", "release"} and not entries:
+        raise ValueError("Provide 1-10 touch points")
+    if len(entries) > 10:
+        raise ValueError("Provide at most 10 touch points")
+    interpolation = max(2, min(int(steps), 30))
     duration = max(0.0, min(float(duration_seconds), 5.0))
     session = _get_session(session_id)
     with session.lock:
         driver = session.driver
         driver.switch_to.default_content()
-        offset_x = 0.0
-        offset_y = 0.0
-        try:
-            if frame_selector:
-                frame = WebDriverWait(driver, 10).until(
-                    conditions.visibility_of_element_located(
-                        (By.CSS_SELECTOR, frame_selector)
-                    )
-                )
-                rect = driver.execute_script(
-                    "const r=arguments[0].getBoundingClientRect();"
-                    "return {x:r.x,y:r.y,width:r.width,height:r.height};",
-                    frame,
-                )
-                offset_x = float(rect["x"])
-                offset_y = float(rect["y"])
-                driver.switch_to.frame(frame)
-            viewport = driver.execute_script(
-                "return {width: window.innerWidth, height: window.innerHeight};"
-            )
-            current_local_x = session.pointer_x - offset_x
-            current_local_y = session.pointer_y - offset_y
-            if selected_coordinate_mode == "delta":
-                local_x = current_local_x + float(x)
-                local_y = current_local_y + float(y)
-            else:
-                local_x = float(x)
-                local_y = float(y)
-            if not 0 <= local_x < float(viewport["width"]) or not 0 <= local_y < float(
-                viewport["height"]
-            ):
-                raise ValueError("Pointer coordinates must be inside the selected viewport")
-            if selected_coordinate_mode == "delta":
-                local_end_x = local_x + (float(end_x) if end_x is not None else 0.0)
-                local_end_y = local_y + (float(end_y) if end_y is not None else 0.0)
-            else:
-                local_end_x = float(end_x) if end_x is not None else local_x
-                local_end_y = float(end_y) if end_y is not None else local_y
-            if selected_action == "drag" and (end_x is None or end_y is None):
-                raise ValueError("drag requires end_x and end_y")
-            if not 0 <= local_end_x < float(viewport["width"]) or not 0 <= local_end_y < float(
-                viewport["height"]
-            ):
-                raise ValueError("Pointer end coordinates must be inside the selected viewport")
-        finally:
-            driver.switch_to.default_content()
+        offset_x, offset_y = _frame_offset(driver, frame_selector)
 
-        start_x = local_x + offset_x
-        start_y = local_y + offset_y
-        finish_x = local_end_x + offset_x
-        finish_y = local_end_y + offset_y
+        def touch_points(progress: float) -> list[dict[str, Any]]:
+            resolved = []
+            for index, entry in enumerate(entries):
+                start_x = float(entry["x"])
+                start_y = float(entry["y"])
+                target_x = float(entry.get("end_x", start_x))
+                target_y = float(entry.get("end_y", start_y))
+                resolved.append(
+                    {
+                        "x": offset_x + start_x + (target_x - start_x) * progress,
+                        "y": offset_y + start_y + (target_y - start_y) * progress,
+                        "id": int(entry.get("id", index)),
+                        "radiusX": float(entry.get("radius_x", 6.0)),
+                        "radiusY": float(entry.get("radius_y", 6.0)),
+                        "force": float(entry.get("force", 1.0)),
+                    }
+                )
+            return resolved
 
-        def dispatch(event_type: str, px: float, py: float, **extra: Any) -> None:
+        def dispatch(event_type: str, resolved: list[dict[str, Any]]) -> None:
             driver.execute_cdp_cmd(
-                "Input.dispatchMouseEvent",
-                {
-                    "type": event_type,
-                    "x": px,
-                    "y": py,
-                    "button": extra.pop("button", "none"),
-                    **extra,
-                },
+                "Input.dispatchTouchEvent",
+                {"type": event_type, "touchPoints": resolved, "modifiers": _session_modifiers(session)},
             )
 
-        held_mask = sum(button_bits[item] for item in session.held_buttons)
-        dispatch("mouseMoved", start_x, start_y, buttons=held_mask)
-        if selected_action == "move":
-            pass
+        if selected_action == "cancel":
+            dispatch("touchCancel", [])
         elif selected_action == "press":
-            session.held_buttons.add(selected_button)
-            dispatch(
-                "mousePressed",
-                start_x,
-                start_y,
-                button=selected_button,
-                buttons=sum(button_bits[item] for item in session.held_buttons),
-                clickCount=1,
-            )
+            dispatch("touchStart", touch_points(0.0))
+        elif selected_action == "move":
+            dispatch("touchMove", touch_points(1.0))
         elif selected_action == "release":
-            session.held_buttons.discard(selected_button)
-            dispatch(
-                "mouseReleased",
-                start_x,
-                start_y,
-                button=selected_button,
-                buttons=sum(button_bits[item] for item in session.held_buttons),
-                clickCount=1,
-            )
-        elif selected_action in {"click", "double_click"}:
-            count = 2 if selected_action == "double_click" else 1
-            for click_count in range(1, count + 1):
-                dispatch(
-                    "mousePressed",
-                    start_x,
-                    start_y,
-                    button=selected_button,
-                    buttons=held_mask | button_bits[selected_button],
-                    clickCount=click_count,
-                )
-                dispatch(
-                    "mouseReleased",
-                    start_x,
-                    start_y,
-                    button=selected_button,
-                    buttons=held_mask,
-                    clickCount=click_count,
-                )
+            dispatch("touchEnd", [])
+        elif selected_action == "tap":
+            dispatch("touchStart", touch_points(0.0))
+            dispatch("touchEnd", [])
         else:
-            dispatch(
-                "mousePressed",
-                start_x,
-                start_y,
-                button=selected_button,
-                buttons=held_mask | button_bits[selected_button],
-                clickCount=1,
-            )
-            steps = max(2, min(30, int(duration * 30) or 2))
-            for step in range(1, steps + 1):
-                ratio = step / steps
-                dispatch(
-                    "mouseMoved",
-                    start_x + (finish_x - start_x) * ratio,
-                    start_y + (finish_y - start_y) * ratio,
-                    button=selected_button,
-                    buttons=held_mask | button_bits[selected_button],
-                )
+            dispatch("touchStart", touch_points(0.0))
+            for step in range(1, interpolation + 1):
+                dispatch("touchMove", touch_points(step / interpolation))
                 if duration:
-                    time.sleep(duration / steps)
-            dispatch(
-                "mouseReleased",
-                finish_x,
-                finish_y,
-                button=selected_button,
-                buttons=held_mask,
-                clickCount=1,
-            )
-        session.pointer_x = finish_x if selected_action == "drag" else start_x
-        session.pointer_y = finish_y if selected_action == "drag" else start_y
+                    time.sleep(duration / interpolation)
+            dispatch("touchEnd", [])
         if _advance_frame:
             _auto_advance_render_after_input(session)
         _wait_after_action(driver, wait_seconds)
         return {
-            **_page_summary(driver, session_id),
+            **_action_summary(driver, session_id, include_summary),
             "success": True,
-            "action": requested_action,
-            "button": selected_button,
-            "x": local_x,
-            "y": local_y,
-            "coordinate_mode": selected_coordinate_mode,
-            "delta_x": float(x) if selected_coordinate_mode == "delta" else None,
-            "delta_y": float(y) if selected_coordinate_mode == "delta" else None,
-            "end_x": local_end_x if selected_action == "drag" else None,
-            "end_y": local_end_y if selected_action == "drag" else None,
+            "action": selected_action,
+            "points": len(entries),
+            "touch_enabled": session.touch_enabled,
             "frame_selector": frame_selector,
-            "held_buttons": sorted(session.held_buttons),
+        }
+
+
+_POINTER_LOCK_SCRIPT = """
+const selector = arguments[0];
+const wanted = arguments[1];
+const target = selector ? document.querySelector(selector)
+                        : (document.querySelector('canvas') || document.body);
+if (!target) return {success: false, error: 'No pointer lock target on this page'};
+if (wanted === 'release') {
+  document.exitPointerLock();
+  return {success: true, locked: false, element: null};
+}
+try { target.requestPointerLock(); } catch (error) {
+  return {success: false, error: String(error)};
+}
+return {success: true, requested: true};
+"""
+
+_POINTER_LOCK_STATUS_SCRIPT = """
+const locked = document.pointerLockElement;
+return {
+  locked: !!locked,
+  element: locked ? (locked.id || locked.tagName.toLowerCase()) : null
+};
+"""
+
+
+def pointer_lock(
+    action: str = "status",
+    session_id: str = "default",
+    selector: str | None = None,
+    frame_selector: str | None = None,
+    timeout_seconds: float = 2.0,
+) -> dict[str, Any]:
+    """Acquire, release, or read pointer lock for first-person style games.
+
+    ``requestPointerLock`` needs a user gesture, so acquiring first sends a real
+    click on the target through CDP and then requests the lock from that gesture.
+    """
+    selected_action = action.strip().lower()
+    if selected_action not in {"acquire", "release", "status"}:
+        raise ValueError("action must be 'acquire', 'release', or 'status'")
+    timeout = max(0.1, min(float(timeout_seconds), 10.0))
+    session = _get_session(session_id)
+    with session.lock:
+        driver = session.driver
+        _select_frame(driver, frame_selector)
+        try:
+            if selected_action == "acquire":
+                rect = driver.execute_script(
+                    "const t = arguments[0] ? document.querySelector(arguments[0])"
+                    " : (document.querySelector('canvas') || document.body);"
+                    "if (!t) return null;"
+                    "const r = t.getBoundingClientRect();"
+                    "return {x: r.x + r.width / 2, y: r.y + r.height / 2};",
+                    selector,
+                )
+                if rect is None:
+                    raise ValueError("No pointer lock target on this page")
+        finally:
+            driver.switch_to.default_content()
+        if selected_action == "acquire":
+            offset_x, offset_y = _frame_offset(driver, frame_selector)
+            click_x = offset_x + float(rect["x"])
+            click_y = offset_y + float(rect["y"])
+            for event_type in ("mousePressed", "mouseReleased"):
+                driver.execute_cdp_cmd(
+                    "Input.dispatchMouseEvent",
+                    {
+                        "type": event_type,
+                        "x": click_x,
+                        "y": click_y,
+                        "button": "left",
+                        "buttons": 1 if event_type == "mousePressed" else 0,
+                        "clickCount": 1,
+                    },
+                )
+        _select_frame(driver, frame_selector)
+        try:
+            if selected_action != "status":
+                result = driver.execute_script(
+                    _POINTER_LOCK_SCRIPT, selector, selected_action
+                )
+                if not result.get("success"):
+                    raise RuntimeError(result.get("error") or "Pointer lock failed")
+            expected = selected_action == "acquire"
+            deadline = time.monotonic() + timeout
+            status = driver.execute_script(_POINTER_LOCK_STATUS_SCRIPT)
+            while (
+                selected_action != "status"
+                and bool(status["locked"]) is not expected
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.05)
+                status = driver.execute_script(_POINTER_LOCK_STATUS_SCRIPT)
+        finally:
+            driver.switch_to.default_content()
+        session.pointer_locked = bool(status["locked"])
+        return {
+            **_page_summary(driver, session_id),
+            "success": selected_action == "status" or session.pointer_locked is expected,
+            "action": selected_action,
+            "locked": session.pointer_locked,
+            "element": status.get("element"),
+            "frame_selector": frame_selector,
+            "note": (
+                "Use pointer coordinate_mode='relative' while locked; only "
+                "movementX/movementY reach the game."
+                if session.pointer_locked
+                else None
+            ),
         }
 
 
@@ -1242,7 +2119,8 @@ def input_batch(
     session_id: str = "default",
     target_selector: str | None = None,
     frame_selector: str | None = None,
-    wait_seconds: float = 0.2,
+    wait_seconds: float = 0.0,
+    include_summary: bool = True,
 ) -> dict[str, Any]:
     """Apply mixed keyboard/pointer actions before advancing one step-mode frame."""
     selected_keys = list(key_actions or [])
@@ -1272,57 +2150,86 @@ def input_batch(
     session = _get_session(session_id)
     pointer_results: list[dict[str, Any]] = []
     with session.lock:
-        for index, item in enumerate(normalized_keys):
-            press_keys(
-                [item["key"]],
-                session_id,
-                target_selector if index == 0 else None,
-                frame_selector,
-                0.0,
-                1,
-                0.0,
-                item["action"],
-                False,
-            )
-        for item in normalized_pointers:
-            result = pointer_action(
-                str(item["action"]),
-                float(item["x"]),
-                float(item["y"]),
-                session_id,
-                float(item["end_x"]) if item.get("end_x") is not None else None,
-                float(item["end_y"]) if item.get("end_y") is not None else None,
-                str(item.get("button", "left")),
-                float(item.get("duration_seconds", 0.0)),
-                frame_selector,
-                0.0,
-                str(item.get("coordinate_mode", "absolute")),
-                False,
-            )
-            pointer_results.append(
-                {
-                    key: result[key]
-                    for key in (
-                        "action",
-                        "button",
-                        "x",
-                        "y",
-                        "end_x",
-                        "end_y",
-                        "coordinate_mode",
-                        "delta_x",
-                        "delta_y",
-                    )
-                }
-            )
+        driver = session.driver
+        # A tap is pressed with the rest of the batch and lifted only after the
+        # frame runs, so an engine that polls key state still sees it down.
+        tapped = [item["key"] for item in normalized_keys if item["action"] == "tap"]
+        if normalized_keys:
+            # One frame switch, one focus and one event stream for the whole
+            # batch: per-action round-trips are what make input feel laggy.
+            events: list[dict[str, Any]] = []
+            for item in normalized_keys:
+                key_ids = [item["key"].strip().upper()]
+                normalized = [_normalize_game_key(item["key"])]
+                action = "hold" if item["action"] == "tap" else item["action"]
+                down, up = _key_event_pair(session, key_ids, normalized, action)
+                events.extend(down)
+                events.extend(up)
+                _commit_held_keys(session, key_ids, normalized, action)
+            _select_frame(driver, frame_selector)
+            try:
+                _focus_target(driver, target_selector, "focus")
+                if events:
+                    _perform_key_events(driver, events)
+            finally:
+                if frame_selector:
+                    driver.switch_to.default_content()
+        if normalized_pointers:
+            offset_x, offset_y, viewport = _pointer_context(driver, frame_selector)
+            for item in normalized_pointers:
+                result = _pointer_dispatch(
+                    session,
+                    str(item["action"]),
+                    float(item["x"]),
+                    float(item["y"]),
+                    viewport,
+                    offset_x=offset_x,
+                    offset_y=offset_y,
+                    end_x=float(item["end_x"]) if item.get("end_x") is not None else None,
+                    end_y=float(item["end_y"]) if item.get("end_y") is not None else None,
+                    button=str(item.get("button", "left")),
+                    duration_seconds=float(item.get("duration_seconds", 0.0)),
+                    coordinate_mode=str(item.get("coordinate_mode", "absolute")),
+                    delta_x=float(item.get("delta_x", 0.0)),
+                    delta_y=float(item.get("delta_y", 0.0)),
+                )
+                pointer_results.append(
+                    {
+                        key: result[key]
+                        for key in (
+                            "action",
+                            "button",
+                            "x",
+                            "y",
+                            "end_x",
+                            "end_y",
+                            "coordinate_mode",
+                            "delta_x",
+                            "delta_y",
+                        )
+                    }
+                )
         frame_advanced = session.render_mode == "step"
         _auto_advance_render_after_input(session)
-        _wait_after_action(session.driver, wait_seconds)
+        if tapped:
+            key_ids = [key.strip().upper() for key in tapped]
+            normalized = [_normalize_game_key(key) for key in tapped]
+            _, up = _key_event_pair(session, key_ids, normalized, "release")
+            _commit_held_keys(session, key_ids, normalized, "release")
+            if up:
+                _select_frame(driver, frame_selector)
+                try:
+                    _perform_key_events(driver, up)
+                finally:
+                    if frame_selector:
+                        driver.switch_to.default_content()
+        _wait_after_action(driver, wait_seconds)
         return {
-            **_page_summary(session.driver, session_id),
+            **_action_summary(driver, session_id, include_summary),
             "success": True,
             "key_actions": normalized_keys,
             "pointer_actions": pointer_results,
+            "render_mode": session.render_mode,
             "held_keys": sorted(session.held_keys),
             "held_buttons": sorted(session.held_buttons),
             "frame_advanced": frame_advanced,
@@ -1452,62 +2359,289 @@ _RENDER_BOOTSTRAP_SCRIPT = r"""
 (() => {
 const stateKey = '__webSearchNeoRenderControl';
 if (window[stateKey]) return;
+
+// Capture every timing primitive before anything is replaced, so the gate can
+// restore real timing and can schedule its own work without gating itself.
+const nativeRequest = window.requestAnimationFrame.bind(window);
+const nativeCancel = window.cancelAnimationFrame.bind(window);
+const nativeSetTimeout = window.setTimeout.bind(window);
+const nativeClearTimeout = window.clearTimeout.bind(window);
+const nativeSetInterval = window.setInterval.bind(window);
+const nativeClearInterval = window.clearInterval.bind(window);
+const nativeIdle = window.requestIdleCallback ? window.requestIdleCallback.bind(window) : null;
+const nativeCancelIdle = window.cancelIdleCallback ? window.cancelIdleCallback.bind(window) : null;
+const nativePerformanceNow = performance.now.bind(performance);
+const nativeDateNow = Date.now.bind(Date);
+const epochOffset = nativeDateNow() - nativePerformanceNow();
+
 const state = {
     mode: 'normal',
     targetFps: null,
     interval: 1000 / 60,
-    lastFrame: performance.now(),
+    frameDelta: 1000 / 60,
+    freezeTime: true,
+    gateTimers: true,
+    clockInstalled: false,
+    timersInstalled: false,
+    virtualNow: nativePerformanceNow(),
+    lastFrame: nativePerformanceNow(),
+    lastRealFlush: nativePerformanceNow(),
+    frameCount: 0,
     nextId: -1,
+    nextTimerId: -1,
     pending: new Map(),
+    native: new Map(),
+    timers: new Map(),
+    liveTimers: new Map(),
     timer: null,
-    nativeRequest: window.requestAnimationFrame.bind(window),
-    nativeCancel: window.cancelAnimationFrame.bind(window)
+    nativeRequest: nativeRequest,
+    nativeCancel: nativeCancel
 };
-state.flush = timestamp => {
+
+// The page-visible clock. While the gate is engaged it only moves when a frame
+// is released, so a game sees a constant delta no matter how long the agent
+// spent thinking between calls.
+state.now = () => (state.gated() && state.freezeTime ? state.virtualNow : nativePerformanceNow());
+state.gated = () => state.mode !== 'normal';
+
+state.installClock = () => {
+    if (state.clockInstalled) return;
+    performance.now = () => state.now();
+    Date.now = () => Math.round(epochOffset + state.now());
+    state.clockInstalled = true;
+};
+state.restoreClock = () => {
+    if (!state.clockInstalled) return;
+    performance.now = nativePerformanceNow;
+    Date.now = nativeDateNow;
+    state.clockInstalled = false;
+};
+
+// Timer wrappers are installed once, at bootstrap, and stay pass-through while
+// the gate is off. Installing them only when step mode starts would leave every
+// timer a real game registered during load running on the wall clock, which is
+// exactly the case that matters.
+state.wrapTimer = (callback, delay, args, interval) => {
+    if (typeof callback !== 'function') return null;
+    const id = state.nextTimerId--;
+    const wait = interval === null
+      ? Math.max(0, Number(delay) || 0)
+      : Math.max(1, Number(delay) || 0);
+    if (state.gated() && state.gateTimers) {
+      state.timers.set(id, {
+        callback: callback, args: args, interval: interval, due: state.now() + wait
+      });
+      return id;
+    }
+    const fire = interval === null
+      ? (...inner) => { state.liveTimers.delete(id); callback(...inner); }
+      : callback;
+    const nativeId = interval === null
+      ? nativeSetTimeout(fire, wait, ...args)
+      : nativeSetInterval(fire, wait, ...args);
+    state.liveTimers.set(id, {
+      nativeId: nativeId, callback: callback, args: args,
+      interval: interval, realDue: nativePerformanceNow() + wait
+    });
+    return id;
+};
+
+state.dropTimer = id => {
+    if (state.timers.delete(id)) return true;
+    const live = state.liveTimers.get(id);
+    if (!live) return false;
+    if (live.interval === null) nativeClearTimeout(live.nativeId);
+    else nativeClearInterval(live.nativeId);
+    state.liveTimers.delete(id);
+    return true;
+};
+
+state.installTimers = () => {
+    if (state.timersInstalled) return;
+    window.setTimeout = (callback, delay, ...args) =>
+      state.wrapTimer(callback, delay, args, null) ?? nativeSetTimeout(callback, delay, ...args);
+    window.clearTimeout = id => { if (!state.dropTimer(id)) nativeClearTimeout(id); };
+    window.setInterval = (callback, delay, ...args) =>
+      state.wrapTimer(callback, delay, args, Math.max(1, Number(delay) || 0))
+        ?? nativeSetInterval(callback, delay, ...args);
+    window.clearInterval = id => { if (!state.dropTimer(id)) nativeClearInterval(id); };
+    if (nativeIdle) {
+      window.requestIdleCallback = (callback, options) => {
+        if (typeof callback !== 'function') return nativeIdle(callback, options);
+        return state.wrapTimer(
+          () => callback({didTimeout: false, timeRemaining: () => 8}), 0, [], null
+        );
+      };
+      window.cancelIdleCallback = id => { if (!state.dropTimer(id)) nativeCancelIdle(id); };
+    }
+    state.timersInstalled = true;
+};
+
+// Pull timers the real scheduler is already holding into the virtual queue, so
+// that gating catches everything the page set up before the gate existed.
+state.captureTimers = () => {
+    const now = state.now();
+    const real = nativePerformanceNow();
+    for (const [id, entry] of state.liveTimers) {
+      if (entry.interval === null) nativeClearTimeout(entry.nativeId);
+      else nativeClearInterval(entry.nativeId);
+      const remaining = entry.interval === null
+        ? Math.max(0, entry.realDue - real)
+        : entry.interval;
+      state.timers.set(id, {
+        callback: entry.callback, args: entry.args,
+        interval: entry.interval, due: now + remaining
+      });
+    }
+    state.liveTimers.clear();
+};
+
+// Give the queue back to the real scheduler, keeping ids valid for clearTimeout.
+state.releaseTimers = () => {
+    const queued = Array.from(state.timers.entries());
+    state.timers.clear();
+    const real = nativePerformanceNow();
+    for (const [id, entry] of queued) {
+      const fire = entry.interval === null
+        ? (...inner) => { state.liveTimers.delete(id); entry.callback(...inner); }
+        : entry.callback;
+      const wait = entry.interval === null ? Math.max(0, entry.due - state.now()) : entry.interval;
+      const nativeId = entry.interval === null
+        ? nativeSetTimeout(fire, wait, ...entry.args)
+        : nativeSetInterval(fire, wait, ...entry.args);
+      state.liveTimers.set(id, {
+        nativeId: nativeId, callback: entry.callback, args: entry.args,
+        interval: entry.interval, realDue: real + wait
+      });
+    }
+};
+state.runDueTimers = now => {
+    if (!state.gateTimers || !state.timers.size) return 0;
+    let count = 0;
+    for (let guard = 0; guard < 64; guard++) {
+      const due = Array.from(state.timers.entries())
+        .filter(entry => entry[1].due <= now)
+        .sort((a, b) => a[1].due - b[1].due);
+      if (!due.length) break;
+      for (const [id, entry] of due) {
+        if (entry.interval) entry.due = now + entry.interval;
+        else state.timers.delete(id);
+        try { entry.callback(...entry.args); }
+        catch (error) { nativeSetTimeout(() => { throw error; }, 0); }
+        count += 1;
+      }
+    }
+    return count;
+};
+
+state.flush = () => {
+    if (state.gated() && state.freezeTime) state.virtualNow += state.frameDelta;
+    else state.virtualNow = nativePerformanceNow();
+    const timestamp = state.now();
     state.lastFrame = timestamp;
+    state.frameCount += 1;
+    state.runDueTimers(timestamp);
     const batch = Array.from(state.pending.entries());
     state.pending.clear();
     for (const [, callback] of batch) {
-      try { callback(timestamp); } catch (error) { setTimeout(() => { throw error; }, 0); }
+      try { callback(timestamp); } catch (error) { nativeSetTimeout(() => { throw error; }, 0); }
     }
     state.schedule();
     return batch.length;
 };
+
 state.schedule = () => {
     if (state.mode !== 'throttled' || state.timer !== null || !state.pending.size) return;
-    const delay = Math.max(0, state.interval - (performance.now() - state.lastFrame));
-    state.timer = setTimeout(() => {
+    const elapsed = nativePerformanceNow() - state.lastRealFlush;
+    const delay = Math.max(0, state.interval - elapsed);
+    state.timer = nativeSetTimeout(() => {
       state.timer = null;
-      state.flush(performance.now());
+      state.lastRealFlush = nativePerformanceNow();
+      state.flush();
     }, delay);
 };
+
+// While the gate is off the callback goes to the real scheduler, but it is also
+// remembered: a callback already queued there when the gate engages would fire
+// on the next compositor frame - one the agent never asked for, landing in the
+// middle of an unrelated call - so setMode has to be able to reclaim it.
 state.request = callback => {
-    if (state.mode === 'normal') return state.nativeRequest(callback);
+    if (state.mode === 'normal') {
+      const id = state.nativeRequest(timestamp => {
+        state.native.delete(id);
+        callback(timestamp);
+      });
+      state.native.set(id, callback);
+      return id;
+    }
     const id = state.nextId--;
     state.pending.set(id, callback);
     state.schedule();
     return id;
 };
 state.cancel = id => {
-    if (!state.pending.delete(id)) state.nativeCancel(id);
+    if (state.pending.delete(id)) return;
+    state.native.delete(id);
+    state.nativeCancel(id);
 };
-state.setMode = (mode, targetFps) => {
-    if (state.timer !== null) clearTimeout(state.timer);
+
+// Release `count` frames, yielding to the real task queue between them so that
+// network callbacks and page microtasks can run like they would in a real frame.
+state.step = (count, done) => {
+    let remaining = count;
+    let callbacks = 0;
+    const run = () => {
+      callbacks += state.flush();
+      remaining -= 1;
+      if (remaining > 0) nativeSetTimeout(run, 0);
+      else done({
+        success: true, frames: count, callbacks,
+        pending_callbacks: state.pending.size,
+        pending_timers: state.timers.size,
+        frame_count: state.frameCount,
+        virtual_now: Math.round(state.now())
+      });
+    };
+    run();
+};
+
+state.setMode = (mode, targetFps, options) => {
+    const settings = options || {};
+    if (state.timer !== null) nativeClearTimeout(state.timer);
     state.timer = null;
     state.mode = mode;
     state.targetFps = mode === 'throttled' ? targetFps : null;
     state.interval = 1000 / targetFps;
+    if (settings.frame_delta_ms) state.frameDelta = settings.frame_delta_ms;
+    if (settings.freeze_time !== undefined) state.freezeTime = !!settings.freeze_time;
+    if (settings.gate_timers !== undefined) state.gateTimers = !!settings.gate_timers;
     if (mode === 'normal') {
+      state.releaseTimers();
+      state.restoreClock();
       const callbacks = Array.from(state.pending.values());
       state.pending.clear();
-      for (const callback of callbacks) state.nativeRequest(callback);
+      for (const callback of callbacks) state.request(callback);
     } else {
+      // Reclaim frames the real scheduler still owes, keeping their ids valid
+      // so a later cancelAnimationFrame still finds them.
+      for (const [id, callback] of state.native) {
+        state.nativeCancel(id);
+        state.pending.set(id, callback);
+      }
+      state.native.clear();
+      state.virtualNow = nativePerformanceNow();
+      if (state.freezeTime) state.installClock(); else state.restoreClock();
+      if (state.gateTimers) state.captureTimers(); else state.releaseTimers();
       state.schedule();
     }
 };
+
 window[stateKey] = state;
 window.requestAnimationFrame = state.request;
 window.cancelAnimationFrame = state.cancel;
+// Wrap timers immediately so the ones a game registers while loading can be
+// reclaimed later; while the gate is off they pass straight through.
+state.installTimers();
 })();
 """
 
@@ -1515,23 +2649,35 @@ window.cancelAnimationFrame = state.cancel;
 _RENDER_CONTROL_SCRIPT = r"""
 const mode = arguments[0];
 const targetFps = arguments[1];
+const options = arguments[2];
 const state = window.__webSearchNeoRenderControl;
 if (!state) {
   return {error: 'Render bootstrap is unavailable in this document'};
 }
-state.setMode(mode, targetFps);
-return {mode: state.mode, target_fps: state.targetFps, pending_callbacks: state.pending.size};
+state.setMode(mode, targetFps, options);
+return {
+  mode: state.mode,
+  target_fps: state.targetFps,
+  pending_callbacks: state.pending.size,
+  frame_delta_ms: Math.round(state.frameDelta * 1000) / 1000,
+  time_frozen: state.clockInstalled,
+  timers_gated: state.gated() && state.gateTimers
+};
 """
 
 
 def _register_render_bootstrap(session: BrowserSession) -> None:
-    """Install the frame gate before any script in future documents and frames."""
+    """Install the frame gate and console hook before any script in new documents."""
     if session.render_bootstrap_registered:
         return
-    session.driver.execute_cdp_cmd(
-        "Page.addScriptToEvaluateOnNewDocument",
-        {"source": _RENDER_BOOTSTRAP_SCRIPT},
-    )
+    for source in (
+        _RENDER_BOOTSTRAP_SCRIPT,
+        diagnostics.CONSOLE_HOOK_SCRIPT,
+        page_perception.REF_REGISTRY_SCRIPT,
+    ):
+        session.driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument", {"source": source}
+        )
     session.render_bootstrap_registered = True
 
 
@@ -1539,19 +2685,15 @@ _RENDER_STEP_SCRIPT = r"""
 const count = arguments[0];
 const done = arguments[arguments.length - 1];
 const state = window.__webSearchNeoRenderControl;
-if (!state || state.mode !== 'step') {
-  done({success: false, error: 'Render control is not in step mode'});
+if (!state) {
+  done({success: false, error: 'missing_bootstrap'});
   return;
 }
-let remaining = count;
-let callbacks = 0;
-const run = () => {
-  callbacks += state.flush(performance.now());
-  remaining -= 1;
-  if (remaining > 0) queueMicrotask(run);
-  else done({success: true, frames: count, callbacks, pending_callbacks: state.pending.size});
-};
-run();
+if (state.mode !== 'step') {
+  done({success: false, error: 'not_step_mode', mode: state.mode});
+  return;
+}
+state.step(count, done);
 """
 
 
@@ -1565,17 +2707,50 @@ def _select_frame(driver: webdriver.Chrome, frame_selector: str | None) -> None:
         )
 
 
+def _apply_render_mode(
+    driver: webdriver.Chrome,
+    frame_selector: str | None,
+    mode: str,
+    fps: float,
+    options: dict[str, Any],
+) -> dict[str, Any]:
+    """Install the gate in the selected document and switch it to one mode."""
+    _select_frame(driver, frame_selector)
+    try:
+        driver.execute_script(_RENDER_BOOTSTRAP_SCRIPT)
+        return driver.execute_script(_RENDER_CONTROL_SCRIPT, mode, fps, options)
+    finally:
+        driver.switch_to.default_content()
+
+
 def set_render_control(
     mode: str,
     session_id: str = "default",
     target_fps: float = 10.0,
     frame_selector: str | None = None,
+    frame_delta_ms: float = 1000 / 60,
+    freeze_time: bool = True,
+    gate_timers: bool = True,
+    key_repeat: bool = True,
 ) -> dict[str, Any]:
-    """Set normal, continuously throttled, or manual/input-driven frame stepping."""
+    """Set normal, continuously throttled, or manual/input-driven frame stepping.
+
+    While the gate is engaged, ``freeze_time`` makes ``performance.now()`` and
+    ``Date.now()`` advance by exactly ``frame_delta_ms`` per released frame, and
+    ``gate_timers`` queues ``setTimeout``/``setInterval`` against that same
+    clock. Without them a game measures the agent's thinking time as its frame
+    delta and behaves nothing like it does for a human.
+    """
     selected_mode = mode.strip().lower()
     if selected_mode not in {"normal", "throttled", "step"}:
         raise ValueError("mode must be 'normal', 'throttled', or 'step'")
     fps = max(1.0, min(float(target_fps), 60.0))
+    delta = max(0.1, min(float(frame_delta_ms), 1000.0))
+    options = {
+        "frame_delta_ms": delta,
+        "freeze_time": bool(freeze_time),
+        "gate_timers": bool(gate_timers),
+    }
     session = _get_session(session_id)
     with session.lock:
         driver = session.driver
@@ -1588,19 +2763,14 @@ def set_render_control(
             session.render_mode != "normal"
             and selected_frame != session.render_frame_selector
         ):
-            _select_frame(driver, session.render_frame_selector)
-            try:
-                driver.execute_script(_RENDER_CONTROL_SCRIPT, "normal", 60.0)
-            finally:
-                driver.switch_to.default_content()
-        _select_frame(driver, selected_frame)
-        try:
-            driver.execute_script(_RENDER_BOOTSTRAP_SCRIPT)
-            state = driver.execute_script(_RENDER_CONTROL_SCRIPT, selected_mode, fps)
-        finally:
-            driver.switch_to.default_content()
+            _apply_render_mode(
+                driver, session.render_frame_selector, "normal", 60.0, options
+            )
+        state = _apply_render_mode(driver, selected_frame, selected_mode, fps, options)
         if state.get("error"):
             raise RuntimeError(state["error"])
+        session.render_options = options
+        session.key_repeat = bool(key_repeat)
         session.render_mode = selected_mode
         session.render_target_fps = fps if selected_mode == "throttled" else None
         session.render_frame_selector = selected_frame if selected_mode != "normal" else None
@@ -1610,40 +2780,108 @@ def set_render_control(
             "mode": selected_mode,
             "target_fps": session.render_target_fps,
             "frame_selector": session.render_frame_selector,
+            "key_repeat": session.key_repeat,
             "input_advances_frame": selected_mode == "step",
             "engine": "requestAnimationFrame gate",
             **state,
         }
 
 
-def _advance_render_frames(
+def _step_frames_once(
     driver: webdriver.Chrome, frame_selector: str | None, frames: int
 ) -> dict[str, Any]:
     _select_frame(driver, frame_selector)
     try:
-        result = driver.execute_async_script(_RENDER_STEP_SCRIPT, frames)
+        return driver.execute_async_script(_RENDER_STEP_SCRIPT, frames)
     finally:
         driver.switch_to.default_content()
+
+
+def _repeat_held_keys(session: BrowserSession) -> None:
+    """Auto-repeat held keys the way a real keyboard does, before frames run.
+
+    A single synthetic keydown never comes back, so a game that latches movement
+    on keydown and clears that latch itself - the platformer fixture does it on
+    respawn - stays dead forever even though the key is still held down.
+    """
+    if not session.key_repeat or not session.held_keys:
+        session.fresh_keys.clear()
+        return
+    driver = session.driver
+    events = [
+        {"type": "down", "key": key, "repeat": True}
+        for key_id, key in session.held_keys.items()
+        if key_id not in session.fresh_keys
+    ]
+    session.fresh_keys.clear()
+    if not events:
+        return
+    frame_selector = session.render_frame_selector
+    if frame_selector:
+        _select_frame(driver, frame_selector)
+    try:
+        _perform_key_events(driver, events)
+    finally:
+        if frame_selector:
+            driver.switch_to.default_content()
+
+
+def _advance_render_frames(
+    session: BrowserSession, frames: int, session_id: str = ""
+) -> dict[str, Any]:
+    """Release frames, reinstalling the gate if the document was replaced.
+
+    A game that reloads itself - a level restart, or a cross-origin game iframe
+    swapping its document - drops the injected gate. Without recovery every
+    later input call fails, so the gate is reinstalled once and retried.
+    """
+    driver = session.driver
+    frame_selector = session.render_frame_selector
+    _repeat_held_keys(session)
+    result = _step_frames_once(driver, frame_selector, frames)
+    if not result.get("success") and result.get("error") in {
+        "missing_bootstrap",
+        "not_step_mode",
+    }:
+        state = _apply_render_mode(
+            driver, frame_selector, "step", 60.0, session.render_options
+        )
+        if not state.get("error"):
+            result = _step_frames_once(driver, frame_selector, frames)
+            result["gate_reinstalled"] = True
     if not result.get("success"):
-        raise RuntimeError(result.get("error") or "Render step failed")
+        reason = {
+            "missing_bootstrap": (
+                "The frame gate is missing in this document, most likely because the "
+                "page or game iframe reloaded. Call render(mode='step') again."
+            ),
+            "not_step_mode": "Render control is not in step mode",
+        }.get(result.get("error"), result.get("error") or "Render step failed")
+        raise RuntimeError(reason)
     return result
 
 
 def render_step(
     frames: int = 1,
     session_id: str = "default",
+    include_summary: bool = True,
 ) -> dict[str, Any]:
     """Advance an active step-mode canvas/WebGL loop by a bounded frame count."""
     frame_count = max(1, min(int(frames), 120))
     session = _get_session(session_id)
     with session.lock:
         if session.render_mode != "step":
-            raise ValueError("Render control must be in step mode")
-        result = _advance_render_frames(
-            session.driver, session.render_frame_selector, frame_count
-        )
+            # Naming the exact call matters: "not in step mode" alone leaves the
+            # caller stepping a page that is really running at full speed.
+            raise ValueError(
+                f"Frames can only be stepped in step mode; this session is in "
+                f"'{session.render_mode}' mode, so the page is running on its own. "
+                'Send {"action": "render", "mode": "step", "session_id": '
+                f'"{session_id}"}} first.'
+            )
+        result = _advance_render_frames(session, frame_count, session_id)
         return {
-            **_page_summary(session.driver, session_id),
+            **_action_summary(session.driver, session_id, include_summary),
             "success": True,
             "mode": "step",
             "frame_selector": session.render_frame_selector,
@@ -1651,9 +2889,9 @@ def render_step(
         }
 
 
-def _auto_advance_render_after_input(session: BrowserSession) -> None:
+def _auto_advance_render_after_input(session: BrowserSession, frames: int = 1) -> None:
     if session.render_mode == "step":
-        _advance_render_frames(session.driver, session.render_frame_selector, 1)
+        _advance_render_frames(session, frames)
 
 
 def release_inputs(session_id: str = "default") -> dict[str, Any]:
@@ -1702,7 +2940,7 @@ def submit_form(
     """Submit a form using requestSubmit so browser validation and events run."""
     session = _get_session(session_id)
     with session.lock:
-        form = session.driver.find_element(By.CSS_SELECTOR, form_selector)
+        form = _resolve_element(session.driver, form_selector)
         validation = session.driver.execute_script(
             "const form = arguments[0]; const invalid = Array.from(form.elements)"
             ".filter(el => el.willValidate && !el.checkValidity())"
@@ -1802,7 +3040,7 @@ def get_status(session_id: str = "default") -> dict[str, Any]:
         session = _sessions.get(session_id)
         active_ids = sorted(_sessions)
     if session is None:
-        bridge_status = get_chrome_bridge().status(0.0)
+        bridge_status = _companion_status()
         return {
             "available": bool(bridge_status["connected"] or _browser_available),
             "availability_error": _browser_error,
@@ -1813,7 +3051,7 @@ def get_status(session_id: str = "default") -> dict[str, Any]:
             "current_chrome": bridge_status,
         }
     with session.lock:
-        bridge_status = get_chrome_bridge().status(0.0)
+        bridge_status = _companion_status()
         if session.profile_mode == "current" and not bridge_status["connected"]:
             return {
                 "available": False,
@@ -1890,7 +3128,7 @@ def upload_file(
             raise ValueError(f"Upload path is not a file: {path}")
         resolved.append(str(path))
     with session.lock:
-        element = session.driver.find_element(By.CSS_SELECTOR, selector)
+        element = _resolve_element(session.driver, selector)
         if (element.get_attribute("type") or "").lower() != "file":
             raise ValueError("Selector does not point to an input[type=file]")
         if len(resolved) > 1 and element.get_attribute("multiple") is None:
@@ -1948,24 +3186,38 @@ def _reset_session_runtime_state(session: BrowserSession) -> None:
             pass
 
 
-def close_session(session_id: str = "default") -> dict[str, Any]:
-    """Close one browser session and release Chrome resources."""
+def close_session(session_id: str = "default", close_tab: bool | None = None) -> dict[str, Any]:
+    """Close one browser session and release Chrome resources.
+
+    In ``current`` mode a tab the server opened is closed by default, otherwise
+    every session would leave another tab behind in the user's Chrome. A tab that
+    was claimed with ``attach_tab`` is always left open.
+    """
     session_id = _validate_session_id(session_id)
     with _sessions_lock:
         session = _sessions.pop(session_id, None)
         remaining = sorted(_sessions)
     closed = session is not None
+    tab_closed = False
     if session is not None:
         with session.lock:
+            should_close_tab = session.owns_tab if close_tab is None else bool(close_tab)
             try:
                 _reset_session_runtime_state(session)
+                if should_close_tab and hasattr(session.driver, "close_tab"):
+                    tab_closed = bool(session.driver.close_tab().get("removed"))
                 if session.owns_browser:
                     session.driver.quit()
                 else:
                     session.driver.service.stop()
             except Exception:
                 pass
-    return {"session_id": session_id, "closed": closed, "active_sessions": remaining}
+    return {
+        "session_id": session_id,
+        "closed": closed,
+        "tab_closed": tab_closed,
+        "active_sessions": remaining,
+    }
 
 
 def close_all_sessions() -> None:

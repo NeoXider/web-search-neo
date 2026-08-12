@@ -1,6 +1,8 @@
 """Web Search Neo: API-free search, fetch, and rendered browser MCP server."""
 
 import asyncio
+from dataclasses import dataclass
+import functools
 import logging
 from logging.handlers import RotatingFileHandler
 import os
@@ -10,12 +12,15 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 from mcp.server.fastmcp import FastMCP, Image
+from pydantic import ValidationError
 
 import browser_tools
 import msp_date_time
 import msp_search
 from web_client import request
 
+
+__version__ = "1.2.0"
 
 PROJECT_DIR = Path(__file__).resolve().parent
 log = logging.getLogger("web_search_neo")
@@ -462,6 +467,140 @@ async def browser_get_page_elements(
 
 
 @mcp.tool()
+async def browser_page_outline(
+    session_id: str = "default",
+    limit: int = 200,
+    include_occlusion: bool = True,
+    output: Literal["text", "json"] = "text",
+    frame_selector: str | None = None,
+) -> dict[str, Any]:
+    """Outline the page: roles, names, states, refs, and boxes, including shadow DOM."""
+    return await asyncio.to_thread(
+        functools.partial(
+            browser_tools.get_page_outline,
+            session_id=session_id,
+            limit=limit,
+            include_occlusion=include_occlusion,
+            output=output,
+            frame_selector=frame_selector,
+        )
+    )
+
+
+@mcp.tool()
+async def browser_page_text(
+    session_id: str = "default",
+    max_chars: int = 20_000,
+    mode: Literal["main", "full"] = "main",
+    include_links: bool = False,
+    frame_selector: str | None = None,
+) -> dict[str, Any]:
+    """Read the rendered page as text, including content that only exists after JS."""
+    return await asyncio.to_thread(
+        functools.partial(
+            browser_tools.get_page_text,
+            session_id=session_id,
+            max_chars=max_chars,
+            mode=mode,
+            include_links=include_links,
+            frame_selector=frame_selector,
+        )
+    )
+
+
+@mcp.tool()
+async def browser_find(
+    query: str,
+    session_id: str = "default",
+    role: str | None = None,
+    limit: int = 5,
+    visible_only: bool = True,
+    frame_selector: str | None = None,
+) -> dict[str, Any]:
+    """Find elements by meaning and get refs back, instead of reading the whole page."""
+    return await asyncio.to_thread(
+        functools.partial(
+            browser_tools.find_elements,
+            query,
+            session_id=session_id,
+            role=role,
+            limit=limit,
+            visible_only=visible_only,
+            frame_selector=frame_selector,
+        )
+    )
+
+
+@mcp.tool()
+async def browser_console(
+    session_id: str = "default",
+    levels: list[str] | None = None,
+    contains: str | None = None,
+    kinds: list[str] | None = None,
+    limit: int = 50,
+    since_seq: int = 0,
+    clear: bool = False,
+) -> dict[str, Any]:
+    """Read console output and uncaught page errors with stack traces."""
+    return await asyncio.to_thread(
+        functools.partial(
+            browser_tools.get_console,
+            session_id=session_id,
+            levels=levels,
+            contains=contains,
+            kinds=kinds,
+            limit=limit,
+            since_seq=since_seq,
+            clear=clear,
+        )
+    )
+
+
+@mcp.tool()
+async def browser_network(
+    session_id: str = "default",
+    url_pattern: str | None = None,
+    types: list[str] | None = None,
+    status_min: int | None = None,
+    status_max: int | None = None,
+    only_errors: bool = False,
+    limit: int = 50,
+    output: Literal["text", "json"] = "text",
+) -> dict[str, Any]:
+    """List the page's HTTP requests with status, type, duration, and size."""
+    return await asyncio.to_thread(
+        functools.partial(
+            browser_tools.get_network,
+            session_id=session_id,
+            url_pattern=url_pattern,
+            types=types,
+            status_min=status_min,
+            status_max=status_max,
+            only_errors=only_errors,
+            limit=limit,
+            output=output,
+        )
+    )
+
+
+@mcp.tool()
+async def browser_network_body(
+    request_id: str,
+    session_id: str = "default",
+    max_chars: int = 20_000,
+) -> dict[str, Any]:
+    """Fetch one response body by the request_id reported by the network topic."""
+    return await asyncio.to_thread(
+        functools.partial(
+            browser_tools.get_network_body,
+            request_id,
+            session_id=session_id,
+            max_chars=max_chars,
+        )
+    )
+
+
+@mcp.tool()
 async def browser_wait_for(
     selector: str,
     session_id: str = "default",
@@ -533,25 +672,31 @@ async def browser_press_keys(
     repeat: int = 1,
     wait_seconds: float = 0.2,
     action: Literal["tap", "hold", "release"] = "tap",
+    hold_frames: int = 1,
+    focus_mode: Literal["focus", "click", "none"] = "focus",
 ) -> dict[str, Any]:
     """Tap, hold, or release one or more keys as a single input batch."""
     return await asyncio.to_thread(
-        browser_tools.press_keys,
-        keys,
-        session_id,
-        target_selector,
-        frame_selector,
-        hold_seconds,
-        repeat,
-        wait_seconds,
-        action,
+        functools.partial(
+            browser_tools.press_keys,
+            keys,
+            session_id=session_id,
+            target_selector=target_selector,
+            frame_selector=frame_selector,
+            hold_seconds=hold_seconds,
+            repeat=repeat,
+            wait_seconds=wait_seconds,
+            action=action,
+            hold_frames=hold_frames,
+            focus_mode=focus_mode,
+        )
     )
 
 
 @mcp.tool()
 async def browser_pointer(
-    action: Literal[
-        "click", "double_click", "move", "hover", "drag", "press", "release"
+    pointer_action: Literal[
+        "click", "double_click", "move", "hover", "drag", "press", "release", "wheel"
     ],
     x: float,
     y: float,
@@ -562,22 +707,97 @@ async def browser_pointer(
     duration_seconds: float = 0.3,
     frame_selector: str | None = None,
     wait_seconds: float = 0.2,
-    coordinate_mode: Literal["absolute", "delta"] = "absolute",
+    coordinate_mode: Literal["absolute", "delta", "relative"] = "absolute",
+    delta_x: float = 0.0,
+    delta_y: float = 0.0,
 ) -> dict[str, Any]:
-    """Click, hover, drag, press, or release using absolute or delta coordinates."""
+    """Click, hover, drag, scroll the wheel, or hold a mouse button.
+
+    Use coordinate_mode='relative' while pointer lock is held: the cursor cannot
+    move, so only the movement delta reaches the game.
+    """
     return await asyncio.to_thread(
-        browser_tools.pointer_action,
-        action,
-        x,
-        y,
-        session_id,
-        end_x,
-        end_y,
-        button,
-        duration_seconds,
-        frame_selector,
-        wait_seconds,
-        coordinate_mode,
+        functools.partial(
+            browser_tools.pointer_action,
+            pointer_action,
+            x,
+            y,
+            session_id=session_id,
+            end_x=end_x,
+            end_y=end_y,
+            button=button,
+            duration_seconds=duration_seconds,
+            frame_selector=frame_selector,
+            wait_seconds=wait_seconds,
+            coordinate_mode=coordinate_mode,
+            delta_x=delta_x,
+            delta_y=delta_y,
+        )
+    )
+
+
+@mcp.tool()
+async def browser_touch(
+    touch_action: Literal["tap", "press", "move", "release", "swipe", "cancel"],
+    points: list[dict[str, Any]] | None = None,
+    session_id: str = "default",
+    frame_selector: str | None = None,
+    steps: int = 8,
+    duration_seconds: float = 0.2,
+    wait_seconds: float = 0.2,
+) -> dict[str, Any]:
+    """Send touch input: tap, multi-finger press/move/release, or a swipe."""
+    return await asyncio.to_thread(
+        functools.partial(
+            browser_tools.touch_action,
+            touch_action,
+            points=points,
+            session_id=session_id,
+            frame_selector=frame_selector,
+            steps=steps,
+            duration_seconds=duration_seconds,
+            wait_seconds=wait_seconds,
+        )
+    )
+
+
+@mcp.tool()
+async def browser_touch_emulation(
+    session_id: str = "default",
+    enabled: bool = True,
+    max_touch_points: int = 5,
+    reload_page: bool = True,
+) -> dict[str, Any]:
+    """Present the page as a touch device so mobile code paths actually run."""
+    return await asyncio.to_thread(
+        functools.partial(
+            browser_tools.set_touch_emulation,
+            session_id=session_id,
+            enabled=enabled,
+            max_touch_points=max_touch_points,
+            reload_page=reload_page,
+        )
+    )
+
+
+@mcp.tool()
+async def browser_pointer_lock(
+    operation: Literal["acquire", "release", "status"] = "status",
+    session_id: str = "default",
+    selector: str | None = None,
+    frame_selector: str | None = None,
+    timeout_seconds: float = 2.0,
+) -> dict[str, Any]:
+    """Acquire, release, or read pointer lock for first-person style games."""
+    return await asyncio.to_thread(
+        functools.partial(
+            browser_tools.pointer_lock,
+            operation,
+            session_id=session_id,
+            selector=selector,
+            frame_selector=frame_selector,
+            timeout_seconds=timeout_seconds,
+        )
     )
 
 
@@ -625,15 +845,32 @@ async def browser_render_control(
     session_id: str = "default",
     target_fps: float = 10.0,
     frame_selector: str | None = None,
+    frame_delta_ms: float = 1000 / 60,
+    freeze_time: bool = True,
+    gate_timers: bool = True,
 ) -> dict[str, Any]:
     """Run normally, throttle requestAnimationFrame, or advance frames only on command/input."""
-    return await asyncio.to_thread(
-        browser_tools.set_render_control,
-        mode,
-        session_id,
-        target_fps,
-        frame_selector,
+    result = await asyncio.to_thread(
+        functools.partial(
+            browser_tools.set_render_control,
+            mode,
+            session_id=session_id,
+            target_fps=target_fps,
+            frame_selector=frame_selector,
+            frame_delta_ms=frame_delta_ms,
+            freeze_time=freeze_time,
+            gate_timers=gate_timers,
+        )
     )
+    # Say what to call next: "step mode is on" is not actionable on its own, and
+    # a caller that does not know can sit here re-selecting the same mode.
+    result["next"] = (
+        'The page is frozen. Send {"action": "step", "frames": N, "session_id": '
+        f'"{session_id}"}} to advance, or an input action, which advances one frame.'
+        if mode == "step"
+        else "Animation runs on its own; no step calls are needed."
+    )
+    return result
 
 
 @mcp.tool()
@@ -722,191 +959,341 @@ mcp = FastMCP(
 )
 
 
-_ACTION_HANDLERS = {
-    "search": search_web,
-    "fetch_text": fetch_url_text,
-    "fetch_links": fetch_page_links,
-    "fetch_many": fetch_urls_text,
-    "open": browser_open_page,
-    "open_many": browser_open_pages,
-    "attach_tab": browser_attach_tab,
-    "setup_current_chrome": browser_setup_current_chrome,
-    "wait": browser_wait_for,
-    "wait_challenge": browser_wait_for_challenge,
-    "fill": browser_fill_fields,
-    "upload": browser_upload_file,
-    "click": browser_click,
-    "input": browser_input_batch,
-    "render": browser_render_control,
-    "step": browser_render_step,
-    "release_inputs": browser_release_inputs,
-    "submit": browser_submit_form,
-    "close": browser_close,
-    "close_all": browser_close_all,
+@dataclass(frozen=True)
+class ActionSpec:
+    """One dispatcher action, described once and reused everywhere."""
+
+    name: str
+    handler: Any
+    tool_name: str
+    group: str
+    summary: str
+
+
+def _action(name: str, handler: Any, group: str, summary: str) -> ActionSpec:
+    return ActionSpec(name, handler, handler.__name__, group, summary)
+
+
+_ACTIONS: dict[str, ActionSpec] = {
+    spec.name: spec
+    for spec in (
+        _action("search", search_web, "search", "Web search with automatic multi-engine fallback."),
+        _action(
+            "fetch_text", fetch_url_text, "fetch", "Read one page as text without opening a browser."
+        ),
+        _action("fetch_links", fetch_page_links, "fetch", "List the links of one page without a browser."),
+        _action("fetch_many", fetch_urls_text, "fetch", "Read several pages concurrently as text."),
+        _action("open", browser_open_page, "session", "Open a URL in a named browser session."),
+        _action(
+            "open_many", browser_open_pages, "session", "Open several URLs in independent sessions at once."
+        ),
+        _action(
+            "attach_tab",
+            browser_attach_tab,
+            "session",
+            "Claim an existing Chrome tab by id without navigating or moving it.",
+        ),
+        _action(
+            "setup_current_chrome",
+            browser_setup_current_chrome,
+            "session",
+            "Connect the companion extension; changing Chrome needs explicit user approval.",
+        ),
+        _action("wait", browser_wait_for, "page", "Wait until an element is present, visible, or clickable."),
+        _action(
+            "wait_challenge",
+            browser_wait_for_challenge,
+            "page",
+            "Hand the visible browser to the user so they can solve a challenge.",
+        ),
+        _action("fill", browser_fill_fields, "page", "Set values on form fields by CSS selector."),
+        _action("upload", browser_upload_file, "page", "Attach local files to a file input."),
+        _action("click", browser_click, "page", "Click one element by CSS selector."),
+        _action(
+            "input",
+            browser_input_batch,
+            "game",
+            "Apply mixed keyboard and pointer input atomically; releases one frame in step mode.",
+        ),
+        _action(
+            "pointer",
+            browser_pointer,
+            "game",
+            "One pointer event: click, hover, drag, wheel, or a held button.",
+        ),
+        _action(
+            "touch",
+            browser_touch,
+            "game",
+            "Touch input: tap, swipe, or multi-finger press/move/release.",
+        ),
+        _action(
+            "touch_emulation",
+            browser_touch_emulation,
+            "game",
+            "Present the page as a touch device so mobile code paths run.",
+        ),
+        _action(
+            "pointer_lock",
+            browser_pointer_lock,
+            "game",
+            "Acquire, release, or read pointer lock for first-person games.",
+        ),
+        _action("render", browser_render_control, "game", "Set the animation gate: normal, throttled, or step."),
+        _action("step", browser_render_step, "game", "Release an explicit number of animation frames."),
+        _action(
+            "release_inputs", browser_release_inputs, "game", "Release every held key and pointer button."
+        ),
+        _action("submit", browser_submit_form, "page", "Submit a form."),
+        _action(
+            "close", browser_close, "session", "Close one session; a claimed current-Chrome tab stays open."
+        ),
+        _action("close_all", browser_close_all, "session", "Close every session owned by this server."),
+    )
 }
 
-_ACTION_TOOL_NAMES = {
-    "search": "search_web",
-    "fetch_text": "fetch_url_text",
-    "fetch_links": "fetch_page_links",
-    "fetch_many": "fetch_urls_text",
-    "open": "browser_open_page",
-    "open_many": "browser_open_pages",
-    "attach_tab": "browser_attach_tab",
-    "setup_current_chrome": "browser_setup_current_chrome",
-    "wait": "browser_wait_for",
-    "wait_challenge": "browser_wait_for_challenge",
-    "fill": "browser_fill_fields",
-    "upload": "browser_upload_file",
-    "click": "browser_click",
-    "input": "browser_input_batch",
-    "render": "browser_render_control",
-    "step": "browser_render_step",
-    "release_inputs": "browser_release_inputs",
-    "submit": "browser_submit_form",
-    "close": "browser_close",
-    "close_all": "browser_close_all",
+
+def _argument_model(tool_name: str) -> Any:
+    """Return the pydantic model FastMCP generated for one wrapper function."""
+    return legacy_mcp._tool_manager._tools[tool_name].fn_metadata.arg_model
+
+
+def _parameter_names(tool_name: str) -> tuple[list[str], list[str]]:
+    """Split a wrapper's parameters into required and optional names."""
+    fields = _argument_model(tool_name).model_fields
+    required = [name for name, field in fields.items() if field.is_required()]
+    optional = [name for name, field in fields.items() if not field.is_required()]
+    return required, optional
+
+
+_ACTION_KEY_ALIASES = ("type", "name", "tool", "command", "op", "operation", "method")
+
+
+def _unsupported_action_error(action_name: str, arguments: dict[str, Any]) -> str:
+    """Explain a bad action well enough that the caller fixes it on the next try.
+
+    A weaker model that writes ``{"type": "open"}`` will otherwise repeat the
+    same call forever, because "unsupported action" does not say what to change.
+    """
+    if not action_name:
+        misplaced = [key for key in _ACTION_KEY_ALIASES if key in arguments]
+        if misplaced:
+            key = misplaced[0]
+            return (
+                f"Every action object needs an \"action\" key; this one used "
+                f"\"{key}\": {arguments[key]!r}. Rename it to \"action\". "
+                f"Available actions: {sorted(_ACTIONS)}."
+            )
+        return (
+            "Every action object needs an \"action\" key, for example "
+            '{"action": "open", "url": "https://example.com"}. '
+            f"Available actions: {sorted(_ACTIONS)}."
+        )
+    close = [name for name in _ACTIONS if name.startswith(action_name[:3])]
+    suggestion = f" Did you mean {close}?" if close else ""
+    return (
+        f"Unsupported action: {action_name}.{suggestion} "
+        f"Available actions: {sorted(_ACTIONS)}."
+    )
+
+
+def _validate_arguments(tool_name: str, label: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Validate and coerce caller arguments against the published schema.
+
+    ``web_action`` and ``web_info`` dispatch to plain functions, so without this
+    the advertised JSON Schema and the accepted input would drift apart and a
+    typo would surface as an internal ``TypeError``.
+    """
+    model = _argument_model(tool_name)
+    allowed = list(model.model_fields)
+    unknown = [key for key in arguments if key not in allowed]
+    if unknown:
+        raise ValueError(
+            f"{label}: unknown parameter(s) {sorted(unknown)}. "
+            f"Allowed: {allowed}. "
+            "Call web_info(topic='action_schema', params={'action': '<name>'}) for the full schema."
+        )
+    try:
+        validated = model.model_validate(arguments)
+    except ValidationError as exc:
+        problems = "; ".join(
+            f"{'.'.join(str(part) for part in error['loc']) or '<root>'}: {error['msg']}"
+            for error in exc.errors()
+        )
+        required, optional = _parameter_names(tool_name)
+        raise ValueError(
+            f"{label}: {problems}. Required: {required}. Optional: {optional}."
+        ) from None
+    return validated.model_dump(exclude_unset=True)
+
+
+_INFO_TOPICS = {
+    "capabilities": "This contract: topics, actions, recipes, and pitfalls.",
+    "action_schema": "Full JSON Schema for one action; pass params.action.",
+    "page_outline": "Roles, names, states, refs, and boxes - start looking here.",
+    "page_text": "Readable text of the rendered page; params.mode=main|full.",
+    "find": "Find an element by meaning: params.query='submit application'.",
+    "page_elements": "Flat CSS selectors for links, forms, fields, buttons.",
+    "console": "console.log/warn/error and uncaught errors; params.levels, params.contains.",
+    "network": "HTTP requests with status, type, ms, size; params.only_errors=true.",
+    "network_body": "One response body; params.request_id from the network topic.",
+    "screenshot": "PNG image of the current page.",
+    "game_probe": "Canvas/WebGL/iframe surfaces, FPS, focus, console, held input.",
+    "browser_status": "Chrome availability and named session state.",
+    "browser_tabs": "Tabs open in the user's Chrome, with ids and groups.",
+    "search_status": "Search providers, live availability, latency, cooldowns.",
+    "time": "Current local date, time, and UTC offset.",
 }
+
+_ACTION_NOTES = {
+    "input": {
+        "key_action": {"key": "W|SPACE|ARROW_LEFT|F5|NUMPAD1|...", "action": "tap|hold|release"},
+        "pointer_action": {
+            "action": "click|double_click|hover|move|drag|press|release|wheel",
+            "coordinates": "x/y absolute, deltas when coordinate_mode=delta or relative",
+            "wheel": "pass delta_x/delta_y; x/y is where the wheel is scrolled",
+        },
+        "atomicity": "Every change lands before the single released frame; taps stay down for it.",
+    },
+    "render": {
+        "modes": ["normal", "throttled", "step"],
+        "determinism": (
+            "step freezes performance.now()/Date.now() and queues timers, so each "
+            "released frame is a fixed frame_delta_ms. Without it a game measures "
+            "your thinking time as its frame delta."
+        ),
+    },
+    "pointer": {
+        "pointer_action": "click|double_click|hover|move|drag|press|release|wheel",
+        "note": "The dispatcher key is 'action'; the pointer verb is 'pointer_action'.",
+    },
+    "pointer_lock": {
+        "operation": "acquire|release|status",
+        "note": "After acquire, move with coordinate_mode='relative'.",
+    },
+    "touch": {
+        "touch_action": "tap|press|move|release|swipe|cancel",
+        "points": [{"x": 0, "y": 0, "id": 0, "end_x": 0, "end_y": 0}],
+    },
+    "open": {
+        "profile_mode": {
+            "current": "the user's signed-in Chrome through the companion extension (default)",
+            "auto": "current, falling back to a visible temporary profile",
+            "temporary": "clean disposable profile",
+            "persistent": "durable server-owned profile, keeps logins",
+            "attach": "a Chrome you started with a DevTools port",
+        }
+    },
+}
+
+_RECIPES = {
+    "lookup": ["search {query}", "open {url}", "page_elements", "read the answer"],
+    "form": [
+        "open {url}",
+        "page_elements to get selectors",
+        "fill {selector: value}",
+        "submit {form_selector}",
+        "screenshot to confirm",
+    ],
+    "existing_tab": ["browser_tabs", "attach_tab {tab_id}", "page_elements", "act"],
+    "game": [
+        "open {url}",
+        "game_probe (read frame_selector and canvas rect)",
+        "render mode=step",
+        "input {key_actions/pointer_actions} or step {frames}",
+        "screenshot or game_probe between batches",
+        "release_inputs, then render mode=normal",
+    ],
+}
+
+_PITFALLS = [
+    "web_action success=true is not task success: check failure_count and every results[i].success.",
+    "Selectors die when the document changes; re-read page_elements after navigation.",
+    "challenge_detected means a CAPTCHA: use wait_challenge or let search fall back, never hammer clicks.",
+    "profile_mode=current drives the user's real Chrome; close frees the session and leaves their tab open.",
+    "In render=step nothing moves until input or step runs, so a screenshot taken first shows the old frame.",
+    "Always release_inputs after hold, and return render to normal before you finish.",
+    "Pointer coordinates are viewport-local; inside an iframe pass frame_selector and frame-local x/y.",
+    "Plain http:// to public hosts is refused; use https. Loopback and private addresses stay allowed.",
+]
+
+
+_EXAMPLES = {
+    "search": {
+        "actions": [
+            {
+                "action": "search",
+                "query": "free browser automation MCP",
+                "engine": "duckduckgo",
+                "fallback": True,
+            }
+        ]
+    },
+    "input": {
+        "actions": [
+            {
+                "action": "render",
+                "mode": "step",
+                "session_id": "game",
+                "frame_selector": "#game-frame",
+            },
+            {
+                "action": "input",
+                "session_id": "game",
+                "frame_selector": "#game-frame",
+                "key_actions": [
+                    {"key": "W", "action": "hold"},
+                    {"key": "S", "action": "release"},
+                    {"key": "SPACE", "action": "tap"},
+                ],
+                "pointer_actions": [
+                    {"action": "hover", "x": 640, "y": 360},
+                    {"action": "wheel", "x": 640, "y": 360, "delta_y": -240},
+                    {"action": "move", "x": 20, "y": -5, "coordinate_mode": "delta"},
+                ],
+            },
+        ]
+    },
+    "pointer_lock": {
+        "actions": [
+            {"action": "pointer_lock", "operation": "acquire", "session_id": "fps"},
+            {
+                "action": "input",
+                "session_id": "fps",
+                "pointer_actions": [
+                    {"action": "move", "x": 400, "y": 0, "coordinate_mode": "relative"}
+                ],
+            },
+        ]
+    },
+}
+
+
+def _action_documentation() -> dict[str, dict[str, Any]]:
+    """Describe every action from the single registry, never a parallel list."""
+    document = {}
+    for name, spec in _ACTIONS.items():
+        required, optional = _parameter_names(spec.tool_name)
+        entry: dict[str, Any] = {"summary": spec.summary}
+        if required:
+            entry["required"] = required
+        if optional:
+            entry["optional"] = optional
+        entry.update(_ACTION_NOTES.get(name, {}))
+        document[name] = entry
+    return document
 
 
 def _capabilities(action_name: str | None = None) -> dict[str, Any]:
-    document = {
-        "public_tools": ["web_info", "web_action"],
-        "info_topics": {
-            "capabilities": "This compact contract and examples.",
-            "action_schema": "Detailed parameters for one action type; pass params.action.",
-            "search_status": "Configured/live search providers, latency, cooldowns, challenges.",
-            "browser_status": "Chrome availability and named session state.",
-            "browser_tabs": "Open tabs in the user's current Chrome with IDs and groups.",
-            "page_elements": "Rendered links, forms, fields, and buttons with CSS selectors.",
-            "game_probe": "Canvas/WebGL/iframe surfaces, FPS, focus, console, held input.",
-            "screenshot": "PNG Image response for a browser session.",
-            "time": "Current local date, time, and UTC offset.",
-        },
-        "action_types": {
-            "search": {
-                "required": ["query"],
-                "optional": [
-                    "num",
-                    "engine",
-                    "fallback",
-                    "timeout_seconds",
-                    "fresh",
-                    "challenge_mode",
-                    "manual_timeout_seconds",
-                ],
-            },
-            "fetch_text": {"required": ["url"], "optional": ["max_chars", "timeout_seconds"]},
-            "fetch_links": {"required": ["url"], "optional": ["limit", "timeout_seconds"]},
-            "fetch_many": {
-                "required": ["urls"],
-                "optional": ["max_chars_per_page", "timeout_seconds"],
-            },
-            "open": {
-                "required": ["url"],
-                "optional": [
-                    "session_id",
-                    "width",
-                    "height",
-                    "timeout_seconds",
-                    "headless",
-                    "profile_mode",
-                    "profile_id",
-                    "debugger_address",
-                    "current_tab_id",
-                    "tab_group",
-                ],
-            },
-            "open_many": {"required": ["urls"], "optional": ["session_ids", "width", "height", "timeout_seconds", "headless", "profile_mode", "tab_group"]},
-            "attach_tab": {"required": ["tab_id"], "optional": ["session_id"]},
-            "setup_current_chrome": {
-                "optional": ["confirm_install", "timeout_seconds", "window_title"],
-                "confirmation": "Call first without confirmation; proceed only after the user explicitly approves extension installation.",
-            },
-            "wait": {"required": ["selector"], "optional": ["session_id", "state", "timeout_seconds"]},
-            "wait_challenge": {"optional": ["session_id", "timeout_seconds"]},
-            "fill": {"required": ["fields"], "optional": ["files", "session_id"]},
-            "upload": {"required": ["selector", "file_paths"], "optional": ["session_id"]},
-            "click": {"required": ["selector"], "optional": ["session_id", "wait_seconds"]},
-            "input": {
-                "optional": [
-                    "key_actions",
-                    "pointer_actions",
-                    "session_id",
-                    "target_selector",
-                    "frame_selector",
-                    "wait_seconds",
-                ],
-                "key_action": {"key": "W|SPACE|...", "action": "tap|hold|release"},
-                "pointer_action": {
-                    "action": "click|double_click|hover|move|drag|press|release",
-                    "coordinates": "x/y absolute, or deltas when coordinate_mode=delta",
-                },
-            },
-            "render": {"required": ["mode"], "optional": ["session_id", "target_fps", "frame_selector"], "modes": ["normal", "throttled", "step"]},
-            "step": {"optional": ["frames", "session_id"]},
-            "release_inputs": {"optional": ["session_id"]},
-            "submit": {"required": ["form_selector"], "optional": ["session_id", "submit_selector", "wait_seconds"]},
-            "close": {"optional": ["session_id"]},
-            "close_all": {},
-        },
-        "examples": {
-            "search": {
-                "actions": [
-                    {
-                        "action": "search",
-                        "query": "free browser automation MCP",
-                        "engine": "duckduckgo",
-                        "fallback": True,
-                    }
-                ]
-            },
-            "atomic_game_frame": {
-                "actions": [
-                    {
-                        "action": "render",
-                        "mode": "step",
-                        "session_id": "game",
-                        "frame_selector": "#game-frame",
-                    },
-                    {
-                        "action": "input",
-                        "session_id": "game",
-                        "frame_selector": "#game-frame",
-                        "key_actions": [
-                            {"key": "W", "action": "hold"},
-                            {"key": "S", "action": "release"},
-                            {"key": "SPACE", "action": "tap"},
-                            {"key": "E", "action": "tap"},
-                        ],
-                        "pointer_actions": [
-                            {"action": "hover", "x": 640, "y": 360},
-                            {
-                                "action": "move",
-                                "x": 20,
-                                "y": -5,
-                                "coordinate_mode": "delta",
-                            },
-                        ],
-                    },
-                ]
-            },
-        },
-        "limits": {
-            "ordered_actions_per_call": 32,
-            "parallel_browser_sessions": browser_tools.MAX_SESSIONS,
-            "input_actions_per_batch": 16,
-            "automatic_captcha": False,
-            "captcha_modes": ["fallback", "manual"],
-        },
-    }
+    """Return the whole agent-facing contract, or one action's schema."""
     if action_name is not None:
         selected = action_name.strip().lower()
-        notes = document["action_types"].get(selected)
-        legacy_name = _ACTION_TOOL_NAMES.get(selected)
-        if notes is None or legacy_name is None:
-            raise ValueError(f"Unknown action schema: {selected}")
-        original = legacy_mcp._tool_manager._tools[legacy_name].parameters
+        spec = _ACTIONS.get(selected)
+        if spec is None:
+            raise ValueError(
+                f"Unknown action schema: {selected}. Available: {sorted(_ACTIONS)}"
+            )
+        original = legacy_mcp._tool_manager._tools[spec.tool_name].parameters
         input_schema = {
             **original,
             "properties": {
@@ -920,27 +1307,64 @@ def _capabilities(action_name: str | None = None) -> dict[str, Any]:
             "required": ["action", *original.get("required", [])],
             "title": f"{selected}Action",
         }
-        response = {"action": selected, "input_schema": input_schema, "notes": notes}
-        if selected == "input":
-            response["example"] = document["examples"]["atomic_game_frame"]
-        elif selected == "search":
-            response["example"] = document["examples"]["search"]
+        response = {
+            "action": selected,
+            "input_schema": input_schema,
+            "notes": _action_documentation()[selected],
+        }
+        example = _EXAMPLES.get(selected)
+        if example is not None:
+            response["example"] = example
         return response
-    document.pop("action_types")
-    document["action_groups"] = {
-        "search": ["search"],
-        "fetch": ["fetch_text", "fetch_links", "fetch_many"],
-        "session": ["setup_current_chrome", "open", "open_many", "attach_tab", "close", "close_all"],
-        "page": ["wait", "wait_challenge", "fill", "upload", "click", "submit"],
-        "game": ["input", "render", "step", "release_inputs"],
+
+    groups: dict[str, list[str]] = {}
+    for name, spec in _ACTIONS.items():
+        groups.setdefault(spec.group, []).append(name)
+    return {
+        "server": "Web Search Neo",
+        "version": __version__,
+        "public_tools": ["web_info", "web_action"],
+        "how": (
+            "web_info(topic=...) reads state; web_action(actions=[...]) performs 1-32 "
+            "ordered actions. One session_id is one page - reuse it. This document "
+            "is the whole contract; no external skill is required."
+        ),
+        "info_topics": _INFO_TOPICS,
+        "actions": {name: spec.summary for name, spec in _ACTIONS.items()},
+        "action_groups": groups,
+        "recipes": _RECIPES,
+        "pitfalls": _PITFALLS,
+        "examples": _EXAMPLES,
+        "limits": {
+            "ordered_actions_per_call": 32,
+            "parallel_browser_sessions": browser_tools.MAX_SESSIONS,
+            "input_actions_per_batch": 16,
+            "automatic_captcha": False,
+            "captcha_modes": ["fallback", "manual"],
+        },
+        "discovery": {
+            "next_call": "web_info",
+            "topic": "action_schema",
+            "params_example": {"action": "input"},
+            "note": "Describe only the action you need, then call it through web_action.",
+        },
     }
-    document["discovery"] = {
-        "next_call": "web_info",
-        "topic": "action_schema",
-        "params_example": {"action": "input"},
-        "note": "Describe only the action you need, then call it through web_action.",
-    }
-    return document
+
+
+_TOPIC_HANDLERS = {
+    "search_status": get_search_engines_status,
+    "browser_status": browser_get_status,
+    "browser_tabs": browser_list_tabs,
+    "page_outline": browser_page_outline,
+    "page_text": browser_page_text,
+    "find": browser_find,
+    "page_elements": browser_get_page_elements,
+    "console": browser_console,
+    "network": browser_network,
+    "network_body": browser_network_body,
+    "game_probe": browser_game_probe,
+    "screenshot": browser_screenshot,
+}
 
 
 @mcp.tool()
@@ -951,14 +1375,24 @@ async def web_info(
         "search_status",
         "browser_status",
         "browser_tabs",
+        "page_outline",
+        "page_text",
+        "find",
         "page_elements",
+        "console",
+        "network",
+        "network_body",
         "game_probe",
         "screenshot",
         "time",
     ] = "capabilities",
     params: dict[str, Any] | None = None,
 ) -> Any:
-    """Discover the compact contract or read search, page, browser, game, image, or time state."""
+    """Read the contract, the page, the console, the network, or search/browser state.
+
+    Called with no arguments it returns the whole contract, including recipes and
+    common mistakes, so no external skill file is needed.
+    """
     arguments = dict(params or {})
     if topic == "capabilities":
         if arguments:
@@ -971,23 +1405,17 @@ async def web_info(
         if not action_name:
             raise ValueError("action_schema requires params.action")
         return _capabilities(action_name)
-    if topic == "search_status":
-        return await get_search_engines_status(**arguments)
-    if topic == "browser_status":
-        return await browser_get_status(**arguments)
-    if topic == "browser_tabs":
-        return await browser_list_tabs(**arguments)
-    if topic == "page_elements":
-        return await browser_get_page_elements(**arguments)
-    if topic == "game_probe":
-        return await browser_game_probe(**arguments)
-    if topic == "screenshot":
-        return await browser_screenshot(**arguments)
     if topic == "time":
         if arguments:
             raise ValueError("time does not accept params")
         return get_current_time_and_region()
-    raise ValueError(f"Unsupported info topic: {topic}")
+    handler = _TOPIC_HANDLERS.get(topic)
+    if handler is None:
+        raise ValueError(
+            f"Unsupported info topic: {topic}. Available: {sorted(_INFO_TOPICS)}"
+        )
+    validated = _validate_arguments(handler.__name__, f"topic '{topic}'", arguments)
+    return await handler(**validated)
 
 
 @mcp.tool()
@@ -1004,20 +1432,24 @@ async def web_action(
             raise ValueError(f"Action {index} must be an object")
         arguments = dict(raw_action)
         action_name = str(arguments.pop("action", "")).strip().lower()
-        handler = _ACTION_HANDLERS.get(action_name)
-        if handler is None:
+        spec = _ACTIONS.get(action_name)
+        if spec is None:
             error = {
                 "index": index,
                 "action": action_name or None,
                 "success": False,
-                "error": f"Unsupported action: {action_name or '<missing>'}",
+                "error": _unsupported_action_error(action_name, arguments),
+                "example": {
+                    "actions": [{"action": "open", "url": "https://example.com", "session_id": "s"}]
+                },
             }
             results.append(error)
             if not continue_on_error:
                 break
             continue
         try:
-            data = await handler(**arguments)
+            validated = _validate_arguments(spec.tool_name, f"action '{action_name}'", arguments)
+            data = await spec.handler(**validated)
             reported_failure = (
                 isinstance(data, dict) and data.get("success") is False
             )

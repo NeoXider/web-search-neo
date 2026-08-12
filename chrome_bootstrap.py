@@ -13,6 +13,17 @@ from chrome_bridge import CHROME_EXTENSION_ID, get_chrome_bridge
 EXTENSION_NAME = "Web Search Neo Companion"
 EXTENSION_DIR = (Path(__file__).resolve().parent / "chrome-extension").resolve()
 
+# pywinauto reads these as modifiers and grouping, so a repository cloned into a
+# path like "C:\Git\Web (new)+tools" would type Ctrl and Alt into Chrome's dialog
+# instead of the path.
+_SEND_KEYS_SPECIAL = "^%+~(){}[]"
+
+
+def _escape_send_keys(text: str) -> str:
+    """Escape pywinauto's control characters so a literal string is typed."""
+    return "".join(f"{{{character}}}" if character in _SEND_KEYS_SPECIAL else character
+                   for character in text)
+
 
 def _control_text(control: Any) -> str:
     try:
@@ -87,34 +98,72 @@ def _select_chrome_window(desktop: Any, window_title: str | None) -> tuple[Any, 
     return candidates[0]
 
 
-def _wait_for_dialog(desktop: Any, known_handles: set[int], timeout_seconds: float) -> Any:
+def _visible_top_level_windows() -> list[tuple[int, str]]:
+    """Enumerate visible top-level windows and their titles through win32.
+
+    pywinauto's UIA desktop enumeration does not list Chrome's folder picker on
+    current Windows builds, so waiting for the dialog through it never succeeds
+    even while the dialog is plainly on screen.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    found: list[tuple[int, str]] = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def collect(handle, _parameter):
+        if user32.IsWindowVisible(handle):
+            length = user32.GetWindowTextLengthW(handle)
+            if length:
+                buffer = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(handle, buffer, length + 1)
+                found.append((int(handle), buffer.value))
+        return True
+
+    user32.EnumWindows(collect, 0)
+    return found
+
+
+_PICKER_TITLES = (
+    "select the extension directory",
+    "select extension directory",
+    "выберите каталог расширения",
+    "выберите папку расширения",
+    "обзор папок",
+)
+
+
+def _wait_for_dialog(known_handles: set[int], timeout_seconds: float) -> int:
+    """Return the picker's window handle.
+
+    The handle is used directly rather than through a pywinauto wrapper: this
+    dialog cannot be wrapped by the UIA backend on current Windows builds, which
+    is why waiting for it used to time out while it sat on screen.
+    """
     deadline = time.monotonic() + timeout_seconds
-    title_markers = (
-        "select the extension directory",
-        "select extension directory",
-        "выберите каталог расширения",
-        "выберите папку расширения",
-        "обзор папок",
-    )
     while time.monotonic() < deadline:
-        for window in desktop.windows():
-            try:
-                handle = int(window.handle)
-            except Exception:
-                handle = -1
-            title = _control_text(window)
-            if handle not in known_handles and (
-                any(marker in title for marker in title_markers)
-                or _find_control(
-                    window,
-                    ("select folder", "выбор папки", "выбрать папку"),
-                    "Button",
-                )
-                is not None
+        for handle, title in _visible_top_level_windows():
+            normalized = title.strip().casefold()
+            if handle not in known_handles and any(
+                marker in normalized for marker in _PICKER_TITLES
             ):
-                return window
+                return handle
         time.sleep(0.2)
     raise TimeoutError("Chrome extension directory picker did not open")
+
+
+def _focus_window(handle: int) -> None:
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    user32.ShowWindow(handle, 9)  # SW_RESTORE
+    user32.SetForegroundWindow(handle)
+    time.sleep(0.3)
+
+
+def _window_is_open(handle: int) -> bool:
+    return any(found == handle for found, _title in _visible_top_level_windows())
 
 
 def _try_enable_existing(extension_window: Any, reload_existing: bool) -> str | None:
@@ -183,7 +232,7 @@ def _install_with_windows_ui(
     extension_window, chrome = _select_chrome_window(desktop, window_title)
     extension_window.set_focus()
     send_keys("^l")
-    send_keys("chrome://extensions/", with_spaces=True)
+    send_keys(_escape_send_keys("chrome://extensions/"), with_spaces=True)
     send_keys("{ENTER}")
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
@@ -226,28 +275,22 @@ def _install_with_windows_ui(
     if load_button is None:
         raise RuntimeError("Chrome Load unpacked button was not found")
 
-    known_handles = {
-        int(window.handle)
-        for window in desktop.windows()
-        if getattr(window, "handle", None) is not None
-    }
+    known_handles = {handle for handle, _title in _visible_top_level_windows()}
     load_button.click_input()
-    picker = _wait_for_dialog(desktop, known_handles, min(timeout_seconds, 15.0))
-    picker.set_focus()
+    picker = _wait_for_dialog(known_handles, min(timeout_seconds, 15.0))
+    _focus_window(picker)
 
+    # Alt+D focuses the picker's path box; entering a full path selects that
+    # folder. A second Enter confirms if the dialog is still up.
     send_keys("%d")
-    send_keys(str(extension_dir), with_spaces=True)
+    send_keys(_escape_send_keys(str(extension_dir)), with_spaces=True)
     send_keys("{ENTER}")
-    time.sleep(0.5)
-    select_button = _find_control(
-        picker,
-        ("select folder", "выбор папки", "выбрать папку", "select"),
-        "Button",
-    )
-    if select_button is not None:
-        select_button.click_input()
-    else:
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and _window_is_open(picker):
         send_keys("{ENTER}")
+        time.sleep(0.5)
+    if _window_is_open(picker):
+        raise TimeoutError("The extension directory picker did not accept the folder")
 
     return {
         "ui_action": "loaded_unpacked",
@@ -256,7 +299,7 @@ def _install_with_windows_ui(
     }
 
 
-def _expected_extension_version() -> str:
+def expected_extension_version() -> str:
     try:
         import json
 
@@ -275,7 +318,7 @@ def setup_current_chrome(
     bridge = get_chrome_bridge()
     bridge.start()
     status = bridge.status(1.0)
-    expected_version = _expected_extension_version()
+    expected_version = expected_extension_version()
     connected_version = str(status.get("browser", {}).get("extension_version") or "")
     version_current = bool(expected_version and connected_version == expected_version)
     if status["connected"] and version_current:
