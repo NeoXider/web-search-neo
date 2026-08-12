@@ -22,7 +22,9 @@ One `session_id` is one page — reuse it.
   says so with `fallback_used` and `mode_used`.
 - `find`: `params.query="submit application"` returns ranked refs instead of a whole page.
 - `page_elements`: flat CSS selectors, `<select>` options, and form metadata.
-- `console`: console output and uncaught errors with stack frames.
+- `console`: console output and uncaught errors with stack frames. Pages through history
+  with `since_seq` and `limit`, and keeps its own place, so it never competes with
+  `game_probe` for entries.
 - `network`: requests with status, type, ms, and size; `only_errors=true` to triage. Use
   `output="json"` to get the `id` that `network_body` needs.
 - `screenshot`, `game_probe`, `browser_status`, `browser_tabs`, `search_status`, `time`.
@@ -33,7 +35,7 @@ is a stub, so pass its selector as `frame_selector` to read it.
 ## Locators
 
 Plain CSS works everywhere and stays the default. `fill`, `upload`, `click`, `wait`, and the
-`form_selector` of `submit` also accept a ref handle such as `ref:3f9a1c04:12` from the
+`form_selector` of `submit` also accept a ref handle such as `ref:3f9a1c04b7e25d18:12` from the
 outline or `find`, and a piercing path such as `#host >>> .inner` that steps through an open
 shadow root or a same-origin iframe per segment. `submit_selector` and every
 `frame_selector` still need plain CSS. Those two forms need a live element handle, so they
@@ -137,6 +139,12 @@ or close. Take a screenshot or read `game_probe` between batches; in step mode a
 taken before the first frame still shows the old frame, and `game_probe` reports
 `animation.animation_suspended` with `animation.fps: null` instead of measuring a gate you
 are driving by hand.
+
+A probe's `console_messages` holds only the warnings and errors new since the previous
+`game_probe` call — the result says so in `console_scope` — so polling it in a loop is cheap
+and its output never grows with the run. Each entry is delivered once: read
+`console_messages` on every probe you make, because a result you drop takes them with it.
+Use the `console` topic when you need history, `log`/`info` levels, or stack frames.
 
 ## Batch results
 

@@ -29,7 +29,21 @@ CONSOLE_HOOK_SCRIPT = r"""
 (() => {
 const key = '__wsnConsole';
 if (window[key]) return;
-const state = {seq: 0, dropped: 0, items: [], limit: 500};
+// Entries are numbered from one in every document, so a reader that keeps a
+// sequence number also has to know which document minted it. The identity is
+// the document's creation time, which only moves forward within a tab, plus
+// random bytes, because two documents can be created in the same millisecond.
+const mintDocumentId = () => {
+  const bytes = new Uint8Array(6);
+  if (window.crypto && window.crypto.getRandomValues) window.crypto.getRandomValues(bytes);
+  else for (let index = 0; index < bytes.length; index += 1) bytes[index] = Math.floor(Math.random() * 256);
+  let suffix = '';
+  for (const byte of bytes) suffix += byte.toString(16).padStart(2, '0');
+  let origin;
+  try { origin = Math.round(performance.timeOrigin || Date.now()); } catch (_) { origin = Date.now(); }
+  return origin + '-' + suffix;
+};
+const state = {seq: 0, dropped: 0, items: [], limit: 500, doc: mintDocumentId()};
 const clip = (value, max) => {
   // Strings go through verbatim; quoting them would make every log line noisy.
   let text;
@@ -78,25 +92,52 @@ window[key] = state;
 
 _CONSOLE_READ_SCRIPT = """
 const since = arguments[0];
+const knownDoc = arguments[1];
 const state = window.__wsnConsole;
-if (!state) return {entries: [], next_seq: 0, dropped: 0, installed: false};
-const entries = state.items.filter(item => item.seq > since);
-if (arguments[1]) { state.items = []; }
+if (!state) {
+  return {entries: [], next_seq: 0, doc: '', document_changed: false,
+          dropped: 0, installed: false};
+}
+// A sequence number minted in a document that has since been replaced says
+// nothing about this one. Honouring it would hide everything the new document
+// logged while it was booting, which is the output worth reading most, so the
+// reader is served from the beginning instead. A reader that carries no
+// document at all is taken at its word, which keeps a bare `since_seq` working.
+const replaced = knownDoc ? knownDoc !== state.doc : false;
+const entries = state.items.filter(item => item.seq > (replaced ? 0 : since));
+if (arguments[2]) { state.items = []; }
 return {
   entries: entries,
   next_seq: state.seq,
+  doc: state.doc,
+  document_changed: replaced,
   dropped: state.dropped,
   installed: true
 };
 """
 
 
-def read_page_console(driver: Any, since_seq: int = 0, clear: bool = False) -> dict[str, Any]:
-    """Drain the in-page console hook, installing it first if needed."""
-    result = driver.execute_script(_CONSOLE_READ_SCRIPT, int(since_seq), bool(clear))
+def read_page_console(
+    driver: Any, since_seq: int = 0, clear: bool = False, doc: str | None = None
+) -> dict[str, Any]:
+    """Drain the in-page console hook, installing it first if needed.
+
+    ``doc`` is the document ``since_seq`` was minted in, as reported by an earlier
+    read. Passing it is what lets the hook tell a cursor that is merely behind
+    from one that belongs to a page which no longer exists.
+    """
+    result = driver.execute_script(
+        _CONSOLE_READ_SCRIPT, int(since_seq), str(doc or ""), bool(clear)
+    )
     if not result.get("installed"):
         driver.execute_script(CONSOLE_HOOK_SCRIPT)
-        return {"entries": [], "next_seq": 0, "dropped": 0}
+        return {
+            "entries": [],
+            "next_seq": 0,
+            "doc": "",
+            "document_changed": False,
+            "dropped": 0,
+        }
     return result
 
 

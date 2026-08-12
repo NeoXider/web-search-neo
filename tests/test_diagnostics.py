@@ -409,6 +409,7 @@ def test_read_page_console_installs_the_hook_when_it_is_missing():
     class _HookDriver:
         def __init__(self):
             self.scripts: list[str] = []
+            self.arguments: list[tuple] = []
             self.installed = False
 
         def execute_script(self, script: str, *args):
@@ -416,23 +417,45 @@ def test_read_page_console_installs_the_hook_when_it_is_missing():
             if script is diagnostics.CONSOLE_HOOK_SCRIPT:
                 self.installed = True
                 return None
+            self.arguments.append(args)
             if not self.installed:
-                return {"entries": [], "next_seq": 0, "dropped": 0, "installed": False}
+                return {
+                    "entries": [],
+                    "next_seq": 0,
+                    "doc": "",
+                    "document_changed": False,
+                    "dropped": 0,
+                    "installed": False,
+                }
             return {
                 "entries": [{"seq": 7, "level": "info", "text": "hello"}],
                 "next_seq": 7,
+                "doc": "1700000000000-a1b2c3",
+                "document_changed": False,
                 "dropped": 2,
                 "installed": True,
             }
 
     driver = _HookDriver()
-    assert diagnostics.read_page_console(driver) == {"entries": [], "next_seq": 0, "dropped": 0}
+    assert diagnostics.read_page_console(driver) == {
+        "entries": [],
+        "next_seq": 0,
+        "doc": "",
+        "document_changed": False,
+        "dropped": 0,
+    }
     assert driver.scripts[-1] is diagnostics.CONSOLE_HOOK_SCRIPT
 
-    payload = diagnostics.read_page_console(driver, since_seq=3, clear=True)
+    payload = diagnostics.read_page_console(
+        driver, since_seq=3, clear=True, doc="1700000000000-a1b2c3"
+    )
     assert payload["entries"][0]["text"] == "hello"
     assert payload["next_seq"] == 7
     assert payload["dropped"] == 2
+    assert payload["doc"] == "1700000000000-a1b2c3"
+    # The document a cursor was minted in travels with it, which is what lets the
+    # page tell a cursor from a replaced document from one that is merely behind.
+    assert driver.arguments[-1] == (3, "1700000000000-a1b2c3", True)
 
 
 def test_console_reports_logs_errors_and_uncaught_exceptions(local_site):
@@ -535,6 +558,168 @@ def test_one_console_error_is_reported_once_by_a_live_chrome(local_site):
         ]
     finally:
         browser_tools.close_session("console-dedupe")
+
+
+def _boot_log_url(local_site, marker: str) -> str:
+    return f"{local_site.base_url}/boot-log?marker={marker}"
+
+
+def _hooked_texts(payload: dict) -> set[str]:
+    """The texts the in-page hook reported, which is where args and stacks live.
+
+    Chrome's browser log carries its own JSON-quoted copy of the same messages, so
+    a test that looked at the text alone would pass on that copy while the hook
+    itself stayed silent.
+    """
+    return {item["text"] for item in payload["entries"] if item["kind"] == "console"}
+
+
+def test_console_reports_what_a_replacement_document_logged_while_booting(local_site):
+    _open_or_skip(_boot_log_url(local_site, "first"), "console-boot")
+    try:
+        first = browser_tools.get_console("console-boot", limit=200)
+        assert "boot-error-first" in _hooked_texts(first)
+        assert first["next_seq"] >= 3  # the cursor now sits past the first page
+
+        # The page numbers its entries from one again with the new document, so a
+        # cursor kept from the document that was replaced sits above everything
+        # the new one logged while booting.
+        browser_tools.open_page(
+            _boot_log_url(local_site, "second"),
+            session_id="console-boot",
+            headless=True,
+            profile_mode="temporary",
+        )
+        after = browser_tools.get_console("console-boot", limit=200)
+        assert {"boot-log-second", "boot-warn-second", "boot-error-second"} <= _hooked_texts(after)
+        assert after["cursor_reset"] is True
+
+        # A reload is the same boundary with the same text on either side of it,
+        # which is what a level restart looks like.
+        browser_tools._get_session("console-boot").driver.refresh()
+        reloaded = browser_tools.get_console("console-boot", limit=200)
+        assert {"boot-log-second", "boot-warn-second", "boot-error-second"} <= _hooked_texts(
+            reloaded
+        )
+        assert reloaded["cursor_reset"] is True
+
+        # Reading twice inside one document still reports each entry once.
+        repeated = browser_tools.get_console("console-boot", limit=200)
+        assert _hooked_texts(repeated) == set()
+        assert repeated["cursor_reset"] is False
+    finally:
+        browser_tools.close_session("console-boot")
+
+
+def test_console_still_reports_what_a_page_logged_before_it_navigated_away(local_site):
+    _open_or_skip(_boot_log_url(local_site, "alpha"), "console-farewell")
+    driver = browser_tools._get_session("console-farewell").driver
+    try:
+        browser_tools.get_console("console-farewell", limit=200)
+        driver.execute_script("console.error('doomed-before-navigation');")
+        browser_tools.open_page(
+            _boot_log_url(local_site, "beta"),
+            session_id="console-farewell",
+            headless=True,
+            profile_mode="temporary",
+        )
+
+        # The hook's buffer dies with the document it lived in. Chrome's browser
+        # log belongs to the browser rather than to the page, so the last thing a
+        # page said before being replaced is still delivered.
+        texts: list[str] = []
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            payload = browser_tools.get_console("console-farewell", limit=200)
+            texts.extend(item["text"] for item in payload["entries"])
+            if any("doomed-before-navigation" in item for item in texts):
+                break
+            time.sleep(0.1)
+        assert any("doomed-before-navigation" in item for item in texts), texts
+    finally:
+        browser_tools.close_session("console-farewell")
+
+
+def test_game_probe_reports_the_boot_output_of_the_page_it_was_pointed_at(local_site):
+    _open_or_skip(_boot_log_url(local_site, "one"), "probe-boot")
+    try:
+        browser_tools.game_probe("probe-boot", sample_seconds=0.1)
+        browser_tools.open_page(
+            _boot_log_url(local_site, "two"),
+            session_id="probe-boot",
+            headless=True,
+            profile_mode="temporary",
+        )
+        probe = browser_tools.game_probe("probe-boot", sample_seconds=0.1)
+        messages = {item["message"] for item in probe["console_messages"]}
+        assert {"boot-warn-two", "boot-error-two"} <= messages, messages
+        assert not any(item.endswith("-one") for item in messages)  # already reported
+    finally:
+        browser_tools.close_session("probe-boot")
+
+
+class _FakeCompanionDriver:
+    """The companion backend's ``events.get`` contract, without an extension.
+
+    The extension buffers per tab in its service worker, so a navigation never
+    disturbs its numbering; the counter restarts only when the worker itself is
+    evicted, and its ``collectEvents`` then replays from the beginning and says
+    ``reset``. Nothing in this suite can drive the real extension, so this stands
+    in for the contract the reader has to honour.
+    """
+
+    def __init__(self):
+        self.entries: list[dict] = []
+        self.seq = 0
+
+    def log(self, text: str) -> None:
+        self.seq += 1
+        self.entries.append(
+            {"seq": self.seq, "ts": self.seq, "kind": "console", "level": "error", "text": text}
+        )
+
+    def evict_worker(self) -> None:
+        self.entries = []
+        self.seq = 0
+
+    def get_events(self, *, kinds=None, since_seq=0, limit=200) -> dict:
+        reset = since_seq > self.seq
+        since = 0 if reset else since_seq
+        entries = [item for item in self.entries if item["seq"] > since][:limit]
+        return {"entries": entries, "next_seq": self.seq, "dropped": None, "reset": reset}
+
+    def clear_events(self, kinds=None) -> dict:
+        self.entries = []
+        return {"cleared": []}
+
+
+def test_console_replays_when_the_companion_backend_restarts_its_counter():
+    driver = _FakeCompanionDriver()
+    browser_tools._sessions["fake-companion"] = browser_tools.BrowserSession(
+        driver=driver, headless=True, profile_mode="current"
+    )
+    try:
+        driver.log("before-navigation")
+        first = browser_tools.get_console("fake-companion", limit=200)
+        assert [item["text"] for item in first["entries"]] == ["before-navigation"]
+        assert first["cursor_reset"] is False
+
+        # A navigation is not a boundary for this backend: one buffer serves the
+        # whole tab, so the numbering carries on across it.
+        driver.log("after-navigation")
+        second = browser_tools.get_console("fake-companion", limit=200)
+        assert [item["text"] for item in second["entries"]] == ["after-navigation"]
+        assert second["cursor_reset"] is False
+
+        # An evicted worker counts from one again. Going quiet until the new
+        # counter passes the old cursor is the failure being fixed here.
+        driver.evict_worker()
+        driver.log("after-the-worker-restarted")
+        third = browser_tools.get_console("fake-companion", limit=200)
+        assert [item["text"] for item in third["entries"]] == ["after-the-worker-restarted"]
+        assert third["cursor_reset"] is True
+    finally:
+        browser_tools._sessions.pop("fake-companion", None)
 
 
 def test_network_lists_the_document_and_isolates_the_failing_request(local_site):

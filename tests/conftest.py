@@ -105,6 +105,20 @@ def local_site() -> LocalSite:
             if parsed.path == "/relative":
                 self._send_html("<html><title>Relative</title><body>relative target</body></html>")
                 return
+            if parsed.path == "/boot-log":
+                # Writes its whole console output while the document is parsing,
+                # which is where a page that fails to start says what went wrong.
+                marker = parse_qs(parsed.query).get("marker", ["boot"])[0]
+                self._send_html(
+                    f"""<!doctype html>
+                    <html><head><title>Boot log {marker}</title><script>
+                    console.log('boot-log-{marker}');
+                    console.warn('boot-warn-{marker}');
+                    console.error('boot-error-{marker}');
+                    </script></head>
+                    <body><p id="session-marker">{marker}</p></body></html>"""
+                )
+                return
             if parsed.path == "/form":
                 marker = parse_qs(parsed.query).get("session", ["default"])[0]
                 self._send_html(

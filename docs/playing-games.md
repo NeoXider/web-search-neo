@@ -105,10 +105,13 @@ have to be `https://`.
 
 The probe answers with the canvas list (`selector`, `context` of `2d`/`webgl`/
 `webgl2`, `width`/`height`, and the on-screen `rect`), `iframes` with their
-selectors, `document_has_focus`, `navigation_ms`, sampled `animation.fps`, any
-console warnings and errors, and the currently `held_inputs`. Take the canvas
-selector from here — `#game` for this fixture — and the iframe selector if the
-game lives in one.
+selectors, `document_has_focus`, `navigation_ms`, sampled `animation.fps`,
+`console_messages` with any warnings and errors, and the currently `held_inputs`.
+Take the canvas selector from here — `#game` for this fixture — and the iframe
+selector if the game lives in one. This first probe reports everything logged so
+far; every later one reports only what is new since it, which is the contract
+described under [Reading the console between
+probes](#reading-the-console-between-probes).
 
 ### 3. Engage the gate
 
@@ -399,7 +402,7 @@ frame in step mode.
 
 | Call | What it tells you |
 | --- | --- |
-| `web_info(topic="game_probe")` | Canvas and WebGL context, iframe surfaces, document focus, `animation.fps` (or `animation.animation_suspended` while gated), load time, console warnings and errors, and which keys and buttons the session is still holding. |
+| `web_info(topic="game_probe")` | Canvas and WebGL context, iframe surfaces, document focus, `animation.fps` (or `animation.animation_suspended` while gated), load time, the console warnings and errors new since the previous probe, and which keys and buttons the session is still holding. |
 | `web_info(topic="screenshot")` | A PNG of the current frame. In step mode it shows the last *released* frame, so take it after the step, never before. |
 | `web_info(topic="console")` | `console.log/info/warn/error`, uncaught exceptions, and rejections with stack frames. Filter with `levels`, `kinds`, `contains`. |
 | `web_info(topic="page_text")` | The DOM status line or HUD many games render outside the canvas. |
@@ -410,8 +413,39 @@ frame in step mode.
 
 The console buffer starts when the session attaches to the tab, so errors thrown
 during the initial load are only visible after a reload. `game_probe` and the
-`console` topic read from one shared session buffer; neither steals the other's
-entries.
+`console` topic read from the same buffers, each keeping its own place in them;
+neither steals the other's entries.
+
+### Reading the console between probes
+
+A game loop probes often, and a probe that repeated every warning the session
+had ever logged became useless within a minute. So `game_probe` reports only
+what is new since **its own** previous call, and says so in the result:
+
+```json
+{"console_scope": "new since the previous game_probe call"}
+```
+
+What follows from that:
+
+- polling `game_probe` every frame is safe. The output stays the size of what
+  just happened, not the size of the run;
+- an entry is handed over exactly once. A probe result you discard takes its
+  `console_messages` with it, so read them on every call — or reach for the
+  `console` topic, which pages through history with `since_seq` and `limit` and
+  can re-read a window. One probe also carries at most the hundred most recent
+  of them, counted before the warning/error filter, so a burst larger than that
+  loses its oldest lines;
+- the two readers are independent. Polling the probe hides nothing from
+  `console`, and reading `console` hides nothing from the probe;
+- both channels are covered: the probe reads the in-page hook as well as
+  Chrome's browser log, so `console.warn`, `console.error`, and uncaught
+  exceptions arrive in `console_messages` whichever backend drives the session.
+  In companion `current` mode Chrome's browser log is not readable at all, and
+  earlier builds — which read only it — reported nothing there.
+
+The probe still filters to `warn` and `error`. Use the `console` topic for
+`log`/`info`, for stack frames, and for anything you want to read twice.
 
 ## Cleanup is not optional
 

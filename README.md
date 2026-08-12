@@ -471,7 +471,7 @@ The outline and `find` walk open shadow roots and same-origin iframes, including
 | Form | Example | Notes |
 | --- | --- | --- |
 | CSS selector | `input[name='q']` | Unchanged, and still the only form accepted everywhere. |
-| Ref handle | `ref:3f9a1c04:12` | Issued by `page_outline` and `find`. The first field is the document epoch, also reported separately as `dom_epoch`; the second is the element number. |
+| Ref handle | `ref:3f9a1c04b7e25d18:12` | Issued by `page_outline` and `find`. The first field is the document epoch — 16 hex characters, also reported separately as `dom_epoch`; the second is the element number. |
 | Piercing path | `#host >>> .inner` | The separator is a space-padded ` >>> `. Each step enters the element's open shadow root, or its document when the element is a same-origin iframe. Any number of segments may be chained. |
 
 Ref handles carry the document they were read from:
@@ -555,7 +555,7 @@ Browser automation is not limited to DOM forms. The compact contract covers comm
 
 | Call | What it does |
 | --- | --- |
-| `web_info(topic="game_probe")` | Reports canvases, 2D/WebGL context, iframe surfaces, document focus, sampled FPS under `animation`, loading time, console issues, and held input. |
+| `web_info(topic="game_probe")` | Reports canvases, 2D/WebGL context, iframe surfaces, document focus, sampled FPS under `animation`, loading time, the console warnings and errors new since the previous probe, and held input. |
 | `input` | Mixes per-key `tap`/`hold`/`release` with pointer `click`, `double_click`, `hover`, `move`, `drag`, `press`, `release`, and `wheel`, using absolute coordinates, deltas, or unbounded relative motion, up to 16 entries of each kind. |
 | `press_keys` | Keyboard-only shortcut: `keys` plus `key_action` (`tap`, `hold`, `release`), `repeat`, `hold_seconds`, `focus_mode` (`focus`, `click`, `none`), and `hold_frames`, which keeps a tap down across N released frames in `step` mode. |
 | `touch`, `touch_emulation` | `tap`, `press`, `move`, `release`, `swipe`, or `cancel` with up to ten simultaneous points; the emulation makes the page report `navigator.maxTouchPoints` and `ontouchstart` so a game's mobile code path actually runs. |
@@ -640,9 +640,21 @@ a fabricated zero; the probe returns immediately with an `animation` object hold
 `fps: null`, `animation_suspended: true`, and a `reason` naming the active render mode and
 the gated frame. Every frame-rate field lives in that nested object — `animation.fps`,
 `animation.frames`, `animation.elapsed_ms`, `animation.available` — never at the top level
-of the result. The probe also no longer consumes Chrome's browser log — `get_log` hands it
-out exactly once, so reading it destroyed the diagnostics that the `console` topic was
-supposed to report. Both readers now draw from one bounded session buffer.
+of the result.
+
+`console_messages` holds the warnings and errors that appeared **since the previous
+`game_probe` call**, which is what the probe's `console_scope` field says in the result. A
+polling loop therefore reports a problem when it happens instead of re-reading everything
+the session has ever logged, and its output does not grow with the length of the run. The
+flip side is that each entry is delivered exactly once: a probe result that is thrown away
+takes its console entries with it. Read `console_messages` on every probe you make, or use
+the `console` topic, which keeps its own place in the same buffers — polling the probe never
+hides entries from `console`, and reading `console` never hides them from the probe.
+
+The probe reads the in-page hook as well as Chrome's browser log, so `console.warn`,
+`console.error`, and uncaught exceptions are covered on both backends. In companion
+`current` mode that browser log is not available at all, and earlier builds, which read only
+it, reported nothing there.
 
 ### Input latency
 
@@ -731,7 +743,7 @@ python -m pytest
 python -m pytest --cov=. --cov-report=term-missing
 ```
 
-The deterministic suite is 269 tests, grouped by what they protect:
+The deterministic suite is 273 tests, grouped by what they protect:
 
 | Area | Covered |
 | --- | --- |
