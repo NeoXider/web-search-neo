@@ -306,14 +306,14 @@ def test_compact_web_info_discovers_one_action_at_a_time():
     open_schema = asyncio.run(main.web_info("action_schema", {"action": "open"}))
     assert open_schema["input_schema"]["properties"]["headless"]["default"] is None
     assert open_schema["input_schema"]["properties"]["profile_mode"]["default"] == "current"
-    assert open_schema["input_schema"]["properties"]["tab_group"]["default"] == "AI"
+    assert open_schema["input_schema"]["properties"]["tab_group"]["default"] == "🟢 AI"
 
     open_many_schema = asyncio.run(
         main.web_info("action_schema", {"action": "open_many"})
     )
     assert open_many_schema["input_schema"]["properties"]["headless"]["default"] is None
     assert open_many_schema["input_schema"]["properties"]["profile_mode"]["default"] == "current"
-    assert open_many_schema["input_schema"]["properties"]["tab_group"]["default"] == "AI"
+    assert open_many_schema["input_schema"]["properties"]["tab_group"]["default"] == "🟢 AI"
 
     setup_schema = asyncio.run(
         main.web_info("action_schema", {"action": "setup_current_chrome"})

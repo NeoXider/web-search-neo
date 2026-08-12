@@ -2,7 +2,7 @@
 
 This guide installs the MCP server from source and connects it to LM Studio or another stdio-compatible MCP client.
 
-It describes version 1.3.1. The Python package, the server, and the bundled Chrome
+It describes version 1.3.2. The Python package, the server, and the bundled Chrome
 companion carry that same version, and the bridge only accepts a companion able to complete
 the 1.3.0 handshake — see [Updating](#updating) if an older one is already installed.
 
@@ -125,8 +125,16 @@ Some clients do not support a separate working-directory field. In that case kee
 ## 6. Connect the current signed-in Chrome (default)
 
 `profile_mode="current"` is the default. It controls tabs in the Chrome you already
-use, preserves the page's existing login, opens new tabs into a visible purple
-group named `AI`, and leaves tabs open when MCP sessions close.
+use, preserves the page's existing login, opens new tabs into a visible group named
+`🟢 AI` — purple, when the companion is the one creating it — and leaves tabs open when MCP
+sessions close.
+
+From 1.3.2 it stays out of your way while it does so: agent tabs open in the background, in
+a window that is already there, and navigation no longer brings a tab to the front, so you
+can keep working in the same Chrome. Chrome throttles a tab nobody is watching almost to a
+standstill — and silently drops input into one that has never been shown — so the companion
+turns on DevTools focus emulation for the tabs it drives, which restores normal speed and
+delivery for as long as it is attached to them.
 
 Start/restart the MCP first, then ask it for setup state:
 
@@ -160,7 +168,7 @@ Earlier revisions tried to perform those clicks for you through Windows UI Autom
 code is gone. It depended on the interface language, on which window happened to have focus,
 and on a folder picker that the automation backend does not even enumerate.
 
-The bundled companion is version 1.3.1 and declares five permissions: `alarms`, `debugger`,
+The bundled companion is version 1.3.2 and declares five permissions: `alarms`, `debugger`,
 `storage`, `tabs`, and `tabGroups`. There are no content scripts and no `host_permissions`;
 page access comes from `debugger`, which attaches the Chrome DevTools Protocol to the tabs
 the agent drives. `alarms` exists because Chrome suspends an idle MV3 service worker after
@@ -182,7 +190,9 @@ an extension at all, use the Selenium modes in section 7 — `profile_mode="temp
 Verify it with `web_info(topic="browser_status")`; `current_chrome.connected`
 should be `true`. List tabs with `web_info(topic="browser_tabs")`, then claim an
 existing returned ID with an `attach_tab` action. A normal `open` creates a new
-tab in group `AI` unless another `tab_group` is supplied.
+tab in group `🟢 AI` unless another `tab_group` is supplied — including an `open`
+on a session that claimed one of your tabs, which takes a tab of its own rather
+than navigating yours away, and hands the claimed one back untouched.
 
 The bridge listens only on `127.0.0.1:8765` and accepts the fixed bundled extension
 ID. If that port conflicts, change `WEB_SEARCH_NEO_BRIDGE_PORT` for the MCP and the
@@ -207,7 +217,10 @@ Two consequences are worth knowing before you troubleshoot anything:
 - The badge stays `ON` between agent calls, and while no agent runs at all. It goes `OFF`
   only when no daemon is listening.
 - Two MCP clients can use the same Chrome at once — Claude Code and LM Studio together, for
-  instance. Both relay through the one daemon.
+  instance. Both relay through the one daemon, which also keeps them off each other's tabs:
+  it registers every tab an agent opens or claims, refuses an `attach_tab` for a tab another
+  agent is already driving, and frees a tab the moment that agent's connection ends, however
+  it ends.
 
 You can drive it directly from the clone:
 
@@ -501,7 +514,7 @@ or when `setup_current_chrome` answered `self_update: "unsupported"` or `"timeou
    or a copied checkout, so start the server from the same directory Chrome loaded and
    reload the extension again. A daemon that is still running with a secret rotated out from
    under it says the same thing; `python main.py --bridge --stop` retires it.
-3. Check the card's version. It must read 1.3.1; anything older than 1.3.0 cannot
+3. Check the card's version. It must read 1.3.2; anything older than 1.3.0 cannot
    authenticate at all, and Chrome only picks up the new manifest on reload.
 4. `%LOCALAPPDATA%\WebSearchNeo\bridge-daemon.log` records the bridge's side: `Rejected a
    bridge client that did not present the companion token` confirms that something did reach
@@ -533,10 +546,21 @@ private addresses are unaffected and never need the override.
 
 ### The console or network topic returns nothing
 
-Console capture begins when the session attaches to the tab and network capture begins on
-the first `network` read, so anything that happened earlier is not buffered. Re-open or
-reload the page and read again. If the companion was updated in place, reload it at
-`chrome://extensions` first.
+Capture is armed when the session takes its tab, before the first navigation, so an empty
+result is usually a genuinely quiet page rather than a missed one. Two cases are not: a tab
+claimed with `attach_tab` is recorded only from the claim onwards, and a busy page evicts its
+own history — each stream keeps the newest 500 entries within a 512 KB budget shared with the
+other, and `dropped` says how many went that way. Re-open or reload the page and read again.
+If the companion was updated in place, reload it at `chrome://extensions` first.
+
+### A session stops working after Chrome was restarted
+
+Expected, and deliberate. Chrome hands out tab ids from a counter that starts again with the
+browser, so a session opened before the restart would address whatever tab inherited its
+number — possibly one of yours. Such a session is dropped instead, with an error that says
+to open the page again; nothing is sent to the new browser on the way out. A companion that
+updates itself counts as a new run for the same reason: its reload drops every debugger
+attachment those sessions stood on. Open the page again under the same `session_id`.
 
 ### Search provider is challenged
 

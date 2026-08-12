@@ -72,7 +72,9 @@ def test_ddgs_provider_classifies_captcha(monkeypatch):
     assert error.value.kind == "challenge"
 
 
-def test_ddgs_provider_treats_blocked_no_results_as_challenge(monkeypatch):
+def test_ddgs_no_results_signal_is_an_empty_answer_not_a_challenge(monkeypatch):
+    """ddgs reports "nothing matched" by raising; that is an answer, not a failure."""
+
     class FakeDDGS:
         def __init__(self, **_kwargs):
             pass
@@ -82,9 +84,53 @@ def test_ddgs_provider_treats_blocked_no_results_as_challenge(monkeypatch):
 
     monkeypatch.setattr(msp_search, "DDGS", FakeDDGS)
     provider = msp_search.DdgsSearchProvider("test", "test", "https://x/?q={query}")
-    with pytest.raises(msp_search.SearchProviderError) as error:
-        provider.search("common query", 1, 2)
-    assert error.value.kind == "challenge"
+    assert provider.search("common query", 1, 2) == []
+
+
+def test_ddgs_provider_returns_empty_list_when_the_backend_has_no_hits(monkeypatch):
+    class FakeDDGS:
+        def __init__(self, **_kwargs):
+            pass
+
+        def text(self, *_args, **_kwargs):
+            return []
+
+    monkeypatch.setattr(msp_search, "DDGS", FakeDDGS)
+    provider = msp_search.DdgsSearchProvider("test", "test", "https://x/?q={query}")
+    assert provider.search("zzqxv obscure phrase", 5, 2) == []
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("Connection reset by peer at 2026-08-12T10:00:00Z", "provider_error"),
+        ("ConnectionError: connection refused by 2026 host", "provider_error"),
+        ("read timeout after 2026 ms", "timeout"),
+        ("socket error 40329 while sending 4030 bytes", "provider_error"),
+        ("Failed to fetch https://x.test/2024/03/402913: unexpected end of stream",
+         "provider_error"),
+        ("HTTP 429 CAPTCHA required", "challenge"),
+        ("Failed to fetch https://links.test/d.js: HTTP 202", "challenge"),
+        ("Failed to fetch https://links.test/d.js: HTTP 403", "challenge"),
+        ("Ratelimit exceeded for this client", "challenge"),
+        ("Sorry, we need to verify you are human", "challenge"),
+        ("The request timed out", "timeout"),
+    ],
+)
+def test_error_classification_matches_tokens_not_bare_substrings(message, expected):
+    assert msp_search.classify_provider_error(RuntimeError(message)) == expected
+
+
+def test_transport_failures_outrank_challenge_tokens_by_exception_type():
+    assert msp_search.classify_provider_error(TimeoutError("gave up")) == "timeout"
+    assert (
+        msp_search.classify_provider_error(ConnectionResetError("reset")) == "provider_error"
+    )
+
+    class RatelimitException(RuntimeError):
+        pass
+
+    assert msp_search.classify_provider_error(RatelimitException("slow down")) == "challenge"
 
 
 def test_bing_html_provider_parses_real_bing_markup(monkeypatch):
@@ -105,6 +151,14 @@ def test_bing_html_provider_parses_real_bing_markup(monkeypatch):
             "snippet": "Useful snippet",
         }
     ]
+
+
+def test_bing_html_provider_reports_no_hits_as_an_empty_answer(monkeypatch):
+    class Response:
+        text = '<ol id="b_results"><li class="b_no">No results found</li></ol>'
+
+    monkeypatch.setattr(msp_search, "request", lambda *_args, **_kwargs: Response())
+    assert msp_search.BingHtmlSearchProvider().search("zzqxv obscure phrase", 5, 2) == []
 
 
 def test_bing_html_provider_reports_challenge_instead_of_false_availability(monkeypatch):
@@ -303,6 +357,138 @@ def test_real_search_challenge_still_records_cooldown(monkeypatch):
     monkeypatch.setitem(msp_search.SEARCH_PROVIDERS, "duckduckgo", _provider("duckduckgo", blocked))
     msp_search.search_web("query", engine="duckduckgo", fallback=False)
     assert msp_search._cooldown_remaining("duckduckgo") > 0
+
+
+def test_no_hits_reports_an_honest_empty_success_without_cooling_providers_down(monkeypatch):
+    """A provider that answers "nothing matched" answered correctly and stays usable."""
+    calls = []
+    monkeypatch.setattr(msp_search, "ENGINE_ORDER", ["duckduckgo", "brave"])
+    for name in ("duckduckgo", "brave"):
+        monkeypatch.setitem(
+            msp_search.SEARCH_PROVIDERS,
+            name,
+            _provider(name, lambda *_args, current=name: calls.append(current) or []),
+        )
+
+    response = msp_search.search_web("zzqxv obscure phrase")
+
+    assert response["success"] is True
+    assert response["results"] == []
+    assert response["result_status"] == "empty"
+    assert response["engines_without_results"] == ["duckduckgo", "brave"]
+    assert response["errors"] == {}
+    assert response["challenge_recoveries"] == []
+    assert msp_search._cooldown_remaining("duckduckgo") == 0
+    assert msp_search._cooldown_remaining("brave") == 0
+
+    # A different query must still reach every provider: nothing was disabled.
+    msp_search.search_web("python asyncio tutorial")
+    assert calls == ["duckduckgo", "brave", "duckduckgo", "brave"]
+
+    status = msp_search.get_search_engines_status(force_refresh=True)
+    assert [item["state"] for item in status["engines"]] == ["no_results", "no_results"]
+    assert all(item["cooldown_seconds"] == 0 for item in status["engines"])
+
+
+def test_legacy_empty_results_kind_is_still_read_as_an_answer(monkeypatch):
+    """A third-party provider raising the old kind must not be cooled down either."""
+
+    def no_hits(*_args):
+        raise msp_search.SearchProviderError("nothing matched", "empty_results")
+
+    monkeypatch.setattr(msp_search, "ENGINE_ORDER", ["duckduckgo"])
+    monkeypatch.setitem(
+        msp_search.SEARCH_PROVIDERS, "duckduckgo", _provider("duckduckgo", no_hits)
+    )
+
+    response = msp_search.search_web("query", fallback=False)
+
+    assert response["success"] is True
+    assert response["result_status"] == "empty"
+    assert response["errors"] == {}
+    assert msp_search._cooldown_remaining("duckduckgo") == 0
+
+
+def test_empty_answer_falls_through_to_a_provider_that_has_hits(monkeypatch):
+    monkeypatch.setattr(msp_search, "ENGINE_ORDER", ["duckduckgo", "brave"])
+    monkeypatch.setitem(
+        msp_search.SEARCH_PROVIDERS, "duckduckgo", _provider("duckduckgo", lambda *_a: [])
+    )
+    monkeypatch.setitem(
+        msp_search.SEARCH_PROVIDERS, "brave", _provider("brave", lambda *_a: RESULT)
+    )
+
+    response = msp_search.search_web("query", num=1)
+
+    assert response["success"] is True
+    assert response["engine_used"] == "brave"
+    assert response["fallback_used"] is True
+    assert response["engines_without_results"] == ["duckduckgo"]
+    assert response["result_status"] == "ok"
+    assert msp_search._cooldown_remaining("duckduckgo") == 0
+
+
+def test_short_result_set_is_marked_as_partial(monkeypatch):
+    monkeypatch.setattr(msp_search, "ENGINE_ORDER", ["duckduckgo"])
+    monkeypatch.setitem(
+        msp_search.SEARCH_PROVIDERS, "duckduckgo", _provider("duckduckgo", lambda *_a: RESULT)
+    )
+
+    response = msp_search.search_web("query", num=10, fallback=False)
+
+    assert response["result_status"] == "partial"
+    assert response["requested_num"] == 10
+    assert response["result_count"] == 1
+
+
+def test_incomplete_empty_answer_is_not_cached(monkeypatch):
+    """An empty answer taken while another engine was unreachable must be retried."""
+    attempts = []
+    monkeypatch.setattr(msp_search, "ENGINE_ORDER", ["duckduckgo", "brave"])
+    monkeypatch.setitem(
+        msp_search.SEARCH_PROVIDERS,
+        "duckduckgo",
+        _provider("duckduckgo", lambda *_a: (_ for _ in ()).throw(RuntimeError("offline"))),
+    )
+    monkeypatch.setitem(
+        msp_search.SEARCH_PROVIDERS,
+        "brave",
+        _provider("brave", lambda *_a: attempts.append("brave") or []),
+    )
+
+    first = msp_search.search_web("query")
+    assert first["success"] is True
+    assert first["result_status"] == "empty"
+    assert first["errors"]["duckduckgo"]["kind"] == "provider_error"
+
+    second = msp_search.search_web("query")
+    assert second["cached"] is False
+    assert attempts == ["brave", "brave"]
+
+
+def test_cached_success_does_not_replay_a_stale_challenge_handoff(monkeypatch):
+    monkeypatch.setattr(msp_search, "ENGINE_ORDER", ["duckduckgo", "brave"])
+
+    def blocked(*_args):
+        raise msp_search.SearchProviderError("CAPTCHA", "challenge")
+
+    def slow_success(*_args):
+        msp_search.time.sleep(0.2)
+        return RESULT
+
+    monkeypatch.setitem(msp_search.SEARCH_PROVIDERS, "duckduckgo", _provider("duckduckgo", blocked))
+    monkeypatch.setitem(msp_search.SEARCH_PROVIDERS, "brave", _provider("brave", slow_success))
+
+    first = msp_search.search_web("query", num=1)
+    assert first["challenge_recoveries"] and first["elapsed_ms"] >= 150
+
+    second = msp_search.search_web("query", num=1)
+
+    assert second["cached"] is True
+    assert second["results"] == first["results"]
+    assert second["challenge_recoveries"] == []
+    assert second["elapsed_ms"] < 100
+    assert second["cache_age_seconds"] >= 0
 
 
 def test_new_provider_registration_updates_dispatch_and_invalidates_status(monkeypatch):

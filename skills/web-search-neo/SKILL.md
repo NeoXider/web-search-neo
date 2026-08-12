@@ -17,16 +17,24 @@ One `session_id` is one page — reuse it.
 
 - `page_outline`: roles, accessible names, states, `ref:<epoch>:N` handles, and boxes. Start
   here.
-- `page_text`: readable rendered text; `mode="main"` drops navigation and chrome. On a page
-  that is one big form, `main` would be empty, so the reader falls back to the full page and
-  says so with `fallback_used` and `mode_used`.
+- `page_text`: readable rendered text. `mode="full"` is the whole body; `mode="main"` drops
+  navigation and chrome. On a page that is one big form, `main` would be empty, so the reader
+  falls back to the full page and says so with `fallback_used` and `mode_used`. `excluded_chars`
+  and `excluded` say what is missing from the answer and why.
 - `find`: `params.query="submit application"` returns ranked refs instead of a whole page.
-- `page_elements`: flat CSS selectors, `<select>` options, and form metadata.
+  `low_confidence: true` means nothing on the page answers the query - the matches are
+  guesses, so read the page instead of clicking one. `ambiguous: true` means two matched
+  equally and order alone chose; say which you mean. `role` filters.
+- `page_elements`: flat CSS selectors (piercing paths inside shadow roots and frames),
+  `<select>` options, form metadata, and `visible`/`hidden_reason` per entry.
 - `console`: console output and uncaught errors with stack frames. Pages through history
   with `since_seq` and `limit`, and keeps its own place, so it never competes with
   `game_probe` for entries.
 - `network`: requests with status, type, ms, and size; `only_errors=true` to triage. Use
-  `output="json"` to get the `id` that `network_body` needs.
+  `output="json"` to get the `id` that `network_body` needs. Capture is armed when the
+  session takes its tab, so the first navigation is in the buffer; a tab claimed with
+  `attach_tab` is recorded only from the claim onwards. `dropped` counts what the 500-entry
+  buffer evicted, so an empty list plus a high `dropped` is not a quiet page.
 - `screenshot`, `game_probe`, `browser_status`, `browser_tabs`, `search_status`, `time`.
 
 The outline and `find` cross open shadow roots and same-origin iframes; a cross-origin frame
@@ -60,9 +68,17 @@ stay reachable, so local services work unchanged.
 ## Browser profiles
 
 - `current` (default) drives the user's signed-in Chrome through the companion extension.
-  New tabs enter group `AI`; `attach_tab` claims an existing `tab_id` without moving it.
-  `close` removes a tab the agent opened and leaves a claimed tab open; `close_all` follows
-  the same rule for every session at once.
+  New tabs enter group `🟢 AI`; `attach_tab` claims an existing `tab_id` without moving it.
+  `open` on a claimed session does not navigate the user's tab - it takes a new one in the
+  group and reports the tab it gave back as `left_claimed_tab`. `close` removes a tab the
+  agent opened and leaves a claimed tab open; `close_all` follows the same rule for every
+  session at once.
+- Another agent may be driving the same Chrome: `attach_tab` on a tab it already holds is
+  refused with who holds it. Pick a different tab or open your own; do not retry.
+- Tabs open in the background and nothing steals the user's focus, so they keep working
+  while you do. Hidden-tab throttling is compensated, so frames, timers and input behave.
+  A session whose Chrome restarted (or whose companion self-updated) is dropped with an
+  error saying to open again: reopen it, do not retry the action.
 - If the companion is disconnected, read `browser_status` and call `setup_current_chrome`.
   It opens no page and touches no browsing data; a connected companion older than the
   bundled build is reloaded automatically, reported as `self_update`. When it does return
@@ -73,6 +89,13 @@ stay reachable, so local services work unchanged.
   DevTools port and stays open afterwards.
 
 ## Forms
+
+`fill` reads every value back off the control, so `filled` means the field holds what you
+asked for and `field_values` says what it actually holds; a rejected value is an error, not
+a success. Checkboxes take `1/yes/y/on/check/checked` or `0/no/n/off/uncheck/unchecked`.
+`fill`, `click`, `submit`, `upload` and `wait` accept `frame_selector`.
+`challenge_detected` means a challenge is *blocking*; `captcha_widgets` lists captchas that
+are merely present, which you can ignore.
 
 Open the page, read `page_outline` or `page_elements`, then send ordered `fill`, `upload`,
 `click`, and `submit`. Inspect every result: `success=false`, a validation error, or

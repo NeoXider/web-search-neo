@@ -1,0 +1,32 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Fields that refuse what they are given</title></head>
+<body>
+<h1>Picky fields</h1>
+<form id="picky">
+  <label for="age">Age</label>
+  <input id="age" name="age" type="number">
+
+  <label for="code">Code</label>
+  <input id="code" name="code" maxlength="4">
+
+  <label for="role">Role</label>
+  <select id="role" name="role">
+    <option value="python">Python</option>
+    <option value="unity" disabled>Unity Developer</option>
+  </select>
+
+  <label for="locked">Locked</label>
+  <input id="locked" name="locked" readonly value="fixed">
+
+  <label for="off">Disabled</label>
+  <input id="off" name="off" disabled value="untouchable">
+
+  <label for="digits">Digits only</label>
+  <input id="digits" name="digits" oninput="this.value = this.value.replace(/[^0-9]/g, '')">
+
+  <label for="free">Free text</label>
+  <input id="free" name="free">
+</form>
+</body>
+</html>

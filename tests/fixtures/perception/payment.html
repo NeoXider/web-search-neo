@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Payment frame</title><link rel="icon" href="data:,"></head>
+<body>
+<h2>Payment</h2>
+<p id="pay-state">idle</p>
+<p>LEAF-TEXT the amount due is 99.00 EUR.</p>
+<button id="leaf-button"
+  onclick="document.getElementById('pay-state').textContent = 'paid'">Confirm payment</button>
+<input id="leaf-field" name="card_holder" placeholder="Card holder">
+</body>
+</html>

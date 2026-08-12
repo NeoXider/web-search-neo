@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Chrome around a frame</title><link rel="icon" href="data:,"></head>
+<body>
+<nav>NAV-LINKS home archive about contact subscribe privacy imprint jobs press status</nav>
+<main>
+  <h1>The article</h1>
+  <p>MAIN-BODY the landmark holds most of this document's own words, so main mode
+     takes it and drops the navigation and the footer around it.</p>
+  <!-- The frame's text is not part of document.body's rendered text, and it is
+       deliberately longer than the chrome around it: counting what was kept
+       against the body alone then made the loss clamp to zero. -->
+  <iframe id="embed" src="wordy_frame.html" width="420" height="260" title="embedded"></iframe>
+</main>
+<footer>FOOTER-NOTICE copyright licensing cookie policy and a postal address</footer>
+</body>
+</html>

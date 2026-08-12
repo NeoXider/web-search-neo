@@ -35,6 +35,14 @@ _MAX_OUTLINE_NODES = 1000
 _MAX_FIND_MATCHES = 25
 _MAX_TEXT_CHARS = 200000
 
+# How many frames deep every topic walks. One number for all of them on purpose:
+# when the outline reached deeper than find, page_elements and page_text, it
+# handed out refs for elements the other topics denied existed, and the action
+# tools - bounded lower still - refused them as gone. The locator resolver is
+# bounded above this, never below, so a ref the outline minted can always be
+# followed back to its document.
+MAX_FRAME_DEPTH = 8
+
 
 # ---------------------------------------------------------------------------
 # Element reference registry
@@ -120,9 +128,16 @@ def ref_expression(ref_id: int | str) -> str:
         f"if (String(registry.epoch).toLowerCase() !== {json.dumps(epoch, ensure_ascii=True)})"
         " return null;"
         f"const node = registry.nodes.get({number});"
-        # A ref outlives its element; a detached node would accept actions that no
-        # user could ever perform on the page they are looking at.
-        "return node && node.isConnected ? node : null;"
+        # A ref outlives its element, and `isConnected` alone does not notice it:
+        # a node inside an iframe that was removed stays connected to its own
+        # orphaned document and would happily accept actions no user could
+        # perform. The document's window is discarded with the browsing context,
+        # so it is what actually says "this subtree left the page".
+        "if (!node || !node.isConnected) return null;"
+        "const doc = node.ownerDocument;"
+        "let view = null;"
+        "try { view = doc ? doc.defaultView : null; } catch (error) { view = null; }"
+        "return view ? node : null;"
         "})()"
     )
 
@@ -148,6 +163,7 @@ def register_ref_registry(driver: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 _JS_LIB = (
+    f"const WSN_MAX_FRAME_DEPTH = {MAX_FRAME_DEPTH};\n"
     "function wsnRegistry() {\n"
     + REF_REGISTRY_SCRIPT
     + "\n  return window.__wsnRefs;\n}\n"
@@ -409,35 +425,83 @@ function wsnChildNodes(node) {
   return Array.prototype.slice.call(node.childNodes || []);
 }
 
-function wsnSelector(el) {
-  if (!el || !el.tagName) return '';
-  const escape = value => (window.CSS && CSS.escape
+function wsnEscape(value) {
+  return window.CSS && CSS.escape
     ? CSS.escape(value)
-    : String(value).replace(/[^a-zA-Z0-9_-]/g, character => '\\' + character));
-  const doc = el.ownerDocument;
-  if (el.id && doc && doc.querySelectorAll('#' + escape(el.id)).length === 1) {
-    return '#' + escape(el.id);
+    : String(value).replace(/[^a-zA-Z0-9_-]/g, character => '\\' + character);
+}
+
+function wsnUnique(root, path, el) {
+  // "Probably this element" is the failure this whole function exists to avoid:
+  // a path that matches two nodes silently addresses whichever comes first.
+  try {
+    const found = root.querySelectorAll(path);
+    return found.length === 1 && found[0] === el;
+  } catch (error) {
+    return false;
   }
+}
+
+function wsnSelector(el) {
+  // Returns a path that resolves to this element and to nothing else, addressed
+  // from the top document, or '' when no such path exists. A shadow root and a
+  // frame both hide their contents from plain CSS, so both are crossed with the
+  // 'outer >>> inner' piercing form the locator resolver understands. Reporting
+  // the path relative to the inner document instead is worse than reporting
+  // nothing: '#save' names one button in the frame and a different one on the
+  // page, and the caller cannot tell which one it just clicked.
+  if (!el || !el.tagName) return '';
+  const root = el.getRootNode ? el.getRootNode() : el.ownerDocument;
+  if (!root || !root.querySelectorAll) return '';
   const parts = [];
   let node = el;
-  let depth = 0;
-  while (node && node.nodeType === 1 && depth < 6) {
+  let hops = 0;
+  let local = '';
+  while (node && node.nodeType === 1 && hops < 40) {
+    hops += 1;
     let part = node.tagName.toLowerCase();
+    if (node.id) {
+      const byId = '#' + wsnEscape(node.id);
+      if (wsnUnique(root, byId, node)) part = byId;
+    }
+    // A direct child of a shadow root has no parentElement, and skipping the
+    // sibling count there left two identical buttons sharing one bare tag - and
+    // therefore no usable path at all, though nth-of-type separates them.
     const parent = node.parentElement;
-    if (parent) {
+    const container = parent || node.parentNode;
+    if (part.charAt(0) !== '#' && container && container.children) {
       const siblings = Array.prototype.filter.call(
-        parent.children, other => other.tagName === node.tagName
+        container.children, other => other.tagName === node.tagName
       );
       if (siblings.length > 1) {
         part += ':nth-of-type(' + (siblings.indexOf(node) + 1) + ')';
       }
     }
     parts.unshift(part);
-    if (!parent || parent.tagName === 'BODY' || parent.tagName === 'HTML') break;
+    const candidate = parts.join(' > ');
+    if (wsnUnique(root, candidate, el)) {
+      local = candidate;
+      break;
+    }
+    if (part.charAt(0) === '#') break;
     node = parent;
-    depth += 1;
   }
-  return parts.join(' > ');
+  if (!local) return '';
+  if (root.host) {
+    const host = wsnSelector(root.host);
+    return host ? host + ' >>> ' + local : '';
+  }
+  let owner = null;
+  try {
+    owner = root.defaultView ? root.defaultView.frameElement : null;
+  } catch (error) {
+    owner = null;  // cross-origin parent: nothing here is addressable from there
+  }
+  if (owner) {
+    const host = wsnSelector(owner);
+    return host ? host + ' >>> ' + local : '';
+  }
+  return local;
 }
 
 function wsnFrameOffset(el, rect) {
@@ -468,13 +532,132 @@ function wsnHandle(el, registry) {
   return 'ref:' + registry.epoch + ':' + wsnRefFor(el, registry);
 }
 
+function wsnRegistryIn(win) {
+  // Ref numbers restart at 1 in every document, so a handle only means anything
+  // in the document that minted it - and an element handle only works while the
+  // driver is in that same browsing context. A frame therefore gets its own
+  // registry instead of borrowing the top one, which is what makes a ref read
+  // inside a frame resolvable, and actionable, later.
+  if (!win) return null;
+  let current = null;
+  try {
+    current = win.__wsnRefs;
+  } catch (error) {
+    return null;  // cross-origin: nothing here can be addressed anyway
+  }
+  if (current && current.nodes && current.byNode) return current;
+  const bytes = new Uint8Array(8);
+  if (window.crypto && window.crypto.getRandomValues) window.crypto.getRandomValues(bytes);
+  else for (let index = 0; index < bytes.length; index += 1) {
+    bytes[index] = Math.floor(Math.random() * 256);
+  }
+  let epoch = '';
+  for (const byte of bytes) epoch += byte.toString(16).padStart(2, '0');
+  const created = {
+    epoch: epoch, nodes: new Map(), next: 1, byNode: new WeakMap(), closedShadowRoots: 0
+  };
+  try {
+    win.__wsnRefs = created;
+  } catch (error) {
+    return null;
+  }
+  return created;
+}
+
+const WSN_PRUNED = new Set();
+
+function wsnPruneOnce(registry) {
+  if (registry && !WSN_PRUNED.has(registry)) {
+    WSN_PRUNED.add(registry);
+    wsnPruneRegistry(registry);
+  }
+  return registry;
+}
+
+function wsnRegistryOf(el) {
+  const doc = el ? el.ownerDocument : null;
+  let win = null;
+  try {
+    win = doc ? doc.defaultView : null;
+  } catch (error) {
+    win = null;
+  }
+  return wsnPruneOnce(wsnRegistryIn(win) || wsnRegistry());
+}
+
+function wsnHandleFor(el) {
+  return wsnHandle(el, wsnRegistryOf(el));
+}
+
 function wsnPruneRegistry(registry) {
   // The registry holds strong references, so a page that rebuilds its DOM would
   // pile up detached nodes forever. Every fresh read drops what is already gone.
   for (const entry of Array.from(registry.nodes)) {
     const node = entry[1];
-    if (!node || node.isConnected === false) registry.nodes.delete(entry[0]);
+    if (!node || node.isConnected === false) {
+      registry.nodes.delete(entry[0]);
+      continue;
+    }
+    // A node inside a frame that was removed stays connected to its own orphaned
+    // document; the window is what gets discarded with the browsing context.
+    let view = null;
+    try {
+      view = node.ownerDocument ? node.ownerDocument.defaultView : null;
+    } catch (error) {
+      view = null;
+    }
+    if (!view) registry.nodes.delete(entry[0]);
   }
+}
+
+function wsnHiddenBy(el) {
+  // The outline stops at the first aria-hidden or [hidden] ancestor, so anything
+  // that reports elements has to use the same rule or the two topics disagree
+  // about what is on the page. The walk crosses shadow and frame boundaries,
+  // because both of those hide their contents from a plain parent walk.
+  let node = el;
+  let hops = 0;
+  while (node && hops < 200) {
+    hops += 1;
+    if (node.nodeType === 1) {
+      if (wsnAttr(node, 'aria-hidden') === 'true') return 'aria-hidden';
+      if (node.hasAttribute && node.hasAttribute('hidden')) return 'hidden-attribute';
+    }
+    if (node.parentElement) {
+      node = node.parentElement;
+      continue;
+    }
+    const root = node.getRootNode ? node.getRootNode() : null;
+    if (root && root.host) {
+      node = root.host;
+      continue;
+    }
+    let owner = null;
+    try {
+      owner = root && root.defaultView ? root.defaultView.frameElement : null;
+    } catch (error) {
+      owner = null;
+    }
+    node = owner;
+  }
+  return '';
+}
+
+function wsnHiddenReason(el) {
+  const ancestor = wsnHiddenBy(el);
+  if (ancestor) return ancestor;
+  const view = el.ownerDocument ? el.ownerDocument.defaultView : null;
+  const style = view && view.getComputedStyle ? view.getComputedStyle(el) : null;
+  if (style) {
+    if (style.display === 'none') return 'display-none';
+    if (style.visibility === 'hidden' || style.visibility === 'collapse') {
+      return 'visibility-hidden';
+    }
+    if (parseFloat(style.opacity || '1') === 0) return 'transparent';
+  }
+  const rect = el.getBoundingClientRect();
+  if (rect.width <= 0 && rect.height <= 0) return 'zero-size';
+  return '';
 }
 
 function wsnNorm(value) {
@@ -543,6 +726,12 @@ function wsnFieldScore(query, queryTokens, value) {
 )
 
 
+# The element topics in ``browser_tools`` share these helpers, so that a
+# selector, a visibility verdict and the aria-hidden rule mean the same thing
+# whichever topic an agent happens to read.
+JS_LIBRARY = _JS_LIB
+
+
 _EPOCH_SCRIPT = _JS_LIB + "\nreturn wsnRegistry().epoch;\n"
 
 
@@ -553,8 +742,7 @@ _EPOCH_SCRIPT = _JS_LIB + "\nreturn wsnRegistry().epoch;\n"
 _OUTLINE_SCRIPT = _JS_LIB + r"""
 const limit = arguments[0];
 const includeOcclusion = arguments[1];
-const registry = wsnRegistry();
-wsnPruneRegistry(registry);
+const registry = wsnPruneOnce(wsnRegistry());
 
 const ctx = {
   out: [],
@@ -567,6 +755,7 @@ const ctx = {
   lastText: '',
   registry: registry,
   hosts: null,
+  frames: {same_origin: 0, cross_origin: 0, unaddressable: 0, too_deep: 0},
   offsets: {x: 0, y: 0, frame: null},
   view: {width: window.innerWidth, height: window.innerHeight},
   counts: {
@@ -632,16 +821,23 @@ function wsnContainer(el, context) {
   }
 }
 
-function wsnWalkRoot(root, depth, context, offsetX, offsetY, framePath) {
+function wsnWalkRoot(root, depth, context, offsetX, offsetY, frameInfo) {
   const previousHosts = context.hosts;
   const previousOffsets = context.offsets;
+  const previousRegistry = context.registry;
   context.hosts = wsnShadowAncestors(root);
-  context.offsets = {x: offsetX, y: offsetY, frame: framePath};
+  context.offsets = {x: offsetX, y: offsetY, frame: frameInfo || null};
+  // A shadow root belongs to the document that hosts it; a frame document is its
+  // own, and its refs have to be minted there to be resolvable there.
+  if (root.nodeType === 9) {
+    context.registry = wsnPruneOnce(wsnRegistryIn(root.defaultView) || previousRegistry);
+  }
   const start = root.nodeType === 9 ? (root.body || root.documentElement) : root;
   if (start) wsnWalkChildren(start, depth, context);
   wsnFlushText(context);
   context.hosts = previousHosts;
   context.offsets = previousOffsets;
+  context.registry = previousRegistry;
 }
 
 function wsnWalkChildren(node, depth, context) {
@@ -734,7 +930,7 @@ function wsnEmit(el, role, depth, context) {
   const node = {
     kind: 'node',
     depth: depth,
-    ref: wsnHandle(el, context.registry),
+    ref: wsnHandle(el, context.registry || wsnRegistryOf(el)),
     tag: tag,
     role: role,
     name: wsnName(el, role),
@@ -756,7 +952,12 @@ function wsnEmit(el, role, depth, context) {
   const value = wsnValue(el, role);
   if (value) node.value = value;
   if (role === 'link' && el.href) node.href = String(el.href);
-  if (offsets.frame) node.frame = offsets.frame;
+  if (offsets.frame) {
+    node.frame = offsets.frame.path;
+    // A path that cannot be verified unique would send the caller into whichever
+    // frame happens to match first, so it is handed over labelled, not silently.
+    if (!offsets.frame.addressable) node.frame_addressable = false;
+  }
   node.occluded = context.occlusion ? wsnOccluded(el, local) : null;
   context.out.push(node);
   context.counts.nodes += 1;
@@ -783,15 +984,38 @@ function wsnDescendFrame(el, node, depth, context, local) {
   node.src = wsnAttr(el, 'src');
   if (!doc) {
     node.same_origin = false;
+    context.frames.cross_origin += 1;
     return;
   }
   node.same_origin = true;
-  let frameName = el.tagName.toLowerCase();
+  const parent = context.offsets.frame;
+  if ((parent ? parent.depth : 0) >= WSN_MAX_FRAME_DEPTH) {
+    // Every topic stops at the same depth, so none of them can report something
+    // the others cannot reach - or hand out a ref the action tools cannot follow.
+    context.frames.too_deep += 1;
+    node.frame_too_deep = true;
+    return;
+  }
+  context.frames.same_origin += 1;
+  // wsnSelector is already absolute from the top document; composing it with the
+  // parent's path again would name the outer frame twice. The bare tag name is
+  // exactly the path that lands in the wrong document, so a frame whose selector
+  // cannot be verified is carried as not addressable rather than as something the
+  // caller may pass back as frame_selector.
   const selector = wsnSelector(el);
-  if (selector) frameName = selector;
-  const framePath = context.offsets.frame
-    ? context.offsets.frame + ' >>> ' + frameName
-    : frameName;
+  const addressable = !!selector;
+  const framePath = selector
+    || ((parent ? parent.path + ' >>> ' : '') + el.tagName.toLowerCase());
+  const frameInfo = {
+    path: framePath,
+    addressable: addressable,
+    depth: (parent ? parent.depth : 0) + 1
+  };
+  node.frame_path = framePath;
+  if (!addressable) {
+    node.frame_addressable = false;
+    context.frames.unaddressable += 1;
+  }
   try {
     const frameWindow = el.contentWindow;
     if (frameWindow && frameWindow.__wsnRefs) {
@@ -802,7 +1026,7 @@ function wsnDescendFrame(el, node, depth, context, local) {
   }
   const origin = wsnFrameOffset(el, local);
   wsnWalkRoot(doc, depth + 1, context, context.offsets.x + origin.x,
-              context.offsets.y + origin.y, framePath);
+              context.offsets.y + origin.y, frameInfo);
 }
 
 wsnWalkRoot(document, 0, ctx, 0, 0, null);
@@ -815,6 +1039,7 @@ return {
   closed_shadow_roots: ctx.closed,
   truncated: ctx.truncated,
   counts: ctx.counts,
+  frames: ctx.frames,
   viewport: ctx.view,
   nodes: ctx.out
 };
@@ -888,6 +1113,11 @@ def outline(
     The traversal enters open shadow roots and same-origin iframes; cross-origin
     frames are reported as stubs. Closed shadow roots cannot be walked at all and are
     only counted, so the caller knows the outline is incomplete.
+
+    A node inside a frame carries a ref minted in that frame's own document, so its
+    epoch differs from the page's ``dom_epoch``; the action tools follow the ref
+    into its document. Its ``frame`` path is verified to address exactly one frame,
+    and is marked ``frame_addressable: false`` when no such path exists.
     """
     node_limit = max(1, min(int(limit), _MAX_OUTLINE_NODES))
     selected = str(format or "text").strip().lower()
@@ -902,6 +1132,7 @@ def outline(
         "title": raw.get("title", ""),
         "dom_epoch": raw.get("dom_epoch", ""),
         "counts": raw.get("counts", {}),
+        "frames": raw.get("frames", {}),
         "truncated": bool(raw.get("truncated")),
         "closed_shadow_roots": int(raw.get("closed_shadow_roots") or 0),
         "limit": node_limit,
@@ -944,11 +1175,32 @@ function wsnTextWeight(el) {
   return {length: text.length, weight: text.length - noise};
 }
 
+function wsnTextLength(el) {
+  if (!el) return 0;
+  const text = el.innerText === undefined ? (el.textContent || '') : (el.innerText || '');
+  return wsnClean(text, 0).length;
+}
+
 function wsnPickRoot(doc) {
+  const bodyChars = wsnTextLength(doc.body);
+  let articles;
+  try {
+    articles = doc.querySelectorAll('article');
+  } catch (error) {
+    articles = [];
+  }
   const direct = doc.querySelector('main')
     || doc.querySelector('[role="main"]')
-    || doc.querySelector('article');
-  if (direct) return {root: direct, reason: direct.tagName.toLowerCase()};
+    // Several articles are an index page: taking the first one returns a single
+    // post and drops every other, which reads exactly like a complete answer.
+    || (articles.length === 1 ? articles[0] : null);
+  // A landmark is only the main content while it holds most of the page's text.
+  // An app shell whose <main> holds a spinner while the framework mounted
+  // somewhere else looks identical from here, and reporting 'Loading...' as the
+  // page is worse than reporting too much.
+  if (direct && wsnTextLength(direct) * 2 >= bodyChars) {
+    return {root: direct, reason: direct.tagName.toLowerCase(), body_chars: bodyChars};
+  }
   let best = null;
   let bestWeight = 0;
   const visit = (el, depth) => {
@@ -965,7 +1217,11 @@ function wsnPickRoot(doc) {
     for (const child of el.children) visit(child, depth + 1);
   };
   if (doc.body) visit(doc.body, 0);
-  return {root: best || doc.body, reason: best ? 'text-weight' : 'body'};
+  return {
+    root: best || doc.body,
+    reason: best ? 'text-weight' : 'body',
+    body_chars: bodyChars
+  };
 }
 
 function wsnDropped(el) {
@@ -986,6 +1242,10 @@ function wsnDropped(el) {
 
 const chunks = [];
 const links = [];
+// `chars` is what the frames contributed, which the top document's own innerText
+// knows nothing about: without it, "how much of the page is missing" compares two
+// different universes and clamps to zero the moment a frame outweighs the loss.
+const frames = {same_origin: 0, cross_origin: 0, not_loaded: 0, too_deep: 0, chars: 0};
 
 function wsnPreformatted(el) {
   const view = el.ownerDocument ? el.ownerDocument.defaultView : null;
@@ -1005,6 +1265,41 @@ function wsnEmitText(node, parent) {
   chunks.push(raw.replace(/[ \t\r\n]+/g, ' '));
 }
 
+function wsnWalkFrame(el, budget) {
+  // An iframe renders as part of the page a person is reading, so leaving its
+  // text out returns "" for a page whose whole content is one frame, and calls
+  // that the page. What genuinely cannot be read - another origin - is counted
+  // instead of being passed over in silence.
+  let doc = null;
+  try {
+    doc = el.contentDocument;
+  } catch (error) {
+    doc = null;
+  }
+  if (!doc) {
+    frames.cross_origin += 1;
+    return;
+  }
+  if (!doc.body) {
+    // Same origin, simply not parsed yet. Calling that "cannot be read from this
+    // page at all" tells the caller to give up on text that is about to arrive.
+    frames.not_loaded += 1;
+    return;
+  }
+  if (budget.depth >= WSN_MAX_FRAME_DEPTH) {
+    frames.too_deep += 1;
+    return;
+  }
+  // Counted only once it is actually read, so the tally matches the text.
+  frames.same_origin += 1;
+  frames.chars += wsnTextLength(doc.body);
+  budget.depth += 1;
+  chunks.push('\n\n');
+  wsnTextWalk(doc.body, budget);
+  chunks.push('\n\n');
+  budget.depth -= 1;
+}
+
 function wsnTextWalk(el, budget) {
   if (budget.nodes > 60000) return;
   budget.nodes += 1;
@@ -1012,6 +1307,10 @@ function wsnTextWalk(el, budget) {
   if (WSN_SKIP_TAGS.has(tag)) return;
   if (wsnDropped(el)) return;
   if (!wsnDisplayed(el)) return;
+  if (tag === 'IFRAME' || tag === 'FRAME') {
+    wsnWalkFrame(el, budget);
+    return;
+  }
   if (tag === 'BR') {
     chunks.push('\n');
     return;
@@ -1046,22 +1345,62 @@ function wsnTextWalk(el, budget) {
   else if (WSN_BLOCK_TAGS.has(tag)) chunks.push('\n\n');
 }
 
-const picked = wsnPickRoot(document);
+function wsnAppendDialogs(root) {
+  // An open modal is the page as far as the person looking at it is concerned.
+  // It usually lives outside the main landmark, so main mode would drop the one
+  // thing standing between the caller and everything else.
+  let dialogs;
+  try {
+    dialogs = document.querySelectorAll('dialog[open], [role="dialog"], [role="alertdialog"]');
+  } catch (error) {
+    return 0;
+  }
+  const appended = [];
+  for (const dialog of dialogs) {
+    if (dialog.tagName === 'DIALOG' && !dialog.open) continue;
+    if (root && (root === dialog || wsnContains(root, dialog))) continue;
+    // An alertdialog inside a dialog is one overlay, not two. Document order puts
+    // the outer one first, so anything already inside what was appended is
+    // already in the text - emitting it again reads as two separate warnings.
+    if (appended.some(other => other === dialog || wsnContains(other, dialog))) continue;
+    if (!wsnDisplayed(dialog) || wsnHiddenBy(dialog)) continue;
+    const restore = mainOnly;
+    mainOnly = false;  // a login modal is a <form>, which main mode calls chrome
+    chunks.push('\n\n');
+    wsnTextWalk(dialog, {nodes: 0, depth: 0});
+    mainOnly = restore;
+    appended.push(dialog);
+  }
+  return appended.length;
+}
+
+// 'full' means the whole rendered body. Guessing a main-content sub-tree here is
+// what let an app shell answer for a page it had nothing to do with.
+const picked = mainOnly
+  ? wsnPickRoot(document)
+  : {root: document.body, reason: 'body', body_chars: wsnTextLength(document.body)};
 let root = picked.root;
 let reason = picked.reason;
 let fallbackUsed = false;
-if (root) wsnTextWalk(root, {nodes: 0});
+if (root) wsnTextWalk(root, {nodes: 0, depth: 0});
+let dialogsAppended = wsnAppendDialogs(root);
 // Emptiness is the only reliable signal: on a page that is one big <form> the
 // noise list eats everything, and an over-eager root guess does the same. Either
 // way the caller must not be handed a blank page with no way to tell why.
 if (!chunks.join('').trim() && document.body && (mainOnly || root !== document.body)) {
   chunks.length = 0;
   links.length = 0;
+  frames.same_origin = 0;
+  frames.cross_origin = 0;
+  frames.not_loaded = 0;
+  frames.too_deep = 0;
+  frames.chars = 0;
   fallbackUsed = true;
   mainOnly = false;
   root = document.body;
   reason = 'body-fallback';
-  wsnTextWalk(root, {nodes: 0});
+  wsnTextWalk(root, {nodes: 0, depth: 0});
+  dialogsAppended = wsnAppendDialogs(root);
 }
 
 return {
@@ -1071,6 +1410,9 @@ return {
   root_selector: root ? wsnSelector(root) : '',
   root_reason: reason,
   fallback_used: fallbackUsed,
+  body_chars: picked.body_chars || 0,
+  frames: frames,
+  dialogs_appended: dialogsAppended,
   text: chunks.join(''),
   links: links
 };
@@ -1078,6 +1420,7 @@ return {
 
 
 _MULTI_NEWLINE = re.compile(r"\n{3,}")
+_WHITESPACE_RUN = re.compile(r"\s+")
 _MULTI_SPACE = re.compile(r"[ \t]{2,}")
 _SPACE_BEFORE_NEWLINE = re.compile(r"[ \t]+\n")
 _LEADING_CELL = re.compile(r"\n ?\| ")
@@ -1116,6 +1459,65 @@ def _link_listing(text: str, links: list[Any]) -> tuple[str, list[dict[str, Any]
     return listing, selected
 
 
+def _text_exclusions(
+    raw: dict[str, Any],
+    full_text: str,
+    mode: str,
+    fallback_used: bool,
+    truncated: bool,
+    frames: dict[str, Any],
+) -> tuple[int, list[str]]:
+    """Say what this text does not contain, in the caller's own units.
+
+    A sub-tree that reads like a whole page is the failure worth naming: the
+    result is plausible, self-consistent, and wrong, and nothing in it hints that
+    the rest of the page exists.
+
+    Both sides are measured in one universe. ``body_chars`` is the top document's
+    own rendered text and knows nothing about frames, while the text returned
+    includes them, so subtracting one from the other clamped to zero the moment a
+    frame outweighed what main mode had dropped - and reported "nothing is
+    missing" for a page whose navigation and footer had both been thrown away.
+    Link markers are removed before counting because they are this tool's own
+    markup rather than the page's words; the count is otherwise exact to within
+    the few characters of heading and cell punctuation that get inserted.
+    """
+    kept = len(_WHITESPACE_RUN.sub(" ", _MARKER_PATTERN.sub("", full_text)).strip())
+    body_chars = int(raw.get("body_chars") or 0)
+    frame_chars = int(frames.get("chars") or 0)
+    rendered = body_chars + frame_chars
+    missing = max(0, rendered - kept)
+    reasons: list[str] = []
+    if missing:
+        reasons.append(
+            f"{missing} of the {rendered} characters this page renders are not here"
+        )
+        if mode == "main" and not fallback_used:
+            reasons.append(
+                f"mode='main' kept only {raw.get('root_selector') or raw.get('root_tag') or 'a sub-tree'} "
+                "and dropped nav/header/footer/aside/form chrome - call again with mode='full'"
+            )
+        else:
+            reasons.append("aria-hidden, [hidden] and off-layout subtrees are never read")
+    cross_origin = int(frames.get("cross_origin") or 0)
+    if cross_origin:
+        reasons.append(
+            f"{cross_origin} cross-origin frame(s) cannot be read from this page at all"
+        )
+    not_loaded = int(frames.get("not_loaded") or 0)
+    if not_loaded:
+        reasons.append(
+            f"{not_loaded} same-origin frame(s) had not parsed a body yet; read again in a moment"
+        )
+    if int(frames.get("too_deep") or 0):
+        reasons.append(
+            f"{frames['too_deep']} frame(s) nested deeper than {MAX_FRAME_DEPTH} were not entered"
+        )
+    if truncated:
+        reasons.append("clipped at max_chars; raise max_chars for the rest")
+    return missing, reasons
+
+
 def page_text(
     driver: Any,
     *,
@@ -1125,10 +1527,15 @@ def page_text(
 ) -> dict[str, Any]:
     """Extract the readable text of the rendered page, keeping block structure.
 
-    ``mode='main'`` also drops navigation, header, footer, aside and form chrome;
-    ``mode='full'`` keeps everything that is visible. A page whose whole content is
-    chrome - a login or checkout form - would come back empty, so an empty result
-    is retried without the noise list and reported as ``fallback_used``.
+    ``mode='full'`` is the whole rendered ``<body>``, including same-origin frames
+    and open dialogs. ``mode='main'`` narrows to the main-content sub-tree and also
+    drops navigation, header, footer, aside and form chrome; because that can drop a
+    lot, ``excluded_chars`` says how much of the rendered body is not in the result
+    and ``excluded`` says why, so a partial read is never handed over as the page.
+
+    A page whose whole content is chrome - a login or checkout form - would come
+    back empty, so an empty result is retried without the noise list and reported
+    as ``fallback_used``.
     """
     selected_mode = str(mode or "main").strip().lower()
     if selected_mode not in {"main", "full"}:
@@ -1167,6 +1574,10 @@ def page_text(
         truncated = text != full_text
         if listing:
             text = f"{text}\n\n{listing}"
+    frames = raw.get("frames") or {}
+    excluded_chars, excluded = _text_exclusions(
+        raw, full_text, selected_mode, fallback_used, truncated, frames
+    )
     return {
         "url": raw.get("url", ""),
         "title": raw.get("title", ""),
@@ -1179,6 +1590,11 @@ def page_text(
         "text": text,
         "chars": len(text),
         "total_chars": total,
+        "body_chars": int(raw.get("body_chars") or 0),
+        "excluded_chars": excluded_chars,
+        "excluded": excluded,
+        "frames": frames,
+        "dialogs_appended": int(raw.get("dialogs_appended") or 0),
         "truncated": truncated,
         "max_chars": limit,
         **({"links": links} if include_links else {}),
@@ -1195,8 +1611,12 @@ const roleFilter = arguments[1];
 const limit = arguments[2];
 const visibleOnly = arguments[3];
 const includeOcclusion = arguments[4];
-const registry = wsnRegistry();
-wsnPruneRegistry(registry);
+const registry = wsnPruneOnce(wsnRegistry());
+
+// A match at or above this is an answer; below it the tool is guessing. 25 sits
+// just under "every token of the query appears in the element's own name" (34)
+// and far above a bare role-synonym brush (about 7).
+const WSN_MATCH_THRESHOLD = 25;
 
 const WSN_ROLE_SYNONYMS = {
   button: ['button', 'knopka', 'кнопка', 'нажать', 'submit', 'apply'],
@@ -1220,8 +1640,11 @@ const WSN_ACTION_WORDS = new Set([
   'добавить', 'найти', 'поиск', 'продолжить', 'сохранить', 'скачать', 'кнопка', 'ссылка'
 ]);
 
+// `depth` counts frames only. Shadow nesting is finite by construction and
+// costs nothing to follow, while a frame can embed itself forever - and the
+// depth every topic stops at has to be the same one.
 function wsnCollect(root, offsets, out, depth) {
-  if (depth > 6 || out.length > 4000) return;
+  if (out.length > 4000) return;
   let elements;
   try {
     elements = root.querySelectorAll('*');
@@ -1230,8 +1653,12 @@ function wsnCollect(root, offsets, out, depth) {
   }
   for (const el of elements) {
     if (WSN_SKIP_TAGS.has(el.tagName)) continue;
-    if (el.shadowRoot) wsnCollect(el.shadowRoot, offsets, out, depth + 1);
-    if (el.tagName === 'IFRAME') {
+    if (el.shadowRoot) wsnCollect(el.shadowRoot, offsets, out, depth);
+    if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {
+      if (depth >= WSN_MAX_FRAME_DEPTH) {
+        framesTooDeep += 1;
+        continue;
+      }
       let doc = null;
       try {
         doc = el.contentDocument;
@@ -1241,8 +1668,11 @@ function wsnCollect(root, offsets, out, depth) {
       if (doc) {
         const box = el.getBoundingClientRect();
         const origin = wsnFrameOffset(el, {x: box.left, y: box.top});
+        // wsnSelector is absolute from the top document already; a frame with no
+        // verifiable path is reported as having none rather than as a bare tag
+        // that would address a different document.
         wsnCollect(doc, {x: offsets.x + origin.x, y: offsets.y + origin.y,
-                         frame: wsnSelector(el)}, out, depth + 1);
+                         frame: wsnSelector(el) || null}, out, depth + 1);
       }
       continue;
     }
@@ -1261,19 +1691,27 @@ const queryTokens = normalizedQuery ? normalizedQuery.split(' ') : [];
 const wantedRole = roleFilter ? String(roleFilter).toLowerCase() : '';
 const actionish = queryTokens.some(token => WSN_ACTION_WORDS.has(token));
 
+let framesTooDeep = 0;
 const candidates = [];
 wsnCollect(document, {x: 0, y: 0, frame: null}, candidates, 0);
 
 const view = {width: window.innerWidth, height: window.innerHeight};
 const scored = [];
 let anyInteractive = false;
+let hiddenSkipped = 0;
 
 for (let index = 0; index < candidates.length; index += 1) {
   const el = candidates[index].el;
   const offsets = candidates[index].offsets;
   const role = wsnRole(el);
   if (role === 'hidden') continue;
-  if (wsnAttr(el, 'aria-hidden') === 'true' || el.hasAttribute('hidden')) continue;
+  // The outline stops at the first aria-hidden or [hidden] ancestor. Checking
+  // only the element itself let a hidden copy of a real control outrank it, so
+  // the two topics reported different pages and neither said which was wrong.
+  if (wsnHiddenBy(el)) {
+    hiddenSkipped += 1;
+    continue;
+  }
   const box = el.getBoundingClientRect();
   const width = Math.round(box.width);
   const height = Math.round(box.height);
@@ -1290,8 +1728,19 @@ for (let index = 0; index < candidates.length; index += 1) {
     hrefTail = parts.length ? wsnSplitIdentifier(parts[parts.length - 1]) : '';
   }
   const synonyms = WSN_ROLE_SYNONYMS[role] || [role];
+  // An aria-label wins the accessible name and hides the element's own words from
+  // the scorer, so a button reading "Send message" scored nothing against "Send
+  // message" and the tool called itself unsure of the one right answer. What a
+  // person can see is what they will ask for, so it is scored as its own field.
+  let ownText = '';
+  if (!WSN_STRUCTURAL_ROLES.has(role)) {
+    const rendered = el.innerText === undefined ? el.textContent : el.innerText;
+    const cleaned = wsnClean(rendered, WSN_NAME_LIMIT);
+    if (cleaned !== name) ownText = cleaned;
+  }
   const fields = [
     ['name', 1.00, name],
+    ['text', 0.90, ownText],
     ['placeholder', 0.80, wsnAttr(el, 'placeholder')],
     ['title', 0.65, wsnAttr(el, 'title')],
     ['testid', 0.60, wsnSplitIdentifier(testId)],
@@ -1300,18 +1749,23 @@ for (let index = 0; index < candidates.length; index += 1) {
     ['value', 0.40, value],
     ['href', 0.30, hrefTail]
   ];
-  let score = 0;
+  // How well this element answers the query, and nothing else. Kept apart from
+  // the ranking score below, which mixes in where the element sits and whether
+  // it can be clicked - useful for ordering, worthless for deciding whether the
+  // page holds an answer at all.
+  let matchScore = 0;
   let matchedField = '';
   for (const field of fields) {
     const component = wsnFieldScore(normalizedQuery, queryTokens, field[2]);
     if (component <= 0) continue;
     const weighted = component * field[1];
-    if (weighted > score) {
-      score = weighted;
+    if (weighted > matchScore) {
+      matchScore = weighted;
       matchedField = field[0];
     }
   }
-  if (score <= 0) continue;
+  if (matchScore <= 0) continue;
+  let score = matchScore;
   const local = {x: Math.round(box.left), y: Math.round(box.top), w: width, h: height};
   const page = {
     x: Math.round(box.left + offsets.x),
@@ -1338,6 +1792,7 @@ for (let index = 0; index < candidates.length; index += 1) {
     role: role,
     name: name,
     score: score,
+    match_score: matchScore,
     matched_field: matchedField,
     rect: local,
     page_rect: page,
@@ -1353,22 +1808,44 @@ for (const item of scored) {
   if (!item.interactive && anyInteractive && item.role === 'generic') item.score -= 12;
   if (wantedRole && item.role !== wantedRole) item.score -= 20;
   item.score = Math.round(item.score * 10) / 10;
+  item.match_score = Math.round(item.match_score * 10) / 10;
 }
 
 scored.sort((left, right) => (right.score - left.score) || (left.index - right.index));
 
-let selected = scored.filter(item => item.score >= 25).slice(0, limit);
+// The bar has to be applied to the match, not to the ranking score: being in the
+// viewport, looking actionable and being enabled are worth 36 points between
+// them, so on any actionish query every live control on the page cleared a bar
+// of 25 without matching a single word of it. A role filter is a filter, too -
+// asking for a button and being handed a link is not a confident answer.
+const qualified = scored.filter(item => item.match_score >= WSN_MATCH_THRESHOLD
+  && (!wantedRole || item.role === wantedRole));
+let selected = qualified.slice(0, limit);
 let lowConfidence = false;
 if (!selected.length) {
+  // Nothing here answers the query. The closest few are still returned - seeing
+  // what the page does have beats an empty result - but as the guess they are.
   lowConfidence = true;
   selected = scored.slice(0, Math.min(3, limit));
 }
+// Neither the match nor the ranking could separate the top two, so which one
+// came first was decided by document order. That is not a confidence problem -
+// both are good matches - and it needs its own flag rather than sharing one.
+// Read from the qualified pool rather than from what survived `limit`: the
+// caller who asked for exactly one answer is the one who most needs to know the
+// second one was just as good.
+const ambiguous = !lowConfidence && qualified.length > 1
+  && (qualified[0].match_score - qualified[1].match_score) < 5
+  && (qualified[0].score - qualified[1].score) < 5;
 
 const matches = selected.map(item => ({
-  ref: wsnHandle(item.el, registry),
+  // Minted in the element's own document: a handle from another browsing context
+  // resolves to nothing the driver can act on.
+  ref: wsnHandleFor(item.el),
   role: item.role,
   name: item.name,
   score: item.score,
+  match_score: item.match_score,
   matched_field: item.matched_field,
   rect: item.rect,
   page_rect: item.page_rect,
@@ -1383,8 +1860,15 @@ return {
   title: String(document.title || ''),
   dom_epoch: registry.epoch,
   candidates: candidates.length,
+  frames_too_deep: framesTooDeep,
   scored: scored.length,
+  matched: qualified.length,
+  returned: matches.length,
+  truncated: qualified.length > matches.length,
+  match_threshold: WSN_MATCH_THRESHOLD,
   matches: matches,
+  aria_hidden_skipped: hiddenSkipped,
+  ambiguous: ambiguous,
   low_confidence: lowConfidence
 };
 """
@@ -1398,7 +1882,40 @@ def find(
     limit: int = 5,
     visible_only: bool = True,
 ) -> dict[str, Any]:
-    """Find elements by meaning; all scoring happens inside the page in one round-trip."""
+    """Find elements by meaning; all scoring happens inside the page in one round-trip.
+
+    Elements under an ``aria-hidden="true"`` or ``[hidden]`` ancestor are skipped,
+    exactly as the outline skips them, and counted in ``aria_hidden_skipped``: a
+    hidden duplicate of a real control must never outrank the control.
+
+    Every match carries two numbers, because one cannot say both things:
+
+    ``match_score`` (0-100) is how well the query matched that element and nothing
+    else - 100 the whole field, 62 a prefix, 45 a substring, 34 every query token
+    present - multiplied by the field's weight (``name`` 1.0, the element's own
+    visible ``text`` when an accessible name overrode it 0.9, ``placeholder`` 0.8,
+    ``title`` 0.65, ``testid`` 0.6, ``name``/``id`` 0.5, ``role`` and ``value``
+    0.4, ``href`` 0.3). ``matched_field`` names the field it came from.
+
+    ``score`` is the ranking score: ``match_score`` plus where the element sits and
+    whether it can be used (in the viewport, action-shaped query, requested role,
+    enabled, not occluded). It orders the results; it says nothing about relevance,
+    which is why ``low_confidence`` is derived from ``match_score`` against
+    ``match_threshold`` and never from it.
+
+    ``low_confidence`` means nothing on the page answered the query - the matches
+    are the closest things found, offered as a guess. ``ambiguous`` is a different
+    failure and has its own flag: the top two matched equally well *and* ranked
+    equally, so which came first was decided by document order alone.
+
+    ``candidates`` were examined, ``scored`` resembled the query at all (weak
+    role-word brushes included), ``matched`` cleared ``match_threshold``, and
+    ``returned`` fit inside ``limit``; ``truncated`` says ``matched`` did not.
+    Under ``low_confidence`` nothing cleared the bar, so ``matched`` is 0 while
+    ``returned`` counts the guesses handed over anyway - the one case where
+    ``returned`` exceeds ``matched``. ``frames_too_deep`` counts frames nested
+    past ``MAX_FRAME_DEPTH``, which no topic enters.
+    """
     text = str(query or "").strip()
     if not text:
         raise ValueError("query must not be empty")
@@ -1417,7 +1934,15 @@ def find(
         "dom_epoch": raw.get("dom_epoch", ""),
         "matches": raw.get("matches") or [],
         "low_confidence": bool(raw.get("low_confidence")),
+        "ambiguous": bool(raw.get("ambiguous")),
+        "match_threshold": int(raw.get("match_threshold") or 0),
         "candidates": int(raw.get("candidates") or 0),
+        "scored": int(raw.get("scored") or 0),
+        "matched": int(raw.get("matched") or 0),
+        "frames_too_deep": int(raw.get("frames_too_deep") or 0),
+        "returned": int(raw.get("returned") or len(raw.get("matches") or [])),
+        "truncated": bool(raw.get("truncated")),
+        "aria_hidden_skipped": int(raw.get("aria_hidden_skipped") or 0),
     }
 
 
@@ -1480,6 +2005,116 @@ def split_piercing_path(selector: str) -> list[str] | None:
         # on as plain CSS and fails deep inside the driver with nothing to act on.
         raise ValueError(_EMPTY_SEGMENT_HINT.format(selector=selector))
     return parts if len(parts) > 1 else None
+
+
+# Which browsing context minted an epoch. Element references belong to one
+# context, so the answer is not "where is the node" but "which frame must the
+# driver be in before the node can be handed over at all".
+FRAME_FOR_EPOCH_SCRIPT = _JS_LIB + r"""
+const wanted = String(arguments[0]).toLowerCase();
+
+function wsnEpochOf(win) {
+  try {
+    const registry = win.__wsnRefs;
+    return registry && registry.epoch ? String(registry.epoch).toLowerCase() : '';
+  } catch (error) {
+    return '';  // cross-origin: nothing in there was ever handed out
+  }
+}
+
+function wsnFrameElements(root, out) {
+  let frames;
+  try {
+    frames = root.querySelectorAll('iframe, frame');
+  } catch (error) {
+    return out;
+  }
+  for (const el of frames) out.push(el);
+  let hosts;
+  try {
+    hosts = root.querySelectorAll('*');
+  } catch (error) {
+    return out;
+  }
+  for (const el of hosts) {
+    if (el.shadowRoot) wsnFrameElements(el.shadowRoot, out);
+  }
+  return out;
+}
+
+// Searched two levels deeper than any topic walks, so a ref that was minted can
+// always be followed home. Hitting the bound is remembered, because "we did not
+// look that far" and "it is gone" call for opposite things from the caller.
+const WSN_SEARCH_DEPTH = WSN_MAX_FRAME_DEPTH + 2;
+let depthLimited = false;
+
+function wsnHolds(win, depth) {
+  if (!win) return false;
+  if (depth > WSN_SEARCH_DEPTH) {
+    depthLimited = true;
+    return false;
+  }
+  if (wsnEpochOf(win) === wanted) return true;
+  let doc = null;
+  try {
+    doc = win.document;
+  } catch (error) {
+    return false;
+  }
+  if (!doc) return false;
+  for (const el of wsnFrameElements(doc, [])) {
+    let child = null;
+    try {
+      child = el.contentWindow;
+    } catch (error) {
+      child = null;
+    }
+    if (child && wsnHolds(child, depth + 1)) return true;
+  }
+  return false;
+}
+
+if (wsnEpochOf(window) === wanted) return {here: true};
+for (const el of wsnFrameElements(document, [])) {
+  let child = null;
+  try {
+    child = el.contentWindow;
+  } catch (error) {
+    child = null;
+  }
+  if (child && wsnHolds(child, 1)) return {frame: el, path: wsnSelector(el)};
+}
+return {missing: true, depth_limited: depthLimited};
+"""
+
+
+# One document's worth of a piercing path. A frame boundary is returned rather
+# than crossed, because an element read through ``contentDocument`` from the
+# parent document is not a handle any action can use.
+PIERCING_STEP_SCRIPT = r"""
+const parts = arguments[0];
+let root = document;
+let element = null;
+for (let index = 0; index < parts.length; index += 1) {
+  if (!root || !root.querySelector) return {missing: true, at: index};
+  try {
+    element = root.querySelector(parts[index]);
+  } catch (error) {
+    return {invalid: true, at: index};
+  }
+  if (!element) return {missing: true, at: index};
+  if (index === parts.length - 1) return {element: element};
+  if (element.shadowRoot) {
+    root = element.shadowRoot;
+    continue;
+  }
+  if (element.tagName === 'IFRAME' || element.tagName === 'FRAME') {
+    return {frame: element, rest: parts.slice(index + 1)};
+  }
+  root = element;
+}
+return {missing: true, at: 0};
+"""
 
 
 def resolve_locator_expression(locator: str) -> str | None:

@@ -96,7 +96,7 @@ def test_browser_full_form_upload_click_submit_and_screenshot(local_site, tmp_pa
         "#role",
         "#remote",
     }
-    assert filled["files_uploaded"] == ["#resume"]
+    assert filled["files_uploaded"] == {"#resume": [resume.name]}
 
     clicked = browser_tools.click("#action-button", "full-flow", wait_seconds=0)
     assert clicked["success"] is True
@@ -252,7 +252,7 @@ def test_separate_upload_tool_supports_file_input(local_site, tmp_path):
     _open_or_skip(f"{local_site.base_url}/form", "upload")
     result = browser_tools.upload_file("#resume", [str(upload)], "upload")
     assert result["success"] is True
-    assert result["files_uploaded"] == 1
+    assert result["files_uploaded"] == {"#resume": ["cv.pdf"]}
     assert result["file_names"] == ["cv.pdf"]
 
 

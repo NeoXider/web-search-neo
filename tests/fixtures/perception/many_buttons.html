@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Thirty rows</title><link rel="icon" href="data:,"></head>
+<body>
+<div id="rows"></div>
+<script>
+  // Thirty equally good matches: a caller handed five of them has to be told
+  // that twenty-five more exist, or "the list" is five items long as far as it
+  // can tell.
+  let markup = '';
+  for (let index = 0; index < 30; index += 1) {
+    markup += '<p>Row ' + index + ' <button>Delete item</button></p>';
+  }
+  document.getElementById('rows').innerHTML = markup;
+</script>
+</body>
+</html>

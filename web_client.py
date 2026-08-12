@@ -28,7 +28,18 @@ USER_AGENTS = (
 USER_AGENT = USER_AGENTS[0]
 
 ALLOW_PLAIN_HTTP_ENV = "WEB_SEARCH_NEO_ALLOW_PLAIN_HTTP"
-_LOCAL_SUFFIXES = (".local", ".localhost", ".internal", ".home.arpa")
+_LOCAL_SUFFIXES = (
+    ".local",
+    ".localhost",
+    ".internal",
+    ".home.arpa",
+    ".lan",
+    ".home",
+    ".intranet",
+    ".private",
+    ".corp",
+)
+_IPV4_LITERAL_CHARACTERS = frozenset("0123456789abcdefxX")
 
 _local = threading.local()
 
@@ -38,27 +49,85 @@ def _plain_http_allowed() -> bool:
     return os.getenv(ALLOW_PLAIN_HTTP_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _legacy_ipv4(hostname: str) -> ipaddress.IPv4Address | None:
+    """Parse the inet_aton spellings the OS dials but ``ip_address`` refuses.
+
+    ``127.1``, ``2130706433``, ``0177.0.0.1`` and ``0x7f000001`` all reach
+    loopback, so they have to be classified as the address they resolve to
+    rather than mistaken for hostnames.
+    """
+    parts = hostname.split(".")
+    if not 1 <= len(parts) <= 4:
+        return None
+    values: list[int] = []
+    for part in parts:
+        if not part or not part.isascii() or not set(part) <= _IPV4_LITERAL_CHARACTERS:
+            return None
+        try:
+            if part[:2].lower() == "0x":
+                value = int(part, 16)
+            elif part[0] == "0":
+                value = int(part, 8)
+            else:
+                value = int(part, 10)
+        except ValueError:
+            return None
+        values.append(value)
+    if any(value > 0xFF for value in values[:-1]):
+        return None
+    trailing_octets = 4 - len(values) + 1
+    if not 0 <= values[-1] < 1 << (8 * trailing_octets):
+        return None
+    packed = 0
+    for value in values[:-1]:
+        packed = (packed << 8) | value
+    packed = (packed << (8 * trailing_octets)) | values[-1]
+    return ipaddress.IPv4Address(packed)
+
+
+def _ip_literal(hostname: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """Return the address a host literal dials, or None when it is a name."""
+    try:
+        address: ipaddress.IPv4Address | ipaddress.IPv6Address | None = ipaddress.ip_address(
+            hostname
+        )
+    except ValueError:
+        address = _legacy_ipv4(hostname)
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        # ::ffff:127.0.0.1 connects to 127.0.0.1, but only Python 3.13 says so
+        # via is_loopback/is_private; unwrap it so 3.10-3.13 agree.
+        return address.ipv4_mapped
+    return address
+
+
 def is_local_host(host: str) -> bool:
     """Report whether a hostname points at this machine or a private network.
 
     Local development servers stay reachable over plain http; only public hosts
     are required to use https.
+
+    Names are classified without a DNS lookup. A single-label host (``nas``,
+    ``raspberrypi``) cannot be published on the public DNS, so it can only be
+    answered by the LAN resolver, mDNS, WINS or the hosts file; resolving it
+    would cost a lookup on every URL and every redirect hop, and would make the
+    verdict depend on whichever network the machine is on at that moment. Names
+    under a public domain that resolve privately are the case this misses; they
+    stay covered by the WEB_SEARCH_NEO_ALLOW_PLAIN_HTTP opt-in.
     """
-    hostname = (host or "").strip().strip("[]").lower()
+    hostname = (host or "").strip().strip("[]").rstrip(".").lower()
     if not hostname:
         return False
+    address = _ip_literal(hostname)
+    if address is not None:
+        return bool(
+            address.is_loopback
+            or address.is_private
+            or address.is_link_local
+            or address.is_unspecified
+        )
     if hostname == "localhost" or hostname.endswith(_LOCAL_SUFFIXES):
         return True
-    try:
-        address = ipaddress.ip_address(hostname)
-    except ValueError:
-        return False
-    return bool(
-        address.is_loopback
-        or address.is_private
-        or address.is_link_local
-        or address.is_unspecified
-    )
+    return "." not in hostname
 
 
 def validate_http_url(url: str, *, allow_plain_http: bool | None = None) -> str:
@@ -78,7 +147,8 @@ def validate_http_url(url: str, *, allow_plain_http: bool | None = None) -> str:
                 f"Unencrypted http:// is blocked for the public host '{parsed.hostname}'. "
                 "Use https://, or set "
                 f"{ALLOW_PLAIN_HTTP_ENV}=1 to allow plain HTTP. "
-                "Loopback and private-network addresses are always allowed."
+                "Loopback, private-network addresses and LAN names "
+                "(single-label hosts, .local, .lan, .internal) are always allowed."
             )
     return normalized
 
@@ -127,6 +197,11 @@ def _follow_redirects(
 ) -> requests.Response:
     """Follow redirects manually so every hop is validated before it is requested."""
     history: list[requests.Response] = []
+    # The hop URL already carries the query the server chose. Passing ``params``
+    # again would append the original query to it, so ``/search?q=kittens`` ->
+    # ``/results?q=kittens&form=CANON`` would be re-requested with a duplicate
+    # ``q``.
+    kwargs.pop("params", None)
     for _ in range(MAX_REDIRECTS):
         if not response.is_redirect or not response.headers.get("location"):
             break

@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Shadow twins</title><link rel="icon" href="data:,"></head>
+<body>
+<div id="host"></div>
+<script>
+  // Two id-less children of a shadow root. nth-of-type separates them inside the
+  // root, so "no usable selector" was never the honest answer.
+  document.getElementById('host').attachShadow({mode: 'open'}).innerHTML =
+    '<p id="choice">none</p>' +
+    '<button onclick="this.getRootNode().getElementById(\'choice\').textContent=\'accepted\'">Accept</button>' +
+    '<button onclick="this.getRootNode().getElementById(\'choice\').textContent=\'declined\'">Decline</button>';
+</script>
+</body>
+</html>

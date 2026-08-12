@@ -182,8 +182,11 @@ def test_gated_timers_only_fire_when_a_frame_is_released(local_site):
         assert driver.execute_script("return [window.__ticks, window.__once];") == [1, 1]
 
         browser_tools.render_step(4, "gated-timers")
-        # 16.67ms per frame is above the 10ms period, so exactly one run per frame.
-        assert driver.execute_script("return window.__ticks;") == 5
+        # Five frames of 16.67ms are 83ms of the page's own time, and a 10ms
+        # interval owes eight ticks over that span. One tick per frame - what
+        # rescheduling from the end of the frame used to give - would make every
+        # interval exactly as slow as the frame rate.
+        assert driver.execute_script("return window.__ticks;") == 8
         assert driver.execute_script("return window.__once;") == 1
 
         # Leaving step mode hands the queued interval back to the real scheduler.
@@ -196,14 +199,7 @@ def test_gated_timers_only_fire_when_a_frame_is_released(local_site):
 
 
 def test_gate_timers_freezes_an_interval_registered_before_step_mode(local_site):
-    """A game registers its timers on load, long before the agent gates frames.
-
-    KNOWN FAILURE - real defect in the render bootstrap. ``state.installTimers``
-    only replaces ``window.setInterval``/``setTimeout`` when step mode is entered,
-    so anything scheduled earlier keeps running on Chrome's real scheduler and
-    the "each released frame is a fixed frame_delta_ms" promise does not hold for
-    it.
-    """
+    """A game registers its timers on load, long before the agent gates frames."""
     session = _open_fixture(local_site, PLATFORMER, "legacy-timers")
     driver = session.driver
     try:
@@ -220,7 +216,10 @@ def test_gate_timers_freezes_an_interval_registered_before_step_mode(local_site)
         )
 
         browser_tools.render_step(4, "legacy-timers")
-        assert driver.execute_script("return window.__ticks;") == frozen + 4
+        # Four frames of 16.67ms are 67ms of page time, which a 10ms interval
+        # owes six or seven ticks depending on where in a period the gate caught
+        # it - not the four a once-per-frame reschedule would hand it.
+        assert 6 <= driver.execute_script("return window.__ticks;") - frozen <= 7
     finally:
         browser_tools.close_session("legacy-timers")
 

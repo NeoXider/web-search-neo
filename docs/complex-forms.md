@@ -218,8 +218,9 @@ reports exactly what happened:
 {
   "success": false,
   "filled": ["#candidate-name", "#cover-letter", "#role", "#remote"],
-  "files_uploaded": [],
-  "errors": {"#missing-field": "NoSuchElementException: Message: no such element: ..."}
+  "field_values": {"#candidate-name": "Ada Lovelace", "#role": "unity", "#remote": "true"},
+  "files_uploaded": {},
+  "errors": {"#missing-field": "No element matches this selector"}
 }
 ```
 
@@ -228,6 +229,20 @@ Four fields are set; one selector was wrong. `success` is `false` whenever
 selectors — usually by re-reading `page_outline` — and re-send only the failed
 ones. Re-sending the whole map is harmless: the fields already filled are simply
 overwritten with the same values.
+
+Every write is read back off the control, because a control is free to refuse
+what it is given: a number input drops text it cannot parse, `maxlength`
+truncates, an `oninput` handler rewrites as you type. `field_values` says what
+each control holds afterwards, `filled` means "holds what you asked for", and a
+control that kept something else becomes an entry in `errors` naming both values.
+All three of those cases used to be reported as success. A disabled or readonly
+control is refused in a sentence instead of a driver stacktrace, and a `<select>`
+given an option it does not have lists the ones it has.
+
+Checkbox and radio values are a documented vocabulary: `1`, `yes`, `y`, `on`,
+`check`, `checked` tick the box; `0`, `no`, `n`, `off`, `uncheck`, `unchecked`
+and the empty string clear it. Anything else raises and lists both sets — it used
+to mean *uncheck* and report success, which included the word `"check"` itself.
 
 ## Uploading files
 
@@ -246,8 +261,19 @@ overwritten with the same values.
 ```
 
 ```json
-{"success": true, "files_uploaded": 2, "file_names": ["resume.pdf", "portfolio.pdf"]}
+{
+  "success": true,
+  "files_uploaded": {"#resume": ["resume.pdf", "portfolio.pdf"]},
+  "file_names": ["resume.pdf", "portfolio.pdf"]
+}
 ```
+
+`files_uploaded` has this shape in `fill` as well — it used to be a list of
+selectors there and a count here. Both `file_names` and the values in
+`files_uploaded` are read back off the input, so they say what it now holds
+rather than what was requested: Chrome *appends* to an input that accepts several
+files, so a second `upload` used to leave the first files attached while
+reporting only its own.
 
 Rules enforced before anything is typed into the page: every path must exist and
 be a file, the selector must point at an `input[type=file]`, and more than one
@@ -386,17 +412,36 @@ clicked directly. A cross-origin frame appears as a single node with
 {"topic":"page_outline","params":{"session_id":"apply","frame_selector":"#payment-frame","limit":60}}
 ```
 
-`frame_selector` is available on `page_outline`, `page_text`, and `find`, and it
-always takes plain CSS.
+`frame_selector` is available on `page_outline`, `page_text` and `find`, and now
+on `fill`, `click`, `submit`, `upload` and `wait` too, so a form inside a frame
+can be driven by name rather than only through a ref. It takes plain CSS, or the
+`#host >>> #inner` path the outline reports for a nested frame; plain CSS that
+matches more than one element is refused with the count rather than reading
+whichever came first. A ref handle or a piercing path already carries its own
+document, so passing one *and* a `frame_selector` is refused instead of letting
+one of them quietly win.
 
 ## When a CAPTCHA appears
 
 Every page summary — the object returned by `open`, `fill`, `click`, `submit`,
-and the observation topics — carries `challenge_detected`, `challenge_type`, and
-`challenge_evidence`. Detection looks for a rendered widget (reCAPTCHA,
-hCaptcha, Cloudflare Turnstile, Yandex SmartCaptcha, PerimeterX, or any element
-with `data-sitekey`) at least 20x20 pixels, and only treats challenge wording as
-evidence in a page heading or at the start of a short interstitial.
+and the observation topics — carries `challenge_detected`, `challenge_type`,
+`challenge_evidence` and `captcha_widgets`.
+
+The question those first three answer is "is a challenge *in the way*", not "does
+this page contain a captcha". An article with an hCaptcha in its comment form is
+readable, and used to come back `challenge_detected: true` with
+`manual_action_required: true`; a chat widget carrying a `data-sitekey` was
+treated as a captcha outright. Both now appear in `captcha_widgets` — every
+captcha seen, blocking or not — while `challenge_detected` stays `false`. It goes
+`true` when a widget covers the page's centre, when the page is a sparse
+interstitial, or when the wording says so.
+
+Detection walks open shadow roots and same-origin frames rather than only the top
+document, which is where DataDome, AWS WAF and any challenge one frame down were
+being missed entirely. The widgets recognised are reCAPTCHA, hCaptcha, Cloudflare
+Turnstile, Yandex SmartCaptcha, PerimeterX, DataDome and AWS WAF, at least 20x20
+pixels; a bare `data-sitekey` counts only when the element itself or a nested
+frame says captcha.
 
 When it is `true`, stop automating. Retrying a click is both useless and rude to
 the site. In a visible session, hand control to the user:
@@ -456,11 +501,15 @@ instead:
 {"topic":"console","params":{"session_id":"apply","levels":["error","warn"],"limit":30}}
 ```
 
-Console capture starts when the session attaches to the tab and network capture
-starts on the first `network` read, so anything produced before that is not in
-the buffer — reload the page and repeat the submit to observe a full cycle. Each
-stream keeps up to 500 entries within a shared 512 KB budget and reports how many
-older records were `dropped`.
+Both buffers are armed when the session takes its tab, before the first
+navigation, so the submit you are diagnosing is in them and nothing has to be
+replayed to see it. The exception is `attach_tab`: a claimed tab is recorded from
+the claim onwards, and a submit that happened before you claimed it was recorded
+by nobody — reload and repeat it to observe a full cycle. Each stream keeps up to
+500 entries within a 512 KB budget shared between console and network, and
+reports how many older records were `dropped`; on a page that fires hundreds of
+requests, read `network` promptly, because eviction is oldest-first and takes the
+page load with it.
 
 ## Checklist
 

@@ -341,7 +341,13 @@ game will see that click. Without `selector` the first `<canvas>` is used, or
 
 While locked, the cursor cannot move, so absolute coordinates mean nothing; only
 `movementX`/`movementY` reach the page. Use `coordinate_mode="relative"`, which
-skips the viewport bounds check and moves by an unclamped delta:
+skips the viewport bounds check and moves by an unclamped delta. Chrome derives
+`movementX`/`movementY` from consecutive dispatched positions, so a relative run
+continues from wherever the pointer last was — the acquiring click counts as that
+position. It used to warp to the viewport centre first, and to recentre
+periodically, and the page read each warp as the movement: a first `(3, 2)`
+arrived as `(470, 272)`, and a recentre as `-99281`. Every move now reports
+exactly the delta it was given:
 
 ```json
 {
@@ -398,6 +404,14 @@ Each point takes `x`, `y`, an optional `id` for multi-finger gestures, and
 `end_x`/`end_y` for a swipe. Like every other input action, a touch releases one
 frame in step mode.
 
+Fingers are tracked per session and lifted individually: `release` with
+`points=[{"id": 1}]` ends that finger and leaves the others down, while `release`
+with no points ends them all. A `tap` or `swipe` no longer disturbs a finger that
+is already pressed — every one of those used to end the whole gesture, after
+which Chrome refused to move the survivors with "Must send a TouchStart first".
+The result reports `active_touches`, and a point outside the viewport is refused
+rather than accepted and dropped.
+
 ## Watching what happens
 
 | Call | What it tells you |
@@ -411,10 +425,16 @@ frame in step mode.
 {"topic":"console","params":{"session_id":"game","levels":["error"],"limit":20}}
 ```
 
-The console buffer starts when the session attaches to the tab, so errors thrown
-during the initial load are only visible after a reload. `game_probe` and the
-`console` topic read from the same buffers, each keeping its own place in them;
-neither steals the other's entries.
+The console buffer is armed when the session takes its tab, before the first
+navigation, so in `current` mode an error thrown while the game boots is captured
+rather than lost — which matters for a WebGL context that fails at startup and
+never logs again. Two exceptions: a tab claimed with `attach_tab` is recorded only
+from the claim onwards, and the Selenium-backed modes install their in-page hook
+the first time the console is read, so the *first* page's boot output reaches them
+only through Chrome's browser log. Once installed, that hook survives navigation
+and reports each later page from its first line. Uncaught exceptions reach the
+browser log either way. `game_probe` and the `console` topic read from the same
+buffers, each keeping its own place in them; neither steals the other's entries.
 
 ### Reading the console between probes
 
@@ -460,9 +480,11 @@ Two things outlive a finished run and confuse everything that comes after:
 }
 ```
 
-- `release_inputs` lifts every key and mouse button the session is holding, and
-  reports `held_keys: []` and `held_buttons: []`. A held arrow key left behind
-  keeps steering the next page. In step mode this call, too, releases one frame;
+- `release_inputs` lifts every key, mouse button and touch point the session is
+  holding, and reports `held_keys: []`, `held_buttons: []` and `held_touches: []`.
+  A held arrow key left behind keeps steering the next page, and a finger left
+  down makes the next `move` fail with "Must send a TouchStart first". In step
+  mode this call, too, releases one frame;
 - `render` back to `normal` restores the real clocks, hands queued timers back to
   Chrome's scheduler with their remaining delay intact, and lets the page run on
   its own again. A page left in `step` mode looks frozen to the user.

@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Web component app</title><link rel="icon" href="data:,"></head>
+<body>
+<my-app></my-app>
+<!-- Plain light DOM, plainly unreachable: it was listed with the same fields as
+     a working control, so only clicking it revealed the difference. -->
+<button id="light-stale" style="visibility:hidden">Pay now (stale copy)</button>
+<script>
+  document.querySelector('my-app').attachShadow({mode: 'open'}).innerHTML = [
+    '<main>',
+    '<p id="shadow-state">idle</p>',
+    '<form id="order" action="/submit" method="post">',
+    '<label for="who">Full name</label>',
+    '<input id="who" name="who">',
+    '<button id="pay" type="button">Pay now</button>',
+    '</form>',
+    '<a id="details" href="payment.html">Details</a>',
+    // Nothing can click either of these, and an agent handed their selectors
+    // spends its turn finding that out.
+    '<button id="offscreen" style="display:none">Pay now (stale)</button>',
+    '<div aria-hidden="true"><button id="decorative">Pay now (decorative)</button></div>',
+    '</main>'
+  ].join('');
+  document.querySelector('my-app').shadowRoot.getElementById('pay').addEventListener(
+    'click',
+    () => {
+      document.querySelector('my-app').shadowRoot.getElementById('shadow-state')
+        .textContent = 'clicked';
+    }
+  );
+</script>
+</body>
+</html>

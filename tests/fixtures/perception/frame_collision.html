@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Two frames, one path</title><link rel="icon" href="data:,"></head>
+<body>
+<!-- Neither frame carries an id: a path that is only a tag name matches both,
+     and the payment frame is the one hidden behind a shadow root. -->
+<iframe src="ads.html" width="300" height="120" title="ad"></iframe>
+<div id="widget"></div>
+<script>
+  const shadow = document.getElementById('widget').attachShadow({mode: 'open'});
+  shadow.innerHTML = '<iframe src="payment.html" width="420" height="220"></iframe>';
+</script>
+</body>
+</html>

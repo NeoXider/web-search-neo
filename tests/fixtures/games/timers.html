@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixture: timer and clock harness</title>
+<link rel="icon" href="data:,">
+<style>
+  body { margin: 0; padding: 12px; background: #10131a; color: #d7dde8;
+         font: 13px/1.4 monospace; }
+  #view { width: 320px; height: 180px; background: #1b2130; display: block; }
+</style>
+</head>
+<body>
+<canvas id="view" width="320" height="180"></canvas>
+<p id="hud">booting…</p>
+
+<script>
+(function () {
+  'use strict';
+
+  // Three ways a game keeps time, each recording the clock it was given so a
+  // test can ask how much time the page thinks passed, not just how often a
+  // callback ran: a frame loop, a fast interval, a slow interval, and a
+  // setTimeout(0) chain of the kind an engine uses instead of rAF.
+  var S = {
+    frames: [], fast: [], slow: [], chain: [], late: [],
+    maxChain: 8000
+  };
+  window.__timers = S;
+
+  function stamp(bucket) {
+    if (bucket.length < 20000) bucket.push(Math.round(performance.now() * 100) / 100);
+  }
+
+  function frame() { stamp(S.frames); requestAnimationFrame(frame); }
+  requestAnimationFrame(frame);
+
+  setInterval(function () { stamp(S.fast); }, 5);
+  setInterval(function () { stamp(S.slow); }, 100);
+
+  function chain() {
+    stamp(S.chain);
+    if (S.chain.length < S.maxChain) setTimeout(chain, 0);
+  }
+  setTimeout(chain, 0);
+
+  setTimeout(function () { stamp(S.late); }, 250);
+
+  function spread(values) {
+    return values.length > 1
+      ? Math.round((values[values.length - 1] - values[0]) * 100) / 100
+      : 0;
+  }
+
+  window.__report = function () {
+    return {
+      frames: S.frames.length,
+      fast: S.fast.length, fast_span: spread(S.fast), fast_distinct: new Set(S.fast).size,
+      slow: S.slow.length, slow_span: spread(S.slow),
+      chain: S.chain.length, chain_span: spread(S.chain),
+      chain_distinct: new Set(S.chain).size,
+      late: S.late.length,
+      now: Math.round(performance.now() * 100) / 100
+    };
+  };
+
+  window.__resetTimers = function () {
+    S.frames.length = 0; S.fast.length = 0; S.slow.length = 0;
+    S.chain.length = 0; S.late.length = 0;
+  };
+
+  setInterval(function () {
+    var report = window.__report();
+    document.getElementById('hud').textContent =
+      'frames=' + report.frames + ' fast=' + report.fast + ' slow=' + report.slow +
+      ' chain=' + report.chain + ' now=' + report.now;
+  }, 500);
+})();
+</script>
+</body>
+</html>

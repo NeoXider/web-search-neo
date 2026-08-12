@@ -15,7 +15,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from chrome_bridge import ChromeBridgeDriver, get_chrome_bridge, list_current_chrome_tabs  # noqa: E402
+from chrome_bridge import (  # noqa: E402
+    DEFAULT_TAB_GROUP,
+    ChromeBridgeDriver,
+    get_chrome_bridge,
+    list_current_chrome_tabs,
+)
 
 
 def main() -> int:
@@ -46,7 +51,7 @@ def main() -> int:
         )
         if not bridge.wait_connected(15.0):
             raise RuntimeError(f"Companion did not connect: {bridge.status(0.0)}")
-        driver = ChromeBridgeDriver(bridge=bridge, tab_group="AI")
+        driver = ChromeBridgeDriver(bridge=bridge, tab_group=DEFAULT_TAB_GROUP)
         driver.get(args.url)
         png = driver.get_screenshot_as_png()
         tabs = list_current_chrome_tabs(1.0)["tabs"]
@@ -62,7 +67,7 @@ def main() -> int:
             "screenshot_bytes": len(png),
         }
         print(json.dumps(report, ensure_ascii=False, indent=2))
-        return 0 if report["tab_group"] == "AI" and report["screenshot_png"] else 1
+        return 0 if report["tab_group"] == DEFAULT_TAB_GROUP and report["screenshot_png"] else 1
     finally:
         if driver is not None:
             driver.quit()

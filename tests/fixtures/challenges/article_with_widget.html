@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Leave a comment</title></head>
+<body>
+<h1>Field notes from a long week</h1>
+<p id="body-copy"></p>
+<form id="comment-form">
+  <label for="comment">Comment</label>
+  <textarea id="comment" name="comment"></textarea>
+  <div class="h-captcha" data-sitekey="10000000-ffff-ffff-ffff-000000000001"
+       style="width:303px;height:78px;border:1px solid #ccc"></div>
+  <button id="post-comment" type="submit">Post comment</button>
+</form>
+<script>
+  // A page the agent can read and act on. The captcha guards the comment box; it
+  // does not stand between the agent and the article.
+  document.getElementById('body-copy').textContent =
+    'The article runs long on purpose, so the comment box is well below the fold. '.repeat(120);
+</script>
+</body>
+</html>

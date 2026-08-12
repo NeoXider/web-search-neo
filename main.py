@@ -23,7 +23,7 @@ import msp_search
 from web_client import request
 
 
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 
 PROJECT_DIR = Path(__file__).resolve().parent
 log = logging.getLogger("web_search_neo")
@@ -186,10 +186,15 @@ async def search_web(
         timeout_seconds,
         fresh,
     )
-    if initial.get("success"):
+    recoveries = initial.get("challenge_recoveries") or []
+    # An engine answering "no hits" is a success now, not a failure. That is right
+    # for the caller, but in manual mode it must not swallow the handoff: a run
+    # that came back empty *and* hit a challenge is exactly the run the user asked
+    # to solve by hand, and returning it as a clean empty answer would strand them.
+    stranded = bool(recoveries) and not initial.get("results")
+    if initial.get("success") and not stranded:
         return {**initial, "challenge_mode": "manual", "manual_challenge": None}
 
-    recoveries = initial.get("challenge_recoveries") or []
     if not recoveries:
         if not fallback:
             return {**initial, "challenge_mode": "manual", "manual_challenge": None}
@@ -340,9 +345,9 @@ async def browser_open_page(
     profile_id: str | None = None,
     debugger_address: str | None = None,
     current_tab_id: int | None = None,
-    tab_group: str = "AI",
+    tab_group: str = chrome_bridge.DEFAULT_TAB_GROUP,
 ) -> dict[str, Any]:
-    """Open in the current Chrome AI group by default; use auto for Selenium fallback."""
+    """Open in the current Chrome's agent tab group by default; auto falls back to Selenium."""
     return await asyncio.to_thread(
         browser_tools.open_page,
         url,
@@ -370,9 +375,9 @@ async def browser_open_pages(
     profile_mode: Literal[
         "auto", "current", "temporary", "persistent", "attach"
     ] = "current",
-    tab_group: str = "AI",
+    tab_group: str = chrome_bridge.DEFAULT_TAB_GROUP,
 ) -> dict[str, Any]:
-    """Open up to four pages, using the current Chrome AI group by default."""
+    """Open up to four pages, using the current Chrome's agent tab group by default."""
     if not urls or len(urls) > browser_tools.MAX_SESSIONS:
         raise ValueError(f"Provide 1-{browser_tools.MAX_SESSIONS} URLs")
     ids = session_ids or [f"page-{index + 1}" for index in range(len(urls))]
@@ -602,6 +607,7 @@ async def browser_wait_for(
     session_id: str = "default",
     state: str = "visible",
     timeout_seconds: float = 10.0,
+    frame_selector: str | None = None,
 ) -> dict[str, Any]:
     """Wait for dynamic content to become present, visible, or clickable."""
     return await asyncio.to_thread(
@@ -610,6 +616,7 @@ async def browser_wait_for(
         session_id,
         state,
         timeout_seconds,
+        frame_selector,
     )
 
 
@@ -631,9 +638,12 @@ async def browser_fill_fields(
     fields: dict[str, Any],
     files: dict[str, str] | None = None,
     session_id: str = "default",
+    frame_selector: str | None = None,
 ) -> dict[str, Any]:
     """Fill rendered form fields; map CSS selectors to values or local file paths."""
-    return await asyncio.to_thread(browser_tools.fill_fields, fields, files, session_id)
+    return await asyncio.to_thread(
+        browser_tools.fill_fields, fields, files, session_id, frame_selector
+    )
 
 
 @mcp.tool()
@@ -641,10 +651,11 @@ async def browser_upload_file(
     selector: str,
     file_paths: list[str],
     session_id: str = "default",
+    frame_selector: str | None = None,
 ) -> dict[str, Any]:
     """Upload one or more local files into a rendered input[type=file]."""
     return await asyncio.to_thread(
-        browser_tools.upload_file, selector, file_paths, session_id
+        browser_tools.upload_file, selector, file_paths, session_id, frame_selector
     )
 
 
@@ -653,9 +664,12 @@ async def browser_click(
     selector: str,
     session_id: str = "default",
     wait_seconds: float = 0.5,
+    frame_selector: str | None = None,
 ) -> dict[str, Any]:
     """Click one rendered page element using a CSS selector."""
-    return await asyncio.to_thread(browser_tools.click, selector, session_id, wait_seconds)
+    return await asyncio.to_thread(
+        browser_tools.click, selector, session_id, wait_seconds, frame_selector
+    )
 
 
 @mcp.tool()
@@ -901,7 +915,7 @@ async def browser_render_step(
 
 @mcp.tool()
 async def browser_release_inputs(session_id: str = "default") -> dict[str, Any]:
-    """Release every keyboard key and mouse button held by a browser session."""
+    """Release every key, mouse button and touch point held by a browser session."""
     return await asyncio.to_thread(browser_tools.release_inputs, session_id)
 
 
@@ -911,6 +925,7 @@ async def browser_submit_form(
     session_id: str = "default",
     submit_selector: str | None = None,
     wait_seconds: float = 0.5,
+    frame_selector: str | None = None,
 ) -> dict[str, Any]:
     """Submit a rendered form, preserving browser validation and submit events."""
     return await asyncio.to_thread(
@@ -919,6 +934,7 @@ async def browser_submit_form(
         session_id,
         submit_selector,
         wait_seconds,
+        frame_selector,
     )
 
 
@@ -951,8 +967,7 @@ async def browser_close(session_id: str = "default") -> dict[str, Any]:
 @mcp.tool()
 async def browser_close_all() -> dict[str, Any]:
     """Close every browser session and release all Chrome processes."""
-    await asyncio.to_thread(browser_tools.close_all_sessions)
-    return {"closed_all": True, "active_sessions": []}
+    return await asyncio.to_thread(browser_tools.close_all_sessions)
 
 
 @mcp.tool()
@@ -1207,10 +1222,15 @@ _ACTION_NOTES = {
     "pointer_lock": {
         "operation": "acquire|release|status",
         "note": "After acquire, move with coordinate_mode='relative'.",
+        "movement": "Each move reports exactly the delta you sent; nothing recentres.",
     },
     "touch": {
         "touch_action": "tap|press|move|release|swipe|cancel",
         "points": [{"x": 0, "y": 0, "id": 0, "end_x": 0, "end_y": 0}],
+        "partial_release": (
+            "release with points=[{id}] lifts only those fingers and leaves the "
+            "rest down; release with no points lifts all of them."
+        ),
         "speed": _HOT_PATH_SPEED,
     },
     "step": {
@@ -1266,6 +1286,7 @@ _PITFALLS = [
     "Selectors die when the document changes; re-read page_elements after navigation.",
     "A ref: id belongs to the page_outline you just read; after navigation or a re-render, read page_outline again.",
     "challenge_detected means a CAPTCHA: use wait_challenge or let search fall back, never hammer clicks.",
+    "find low_confidence=true means it is guessing: re-query with other words or a role, do not click matches[0].",
     "profile_mode=current drives the user's real Chrome; close frees the session and leaves their tab open.",
     "In render=step nothing moves until input or step runs, so a screenshot taken first shows the old frame.",
     "Always release_inputs after hold, and return render to normal before you finish.",
@@ -1331,7 +1352,10 @@ _EXAMPLES = {
 # and a small model learns the real contract only from a runtime error.
 _RUNTIME_REQUIREMENTS = {
     "input": "at least one of key_actions=[{key,action}] or pointer_actions=[{action,x,y}]",
-    "touch": "points=[{x,y}], swipe adds end_x/end_y; only release and cancel need none",
+    "touch": (
+        "points=[{x,y}], swipe adds end_x/end_y; only release and cancel need "
+        "none, and release may name ids instead to lift just those fingers"
+    ),
 }
 
 

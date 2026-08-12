@@ -1,0 +1,16 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Repeat search</title></head>
+<body>
+<h1>Repeat search</h1>
+<!-- Re-running a search lands on the very same URL with the very same title, so
+     nothing about the page tells the caller a navigation happened. -->
+<form id="repeat" method="get" action="submit_same.html">
+  <input type="hidden" name="q" value="1">
+  <button id="repeat-button" type="submit">Search again</button>
+</form>
+<script>
+  window.loadedAt = performance.timeOrigin;
+</script>
+</body>
+</html>

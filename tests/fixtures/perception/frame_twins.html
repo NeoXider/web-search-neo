@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Two documents, one id</title><link rel="icon" href="data:,"></head>
+<body>
+<!-- Both documents call their button #save. A selector that does not say which
+     document it belongs to picks this one, and this one is not the one anybody
+     was looking at. -->
+<p id="top-log">intact</p>
+<button id="save" onclick="document.getElementById('top-log').textContent='DESTROYED'">
+  Delete everything
+</button>
+<iframe id="editor" src="editor_frame.html" width="400" height="140" title="editor"></iframe>
+</body>
+</html>

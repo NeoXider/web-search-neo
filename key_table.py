@@ -130,6 +130,20 @@ _SHIFTED_TO_BASE = {
 }
 
 
+def physical_key(raw: str) -> str:
+    """Identify the physical key behind one spelling of it.
+
+    The same key reaches this module under several names - ``LEFT`` and
+    ``ARROW_LEFT``, ``CTRL`` and ``CONTROL``, ``w`` and ``W``, a literal space
+    and ``SPACE`` - and a caller that presses under one name and releases under
+    another must lift the key it really pressed. The US-layout ``code`` is that
+    identity; characters with no physical key on this layout fall back to
+    themselves, folded to upper case so letter case alone never splits a key.
+    """
+    code = resolve_key(raw)[1]
+    return code or raw.upper()
+
+
 def resolve_key(raw: str, *, shifted: bool = False) -> tuple[str, str, int, int]:
     """Resolve one key into ``(key, code, windowsVirtualKeyCode, location)``.
 

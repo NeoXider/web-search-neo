@@ -1,0 +1,13 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Decoy</title></head>
+<body>
+<!-- Same ids as the real form, so acting in the wrong frame is visible. -->
+<form id="application">
+  <input id="candidate" name="candidate" value="decoy">
+</form>
+<p id="clicked">not clicked</p>
+<button id="ping" type="button"
+        onclick="document.getElementById('clicked').textContent = 'decoy clicked'">Ping</button>
+</body>
+</html>

@@ -9,6 +9,7 @@ import pytest
 from selenium.common.exceptions import WebDriverException
 
 import browser_tools
+from chrome_bridge import ChromeBridgeError
 import diagnostics
 
 
@@ -720,6 +721,284 @@ def test_console_replays_when_the_companion_backend_restarts_its_counter():
         assert third["cursor_reset"] is True
     finally:
         browser_tools._sessions.pop("fake-companion", None)
+
+
+class _FakeCompanionBridge:
+    """The companion's capture rules, without an extension.
+
+    Two of them decide what the network topic can report, and both live in the
+    service worker. A request is recorded only if the tab was already subscribed
+    when it was made - ``Network.requestWillBeSent`` returns early otherwise - and
+    each stream keeps the newest 500 records and counts what it dropped. Nothing
+    in this suite can drive the real extension, so this stands in for those two
+    rules and answers the handful of commands one page load needs.
+
+    Traffic is produced the way a browser produces it: navigating makes the
+    requests of a page load, and ``page_requests`` is the page acting on its own.
+    Neither asks whether anyone is listening, which is the whole point.
+    """
+
+    KEPT = 500
+
+    def __init__(self, tab_id: int = 77) -> None:
+        self.tab_id = tab_id
+        self.url = "https://example.test/already-open"
+        self.group = "Existing"
+        self.domains: set[str] = set()
+        self.started_at = 0
+        self.seq = 0
+        self.entries: list[dict] = []
+        self.dropped = {"console": 0, "network": 0}
+        self.methods: list[str] = []
+
+    def page_requests(self, *urls: str) -> None:
+        """Requests the page makes; kept only while the tab is capturing."""
+        if "network" not in self.domains:
+            return
+        for url in urls:
+            self.seq += 1
+            self.entries.append(
+                {
+                    "seq": self.seq,
+                    "ts": self.seq,
+                    "kind": "network",
+                    "level": "info",
+                    "id": f"request-{self.seq}",
+                    "method": "GET",
+                    "url": url,
+                    "type": "Document" if url == self.url else "Script",
+                    "status": 200,
+                    "ms": 5,
+                    "size": 512,
+                    "done": True,
+                }
+            )
+        network = [item for item in self.entries if item["kind"] == "network"]
+        overflow = len(network) - self.KEPT
+        if overflow > 0:
+            for evicted in network[:overflow]:
+                self.entries.remove(evicted)
+            self.dropped["network"] += overflow
+
+    def _tab(self) -> dict:
+        return {"id": self.tab_id, "url": self.url, "title": "Example", "group": self.group}
+
+    def _evaluate(self, params: dict) -> dict:
+        expression = params["params"].get("expression", "")
+        if "location.href" in expression:  # the one-round-trip page summary
+            return {
+                "result": {
+                    "value": {
+                        "url": self.url,
+                        "title": "Example",
+                        "viewport_width": 1440,
+                        "viewport_height": 900,
+                        "page_width": 1440,
+                        "page_height": 900,
+                        "ready_state": "complete",
+                        "challenge": {},
+                    }
+                }
+            }
+        if "document.readyState" in expression:
+            return {"result": {"value": "complete"}}
+        return {"result": {"value": None}}
+
+    def request(self, method: str, params: dict | None = None, timeout: float = 20.0):
+        params = params or {}
+        self.methods.append(method)
+        if method == "tabs.create":
+            self.url = params["url"]
+            self.group = params["group"]
+            return self._tab()
+        if method in {"tabs.get", "tabs.activate"}:
+            return self._tab()
+        if method == "tabs.navigate":
+            self.url = params["url"]
+            self.page_requests(self.url, "https://example.test/boot.js")
+            return self._tab()
+        if method == "cdp.send":
+            if params["method"] == "Runtime.evaluate":
+                return self._evaluate(params)
+            return {}
+        if method == "events.subscribe":
+            self.domains.update(str(item).lower() for item in params["domains"])
+            self.started_at = self.started_at or 1_700_000_000_000
+            return {
+                "started_at": self.started_at,
+                "seq": self.seq,
+                "domains": sorted(self.domains),
+            }
+        if method == "events.unsubscribe":
+            for domain in params.get("domains") or list(self.domains):
+                self.domains.discard(str(domain).lower())
+            return {"domains": sorted(self.domains)}
+        if method == "events.get":
+            wanted = {
+                str(kind).lower() for kind in (params.get("kinds") or ["console", "network"])
+            }
+            since = int(params.get("since_seq") or 0)
+            selected = [
+                item for item in self.entries if item["kind"] in wanted and item["seq"] > since
+            ]
+            return {
+                "entries": selected[: int(params.get("limit") or 200)],
+                "next_seq": self.seq,
+                "dropped": dict(self.dropped),
+                "started_at": self.started_at,
+                "truncated": False,
+                "reset": False,
+                "pending": 0,
+            }
+        if method == "events.clear":
+            self.entries = []
+            return {"cleared": ["console", "network"], "seq": self.seq}
+        if method == "debugger.detach":
+            return {"detached": True}
+        if method == "tabs.remove":
+            return {"removed": True, "id": self.tab_id}
+        raise AssertionError(method)
+
+
+def test_network_reports_the_requests_of_the_very_first_navigation(monkeypatch):
+    """The failure being fixed: an agent opens a page, the page misbehaves, and
+    the network topic answers "no requests were made" because it only started
+    recording when it was asked."""
+    bridge = _FakeCompanionBridge()
+    monkeypatch.setattr(browser_tools, "get_chrome_bridge", lambda: bridge)
+    try:
+        browser_tools.open_page(
+            "https://example.test/first",
+            session_id="companion-first-nav",
+            profile_mode="current",
+        )
+        reported = browser_tools.get_network("companion-first-nav", output="json", limit=50)
+        assert [row["url"] for row in reported["requests"]] == [
+            "https://example.test/first",
+            "https://example.test/boot.js",
+        ]
+        assert reported["dropped"] == 0
+
+        # One capture serves the whole tab, so a navigation is not a boundary:
+        # the subscription made at open still covers the pages that follow.
+        browser_tools.open_page(
+            "https://example.test/second",
+            session_id="companion-first-nav",
+            profile_mode="current",
+        )
+        after = browser_tools.get_network("companion-first-nav", output="json", limit=50)
+        assert [row["url"] for row in after["requests"]] == [
+            "https://example.test/first",
+            "https://example.test/boot.js",
+            "https://example.test/second",
+            "https://example.test/boot.js",
+        ]
+    finally:
+        browser_tools.close_session("companion-first-nav")
+
+
+def test_network_records_a_claimed_tab_from_the_moment_it_was_claimed(monkeypatch):
+    bridge = _FakeCompanionBridge()
+    monkeypatch.setattr(browser_tools, "get_chrome_bridge", lambda: bridge)
+    # Whatever the tab did before the attach was observed by nobody: no capture
+    # was running, so there is nothing to recover and the docstring says so.
+    bridge.page_requests("https://example.test/before-the-attach")
+    try:
+        browser_tools.attach_current_tab(bridge.tab_id, session_id="companion-attach")
+        bridge.page_requests("https://example.test/after-the-attach")
+        reported = browser_tools.get_network("companion-attach", output="json", limit=50)
+        assert [row["url"] for row in reported["requests"]] == [
+            "https://example.test/after-the-attach"
+        ]
+    finally:
+        browser_tools.close_session("companion-attach")
+
+
+def test_network_subscribes_again_when_the_subscription_at_open_failed(monkeypatch):
+    """Capture at open is best-effort: losing it costs history, not the session."""
+
+    class _RefusingBridge(_FakeCompanionBridge):
+        def __init__(self) -> None:
+            super().__init__()
+            self.refusals = 1
+
+        def request(self, method: str, params: dict | None = None, timeout: float = 20.0):
+            if method == "events.subscribe" and self.refusals:
+                self.refusals -= 1
+                raise ChromeBridgeError("the companion was busy")
+            return super().request(method, params, timeout)
+
+    bridge = _RefusingBridge()
+    monkeypatch.setattr(browser_tools, "get_chrome_bridge", lambda: bridge)
+    try:
+        browser_tools.open_page(
+            "https://example.test/first",
+            session_id="companion-refused",
+            profile_mode="current",
+        )
+        driver = browser_tools._get_session("companion-refused").driver
+        assert driver.events_subscribed is False
+
+        # Reading the topic repairs the subscription, so the session degrades to
+        # the old behaviour - late - instead of staying silent for good.
+        assert browser_tools.get_network("companion-refused", output="json")["requests"] == []
+        assert driver.events_subscribed is True
+        bridge.page_requests("https://example.test/after-the-repair")
+        reported = browser_tools.get_network("companion-refused", output="json")
+        assert [row["url"] for row in reported["requests"]] == [
+            "https://example.test/after-the-repair"
+        ]
+    finally:
+        browser_tools.close_session("companion-refused")
+
+
+def test_network_says_how_many_records_a_long_session_lost(monkeypatch):
+    """Capture now runs for the life of the session, so the buffer wraps. A gap
+    that is not reported would be read as a quiet page."""
+    bridge = _FakeCompanionBridge()
+    monkeypatch.setattr(browser_tools, "get_chrome_bridge", lambda: bridge)
+    try:
+        browser_tools.open_page(
+            "https://example.test/first",
+            session_id="companion-wrap",
+            profile_mode="current",
+        )
+        bridge.page_requests(*[f"https://example.test/ping-{index}" for index in range(600)])
+        reported = browser_tools.get_network("companion-wrap", output="json", limit=1000)
+        urls = [row["url"] for row in reported["requests"]]
+        assert len(urls) == 500  # the newest, bounded, never the whole 602
+        assert reported["dropped"] == 102
+        assert urls[-1] == "https://example.test/ping-599"
+        assert "https://example.test/first" not in urls  # wrapped out, and counted
+    finally:
+        browser_tools.close_session("companion-wrap")
+
+
+def test_network_reports_what_the_selenium_buffer_had_to_drop():
+    """The Selenium backend has no subscription to move; it must keep working."""
+    batch: list[dict] = []
+    for index in range(600):
+        batch.append(
+            _will_be_sent(f"REQ-{index}", f"http://host/asset-{index}.js", kind="Script")
+        )
+        batch.append(
+            _perf(
+                "Network.loadingFinished",
+                {"requestId": f"REQ-{index}", "timestamp": 100.01, "encodedDataLength": 10},
+            )
+        )
+    session = browser_tools.BrowserSession(
+        driver=_FakeLogDriver([batch]), headless=True, profile_mode="temporary"
+    )
+    browser_tools._sessions["selenium-wrap"] = session
+    try:
+        reported = browser_tools.get_network("selenium-wrap", output="json", limit=1000)
+        urls = [row["url"] for row in reported["requests"]]
+        assert len(urls) == 500
+        assert reported["dropped"] == 100
+        assert urls[-1] == "http://host/asset-599.js"
+    finally:
+        browser_tools._sessions.pop("selenium-wrap", None)
 
 
 def test_network_lists_the_document_and_isolates_the_failing_request(local_site):

@@ -1,0 +1,25 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Change events</title></head>
+<body>
+<h1>Change events</h1>
+<form id="profile">
+  <input id="first" name="first">
+  <input id="second" name="second">
+  <input id="third" name="third">
+  <textarea id="notes" name="notes"></textarea>
+  <select id="colour" name="colour">
+    <option value="red">Red</option>
+    <option value="blue">Blue</option>
+  </select>
+</form>
+<script>
+  window.changed = [];
+  window.inputEvents = [];
+  for (const node of document.querySelectorAll('#profile input, #profile textarea, #profile select')) {
+    node.addEventListener('change', () => window.changed.push(node.id));
+    node.addEventListener('input', () => window.inputEvents.push(node.id));
+  }
+</script>
+</body>
+</html>

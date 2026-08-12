@@ -16,7 +16,11 @@ import time
 from typing import Any
 
 from selenium import webdriver
-from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.common.exceptions import (
+    NoSuchFrameException,
+    TimeoutException,
+    WebDriverException,
+)
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.action_chains import ActionChains
@@ -27,6 +31,7 @@ from selenium.webdriver.support.ui import Select, WebDriverWait
 
 from chrome_bridge import (
     CHROME_EXTENSION_ID,
+    DEFAULT_TAB_GROUP,
     ChromeBridgeDriver,
     ChromeBridgeError,
     get_chrome_bridge,
@@ -76,13 +81,21 @@ class BrowserSession:
     debugger_address: str | None = None
     current_tab_id: int | None = None
     tab_group: str | None = None
+    # Which run of the user's Chrome the tab id above belongs to. Tab ids restart
+    # with the browser, so without this a session that outlived a Chrome restart
+    # would keep driving whatever tab inherited its number.
+    browser_run: str | None = None
     owns_browser: bool = True
     held_keys: dict[str, str] = field(default_factory=dict)
     held_buttons: set[str] = field(default_factory=set)
+    # Touch id -> the page-space point it is holding, so one finger can be lifted
+    # without lifting the others and so a forgotten finger can still be found.
+    held_touches: dict[int, dict[str, Any]] = field(default_factory=dict)
+    # Where this session last put the mouse, in page pixels. Chrome measures
+    # movementX/movementY against exactly this point, and a session that has
+    # dispatched nothing starts where Chrome's own pointer starts, at (0, 0).
     pointer_x: float = 0.0
     pointer_y: float = 0.0
-    # (0, 0) is a legitimate pointer position, so "never moved" needs its own flag.
-    pointer_initialized: bool = False
     render_mode: str = "normal"
     key_repeat: bool = True
     render_target_fps: float | None = None
@@ -107,7 +120,10 @@ class BrowserSession:
     probe_console_seen: list[dict[str, Any]] = field(default_factory=list)
     network_pending: dict[str, dict[str, Any]] = field(default_factory=dict)
     network_rows: list[dict[str, Any]] = field(default_factory=list)
-    network_subscribed: bool = False
+    # Capture runs from the moment the tab opens, so a long session outlives its
+    # own buffer. Both backends bound what they keep; this counts what the
+    # Selenium one threw away, as the extension counts evictions for the other.
+    network_dropped: int = 0
     lock: threading.RLock = field(default_factory=threading.RLock)
     last_used: float = field(default_factory=time.monotonic)
 
@@ -274,7 +290,7 @@ def create_driver(
     profile_id: str | None = None,
     debugger_address: str | None = None,
     current_tab_id: int | None = None,
-    tab_group: str = "AI",
+    tab_group: str = DEFAULT_TAB_GROUP,
 ) -> Any:
     """Create Chrome through Selenium Manager, optionally visible for human handoff."""
     global _browser_available, _browser_error
@@ -370,6 +386,92 @@ def create_driver(
     return driver
 
 
+def _claim_tab(tab_id: int) -> dict[str, Any]:
+    """Reserve a Chrome tab across every agent driving this browser.
+
+    The guard in ``_create_session`` only sees the sessions of this process. The
+    daemon sees the other MCP clients too, which is the case that matters: two
+    agents claiming the same tab each believe they own it, and the second
+    debugger attach or the first close takes the other's page out from under it.
+
+    An ``unavailable`` answer - no daemon, an older one, a link that just dropped
+    - is not a refusal. A browser nobody is guarding is still perfectly usable,
+    and failing closed here would turn a missing daemon into a permanently busy
+    tab.
+    """
+    try:
+        answer = dict(get_chrome_bridge().claim_tab(int(tab_id)) or {})
+    except Exception as exc:
+        logger.debug("Could not ask the daemon about tab %s: %s", tab_id, exc)
+        return {"status": "unavailable"}
+    if str(answer.get("status") or "") == "refused":
+        raise RuntimeError(
+            str(answer.get("reason") or "")
+            or f"Chrome tab {tab_id} is already being driven by another agent."
+        )
+    return answer
+
+
+def _release_claimed_tab(tab_id: int | None) -> None:
+    """Give a tab back to whoever asks for it next."""
+    if tab_id is None:
+        return
+    try:
+        get_chrome_bridge().release_tab(int(tab_id))
+    except Exception as exc:  # A link that is gone released it on our behalf.
+        logger.debug("Could not release tab %s: %s", tab_id, exc)
+
+
+def _tab_is_gone(session: BrowserSession) -> bool:
+    """Whether the companion says this session's tab no longer exists.
+
+    Only an answer counts. A transport failure means the daemon or the companion
+    is down, which says nothing about the tab and would otherwise condemn every
+    session at once the moment Chrome's companion blinked.
+    """
+    driver = session.driver
+    if not getattr(driver, "is_extension_bridge", False):
+        return False
+    try:
+        driver.bridge.request("tabs.get", {"tabId": driver.tab_id}, timeout=2.0)
+    except ChromeBridgeError:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _drop_sessions_whose_tab_is_gone() -> None:
+    """Free the session slots of tabs the user has since closed by hand.
+
+    Only called at the session cap, because it costs one round trip per session:
+    without it, four tabs closed from the tab strip leave a server that refuses
+    to open a fifth and cannot say why.
+    """
+    with _sessions_lock:
+        candidates = [
+            (session_id, session)
+            for session_id, session in _sessions.items()
+            if session.profile_mode == "current"
+        ]
+    for session_id, session in candidates:
+        if not _tab_is_gone(session):
+            continue
+        with _sessions_lock:
+            if _sessions.get(session_id) is not session:
+                continue
+            del _sessions[session_id]
+        logger.info("Dropped session '%s': its tab is no longer open", session_id)
+        # No page is left to release held input on and no tab to close, so the
+        # full teardown would only collect failures. Give up the debugger
+        # attachment and nothing else - Chrome dropped it with the tab anyway.
+        try:
+            session.driver.quit()
+        except Exception:
+            pass
+        _release_claimed_tab(session.current_tab_id)
+
+
 def _create_session(
     session_id: str,
     width: int,
@@ -379,7 +481,7 @@ def _create_session(
     profile_id: str | None = None,
     debugger_address: str | None = None,
     current_tab_id: int | None = None,
-    tab_group: str = "AI",
+    tab_group: str = DEFAULT_TAB_GROUP,
 ) -> BrowserSession:
     profile_mode = _resolve_profile_mode(profile_mode, headless)
     mode, selected_profile, address, browser_key = _profile_configuration(
@@ -390,6 +492,12 @@ def _create_session(
         while session_id in _pending_sessions:
             _sessions_condition.wait(timeout=30)
         existing = _sessions.get(session_id)
+        if existing is not None and _browser_run_changed(existing) is not None:
+            # Its browser is gone, and reopening under the same name is exactly
+            # the right response to that - so drop it here instead of refusing
+            # the call and making the caller close a session that no longer is one.
+            del _sessions[session_id]
+            existing = None
         if existing is not None:
             if (
                 (headless is not None and existing.headless != effective_headless)
@@ -406,8 +514,16 @@ def _create_session(
                 )
             return existing
         if len(_sessions) + len(_pending_sessions) >= MAX_SESSIONS:
+            _drop_sessions_whose_tab_is_gone()
+        if len(_sessions) + len(_pending_sessions) >= MAX_SESSIONS:
+            oldest = min(_sessions.values(), key=lambda item: item.last_used, default=None)
+            stalest = next(
+                (name for name, item in _sessions.items() if item is oldest), None
+            )
             raise RuntimeError(
-                f"Maximum of {MAX_SESSIONS} browser sessions reached; close one first"
+                f"Maximum of {MAX_SESSIONS} browser sessions reached; close one first. "
+                f"Open: {sorted(_sessions)}."
+                + (f" Least recently used: '{stalest}'." if stalest else "")
             )
         selected_current_tab_id = int(current_tab_id) if mode == "current" and current_tab_id is not None else None
         if selected_current_tab_id is not None:
@@ -441,7 +557,14 @@ def _create_session(
             _pending_browser_keys.add(browser_key)
         _pending_sessions.add(session_id)
     session: BrowserSession | None = None
+    claim: dict[str, Any] = {}
+    claimed_tab: int | None = None
     try:
+        if selected_current_tab_id is not None:
+            # Before the debugger attaches, not after: a refusal has to cost the
+            # other agent's tab nothing.
+            claim = _claim_tab(selected_current_tab_id)
+            claimed_tab = selected_current_tab_id
         driver = create_driver(
             width,
             height,
@@ -452,6 +575,13 @@ def _create_session(
             current_tab_id,
             tab_group,
         )
+        if mode == "current" and claimed_tab is None:
+            opened = getattr(driver, "tab_id", None)
+            if opened is not None:
+                # Ours by construction, so this cannot be refused - it is filed
+                # so that another agent's attach_tab is.
+                claim = _claim_tab(int(opened))
+                claimed_tab = int(opened)
         session = BrowserSession(
             driver=driver,
             headless=effective_headless,
@@ -460,11 +590,19 @@ def _create_session(
             debugger_address=address,
             current_tab_id=getattr(driver, "tab_id", None),
             tab_group=(getattr(driver, "actual_tab_group", None) if mode == "current" else None),
+            browser_run=(
+                claim.get("browser_run") or _current_browser_run()
+                if mode == "current"
+                else None
+            ),
             owns_browser=mode != "attach",
             # A tab we created is ours to clean up; a claimed one belongs to the user.
             owns_tab=mode == "current" and current_tab_id is None,
         )
     finally:
+        if session is None:
+            # The claim outlives this call only when a session came out of it.
+            _release_claimed_tab(claimed_tab)
         with _sessions_condition:
             if session is not None:
                 _sessions[session_id] = session
@@ -496,11 +634,62 @@ def _describe_browser_failure(exc: Exception) -> str:
     )
 
 
+def _current_browser_run() -> str | None:
+    """The companion's id for the browser run in front of us, when it is knowable.
+
+    ``None`` covers three unrelated situations - no companion connected, one older
+    than 1.3.2, and a bridge that never started - and not one of them is evidence
+    that a session is stale, so all three read alike here: nothing to compare.
+    """
+    try:
+        bridge = get_chrome_bridge()
+        if not bridge.connected:
+            return None
+        return bridge.browser_run
+    except Exception:
+        return None
+
+
+def _browser_run_changed(session: BrowserSession) -> str | None:
+    """The current run id, but only when it proves the session's tab is gone."""
+    if session.profile_mode != "current" or not session.browser_run:
+        return None
+    current = _current_browser_run()
+    if current is None or current == session.browser_run:
+        return None
+    return current
+
+
+def _discard_stale_session(session_id: str, session: BrowserSession) -> None:
+    """Forget a session whose browser is gone, without touching the new one.
+
+    Nothing is sent to Chrome on the way out. The tab id this session holds now
+    names a tab in a browser run that never heard of it - quite possibly one of
+    the user's own - so the usual teardown, which releases held keys and closes
+    the tab, would act on a stranger's tab instead of ours. The daemon's claim is
+    not released either: it drops the whole registry when the run changes, and a
+    release aimed at the old id could only hit a claim made since, in the new run.
+    """
+    with _sessions_lock:
+        if _sessions.get(session_id) is session:
+            del _sessions[session_id]
+
+
 def _get_session(session_id: str) -> BrowserSession:
     _validate_session_id(session_id)
     with _sessions_lock:
         session = _sessions.get(session_id)
         open_sessions = sorted(_sessions)
+    if session is not None and _browser_run_changed(session) is not None:
+        _discard_stale_session(session_id, session)
+        raise ValueError(
+            f"Browser session '{session_id}' was opened in a Chrome that is no "
+            "longer running - it was restarted, or the companion updated itself - "
+            "so the tab it held no longer exists and its id now names a different "
+            "tab. The session has been dropped rather than driving that tab. Open "
+            f'the page again: web_action [{{"action":"open","url":...,'
+            f'"session_id":"{session_id}"}}].'
+        )
     if session is None:
         # Name the call the caller actually has. Pointing at an internal helper
         # leaves a small model stuck with no way to recover.
@@ -539,28 +728,116 @@ def _set_viewport(driver: Any, width: int, height: int) -> None:
 # A challenge is a live widget, not the word "captcha" in prose. Matching text
 # alone flags every article about CAPTCHAs and every search result for the word,
 # and then the agent waits three minutes for a human who is not needed.
+#
+# The probe therefore gathers three things and leaves the verdict to
+# _classify_challenge: which provider widgets are on the page, wherever they are -
+# shadow roots and same-origin frames included, because half of them live one
+# document down - which provider SDKs the markup loads, and whether any of it is
+# lying over the middle of the viewport rather than sitting inside a form.
 _CHALLENGE_WIDGET_SCRIPT = """
-const selectors = [
+const WIDGETS = [
   'iframe[src*="recaptcha/api2"]', 'iframe[src*="recaptcha/enterprise"]',
   'iframe[src*="hcaptcha.com"]', 'iframe[src*="challenges.cloudflare.com"]',
-  'iframe[src*="captcha-api.yandex"]', 'iframe[title*="captcha" i]',
+  'iframe[src*="captcha-api.yandex"]', 'iframe[src*="captcha-delivery.com"]',
+  'iframe[src*="captcha.awswaf.com"]', 'iframe[title*="captcha" i]',
   'div.g-recaptcha', 'div.h-captcha', 'div.cf-turnstile', 'div#cf-challenge-running',
-  'form#challenge-form', '[data-sitekey]', '#px-captcha', '.smart-captcha'
+  'form#challenge-form', '#px-captcha', '.smart-captcha', '.datadome-captcha',
+  'awswaf-captcha', '[data-sitekey]'
+];
+// A script tag has no box of its own, so these are counted by presence. Both
+// hosts only serve the SDK that asks a human to solve something; the tags that
+// merely score a request quietly are deliberately not here.
+const MARKERS = [
+  'script[src*="captcha-sdk.awswaf.com"]', 'script[src*="captcha.awswaf.com"]'
 ];
 const found = [];
-for (const selector of selectors) {
-  const element = document.querySelector(selector);
-  if (!element) continue;
+const markers = [];
+const budget = {nodes: 0};
+let blocking = false;
+
+function isVisible(element) {
   const rect = element.getBoundingClientRect();
-  if (rect.width < 20 || rect.height < 20) continue;
-  found.push(selector);
+  if (rect.width < 20 || rect.height < 20) return false;
+  const view = (element.ownerDocument && element.ownerDocument.defaultView) || window;
+  const style = view.getComputedStyle(element);
+  return style.visibility !== 'hidden' && style.opacity !== '0';
 }
+
+// data-sitekey alone says nothing: chat, payment and analytics widgets mint one
+// too, and treating every one of them as a gate stopped the agent on pages that
+// were never blocking it.
+function isCaptchaSitekey(element) {
+  const name = String(element.getAttribute('class') || '') + ' ' + String(element.id || '');
+  if (/captcha|turnstile|challenge/i.test(name)) return true;
+  return !!element.querySelector('iframe[src*="captcha"], iframe[src*="turnstile"]');
+}
+
+function matchedSelector(element, selectors) {
+  for (const selector of selectors) {
+    try { if (element.matches(selector)) return selector; } catch (error) { continue; }
+  }
+  return null;
+}
+
+function scan(root, where, atCenter, depth) {
+  if (found.length >= 3 || depth > 3 || budget.nodes > 8000) return;
+  const doc = root.ownerDocument || root;
+  const view = doc.defaultView;
+  let centerNode = null;
+  if (atCenter && view) {
+    try {
+      centerNode = doc.elementFromPoint(view.innerWidth / 2, view.innerHeight / 2);
+    } catch (error) { centerNode = null; }
+  }
+  let matches = [];
+  try { matches = Array.from(root.querySelectorAll(WIDGETS.join(','))); } catch (error) { matches = []; }
+  for (const element of matches) {
+    const selector = matchedSelector(element, WIDGETS);
+    if (!selector) continue;
+    if (selector === '[data-sitekey]' && !isCaptchaSitekey(element)) continue;
+    if (!isVisible(element)) continue;
+    found.push(selector + where);
+    if (centerNode && (element === centerNode || element.contains(centerNode))) blocking = true;
+    if (found.length >= 3) break;
+  }
+  try {
+    for (const element of root.querySelectorAll(MARKERS.join(','))) {
+      const selector = matchedSelector(element, MARKERS);
+      if (selector && markers.indexOf(selector + where) < 0) markers.push(selector + where);
+    }
+  } catch (error) { /* a root that cannot be queried has nothing to add */ }
+  if (found.length >= 3) return;
+  // Shadow roots and same-origin frames are where the rest of the challenges
+  // live: a top-level querySelector never looks inside either one. A TreeWalker
+  // stops the moment the budget runs out, where querySelectorAll('*') would have
+  // built the whole element list of a huge page before anyone could check.
+  let walker = null;
+  try { walker = doc.createTreeWalker(root, NodeFilter.SHOW_ELEMENT); } catch (error) { walker = null; }
+  while (walker) {
+    const element = walker.nextNode();
+    if (!element || found.length >= 3 || ++budget.nodes > 8000) return;
+    if (element.shadowRoot) {
+      scan(element.shadowRoot, ' (in shadow DOM)', atCenter, depth + 1);
+    } else if (element.tagName === 'IFRAME') {
+      let inner = null;
+      try { inner = element.contentDocument; } catch (error) { inner = null; }
+      if (!inner) continue;
+      const insideCenter = atCenter && !!centerNode &&
+        (element === centerNode || element.contains(centerNode));
+      scan(inner, ' (in a frame)', insideCenter, depth + 1);
+    }
+  }
+}
+
+scan(document, '', true, 0);
 const heading = (document.title || '') + ' ' +
   Array.from(document.querySelectorAll('h1, h2')).slice(0, 3)
     .map(node => node.innerText || '').join(' ');
 const body = (document.body && document.body.innerText) || '';
 return {
   widgets: found,
+  markers: markers,
+  blocking: blocking,
   heading: heading.slice(0, 400),
   body: body.slice(0, 2000),
   body_length: body.length
@@ -588,6 +865,10 @@ _CHALLENGE_HEADINGS = {
         "unusual traffic",
         "access denied",
         "are you a robot",
+        "you have been blocked",
+        "request blocked",
+        "attention required",
+        "enable js and disable any ad blocker",
         "необычный трафик",
     ),
 }
@@ -616,43 +897,67 @@ return {
 )
 
 
-def _classify_challenge(probe: dict[str, Any]) -> dict[str, Any]:
-    """Turn raw page markers into a challenge verdict."""
-    widgets = probe.get("widgets") or []
-    if widgets:
-        return {
-            "challenge_detected": True,
-            "challenge_type": "captcha",
-            "challenge_evidence": widgets[:3],
-            "manual_action_required": True,
-        }
-    heading = str(probe.get("heading") or "").lower()
-    sparse_body = (
-        str(probe.get("body") or "").lower()
-        if int(probe.get("body_length") or 0) <= _CHALLENGE_BODY_LIMIT
-        else ""
-    )
+def _interstitial_phrase(heading: str, sparse_body: str) -> tuple[str, str] | None:
+    """Return the ``(challenge_type, evidence)`` an interstitial's own words give."""
     for challenge_type, phrases in _CHALLENGE_HEADINGS.items():
         for phrase in phrases:
             if phrase in heading:
-                evidence = "page heading"
-            elif sparse_body and 0 <= sparse_body.find(phrase) <= _CHALLENGE_LEAD_LIMIT:
+                return challenge_type, "page heading"
+            if sparse_body and 0 <= sparse_body.find(phrase) <= _CHALLENGE_LEAD_LIMIT:
                 # An interstitial opens with the phrase; an article about
                 # captchas mentions it somewhere in the middle of a paragraph.
-                evidence = "interstitial text"
-            else:
-                continue
+                return challenge_type, "interstitial text"
+    return None
+
+
+def _classify_challenge(probe: dict[str, Any]) -> dict[str, Any]:
+    """Turn raw page markers into a challenge verdict.
+
+    A captcha widget is only a *challenge* when it stands between the caller and
+    the page: on an interstitial that holds nothing else, or lying over the
+    middle of the viewport. The same widget at the foot of a readable article
+    guards that one form and nothing more, so it is reported in
+    ``captcha_widgets`` while ``challenge_detected`` stays false - otherwise the
+    agent parks for three minutes waiting for a human it does not need.
+    """
+    widgets = [str(item) for item in (probe.get("widgets") or [])]
+    markers = [str(item) for item in (probe.get("markers") or [])]
+    heading = str(probe.get("heading") or "").lower()
+    body_length = int(probe.get("body_length") or 0)
+    interstitial_page = body_length <= _CHALLENGE_BODY_LIMIT
+    sparse_body = str(probe.get("body") or "").lower() if interstitial_page else ""
+    phrase = _interstitial_phrase(heading, sparse_body)
+    seen = widgets + markers
+    if seen:
+        if bool(probe.get("blocking")) or interstitial_page or phrase:
             return {
                 "challenge_detected": True,
-                "challenge_type": challenge_type,
-                "challenge_evidence": [evidence],
+                "challenge_type": "captcha",
+                "challenge_evidence": seen[:3],
                 "manual_action_required": True,
+                "captcha_widgets": seen,
             }
+        return {
+            "challenge_detected": False,
+            "challenge_type": None,
+            "challenge_evidence": [],
+            "manual_action_required": False,
+            "captcha_widgets": seen,
+        }
+    if phrase:
+        return {
+            "challenge_detected": True,
+            "challenge_type": phrase[0],
+            "challenge_evidence": [phrase[1]],
+            "manual_action_required": True,
+            "captcha_widgets": [],
+        }
     return {
         "challenge_detected": False,
         "challenge_type": None,
         "challenge_evidence": [],
         "manual_action_required": False,
+        "captcha_widgets": [],
     }
 
 
@@ -684,6 +989,56 @@ def _page_summary(driver: webdriver.Chrome, session_id: str) -> dict[str, Any]:
     }
 
 
+def _leave_claimed_tab(
+    session: BrowserSession, width: int, height: int, tab_group: str
+) -> int | None:
+    """Move a session off a borrowed tab before it navigates; name the tab freed.
+
+    ``attach_tab`` borrows a tab the user opened, and an ``open`` on that session
+    used to navigate it - taking away the page they were reading, in a tab they
+    still thought was theirs. It gets its own tab in the agent's group instead,
+    opened in the background, and the borrowed one is handed back exactly as it
+    was found: the debugger detaches, nothing is closed, nothing is navigated.
+
+    Returns ``None`` when there was nothing to leave, which is the common case.
+    """
+    if session.profile_mode != "current" or session.owns_tab:
+        return None
+    released = session.current_tab_id
+    borrowed = session.driver
+    driver = create_driver(
+        width, height, session.headless, "current", None, None, None, tab_group
+    )
+    if getattr(driver, "tab_id", None) is not None:
+        _claim_tab(int(driver.tab_id))
+    session.driver = driver
+    session.current_tab_id = getattr(driver, "tab_id", None)
+    session.tab_group = getattr(driver, "actual_tab_group", None)
+    session.owns_tab = True
+    session.browser_run = _current_browser_run()
+    # Every buffer below is an account of the borrowed tab. Carrying it into the
+    # new one would answer "what did this page do" with another page's history.
+    session.console = ConsoleCursor()
+    session.probe_console = ConsoleCursor()
+    session.probe_console_seen = []
+    session.browser_log = []
+    session.network_pending = {}
+    session.network_rows = []
+    session.network_dropped = 0
+    session.render_bootstrap_registered = False
+    try:
+        borrowed.quit()
+    except Exception as exc:
+        logger.warning(
+            "Detaching from claimed tab %s failed: %s: %s",
+            released,
+            type(exc).__name__,
+            exc,
+        )
+    _release_claimed_tab(released)
+    return released
+
+
 def open_page(
     url: str,
     session_id: str = "default",
@@ -695,7 +1050,7 @@ def open_page(
     profile_id: str | None = None,
     debugger_address: str | None = None,
     current_tab_id: int | None = None,
-    tab_group: str = "AI",
+    tab_group: str = DEFAULT_TAB_GROUP,
 ) -> dict[str, Any]:
     """Open a URL in a reusable rendered browser session."""
     normalized = validate_http_url(url)
@@ -717,6 +1072,10 @@ def open_page(
             previous_mode = session.render_mode
             previous_frame = session.render_frame_selector
             _reset_session_runtime_state(session)
+            # After the reset, so the borrowed tab is given back with no keys
+            # held and no frame gate on it, and before anything is sent to the
+            # new one.
+            released_tab = _leave_claimed_tab(session, width, height, tab_group)
             _set_viewport(session.driver, width, height)
             _register_render_bootstrap(session)
             session.driver.get(normalized)
@@ -749,6 +1108,7 @@ def open_page(
             "debugger_address": session.debugger_address,
             "current_tab_id": session.current_tab_id,
             "tab_group": session.tab_group,
+            **({"left_claimed_tab": released_tab} if released_tab is not None else {}),
         }
     except (WebDriverException, ChromeBridgeError, TimeoutError, ConnectionError, OSError):
         close_session(session_id)
@@ -804,7 +1164,14 @@ def attach_current_tab(
     tab_id: int,
     session_id: str = "default",
 ) -> dict[str, Any]:
-    """Attach a named MCP session to an existing Chrome tab without navigating it."""
+    """Attach a named MCP session to an existing Chrome tab without navigating it.
+
+    Console and network recording starts at the attach, so the console and
+    network topics report what the tab does from here on. What it did before -
+    the page load that is already finished, the request that already failed - was
+    never recorded and cannot be recovered; reload the page to observe a full
+    load.
+    """
     session_id = _validate_session_id(session_id)
     session = _create_session(
         session_id,
@@ -815,98 +1182,180 @@ def attach_current_tab(
         None,
         None,
         int(tab_id),
-        "AI",
+        DEFAULT_TAB_GROUP,
     )
-    with session.lock:
-        _register_render_bootstrap(session)
-        return {
-            **_page_summary(session.driver, session_id),
-            "success": True,
-            "headless": False,
-            "window_mode": "visible",
-            "profile_mode": "current",
-            "current_tab_id": session.current_tab_id,
-            "tab_group": session.tab_group,
-        }
+    try:
+        with session.lock:
+            _register_render_bootstrap(session)
+            return {
+                **_page_summary(session.driver, session_id),
+                "success": True,
+                "headless": False,
+                "window_mode": "visible",
+                "profile_mode": "current",
+                "current_tab_id": session.current_tab_id,
+                "tab_group": session.tab_group,
+            }
+    except Exception:
+        # A claim that failed halfway used to leave the session registered: it
+        # held the tab against every other session, answered nothing, and had to
+        # be closed by name the caller never saw succeed.
+        close_session(session_id)
+        raise
 
 
-_INSPECT_SCRIPT = r"""
+# Shares the perception helpers so a selector, a visibility verdict and the
+# aria-hidden rule mean the same thing here as in page_outline; the two topics
+# disagreeing about what is on the page is the failure this avoids.
+_INSPECT_SCRIPT = page_perception.JS_LIBRARY + r"""
 const limit = arguments[0];
 const includeLinks = arguments[1];
 const includeForms = arguments[2];
 const includeButtons = arguments[3];
 
-function esc(value) {
-  if (window.CSS && CSS.escape) return CSS.escape(value);
-  return String(value).replace(/[^a-zA-Z0-9_-]/g, c => '\\' + c);
+// A web component keeps its controls in a shadow root and an embedded form keeps
+// them in another document, and `document.querySelectorAll` sees neither. That
+// returned an empty page for an app that plainly has buttons on it, which is the
+// first call the built-in recipes make.
+// `depth` counts frames only, and stops where every other topic stops: a walk
+// that reached deeper than the outline reported controls the outline denied, and
+// one that stopped shallower hid controls the outline had already handed out.
+let framesTooDeep = 0;
+
+function collect(selectors) {
+  const found = [];
+  const seen = new Set();
+  const walk = (root, depth) => {
+    if (found.length > 4000) return;
+    let matched;
+    try {
+      matched = root.querySelectorAll(selectors);
+    } catch (error) {
+      matched = [];
+    }
+    for (const el of matched) {
+      if (seen.has(el)) continue;
+      seen.add(el);
+      found.push(el);
+    }
+    let all;
+    try {
+      all = root.querySelectorAll('*');
+    } catch (error) {
+      return;
+    }
+    for (const el of all) {
+      if (el.shadowRoot) walk(el.shadowRoot, depth);
+      if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {
+        if (depth >= WSN_MAX_FRAME_DEPTH) {
+          framesTooDeep += 1;
+          continue;
+        }
+        let doc = null;
+        try {
+          doc = el.contentDocument;
+        } catch (error) {
+          doc = null;
+        }
+        if (doc) walk(doc, depth + 1);
+      }
+    }
+  };
+  walk(document, 0);
+  return found;
 }
-function selector(el) {
-  if (el.id && document.querySelectorAll('#' + esc(el.id)).length === 1) {
-    return '#' + esc(el.id);
-  }
-  const parts = [];
-  let node = el;
-  while (node && node.nodeType === Node.ELEMENT_NODE && node !== document.documentElement) {
-    let part = node.tagName.toLowerCase();
-    const siblings = node.parentElement
-      ? Array.from(node.parentElement.children).filter(x => x.tagName === node.tagName)
-      : [];
-    if (siblings.length > 1) part += ':nth-of-type(' + (siblings.indexOf(node) + 1) + ')';
-    parts.unshift(part);
-    node = node.parentElement;
-  }
-  return parts.join(' > ');
+
+function visibility(el) {
+  const reason = wsnHiddenReason(el);
+  return {visible: !reason, hidden_reason: reason};
 }
+
+// Something nothing can reach must not push a usable control past the limit.
+function order(elements) {
+  const visible = [];
+  const hidden = [];
+  for (const el of elements) (wsnHiddenReason(el) ? hidden : visible).push(el);
+  return visible.concat(hidden);
+}
+
 function labelFor(el) {
-  if (el.labels && el.labels.length) return el.labels[0].innerText.trim();
-  const parent = el.closest('label');
-  return parent ? parent.innerText.trim() : '';
+  if (el.labels && el.labels.length) return (el.labels[0].innerText || '').trim();
+  let parent = null;
+  try {
+    parent = el.closest ? el.closest('label') : null;
+  } catch (error) {
+    parent = null;
+  }
+  return parent ? (parent.innerText || '').trim() : '';
 }
 function fieldInfo(el) {
-  const result = {
-    selector: selector(el), tag: el.tagName.toLowerCase(),
+  const result = Object.assign({
+    selector: wsnSelector(el), tag: el.tagName.toLowerCase(),
     type: (el.getAttribute('type') || '').toLowerCase(),
     id: el.id || '', name: el.getAttribute('name') || '',
     label: labelFor(el), placeholder: el.getAttribute('placeholder') || '',
     required: !!el.required, disabled: !!el.disabled
-  };
+  }, visibility(el));
   if (el.tagName.toLowerCase() === 'select') {
     result.options = Array.from(el.options).map(o => ({value: o.value, text: o.text, selected: o.selected}));
   }
   return result;
 }
 const output = {links: [], forms: [], fields: [], buttons: [], iframes: []};
+const counts = {links: 0, forms: 0, fields: 0, buttons: 0, iframes: 0};
+const FIELD_SELECTOR = 'input, textarea, select, [contenteditable="true"]';
 if (includeLinks) {
-  output.links = Array.from(document.querySelectorAll('a[href]')).slice(0, limit).map(a => ({
-    selector: selector(a), text: (a.innerText || a.getAttribute('aria-label') || '').trim(), href: a.href
-  }));
+  const links = order(collect('a[href]'));
+  counts.links = links.length;
+  output.links = links.slice(0, limit).map(a => Object.assign({
+    selector: wsnSelector(a),
+    text: (a.innerText || a.getAttribute('aria-label') || '').trim(),
+    href: a.href
+  }, visibility(a)));
 }
 if (includeForms) {
-  output.forms = Array.from(document.forms).slice(0, limit).map((form, index) => ({
-    index, selector: selector(form), id: form.id || '', name: form.getAttribute('name') || '',
+  const forms = order(collect('form'));
+  counts.forms = forms.length;
+  output.forms = forms.slice(0, limit).map((form, index) => Object.assign({
+    index, selector: wsnSelector(form), id: form.id || '',
+    name: form.getAttribute('name') || '',
     action: form.action, method: (form.method || 'get').toLowerCase(), enctype: form.enctype,
-    fields: Array.from(form.querySelectorAll('input, textarea, select, [contenteditable="true"]'))
-      .slice(0, limit).map(fieldInfo)
-  }));
-  output.fields = Array.from(document.querySelectorAll(
-    'input, textarea, select, [contenteditable="true"]'
-  )).slice(0, limit).map(fieldInfo);
+    fields: Array.from(form.querySelectorAll(FIELD_SELECTOR)).slice(0, limit).map(fieldInfo)
+  }, visibility(form)));
+  const fields = order(collect(FIELD_SELECTOR));
+  counts.fields = fields.length;
+  output.fields = fields.slice(0, limit).map(fieldInfo);
 }
 if (includeButtons) {
-  output.buttons = Array.from(document.querySelectorAll(
-    'button, input[type="button"], input[type="submit"], input[type="reset"], input[type="image"], [role="button"]'
-  )).slice(0, limit).map(button => ({
-    selector: selector(button), tag: button.tagName.toLowerCase(),
+  const buttons = order(collect(
+    'button, input[type="button"], input[type="submit"], input[type="reset"], ' +
+    'input[type="image"], [role="button"]'
+  ));
+  counts.buttons = buttons.length;
+  output.buttons = buttons.slice(0, limit).map(button => Object.assign({
+    selector: wsnSelector(button), tag: button.tagName.toLowerCase(),
     type: (button.getAttribute('type') || '').toLowerCase(), id: button.id || '',
     name: button.getAttribute('name') || '',
     text: (button.innerText || button.value || button.getAttribute('aria-label') || '').trim(),
     disabled: !!button.disabled
-  }));
+  }, visibility(button)));
 }
-output.iframes = Array.from(document.querySelectorAll('iframe')).slice(0, limit).map(frame => ({
-  selector: selector(frame), id: frame.id || '', name: frame.name || '', src: frame.src || '',
-  title: frame.title || ''
-}));
+const frames = order(collect('iframe, frame'));
+counts.iframes = frames.length;
+output.iframes = frames.slice(0, limit).map(frame => Object.assign({
+  selector: wsnSelector(frame), id: frame.id || '', name: frame.name || '',
+  src: frame.src || '', title: frame.title || '',
+  same_origin: (() => {
+    try {
+      return !!frame.contentDocument;
+    } catch (error) {
+      return false;
+    }
+  })()
+}, visibility(frame)));
+output.found = counts;
+output.truncated = Object.keys(counts).some(key => counts[key] > (output[key] || []).length);
+output.frames_too_deep = framesTooDeep;
 return output;
 """
 
@@ -918,10 +1367,22 @@ def get_page_elements(
     include_buttons: bool = True,
     limit: int = 200,
 ) -> dict[str, Any]:
-    """Return stable CSS selectors and metadata for rendered page controls."""
+    """Return stable selectors and metadata for rendered page controls.
+
+    Open shadow roots and same-origin frames are included; anything inside one is
+    reported as a ``host >>> control`` path, which the action tools resolve. Every
+    entry carries ``visible`` and, when it is not, ``hidden_reason``, so a control
+    no click can reach is never handed over looking like an ordinary one.
+    """
     limit = max(1, min(int(limit), 1000))
     session = _get_session(session_id)
     with session.lock:
+        # This topic has no frame_selector: it always answers for the whole page.
+        # It therefore starts at the top rather than trusting whatever frame the
+        # previous call happened to leave selected - reporting one frame's
+        # buttons, url and title as the page's is indistinguishable from the
+        # truth on the way out.
+        _leave_element_frame(session.driver)
         elements = session.driver.execute_script(
             _INSPECT_SCRIPT,
             limit,
@@ -937,24 +1398,32 @@ def wait_for_element(
     session_id: str = "default",
     state: str = "visible",
     timeout_seconds: float = 10.0,
+    frame_selector: str | None = None,
 ) -> dict[str, Any]:
     """Wait for a dynamic element to be present, visible, or clickable.
 
     ``selector`` accepts the same three locator forms as ``fill``: CSS, a ref
-    handle, and a piercing path.
+    handle, and a piercing path. ``frame_selector`` names the frame a CSS
+    selector is looked up in, exactly as it does for ``find`` and ``page_text``.
     """
     if state not in _ELEMENT_STATES:
         raise ValueError("state must be 'present', 'visible', or 'clickable'")
     timeout = max(0.1, min(float(timeout_seconds), 30.0))
     session = _get_session(session_id)
     with session.lock:
-        element = _wait_for_locator(session.driver, selector, state, timeout)
+        _enter_action_frame(session.driver, frame_selector, selector)
+        try:
+            element = _wait_for_locator(session.driver, selector, state, timeout)
+            tag = element.tag_name
+        finally:
+            _release_action_frame(session.driver, frame_selector, selector)
         return {
             **_page_summary(session.driver, session_id),
             "success": True,
             "selector": selector,
             "state": state,
-            "tag": element.tag_name,
+            "tag": tag,
+            "frame_selector": frame_selector,
         }
 
 
@@ -997,35 +1466,210 @@ def wait_for_challenge_resolution(
             time.sleep(min(poll_interval, timeout - elapsed))
 
 
+_CHECKBOX_TRUE = frozenset({"1", "true", "yes", "y", "on", "check", "checked"})
+_CHECKBOX_FALSE = frozenset({"0", "false", "no", "n", "off", "uncheck", "unchecked", ""})
+
+
 def _desired_checked(value: Any) -> bool:
+    """Say whether a checkbox value means check or uncheck, or refuse to guess.
+
+    Anything unrecognised used to mean "uncheck", so ``{"#terms": "check"}`` -
+    and every typo - quietly cleared the box and still reported success.
+    """
     if isinstance(value, bool):
         return value
-    return str(value).strip().lower() in {"1", "true", "yes", "on", "checked"}
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in _CHECKBOX_TRUE:
+        return True
+    if text in _CHECKBOX_FALSE:
+        return False
+    raise ValueError(
+        f"'{value}' does not say whether to tick this box or clear it. Pass true or "
+        "false, or one of 1/yes/on/check/checked, 0/no/off/uncheck/unchecked."
+    )
+
+
+# One round-trip that also does the scrolling, so reading what kind of control
+# this is costs nothing extra. A control that cannot take the value says so here,
+# instead of coming back as a driver stacktrace the caller has to decode.
+_FIELD_PREPARE_SCRIPT = """
+const element = arguments[0];
+element.scrollIntoView({block: 'center'});
+const type = String(element.type || '').toLowerCase();
+// readonly is ignored by the controls that are not typed into.
+const readonlyIgnored = ['checkbox', 'radio', 'range', 'color', 'file', 'hidden',
+  'button', 'submit', 'reset', 'image'];
+return {
+  tag: element.tagName.toLowerCase(),
+  type: type,
+  disabled: !!element.disabled,
+  readonly: !!element.readOnly && readonlyIgnored.indexOf(type) < 0
+};
+"""
+
+# Reading the value back is the only honest report: maxlength truncates, a number
+# input drops text it cannot parse, and an input handler may rewrite the lot.
+# Blurring first both settles those handlers and fires the `change` event that the
+# last field of a fill otherwise never got, because nothing ever moved off it.
+_FIELD_STATE_SCRIPT = """
+const element = arguments[0];
+// blur() on a control that never had focus does nothing, so this needs no test
+// for where the focus is - including inside a shadow root, where the document
+// only ever names the host.
+if (element.blur) element.blur();
+const tag = element.tagName.toLowerCase();
+if (tag === 'select') {
+  const option = element.selectedOptions[0];
+  return {
+    kind: 'select',
+    value: element.value,
+    text: option ? String(option.text || '').trim() : '',
+    disabled: option ? !!option.disabled : false
+  };
+}
+const type = String(element.type || '').toLowerCase();
+if (type === 'checkbox' || type === 'radio') return {kind: 'checked', value: !!element.checked};
+if (element.isContentEditable) return {kind: 'text', value: element.textContent};
+return {kind: 'text', value: element.value === undefined ? '' : element.value};
+"""
+
+
+_SELECT_OPTIONS_SCRIPT = """
+return Array.from(arguments[0].options).slice(0, 40).map(option => ({
+  value: String(option.value),
+  text: String(option.text || '').trim(),
+  disabled: !!option.disabled
+}));
+"""
+
+
+def _pick_option(driver: Any, element: Any, value: str) -> dict[str, Any]:
+    """Find the option a value names, by value first and then by visible text.
+
+    Selenium reports only the last thing it tried, so 'this select has no option
+    called unity' came back as 'could not locate element with visible text', and a
+    disabled option went through silently on the companion bridge.
+    """
+    options = driver.execute_script(_SELECT_OPTIONS_SCRIPT, element) or []
+    match = next((option for option in options if option.get("value") == value), None)
+    if match is None:
+        match = next((option for option in options if option.get("text") == value), None)
+    if match is None:
+        offered = ", ".join(f"'{option.get('value')}'" for option in options[:10])
+        raise ValueError(
+            f"No option of this select matches '{value}'. It offers "
+            f"{offered or 'no options at all'}."
+        )
+    if match.get("disabled"):
+        raise ValueError(f"The option '{value}' is disabled, so it cannot be selected")
+    return match
+
+
+def _field_rejection(state: dict[str, Any], requested: Any) -> str | None:
+    """Explain why the control does not hold what was asked, or return None."""
+    kind = state.get("kind")
+    if kind == "checked":
+        return None  # The checkbox paths verify their own state as they go.
+    if kind == "select":
+        if state.get("disabled"):
+            return (
+                f"the option '{state.get('text') or state.get('value')}' is disabled, so "
+                "the selection stayed on "
+                f"'{state.get('value')}'"
+            )
+        wanted = str(requested)
+        if wanted in {str(state.get("value")), str(state.get("text"))}:
+            return None
+        return f"the selection is '{state.get('value')}' instead of '{wanted}'"
+    actual = "" if state.get("value") is None else str(state.get("value"))
+    if actual == str(requested):
+        return None
+    return f"the field holds '{actual}' instead of '{requested}'"
+
+
+def _brief_error(exc: Exception) -> str:
+    """A driver stacktrace in a per-field error is noise the caller cannot use."""
+    text = str(exc).split("Stacktrace:")[0].strip()
+    first = text.splitlines()[0].strip() if text else ""
+    first = first.removeprefix("Message:").strip()
+    return f"{type(exc).__name__}: {first}" if first else type(exc).__name__
+
+
+_FILE_INPUT_STATE_SCRIPT = """
+const element = arguments[0];
+return {
+  type: String(element.type || '').toLowerCase(),
+  multiple: !!element.multiple,
+  names: Array.from(element.files || []).map(file => file.name)
+};
+"""
+
+
+def _attach_files(driver: Any, element: Any, paths: list[str]) -> list[str]:
+    """Leave the input holding exactly ``paths``, and report what it holds.
+
+    Chrome *appends* to an input that accepts multiple files, so a second upload
+    left the first file attached while the result only ever described the call
+    that had just been made. The names are read back off the input for the same
+    reason a filled value is: only the input knows what it ended up with.
+    """
+    state = driver.execute_script(_FILE_INPUT_STATE_SCRIPT, element) or {}
+    if state.get("type") != "file":
+        raise ValueError("Selector does not point to an input[type=file]")
+    if len(paths) > 1 and not state.get("multiple"):
+        raise ValueError("Input does not accept multiple files")
+    if state.get("names"):
+        element.clear()
+    element.send_keys("\n".join(paths))
+    after = driver.execute_script(_FILE_INPUT_STATE_SCRIPT, element) or {}
+    return [str(name) for name in (after.get("names") or [])]
 
 
 def fill_fields(
     fields: dict[str, Any],
     files: dict[str, str] | None = None,
     session_id: str = "default",
+    frame_selector: str | None = None,
 ) -> dict[str, Any]:
-    """Fill controls by CSS selector; file inputs are supplied separately."""
+    """Fill controls by CSS selector; file inputs are supplied separately.
+
+    Every write is read back off the control, because a control is free to refuse
+    what it is given: a number input drops text it cannot parse, ``maxlength``
+    truncates, an input handler rewrites. ``field_values`` reports what each
+    control holds afterwards, ``errors`` names the ones that differ from the
+    request, and ``success`` is false unless every control took its value.
+
+    ``frame_selector`` names the frame the CSS selectors are looked up in, exactly
+    as it does for ``find`` and ``page_text``.
+    """
     if not fields and not files:
         raise ValueError("At least one field or file must be provided")
     session = _get_session(session_id)
     filled: list[str] = []
-    uploaded: list[str] = []
+    uploaded: dict[str, list[str]] = {}
+    values: dict[str, Any] = {}
     errors: dict[str, str] = {}
     with session.lock:
+        driver = session.driver
+        _enter_action_frame(driver, frame_selector, *fields, *(files or {}))
         for selector, value in fields.items():
             try:
-                element = _resolve_element(session.driver, selector)
-                tag = element.tag_name.lower()
-                input_type = (element.get_attribute("type") or "").lower()
-                session.driver.execute_script(
-                    "arguments[0].scrollIntoView({block: 'center'});", element
-                )
+                element = _resolve_element(driver, selector)
+                control = driver.execute_script(_FIELD_PREPARE_SCRIPT, element) or {}
+                tag = str(control.get("tag") or "").lower()
+                input_type = str(control.get("type") or "").lower()
                 if input_type == "file":
                     raise ValueError("Use the files argument for file inputs")
+                if control.get("disabled"):
+                    raise ValueError(
+                        "The control is disabled, so nothing can be written to it"
+                    )
+                if control.get("readonly"):
+                    raise ValueError(
+                        "The control is readonly, so its value cannot be changed"
+                    )
                 if input_type == "checkbox":
                     desired = _desired_checked(value)
                     if element.is_selected() != desired:
@@ -1043,40 +1687,57 @@ def fill_fields(
                     if element.is_selected() != desired:
                         raise ValueError("Radio state did not change")
                 elif tag == "select":
-                    if hasattr(session.driver, "select_option"):
-                        session.driver.select_option(selector, str(value))
+                    option = _pick_option(driver, element, str(value))
+                    if hasattr(driver, "select_option"):
+                        driver.select_option(selector, option["value"])
                     else:
                         select = Select(element)
                         try:
-                            select.select_by_value(str(value))
+                            select.select_by_value(option["value"])
                         except Exception:
-                            select.select_by_visible_text(str(value))
+                            select.select_by_visible_text(option["text"])
                 else:
                     element.clear()
                     element.send_keys(str(value))
-                filled.append(selector)
+                state = driver.execute_script(_FIELD_STATE_SCRIPT, element) or {}
+                values[selector] = state.get("value")
+                rejection = _field_rejection(state, value)
+                if rejection:
+                    errors[selector] = f"The control did not take the value: {rejection}"
+                else:
+                    filled.append(selector)
             except Exception as exc:  # Return partial progress to the caller.
-                errors[selector] = f"{type(exc).__name__}: {exc}"
+                errors[selector] = _brief_error(exc)
+            finally:
+                # A field inside a frame leaves the driver there; the next field
+                # is looked up from the top again. Under a frame_selector every
+                # field shares the one frame, which is left at the end.
+                if not frame_selector:
+                    _release_locator_frame(driver, selector)
 
         for selector, file_path in (files or {}).items():
             try:
                 path = Path(file_path).expanduser().resolve(strict=True)
                 if not path.is_file():
                     raise ValueError("Upload path is not a file")
-                element = _resolve_element(session.driver, selector)
-                if (element.get_attribute("type") or "").lower() != "file":
-                    raise ValueError("Selector does not point to an input[type=file]")
-                element.send_keys(str(path))
-                uploaded.append(selector)
+                element = _resolve_element(driver, selector)
+                uploaded[selector] = _attach_files(driver, element, [str(path)])
             except Exception as exc:
-                errors[selector] = f"{type(exc).__name__}: {exc}"
+                errors[selector] = _brief_error(exc)
+            finally:
+                if not frame_selector:
+                    _release_locator_frame(driver, selector)
 
+        if frame_selector:
+            _leave_element_frame(driver)
         return {
-            **_page_summary(session.driver, session_id),
+            **_page_summary(driver, session_id),
             "success": not errors,
             "filled": filled,
+            "field_values": values,
             "files_uploaded": uploaded,
             "errors": errors,
+            "frame_selector": frame_selector,
         }
 
 
@@ -1097,20 +1758,32 @@ def click(
     selector: str,
     session_id: str = "default",
     wait_seconds: float = 0.5,
+    frame_selector: str | None = None,
 ) -> dict[str, Any]:
-    """Click a rendered element by CSS selector, ref handle, or piercing path."""
+    """Click a rendered element by CSS selector, ref handle, or piercing path.
+
+    ``frame_selector`` names the frame a CSS selector is looked up in, exactly as
+    it does for ``find`` and ``page_text``.
+    """
     session = _get_session(session_id)
     with session.lock:
-        element = _wait_for_locator(session.driver, selector, "clickable", 10.0)
-        session.driver.execute_script(
-            "arguments[0].scrollIntoView({block: 'center'});", element
-        )
-        element.click()
+        _enter_action_frame(session.driver, frame_selector, selector)
+        try:
+            element = _wait_for_locator(session.driver, selector, "clickable", 10.0)
+            session.driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});", element
+            )
+            element.click()
+        finally:
+            # The click may have happened inside a frame; everything after it -
+            # the settle, the page summary - is about the page as a whole.
+            _release_action_frame(session.driver, frame_selector, selector)
         _wait_after_action(session.driver, wait_seconds)
         return {
             **_page_summary(session.driver, session_id),
             "success": True,
             "clicked": selector,
+            "frame_selector": frame_selector,
         }
 
 
@@ -1226,9 +1899,41 @@ def _focus_target(
     driver.execute_script(_FOCUS_SCRIPT, target)
 
 
+@dataclass
+class _StagedKeys:
+    """A copy of a session's key state, so a batch commits only what it sent."""
+
+    held_keys: dict[str, str]
+    fresh_keys: set[str]
+
+    @classmethod
+    def of(cls, session: BrowserSession) -> "_StagedKeys":
+        return cls(dict(session.held_keys), set(session.fresh_keys))
+
+    def commit_to(self, session: BrowserSession) -> None:
+        session.held_keys.clear()
+        session.held_keys.update(self.held_keys)
+        session.fresh_keys.clear()
+        session.fresh_keys.update(self.fresh_keys)
+
+
+def _held_slot(session: BrowserSession | _StagedKeys, normalized: str) -> str | None:
+    """The id this session already holds the given physical key under, if any.
+
+    Held keys are filed under the spelling the caller pressed them with, and one
+    key answers to several spellings, so a lookup by id alone misses: hold('LEFT')
+    followed by release('ARROW_LEFT') would lift nothing and leave the key down
+    for the rest of the session, with its modifier bit stuck on.
+    """
+    wanted = key_table.physical_key(normalized)
+    for held_id, held_key in session.held_keys.items():
+        if key_table.physical_key(held_key) == wanted:
+            return held_id
+    return None
+
+
 def _key_event_pair(
-    session: BrowserSession,
-    key_ids: list[str],
+    session: BrowserSession | _StagedKeys,
     normalized: list[str],
     selected_action: str,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -1236,37 +1941,45 @@ def _key_event_pair(
     down_events: list[dict[str, Any]] = []
     up_events: list[dict[str, Any]] = []
     if selected_action in {"tap", "hold"}:
-        for key_id, key in zip(key_ids, normalized):
-            if selected_action == "tap" or key_id not in session.held_keys:
+        for key in normalized:
+            if selected_action == "tap" or _held_slot(session, key) is None:
                 down_events.append({"type": "down", "key": key})
     if selected_action in {"tap", "release"}:
-        for key_id, key in reversed(list(zip(key_ids, normalized))):
+        for key in reversed(normalized):
             if selected_action == "tap":
                 up_events.append({"type": "up", "key": key})
-            elif key_id in session.held_keys:
+                continue
+            slot = _held_slot(session, key)
+            if slot is not None:
                 # Release exactly what was pressed: a hold("w") that is released
                 # as "W" must still lift the same key.
-                up_events.append({"type": "up", "key": session.held_keys[key_id]})
+                up_events.append({"type": "up", "key": session.held_keys[slot]})
     return down_events, up_events
 
 
 def _commit_held_keys(
-    session: BrowserSession,
+    session: BrowserSession | _StagedKeys,
     key_ids: list[str],
     normalized: list[str],
     selected_action: str,
 ) -> None:
     if selected_action == "hold":
-        # A real keyboard waits before it repeats, so a key pressed for this very
-        # frame must not also arrive as a repeat inside it. A key that was
-        # already down got no keydown here, so it stays eligible to repeat -
-        # otherwise re-holding it would silence the repeat forever.
-        session.fresh_keys.update(
-            key_id for key_id in key_ids if key_id not in session.held_keys
-        )
-        session.held_keys.update(dict(zip(key_ids, normalized)))
+        for key_id, key in zip(key_ids, normalized):
+            if _held_slot(session, key) is not None:
+                # Already down under some spelling of this key; a second entry
+                # for it would survive the release of the first one.
+                continue
+            # A real keyboard waits before it repeats, so a key pressed for this
+            # very frame must not also arrive as a repeat inside it. A key that
+            # was already down got no keydown here, so it stays eligible to
+            # repeat - otherwise re-holding it would silence the repeat forever.
+            session.fresh_keys.add(key_id)
+            session.held_keys[key_id] = key
     elif selected_action == "release":
-        for key_id in key_ids:
+        for key in normalized:
+            key_id = _held_slot(session, key)
+            if key_id is None:
+                continue
             session.held_keys.pop(key_id, None)
             session.fresh_keys.discard(key_id)
 
@@ -1322,16 +2035,25 @@ def press_keys(
             runs = repetitions if selected_action == "tap" else 1
             for _ in range(runs):
                 down_events, up_events = _key_event_pair(
-                    session, key_ids, normalized, selected_action
+                    session, normalized, selected_action
                 )
                 if selected_action == "tap" and stepping:
                     _perform_key_events(driver, down_events)
-                    driver.switch_to.default_content()
-                    _auto_advance_render_after_input(session, frames_held)
-                    frames_advanced += frames_held
-                    if frame_selector:
-                        _select_frame(driver, frame_selector)
-                    _perform_key_events(driver, up_events)
+                    try:
+                        driver.switch_to.default_content()
+                        _auto_advance_render_after_input(session, frames_held)
+                        frames_advanced += frames_held
+                    finally:
+                        # The key is physically down in the browser from here on.
+                        # A frame advance that fails - a document that reloaded
+                        # and dropped the gate - must not end the call with the
+                        # key still down: a tap records nothing in this session's
+                        # state, so release_inputs could not reach it either.
+                        try:
+                            if frame_selector:
+                                _select_frame(driver, frame_selector)
+                        finally:
+                            _perform_key_events(driver, up_events)
                 else:
                     events = list(down_events)
                     if selected_action == "tap" and hold:
@@ -1365,11 +2087,208 @@ def press_keys(
         }
 
 
+class LocatorGone(ValueError):
+    """The document that could answer this locator is not open any more.
+
+    Waiting cannot bring a replaced document back, so the wait loops raise this
+    on sight instead of spending their whole timeout on it.
+    """
+
+
+_POINTER_FALLBACK_HINT = (
+    "A pointer action aimed at the node's page-level 'center' from "
+    "web_info(topic='page_outline') reaches frame content that element handles "
+    "cannot."
+)
+
+
+def _leave_element_frame(driver: Any) -> None:
+    """Put the driver back at the top document after acting inside a frame."""
+    try:
+        driver.switch_to.default_content()
+    except Exception:  # A dead session has nothing left to restore.
+        pass
+
+
+def _release_locator_frame(driver: Any, locator: str) -> None:
+    """Give the driver back after an action, without paying for it needlessly.
+
+    Only a ref handle or a piercing path can have entered a frame, so a plain CSS
+    selector - the overwhelmingly common case - costs no extra round trip.
+    """
+    try:
+        needs_release = page_perception.resolve_locator_expression(locator) is not None
+    except ValueError:
+        needs_release = False
+    if needs_release:
+        _leave_element_frame(driver)
+
+
+def _enter_action_frame(driver: Any, frame_selector: str | None, *locators: str) -> None:
+    """Enter the frame an action names, and refuse a locator that names another one.
+
+    ``frame_selector`` is the same one ``find`` and ``page_text`` take: it says
+    which document the plain CSS selectors are looked up in. A ref handle or a
+    piercing path already carries the document it was read from, so pairing the
+    two would let the caller name two different frames in one call and only one
+    of them could win.
+    """
+    if not frame_selector:
+        return
+    for locator in locators:
+        try:
+            carries_own_frame = page_perception.resolve_locator_expression(locator) is not None
+        except ValueError:
+            carries_own_frame = False
+        if carries_own_frame:
+            raise ValueError(
+                f"frame_selector '{frame_selector}' cannot be combined with '{locator}': an "
+                "element handle and a ' >>> ' path already name the document they came "
+                "from. Use one or the other."
+            )
+    _select_frame(driver, frame_selector)
+
+
+def _release_action_frame(driver: Any, frame_selector: str | None, locator: str) -> None:
+    """Give the driver back to the top document after a single-locator action."""
+    if frame_selector:
+        _leave_element_frame(driver)
+        return
+    _release_locator_frame(driver, locator)
+
+
+def _enter_ref_document(driver: Any, epoch: str) -> str | None:
+    """Switch the driver into the browsing context whose registry minted ``epoch``.
+
+    An element reference belongs to one browsing context: handed over from
+    another one it is refused as stale, which is why a ref read inside a frame
+    could never be acted on. The frame is therefore entered before the ref is
+    resolved, and the caller acts while the driver is still there.
+
+    Returns the path of the frame it entered ('' for the top document), or
+    ``None`` when no document in this tab minted the epoch. ``depth_limited`` in
+    the returned dict means the search stopped at its own bound rather than
+    exhausting the tab - a different thing to tell the caller than "it is gone".
+
+    The bound is two frames deeper than any topic walks, so a ref that could be
+    minted can always be followed back to the document that minted it.
+    """
+    driver.switch_to.default_content()
+    path: list[str] = []
+    depth_limited = False
+    for _ in range(page_perception.MAX_FRAME_DEPTH + 2):
+        try:
+            step = driver.execute_script(page_perception.FRAME_FOR_EPOCH_SCRIPT, epoch)
+        except WebDriverException:
+            return {"found": False, "depth_limited": depth_limited}
+        if not isinstance(step, dict):
+            return {"found": False, "depth_limited": depth_limited}
+        depth_limited = depth_limited or bool(step.get("depth_limited"))
+        if step.get("here"):
+            return {"found": True, "frame": " >>> ".join(path)}
+        frame = step.get("frame")
+        if frame is None:
+            return {"found": False, "depth_limited": depth_limited}
+        path.append(str(step.get("path") or "?"))
+        try:
+            driver.switch_to.frame(frame)
+        except WebDriverException:
+            # The frame went away between finding it and entering it.
+            return {"found": False, "depth_limited": depth_limited}
+    return {"found": False, "depth_limited": True}
+
+
+def _resolve_ref(driver: Any, locator: str, expression: str) -> Any:
+    epoch, _number = page_perception.parse_ref(locator)
+    driver.switch_to.default_content()
+    element = driver.execute_script(f"return {expression};")
+    if element is not None:
+        return element
+    located = _enter_ref_document(driver, epoch)
+    if not located["found"]:
+        _leave_element_frame(driver)
+        if located.get("depth_limited"):
+            # Telling this caller the handle is stale would send them to re-read a
+            # page that hands back the very same handle, forever.
+            raise ValueError(
+                f"Element handle '{locator}' was not found within the "
+                f"{page_perception.MAX_FRAME_DEPTH} frames deep this session walks; "
+                "its document may be nested deeper. Nothing that far in can be "
+                f"acted on by handle. {_POINTER_FALLBACK_HINT}"
+            )
+        raise LocatorGone(
+            f"Element handle '{locator}' was read from a document that is no longer "
+            "open in this tab - the page, or the frame that held it, was replaced or "
+            "removed - so it is stale. Read the page again with "
+            "web_info(topic='page_outline') and use the handle it reports now."
+        )
+    frame = located.get("frame") or ""
+    element = driver.execute_script(f"return {expression};")
+    if element is not None:
+        return element
+    _leave_element_frame(driver)
+    where = f"frame '{frame}'" if frame else "the page"
+    raise ValueError(
+        f"Element handle '{locator}' still names {where}, but the element it was "
+        "read from has been removed from it, so it is stale. Read the page again "
+        f"with web_info(topic='page_outline'). {_POINTER_FALLBACK_HINT}"
+    )
+
+
+def _resolve_piercing(driver: Any, locator: str) -> Any:
+    """Walk a ``a >>> b`` path one document at a time, entering frames on the way."""
+    remaining = [str(part) for part in (page_perception.split_piercing_path(locator) or [])]
+    driver.switch_to.default_content()
+    step: Any = None
+    for _ in range(8):
+        step = driver.execute_script(page_perception.PIERCING_STEP_SCRIPT, remaining)
+        if not isinstance(step, dict):
+            break
+        element = step.get("element")
+        if element is not None:
+            return element
+        frame = step.get("frame")
+        if frame is None:
+            break
+        rest = [str(part) for part in (step.get("rest") or [])]
+        try:
+            driver.switch_to.frame(frame)
+        except WebDriverException as exc:
+            _leave_element_frame(driver)
+            raise ValueError(
+                f"Piercing path '{locator}' names a frame that cannot be entered: "
+                f"{type(exc).__name__}. {_POINTER_FALLBACK_HINT}"
+            ) from exc
+        remaining = rest
+    _leave_element_frame(driver)
+    index = step.get("at") if isinstance(step, dict) else None
+    segment = (
+        remaining[index]
+        if isinstance(index, int) and 0 <= index < len(remaining)
+        else locator
+    )
+    if isinstance(step, dict) and step.get("invalid"):
+        raise ValueError(
+            f"Piercing path '{locator}' has a segment that is not valid CSS: '{segment}'."
+        )
+    raise ValueError(
+        f"Piercing path '{locator}' matches nothing at segment '{segment}'. Each "
+        "segment is looked up inside the previous one's shadow root or frame "
+        "document; read the page again with web_info(topic='page_outline') to see "
+        "what is there now."
+    )
+
+
 def _resolve_element(driver: Any, locator: str) -> Any:
     """Find one element from a CSS selector, a ``ref:<epoch>:N``, or a piercing path.
 
     Plain CSS keeps working exactly as before; ref handles and ``a >>> b`` are new
     forms that survive shadow roots and unstable DOM structure.
+
+    A ref or a path may name something inside a frame. The driver is switched into
+    that frame and **left there**, because an element handed over from another
+    browsing context is refused as stale; whoever acts on the element calls
+    ``_leave_element_frame`` afterwards.
     """
     expression = page_perception.resolve_locator_expression(locator)
     if expression is None:
@@ -1377,17 +2296,12 @@ def _resolve_element(driver: Any, locator: str) -> Any:
     if getattr(driver, "is_extension_bridge", False):
         raise ValueError(
             f"Locator '{locator}' needs a live element handle, which the companion "
-            "bridge cannot return. Use a CSS selector in current-Chrome mode."
+            f"bridge cannot return. Use a CSS selector in current-Chrome mode. "
+            f"{_POINTER_FALLBACK_HINT}"
         )
-    element = driver.execute_script(f"return {expression};")
-    if element is None:
-        raise ValueError(
-            f"Locator '{locator}' resolves to nothing in this document. A ref is only "
-            "valid for the page it was read from and only while its element is still "
-            "attached, so this one is stale - read the page again with "
-            "web_info(topic='page_outline') and use the ref it reports now."
-        )
-    return element
+    if page_perception.REF_PATTERN.match(str(locator).strip()):
+        return _resolve_ref(driver, str(locator).strip(), expression)
+    return _resolve_piercing(driver, str(locator).strip())
 
 
 _ELEMENT_STATES = {
@@ -1424,11 +2338,18 @@ def _wait_for_locator(driver: Any, locator: str, state: str, timeout: float) -> 
             element = _resolve_element(driver, locator)
             if _element_reached_state(element, state):
                 return element
+        except LocatorGone:
+            # A replaced document never comes back, so polling for it would only
+            # spend the timeout before saying the same thing.
+            raise
         except ValueError as exc:
             failure = str(exc)
         except WebDriverException as exc:
             failure = f"{type(exc).__name__}: {exc}"
         if time.monotonic() >= deadline:
+            # The element may have resolved inside a frame without ever reaching
+            # the state; nobody is going to act on it now, so give the driver back.
+            _leave_element_frame(driver)
             raise TimeoutException(failure)
         time.sleep(0.1)
 
@@ -1444,8 +2365,10 @@ def get_page_outline(
     session = _get_session(session_id)
     with session.lock:
         driver = session.driver
-        _select_frame(driver, frame_selector)
+        # Inside the try: a frame selection that fails part-way can leave the
+        # driver in a frame, and then the next read answers for that frame.
         try:
+            _select_frame(driver, frame_selector)
             result = page_perception.outline(
                 driver,
                 limit=limit,
@@ -1453,7 +2376,7 @@ def get_page_outline(
                 format=output,
             )
         finally:
-            driver.switch_to.default_content()
+            _leave_element_frame(driver)
         return {**result, "session_id": session_id, "frame_selector": frame_selector}
 
 
@@ -1468,13 +2391,13 @@ def get_page_text(
     session = _get_session(session_id)
     with session.lock:
         driver = session.driver
-        _select_frame(driver, frame_selector)
         try:
+            _select_frame(driver, frame_selector)
             result = page_perception.page_text(
                 driver, max_chars=max_chars, mode=mode, include_links=include_links
             )
         finally:
-            driver.switch_to.default_content()
+            _leave_element_frame(driver)
         return {**result, "session_id": session_id, "frame_selector": frame_selector}
 
 
@@ -1490,13 +2413,13 @@ def find_elements(
     session = _get_session(session_id)
     with session.lock:
         driver = session.driver
-        _select_frame(driver, frame_selector)
         try:
+            _select_frame(driver, frame_selector)
             result = page_perception.find(
                 driver, query, role=role, limit=limit, visible_only=visible_only
             )
         finally:
-            driver.switch_to.default_content()
+            _leave_element_frame(driver)
         return {**result, "session_id": session_id, "frame_selector": frame_selector}
 
 
@@ -1569,6 +2492,32 @@ def _console_since(
     }
 
 
+def _console_note(session: BrowserSession) -> str:
+    """Say when this session's recording actually started, per backend.
+
+    "Reload to capture load-time output" is false on both backends now and would
+    cost a reload to learn nothing: the companion arms capture while its tab is
+    still blank, and the Selenium hook is installed into every new document
+    before the document's own first script. A tab claimed with ``attach_tab`` is
+    the real exception - what it did before the claim was recorded by nobody.
+    """
+    if session.profile_mode == "current" and not session.owns_tab:
+        return (
+            "Recording started when this session claimed the tab: whatever the page "
+            "logged before that was recorded by nobody. Reload the page to see a "
+            "whole load."
+        )
+    if session.profile_mode == "current":
+        return (
+            "The companion armed recording while this tab was still blank, so "
+            "load-time output is already included; no reload is needed."
+        )
+    return (
+        "The console hook runs before each document's own first script, so "
+        "load-time output is already included; no reload is needed."
+    )
+
+
 def get_console(
     session_id: str = "default",
     levels: list[str] | None = None,
@@ -1611,10 +2560,7 @@ def get_console(
             "cursor_reset": payload["cursor_reset"],
             "dropped": payload["dropped"],
             "levels": levels or list(diagnostics.LEVELS),
-            "note": (
-                "The buffer starts when the session connects; reload the page to "
-                "capture load-time output."
-            ),
+            "note": _console_note(session),
         }
 
 
@@ -1628,22 +2574,41 @@ def get_network(
     limit: int = 50,
     output: str = "text",
 ) -> dict[str, Any]:
-    """List finished HTTP requests made by the page."""
+    """List finished HTTP requests made by the page.
+
+    Recording starts when the session takes its tab, not when this is first
+    called, so the requests of the very first navigation are here to be read. A
+    tab claimed with ``attach_tab`` is recorded from the moment it was claimed:
+    whatever it did before that was observed by nobody and cannot be recovered.
+
+    Both backends keep a bounded history - the newest 500 records - so a session
+    that outlives its own buffer loses the oldest requests rather than growing
+    without limit. ``dropped`` says how many went that way instead of leaving the
+    gap to be mistaken for a quiet page.
+    """
     session = _get_session(session_id)
     with session.lock:
         driver = session.driver
         if hasattr(driver, "get_events"):
-            if not session.network_subscribed:
+            # The tab subscribed when it opened; this only repairs a subscription
+            # that failed then. It can never recover traffic from before it runs,
+            # which is why it cannot be the only place capture is turned on. A
+            # stand-in driver that does not track the flag is already capturing.
+            if not getattr(driver, "events_subscribed", True):
                 driver.subscribe_events(["console", "network"])
-                session.network_subscribed = True
             payload = driver.get_events(kinds=["network"], since_seq=0, limit=500)
             rows = list(payload.get("entries") or [])
+            dropped = int((payload.get("dropped") or {}).get("network") or 0)
         else:
             session.network_rows.extend(
                 diagnostics.selenium_network_rows(driver, session.network_pending)
             )
-            session.network_rows = session.network_rows[-500:]
+            overflow = len(session.network_rows) - 500
+            if overflow > 0:
+                del session.network_rows[:overflow]
+                session.network_dropped += overflow
             rows = list(session.network_rows)
+            dropped = session.network_dropped
         selected = diagnostics.filter_network(
             rows, url_pattern, types, status_min, status_max, only_errors, limit
         )
@@ -1652,6 +2617,7 @@ def get_network(
             "session_id": session_id,
             "returned": len(selected),
             "only_errors": bool(only_errors),
+            "dropped": dropped,
         }
         if output == "json":
             response["requests"] = selected
@@ -1706,21 +2672,22 @@ _VIEWPORT_SCRIPT = "return {width: window.innerWidth, height: window.innerHeight
 
 def _pointer_context(
     driver: webdriver.Chrome, frame_selector: str | None
-) -> tuple[float, float, dict[str, Any]]:
-    """Resolve the frame offset and viewport once, because CDP input is page-absolute."""
+) -> tuple[_FrameMap, dict[str, Any]]:
+    """Resolve the frame's page mapping and viewport once, in that document's terms."""
     driver.switch_to.default_content()
+    frame_map = _frame_map(driver, frame_selector)
     if not frame_selector:
-        return 0.0, 0.0, driver.execute_script(_VIEWPORT_SCRIPT)
-    frame = WebDriverWait(driver, 10).until(
-        conditions.visibility_of_element_located((By.CSS_SELECTOR, frame_selector))
-    )
-    rect = driver.execute_script(_FRAME_ORIGIN_SCRIPT, frame)
+        return frame_map, {
+            "width": frame_map.page_width,
+            "height": frame_map.page_height,
+        }
+    frame = driver.find_element(By.CSS_SELECTOR, frame_selector)
     driver.switch_to.frame(frame)
     try:
         viewport = driver.execute_script(_VIEWPORT_SCRIPT)
     finally:
         driver.switch_to.default_content()
-    return float(rect["x"]), float(rect["y"]), viewport
+    return frame_map, viewport
 
 
 def _pointer_dispatch(
@@ -1729,8 +2696,7 @@ def _pointer_dispatch(
     x: float,
     y: float,
     viewport: dict[str, Any],
-    offset_x: float = 0.0,
-    offset_y: float = 0.0,
+    frame_map: _FrameMap | None = None,
     end_x: float | None = None,
     end_y: float | None = None,
     button: str = "left",
@@ -1767,13 +2733,18 @@ def _pointer_dispatch(
         raise ValueError("button must be 'left', 'right', or 'middle'")
     duration = max(0.0, min(float(duration_seconds), 5.0))
     unbounded = selected_coordinate_mode == "relative"
-    current_local_x = session.pointer_x - offset_x
-    current_local_y = session.pointer_y - offset_y
-    if unbounded and not session.pointer_initialized:
-        # Start a relative run from the middle so small deltas stay on screen.
-        current_local_x = float(viewport["width"]) / 2
-        current_local_y = float(viewport["height"]) / 2
+    mapping = frame_map if frame_map is not None else _FrameMap(
+        page_width=float(viewport["width"]), page_height=float(viewport["height"])
+    )
     if selected_coordinate_mode in {"delta", "relative"}:
+        # A run continues from wherever this session's last event landed, which
+        # is also the position Chrome measures movementX/movementY against.
+        # Teleporting somewhere else first - the viewport middle, say - turns the
+        # first small delta of a pointer-locked run into a several-hundred-pixel
+        # look-jump, because the warp itself is a movement the game reads.
+        current_local_x, current_local_y = mapping.to_local(
+            session.pointer_x, session.pointer_y
+        )
         local_x = current_local_x + float(x)
         local_y = current_local_y + float(y)
     else:
@@ -1798,10 +2769,16 @@ def _pointer_dispatch(
     ):
         raise ValueError("Pointer end coordinates must be inside the selected viewport")
 
-    start_x = local_x + offset_x
-    start_y = local_y + offset_y
-    finish_x = local_end_x + offset_x
-    finish_y = local_end_y + offset_y
+    if unbounded:
+        # A locked pointer has no position on the page at all, so its coordinates
+        # are only a running total that movement is measured from.
+        start_x, start_y = mapping.to_page(local_x, local_y)
+        finish_x, finish_y = mapping.to_page(local_end_x, local_end_y)
+    else:
+        start_x, start_y = _page_point(mapping, local_x, local_y, "Pointer position")
+        finish_x, finish_y = _page_point(
+            mapping, local_end_x, local_end_y, "Pointer end position"
+        )
     modifiers = _session_modifiers(session)
 
     def dispatch(event_type: str, px: float, py: float, **extra: Any) -> None:
@@ -1901,15 +2878,6 @@ def _pointer_dispatch(
         )
     session.pointer_x = finish_x if selected_action == "drag" else start_x
     session.pointer_y = finish_y if selected_action == "drag" else start_y
-    session.pointer_initialized = True
-    if unbounded and (
-        abs(session.pointer_x) > 100_000 or abs(session.pointer_y) > 100_000
-    ):
-        # Relative runs never clamp, so recentre before the numbers get silly:
-        # dropping the flag makes the next one start from the viewport middle again.
-        session.pointer_x = 0.0
-        session.pointer_y = 0.0
-        session.pointer_initialized = False
     return {
         "success": True,
         "action": requested_action,
@@ -1955,20 +2923,25 @@ def pointer_action(
 
     ``coordinate_mode='relative'`` skips the viewport bounds check and moves the
     pointer by a delta without clamping, which is what a pointer-locked game
-    needs: the cursor never moves, only ``movementX``/``movementY`` matter.
+    needs: the cursor never moves, only ``movementX``/``movementY`` matter. Each
+    delta is measured from where this session last put the pointer - the lock
+    click counts - so the movement a game reads is exactly the delta asked for.
+
+    With a ``frame_selector`` the coordinates are the frame's own, carried onto
+    the page through any CSS transform between the two; a point that maps outside
+    the window is refused rather than dispatched into nowhere.
     """
     session = _get_session(session_id)
     with session.lock:
         driver = session.driver
-        offset_x, offset_y, viewport = _pointer_context(driver, frame_selector)
+        frame_map, viewport = _pointer_context(driver, frame_selector)
         result = _pointer_dispatch(
             session,
             action,
             x,
             y,
             viewport,
-            offset_x=offset_x,
-            offset_y=offset_y,
+            frame_map=frame_map,
             end_x=end_x,
             end_y=end_y,
             button=button,
@@ -1988,29 +2961,150 @@ def pointer_action(
 
 
 
-# CDP input is addressed in top-level page pixels, so a frame's offset must be
-# the origin of its *content* box. Using the border box misses by exactly the
-# border and padding, which silently skews every click inside a framed game.
-_FRAME_ORIGIN_SCRIPT = """
+# CDP input is addressed in top-level page pixels, so a point inside a frame has
+# to be carried through everything that stands between the two: the origin of the
+# frame's *content* box - the border box misses by exactly the border and padding
+# - and any CSS transform on the frame or on an ancestor. The linear part of that
+# chain is the product of the ancestors' `transform` matrices; transform-origin,
+# scrolling and layout only add translation, and that is recovered from the box
+# the browser actually painted, so scale, rotation and skew all come out right.
+# A 3D/perspective chain is not affine and says so instead of being mis-aimed.
+_FRAME_MAP_SCRIPT = """
 const frame = arguments[0];
+let linear = new DOMMatrix();
+let flat = true;
+for (let node = frame; node; node = node.parentElement) {
+  const value = getComputedStyle(node).transform;
+  if (value && value !== 'none') {
+    const step = new DOMMatrix(value);
+    if (!step.is2D) flat = false;
+    linear = step.multiply(linear);
+  }
+}
+linear.e = 0;
+linear.f = 0;
+const width = frame.offsetWidth;
+const height = frame.offsetHeight;
+const corners = [[0, 0], [width, 0], [width, height], [0, height]].map(
+  ([x, y]) => linear.transformPoint(new DOMPoint(x, y))
+);
 const rect = frame.getBoundingClientRect();
+const shiftX = rect.left - Math.min(...corners.map(point => point.x));
+const shiftY = rect.top - Math.min(...corners.map(point => point.y));
 const style = getComputedStyle(frame);
+const insetX = parseFloat(style.borderLeftWidth || 0) + parseFloat(style.paddingLeft || 0);
+const insetY = parseFloat(style.borderTopWidth || 0) + parseFloat(style.paddingTop || 0);
+const origin = linear.transformPoint(new DOMPoint(insetX, insetY));
+const unitX = linear.transformPoint(new DOMPoint(insetX + 1, insetY));
+const unitY = linear.transformPoint(new DOMPoint(insetX, insetY + 1));
 return {
-  x: rect.x + parseFloat(style.borderLeftWidth || 0) + parseFloat(style.paddingLeft || 0),
-  y: rect.y + parseFloat(style.borderTopWidth || 0) + parseFloat(style.paddingTop || 0)
+  x: origin.x + shiftX, y: origin.y + shiftY,
+  ax: unitX.x - origin.x, ay: unitX.y - origin.y,
+  bx: unitY.x - origin.x, by: unitY.y - origin.y,
+  flat: flat,
+  page_width: window.innerWidth, page_height: window.innerHeight
 };
 """
 
 
-def _frame_offset(driver: webdriver.Chrome, frame_selector: str | None) -> tuple[float, float]:
-    """Return the top-level offset of a frame; CDP input is always page-absolute."""
+@dataclass(frozen=True)
+class _FrameMap:
+    """Where a point inside a frame lands in the top-level page CDP aims at.
+
+    The default is the identity: with no frame selector, frame coordinates and
+    page coordinates are the same thing.
+    """
+
+    x: float = 0.0
+    y: float = 0.0
+    ax: float = 1.0
+    ay: float = 0.0
+    bx: float = 0.0
+    by: float = 1.0
+    page_width: float = 0.0
+    page_height: float = 0.0
+    flat: bool = True
+
+    def to_page(self, local_x: float, local_y: float) -> tuple[float, float]:
+        return (
+            self.x + self.ax * local_x + self.bx * local_y,
+            self.y + self.ay * local_x + self.by * local_y,
+        )
+
+    def to_local(self, page_x: float, page_y: float) -> tuple[float, float]:
+        determinant = self.ax * self.by - self.bx * self.ay
+        if abs(determinant) < 1e-9:
+            # A frame collapsed to nothing by its transform: no point in it has a
+            # place on the page, so there is nothing to move relative to.
+            raise ValueError(
+                "The selected frame is scaled to zero on this page, so pointer "
+                "coordinates inside it cannot be placed"
+            )
+        dx = page_x - self.x
+        dy = page_y - self.y
+        return (
+            (dx * self.by - dy * self.bx) / determinant,
+            (dy * self.ax - dx * self.ay) / determinant,
+        )
+
+    def on_page(self, page_x: float, page_y: float) -> bool:
+        if not self.page_width or not self.page_height:
+            return True
+        return 0 <= page_x < self.page_width and 0 <= page_y < self.page_height
+
+
+def _frame_map(driver: webdriver.Chrome, frame_selector: str | None) -> _FrameMap:
+    """Resolve how the named frame maps onto the page; CDP input is page-absolute."""
     if not frame_selector:
-        return 0.0, 0.0
+        page = driver.execute_script(_VIEWPORT_SCRIPT)
+        return _FrameMap(
+            page_width=float(page["width"]), page_height=float(page["height"])
+        )
     frame = WebDriverWait(driver, 10).until(
         conditions.visibility_of_element_located((By.CSS_SELECTOR, frame_selector))
     )
-    rect = driver.execute_script(_FRAME_ORIGIN_SCRIPT, frame)
-    return float(rect["x"]), float(rect["y"])
+    mapped = driver.execute_script(_FRAME_MAP_SCRIPT, frame)
+    if not mapped["flat"]:
+        # A perspective projection is not affine, so this mapping is the best
+        # flat approximation of it rather than the truth. Saying so beats a
+        # click that lands a little off with nothing to explain it.
+        logger.warning(
+            "Frame '%s' sits under a 3D transform; pointer coordinates inside it "
+            "are mapped by their flat approximation and may be a few pixels off",
+            frame_selector,
+        )
+    return _FrameMap(
+        x=float(mapped["x"]),
+        y=float(mapped["y"]),
+        ax=float(mapped["ax"]),
+        ay=float(mapped["ay"]),
+        bx=float(mapped["bx"]),
+        by=float(mapped["by"]),
+        page_width=float(mapped["page_width"]),
+        page_height=float(mapped["page_height"]),
+        flat=bool(mapped["flat"]),
+    )
+
+
+def _page_point(
+    frame_map: _FrameMap, local_x: float, local_y: float, what: str
+) -> tuple[float, float]:
+    """Map a frame-local point onto the page, refusing one the window cannot reach.
+
+    A frame scrolled half out of the window still answers questions about its own
+    viewport, so the local coordinate looks fine while the page coordinate it maps
+    to is off-screen. CDP drops that event without a word, which reads exactly
+    like a game that ignored the click.
+    """
+    page_x, page_y = frame_map.to_page(local_x, local_y)
+    if not frame_map.on_page(page_x, page_y):
+        raise ValueError(
+            f"{what} ({local_x:g}, {local_y:g}) is inside the frame but lands at "
+            f"({page_x:g}, {page_y:g}) in the page, outside the "
+            f"{frame_map.page_width:g}x{frame_map.page_height:g} window, so no event "
+            "would reach it. Scroll the frame into view first."
+        )
+    return page_x, page_y
 
 
 def set_touch_emulation(
@@ -2045,6 +3139,7 @@ def set_touch_emulation(
             driver.refresh()
             session.held_keys.clear()
             session.held_buttons.clear()
+            session.held_touches.clear()
             session.render_mode = "normal"
             session.render_frame_selector = None
             session.pointer_locked = False
@@ -2083,7 +3178,9 @@ def touch_action(
     """Dispatch touch input: tap, multi-finger press/move/release, or a swipe.
 
     ``points`` carries one entry per finger as ``{"x":.., "y":.., "id":..}``;
-    ``swipe`` additionally reads ``end_x``/``end_y`` from each entry.
+    ``swipe`` additionally reads ``end_x``/``end_y`` from each entry. ``release``
+    lifts exactly the fingers it names - by ``id`` alone if the finger is already
+    down - and every finger this session holds when it names none.
     """
     selected_action = action.strip().lower()
     if selected_action not in {"tap", "press", "move", "release", "swipe", "cancel"}:
@@ -2100,27 +3197,46 @@ def touch_action(
     session = _get_session(session_id)
     with session.lock:
         driver = session.driver
-        driver.switch_to.default_content()
-        offset_x, offset_y = _frame_offset(driver, frame_selector)
+        frame_map, viewport = _pointer_context(driver, frame_selector)
+
+        def resolve(index: int, entry: dict[str, Any], progress: float) -> dict[str, Any]:
+            identifier = int(entry.get("id", index))
+            tracked = session.held_touches.get(identifier)
+            if "x" not in entry:
+                # A finger that is already down can be named by id alone.
+                if tracked is None:
+                    raise ValueError(
+                        f"Touch point id {identifier} is not down in this session, so "
+                        "it has no position; give 'x' and 'y', or leave 'points' out "
+                        "to lift every finger"
+                    )
+                return dict(tracked)
+            start_x = float(entry["x"])
+            start_y = float(entry["y"])
+            local_x = start_x + (float(entry.get("end_x", start_x)) - start_x) * progress
+            local_y = start_y + (float(entry.get("end_y", start_y)) - start_y) * progress
+            if (
+                not 0 <= local_x < float(viewport["width"])
+                or not 0 <= local_y < float(viewport["height"])
+            ):
+                # Chrome takes an off-screen touch without a word and the page
+                # never hears about it, which reads like a game that ignored it.
+                raise ValueError(
+                    f"Touch point ({local_x:g}, {local_y:g}) is outside the selected "
+                    f"{float(viewport['width']):g}x{float(viewport['height']):g} viewport"
+                )
+            page_x, page_y = _page_point(frame_map, local_x, local_y, "Touch point")
+            return {
+                "x": page_x,
+                "y": page_y,
+                "id": identifier,
+                "radiusX": float(entry.get("radius_x", 6.0)),
+                "radiusY": float(entry.get("radius_y", 6.0)),
+                "force": float(entry.get("force", 1.0)),
+            }
 
         def touch_points(progress: float) -> list[dict[str, Any]]:
-            resolved = []
-            for index, entry in enumerate(entries):
-                start_x = float(entry["x"])
-                start_y = float(entry["y"])
-                target_x = float(entry.get("end_x", start_x))
-                target_y = float(entry.get("end_y", start_y))
-                resolved.append(
-                    {
-                        "x": offset_x + start_x + (target_x - start_x) * progress,
-                        "y": offset_y + start_y + (target_y - start_y) * progress,
-                        "id": int(entry.get("id", index)),
-                        "radiusX": float(entry.get("radius_x", 6.0)),
-                        "radiusY": float(entry.get("radius_y", 6.0)),
-                        "force": float(entry.get("force", 1.0)),
-                    }
-                )
-            return resolved
+            return [resolve(index, entry, progress) for index, entry in enumerate(entries)]
 
         def dispatch(event_type: str, resolved: list[dict[str, Any]]) -> None:
             driver.execute_cdp_cmd(
@@ -2128,24 +3244,53 @@ def touch_action(
                 {"type": event_type, "touchPoints": resolved, "modifiers": _session_modifiers(session)},
             )
 
+        def press(resolved: list[dict[str, Any]]) -> None:
+            dispatch("touchStart", resolved)
+            for point in resolved:
+                session.held_touches[point["id"]] = point
+
+        def lift(resolved: list[dict[str, Any]]) -> None:
+            # touchEnd carries the fingers that came up. An empty list ends every
+            # one of them, so a two-finger gesture would lose the finger it meant
+            # to keep - and Chrome then refuses to move that finger at all.
+            dispatch("touchEnd", resolved)
+            for point in resolved:
+                session.held_touches.pop(point["id"], None)
+
         if selected_action == "cancel":
+            # Chrome rejects a touchCancel that names points: it cancels the lot.
             dispatch("touchCancel", [])
+            session.held_touches.clear()
         elif selected_action == "press":
-            dispatch("touchStart", touch_points(0.0))
+            press(touch_points(0.0))
         elif selected_action == "move":
-            dispatch("touchMove", touch_points(1.0))
+            moved = touch_points(1.0)
+            dispatch("touchMove", moved)
+            for point in moved:
+                session.held_touches[point["id"]] = point
         elif selected_action == "release":
-            dispatch("touchEnd", [])
+            lifted = touch_points(0.0) if entries else list(session.held_touches.values())
+            if lifted:
+                lift(lifted)
+            else:
+                # Nothing on the books - fingers from before this session started
+                # tracking, or none at all - so fall back to ending everything.
+                dispatch("touchEnd", [])
         elif selected_action == "tap":
-            dispatch("touchStart", touch_points(0.0))
-            dispatch("touchEnd", [])
+            resolved = touch_points(0.0)
+            press(resolved)
+            lift(resolved)
         else:
-            dispatch("touchStart", touch_points(0.0))
-            for step in range(1, interpolation + 1):
-                dispatch("touchMove", touch_points(step / interpolation))
-                if duration:
-                    time.sleep(duration / interpolation)
-            dispatch("touchEnd", [])
+            press(touch_points(0.0))
+            try:
+                for step in range(1, interpolation + 1):
+                    dispatch("touchMove", touch_points(step / interpolation))
+                    if duration:
+                        time.sleep(duration / interpolation)
+            finally:
+                # A swipe that dies half way through must not leave the finger
+                # planted on the page for every later gesture to fight with.
+                lift(touch_points(1.0))
         if _advance_frame:
             _auto_advance_render_after_input(session)
         _wait_after_action(driver, wait_seconds)
@@ -2155,6 +3300,7 @@ def touch_action(
             "action": selected_action,
             "points": len(entries),
             "touch_enabled": session.touch_enabled,
+            "active_touches": sorted(session.held_touches),
             "frame_selector": frame_selector,
         }
 
@@ -2219,9 +3365,9 @@ def pointer_lock(
         finally:
             driver.switch_to.default_content()
         if selected_action == "acquire":
-            offset_x, offset_y = _frame_offset(driver, frame_selector)
-            click_x = offset_x + float(rect["x"])
-            click_y = offset_y + float(rect["y"])
+            click_x, click_y = _frame_map(driver, frame_selector).to_page(
+                float(rect["x"]), float(rect["y"])
+            )
             for event_type in ("mousePressed", "mouseReleased"):
                 driver.execute_cdp_cmd(
                     "Input.dispatchMouseEvent",
@@ -2234,6 +3380,10 @@ def pointer_lock(
                         "clickCount": 1,
                     },
                 )
+            # This click is the last thing Chrome saw the mouse do, so it is the
+            # position the first relative move must be measured from.
+            session.pointer_x = click_x
+            session.pointer_y = click_y
         _select_frame(driver, frame_selector)
         try:
             if selected_action != "status":
@@ -2314,26 +3464,33 @@ def input_batch(
         tapped = [item["key"] for item in normalized_keys if item["action"] == "tap"]
         if normalized_keys:
             # One frame switch, one focus and one event stream for the whole
-            # batch: per-action round-trips are what make input feel laggy.
+            # batch: per-action round-trips are what make input feel laggy. The
+            # stream is built against a staged copy of the key state and the real
+            # state is written only once the browser has the events - a batch that
+            # dies on its frame switch or its focus must not leave the session
+            # believing it holds keys the page never saw, because every later
+            # keystroke would then carry that phantom modifier.
+            staged = _StagedKeys.of(session)
             events: list[dict[str, Any]] = []
             for item in normalized_keys:
                 key_ids = [item["key"].strip().upper()]
                 normalized = [_normalize_game_key(item["key"])]
                 action = "hold" if item["action"] == "tap" else item["action"]
-                down, up = _key_event_pair(session, key_ids, normalized, action)
+                down, up = _key_event_pair(staged, normalized, action)
                 events.extend(down)
                 events.extend(up)
-                _commit_held_keys(session, key_ids, normalized, action)
+                _commit_held_keys(staged, key_ids, normalized, action)
             _select_frame(driver, frame_selector)
             try:
                 _focus_target(driver, target_selector, "focus")
                 if events:
                     _perform_key_events(driver, events)
+                staged.commit_to(session)
             finally:
                 if frame_selector:
                     driver.switch_to.default_content()
         if normalized_pointers:
-            offset_x, offset_y, viewport = _pointer_context(driver, frame_selector)
+            frame_map, viewport = _pointer_context(driver, frame_selector)
             for item in normalized_pointers:
                 result = _pointer_dispatch(
                     session,
@@ -2341,8 +3498,7 @@ def input_batch(
                     float(item["x"]),
                     float(item["y"]),
                     viewport,
-                    offset_x=offset_x,
-                    offset_y=offset_y,
+                    frame_map=frame_map,
                     end_x=float(item["end_x"]) if item.get("end_x") is not None else None,
                     end_y=float(item["end_y"]) if item.get("end_y") is not None else None,
                     button=str(item.get("button", "left")),
@@ -2368,19 +3524,28 @@ def input_batch(
                     }
                 )
         frame_advanced = session.render_mode == "step"
-        _auto_advance_render_after_input(session)
-        if tapped:
-            key_ids = [key.strip().upper() for key in tapped]
-            normalized = [_normalize_game_key(key) for key in tapped]
-            _, up = _key_event_pair(session, key_ids, normalized, "release")
-            _commit_held_keys(session, key_ids, normalized, "release")
-            if up:
-                _select_frame(driver, frame_selector)
-                try:
-                    _perform_key_events(driver, up)
-                finally:
-                    if frame_selector:
-                        driver.switch_to.default_content()
+        try:
+            _auto_advance_render_after_input(session)
+        finally:
+            # Whatever the frame did, the taps this batch pressed have to come
+            # back up; a failed advance must not leave them down for good.
+            if tapped:
+                key_ids = [key.strip().upper() for key in tapped]
+                normalized = [_normalize_game_key(key) for key in tapped]
+                _, up = _key_event_pair(session, normalized, "release")
+                if up:
+                    try:
+                        _select_frame(driver, frame_selector)
+                    finally:
+                        try:
+                            _perform_key_events(driver, up)
+                            # Only a key the browser really lifted is forgotten;
+                            # one that could not be sent stays on the books so
+                            # release_inputs can still reach it.
+                            _commit_held_keys(session, key_ids, normalized, "release")
+                        finally:
+                            if frame_selector:
+                                driver.switch_to.default_content()
         _wait_after_action(driver, wait_seconds)
         return {
             **_action_summary(driver, session_id, include_summary),
@@ -2563,6 +3728,7 @@ def game_probe(
             "held_inputs": {
                 "keys": sorted(session.held_keys),
                 "buttons": sorted(session.held_buttons),
+                "touches": sorted(session.held_touches),
             },
         }
 
@@ -2586,6 +3752,27 @@ const nativePerformanceNow = performance.now.bind(performance);
 const nativeDateNow = Date.now.bind(Date);
 const epochOffset = nativeDateNow() - nativePerformanceNow();
 
+// Yielding between frames must not be a timer. A tab nobody is looking at - and
+// agent tabs open in the background so the user can keep working - clamps
+// setTimeout to about a second, and to a minute once intensive throttling kicks
+// in, so stepping sixty frames through nativeSetTimeout took 53 seconds where a
+// visible tab took 241 ms. A MessageChannel message is still a macrotask, so page
+// work, network callbacks and microtasks run between frames exactly as before,
+// but nothing throttles it.
+const yieldChannel = typeof MessageChannel === 'function' ? new MessageChannel() : null;
+const yieldQueue = [];
+if (yieldChannel) {
+  yieldChannel.port1.onmessage = () => {
+    const task = yieldQueue.shift();
+    if (task) task();
+  };
+}
+const yieldTask = task => {
+  if (!yieldChannel) { nativeSetTimeout(task, 0); return; }
+  yieldQueue.push(task);
+  yieldChannel.port2.postMessage(0);
+};
+
 const state = {
     mode: 'normal',
     targetFps: null,
@@ -2607,6 +3794,9 @@ const state = {
     timers: new Map(),
     liveTimers: new Map(),
     timer: null,
+    // How deep inside a chain of timer callbacks the gate currently is, which is
+    // what decides whether the next setTimeout gets the spec's nesting clamp.
+    timerDepth: 0,
     nativeRequest: nativeRequest,
     nativeCancel: nativeCancel
 };
@@ -2637,12 +3827,17 @@ state.restoreClock = () => {
 state.wrapTimer = (callback, delay, args, interval) => {
     if (typeof callback !== 'function') return null;
     const id = state.nextTimerId--;
-    const wait = interval === null
-      ? Math.max(0, Number(delay) || 0)
-      : Math.max(1, Number(delay) || 0);
+    const depth = state.timerDepth + 1;
+    // HTML clamps a timeout scheduled from inside a timer to 4ms once the chain
+    // is five deep, and that clamp is all that stands between a `setTimeout(loop,
+    // 0)` game loop and an unbounded run of ticks inside a single frame, every
+    // one of them reading the same instant off the frozen clock.
+    const floor = interval === null ? (depth > 5 ? 4 : 0) : 1;
+    const wait = Math.max(floor, Number(delay) || 0);
     if (state.gated() && state.gateTimers) {
       state.timers.set(id, {
-        callback: callback, args: args, interval: interval, due: state.now() + wait
+        callback: callback, args: args, interval: interval,
+        due: state.now() + wait, depth: depth
       });
       // A queued timer is work that only a released frame can run, so it has to
       // be able to start the pump on its own; in step mode this does nothing and
@@ -2744,32 +3939,59 @@ state.releaseTimers = referenceNow => {
       });
     }
 };
-state.runDueTimers = now => {
+// A released frame covers `frameDelta` of virtual time, and every timer whose
+// deadline falls inside that span really did come due inside it. So they run in
+// deadline order with the page-visible clock parked at each one's own deadline,
+// and an interval keeps its phase instead of being pushed to the end of the
+// frame - rescheduling from `now` stretched every period out to a whole frame,
+// which made a 5ms interval tick once per frame instead of three times, and made
+// a 16ms one indistinguishable from a 100ms one under a 100ms frame delta.
+state.runDueTimers = (now, spanStart) => {
     if (!state.gateTimers || !state.timers.size) return 0;
+    const steer = state.gated() && state.freezeTime;
+    let cursor = spanStart === undefined ? now : Math.min(spanStart, now);
     let count = 0;
-    for (let guard = 0; guard < 64; guard++) {
-      const due = Array.from(state.timers.entries())
-        .filter(entry => entry[1].due <= now)
-        .sort((a, b) => a[1].due - b[1].due);
-      if (!due.length) break;
-      for (const [id, entry] of due) {
-        if (entry.interval) entry.due = now + entry.interval;
-        else state.timers.delete(id);
-        try { entry.callback(...entry.args); }
-        catch (error) { nativeSetTimeout(() => { throw error; }, 0); }
-        count += 1;
+    while (count < 512) {
+      let dueId = null;
+      let due = null;
+      for (const [id, entry] of state.timers) {
+        if (entry.due <= now && (due === null || entry.due < due.due)) {
+          dueId = id;
+          due = entry;
+        }
+      }
+      if (due === null) break;
+      cursor = Math.max(cursor, Math.min(now, due.due));
+      if (steer) state.virtualNow = cursor;
+      if (due.interval) due.due += due.interval;
+      else state.timers.delete(dueId);
+      const outerDepth = state.timerDepth;
+      state.timerDepth = due.depth || 1;
+      try { due.callback(...due.args); }
+      catch (error) { nativeSetTimeout(() => { throw error; }, 0); }
+      finally { state.timerDepth = outerDepth; }
+      count += 1;
+    }
+    if (count >= 512) {
+      // The page wants more timer work than one frame can hold. Carrying the
+      // backlog forward would make every later frame slower still, so the
+      // stragglers give up their missed ticks the way a real browser does.
+      for (const entry of state.timers.values()) {
+        if (entry.interval && entry.due <= now) entry.due = now + entry.interval;
       }
     }
+    if (steer) state.virtualNow = now;
     return count;
 };
 
 state.flush = () => {
+    const previous = state.lastFrame;
     if (state.gated() && state.freezeTime) state.virtualNow += state.frameDelta;
     else state.virtualNow = nativePerformanceNow();
     const timestamp = state.now();
     state.lastFrame = timestamp;
     state.frameCount += 1;
-    state.runDueTimers(timestamp);
+    state.runDueTimers(timestamp, previous);
     const batch = Array.from(state.pending.entries());
     state.pending.clear();
     for (const [, callback] of batch) {
@@ -2792,11 +4014,22 @@ state.schedule = () => {
     if (state.mode !== 'throttled' || state.timer !== null || !state.pumpWanted()) return;
     const elapsed = nativePerformanceNow() - state.lastRealFlush;
     const delay = Math.max(0, state.interval - elapsed);
-    state.timer = nativeSetTimeout(() => {
+    const pump = () => {
       state.timer = null;
+      if (state.mode !== 'throttled') return;
       state.lastRealFlush = nativePerformanceNow();
       state.flush();
-    }, delay);
+    };
+    // A pump that is already late is not waiting for anything, so it yields
+    // rather than arming a timer a hidden tab would clamp to a second. Zero is
+    // not a timer id any browser hands out, so it marks the pending yield
+    // without confusing the clearTimeout in setMode.
+    if (delay > 0) {
+      state.timer = nativeSetTimeout(pump, delay);
+    } else {
+      state.timer = 0;
+      yieldTask(pump);
+    }
 };
 
 // While the gate is off the callback goes to the real scheduler, but it is also
@@ -2842,13 +4075,15 @@ state.cancel = id => {
 
 // Release `count` frames, yielding to the real task queue between them so that
 // network callbacks and page microtasks can run like they would in a real frame.
+// The yield is a message rather than a timer because a hidden tab clamps timers:
+// see yieldTask.
 state.step = (count, done) => {
     let remaining = count;
     let callbacks = 0;
     const run = () => {
       callbacks += state.flush();
       remaining -= 1;
-      if (remaining > 0) nativeSetTimeout(run, 0);
+      if (remaining > 0) yieldTask(run);
       else done({
         success: true, frames: count, callbacks,
         pending_callbacks: state.pending.size,
@@ -2964,14 +4199,69 @@ state.step(count, done);
 """
 
 
+_FRAME_COUNT_SCRIPT = "return document.querySelectorAll(arguments[0]).length;"
+
+
 def _select_frame(driver: webdriver.Chrome, frame_selector: str | None) -> None:
+    """Enter the one frame ``frame_selector`` names, or say why it cannot.
+
+    A selector that matches two frames used to switch into whichever one came
+    first and report success, so the caller read one document believing it was
+    another. Ambiguity is refused here instead. A ``host >>> frame`` path - what
+    the outline reports for a frame inside a shadow root or a nested one - is
+    walked frame by frame rather than handed to CSS, which cannot express it.
+    """
     driver.switch_to.default_content()
-    if frame_selector:
-        WebDriverWait(driver, 10).until(
-            conditions.frame_to_be_available_and_switch_to_it(
-                (By.CSS_SELECTOR, frame_selector)
+    if not frame_selector:
+        return
+    if page_perception.resolve_locator_expression(frame_selector) is not None:
+        # The resolver leaves the driver inside whatever frame it walked into, so
+        # a failure here has to hand it back. Left inside, the *next* read - an
+        # outline, a page_text, a page_elements - answers for that frame and
+        # presents it as the page, with nothing anywhere saying so.
+        element = _resolve_element(driver, frame_selector)
+        try:
+            driver.switch_to.frame(element)
+        except WebDriverException as exc:
+            _leave_element_frame(driver)
+            raise ValueError(
+                f"frame_selector '{frame_selector}' names an element that is not a "
+                f"frame ({type(exc).__name__}). Pass the frame's own locator - the "
+                "'frame' path a node reports in web_info(topic='page_outline') - "
+                "not a locator for something inside it."
+            ) from exc
+        return
+    deadline = time.monotonic() + 10.0
+    failure = f"frame_selector '{frame_selector}' matched no frame"
+    while True:
+        try:
+            count = int(driver.execute_script(_FRAME_COUNT_SCRIPT, frame_selector) or 0)
+        except WebDriverException as exc:
+            raise ValueError(
+                f"frame_selector '{frame_selector}' is not a valid CSS selector: "
+                f"{type(exc).__name__}"
+            ) from exc
+        if count > 1:
+            raise ValueError(
+                f"frame_selector '{frame_selector}' matches {count} elements in this "
+                "document, so it does not say which one to read. Use a selector that "
+                "matches exactly one frame, or the 'frame' path from "
+                "web_info(topic='page_outline'), which is verified unique."
             )
-        )
+        if count == 1:
+            try:
+                driver.switch_to.frame(driver.find_element(By.CSS_SELECTOR, frame_selector))
+                return
+            except NoSuchFrameException:
+                failure = (
+                    f"frame_selector '{frame_selector}' matches an element that is not "
+                    "a frame this session can enter"
+                )
+            except WebDriverException as exc:
+                failure = f"frame_selector '{frame_selector}': {type(exc).__name__}"
+        if time.monotonic() >= deadline:
+            raise TimeoutException(f"{failure}. {_POINTER_FALLBACK_HINT}")
+        time.sleep(0.1)
 
 
 def _apply_render_mode(
@@ -3162,7 +4452,7 @@ def _auto_advance_render_after_input(session: BrowserSession, frames: int = 1) -
 
 
 def release_inputs(session_id: str = "default") -> dict[str, Any]:
-    """Release all keyboard keys and mouse buttons held by the named session."""
+    """Release every key, mouse button and touch point held by the named session."""
     session = _get_session(session_id)
     with session.lock:
         driver = session.driver
@@ -3189,13 +4479,59 @@ def release_inputs(session_id: str = "default") -> dict[str, Any]:
                     "clickCount": 1,
                 },
             )
+        if session.held_touches:
+            # A finger left down is as sticky as a key left down: the page keeps
+            # a live touch in `event.touches` and every later gesture joins it.
+            driver.execute_cdp_cmd(
+                "Input.dispatchTouchEvent",
+                {
+                    "type": "touchEnd",
+                    "touchPoints": list(session.held_touches.values()),
+                    "modifiers": 0,
+                },
+            )
+            session.held_touches.clear()
         _auto_advance_render_after_input(session)
         return {
             **_page_summary(driver, session_id),
             "success": True,
             "held_keys": [],
             "held_buttons": [],
+            "held_touches": [],
         }
+
+
+# The submit event is dispatched, and then the navigation it starts throws the
+# whole window away - counter included. sessionStorage survives a same-origin
+# load, and the token on the window says whether this is still the document the
+# form was submitted from, which is the only way a POST back onto the same URL
+# under the same title can be told apart from nothing happening at all.
+_SUBMIT_WATCH_SCRIPT = """
+const form = arguments[0];
+const token = arguments[1];
+const state = {token: token, fired: 0, prevented: false};
+window.__webSearchNeoSubmit = state;
+try { sessionStorage.removeItem('__webSearchNeoSubmit'); } catch (error) { /* denied */ }
+form.addEventListener('submit', (event) => {
+  state.fired += 1;
+  try { sessionStorage.setItem('__webSearchNeoSubmit', token); } catch (error) { /* denied */ }
+  // defaultPrevented is only final once every listener has run.
+  queueMicrotask(() => { state.prevented = event.defaultPrevented; });
+}, {once: true});
+"""
+
+_SUBMIT_RESULT_SCRIPT = """
+const token = arguments[0];
+const state = window.__webSearchNeoSubmit;
+let stored = false;
+try { stored = sessionStorage.getItem('__webSearchNeoSubmit') === token; } catch (error) { stored = false; }
+return {
+  same_document: !!state && state.token === token,
+  fired: !!state && state.fired > 0,
+  prevented: !!state && !!state.prevented,
+  stored: stored
+};
+"""
 
 
 def submit_form(
@@ -3203,20 +4539,64 @@ def submit_form(
     session_id: str = "default",
     submit_selector: str | None = None,
     wait_seconds: float = 0.5,
+    frame_selector: str | None = None,
 ) -> dict[str, Any]:
-    """Submit a form using requestSubmit so browser validation and events run."""
+    """Submit a form using requestSubmit so browser validation and events run.
+
+    Whether the form actually went is decided by the document, not by its title: a
+    search re-run lands on the very same URL under the very same heading, and a
+    page that ticks a counter into its title changes it without submitting
+    anything. The submit event is recorded where a navigation cannot erase it, and
+    the document is tagged, so a load - even one back onto the same URL - is seen
+    for what it is.
+
+    ``frame_selector`` names the frame the form is looked up in, exactly as it
+    does for ``find`` and ``page_text``; the submit button is looked for in that
+    same document.
+    """
     session = _get_session(session_id)
+    token = f"submit-{time.monotonic_ns()}"
     with session.lock:
-        form = _resolve_element(session.driver, form_selector)
-        validation = session.driver.execute_script(
-            "const form = arguments[0]; const invalid = Array.from(form.elements)"
-            ".filter(el => el.willValidate && !el.checkValidity())"
-            ".map(el => ({name: el.name || '', id: el.id || '', message: el.validationMessage || ''}));"
-            "return {valid: form.checkValidity(), invalid};",
-            form,
+        # A form inside a frame is submitted from inside that frame, and so is the
+        # submit button, which lives in the same document as the form.
+        _enter_action_frame(
+            session.driver, frame_selector, form_selector, submit_selector or ""
         )
+        try:
+            form = _resolve_element(session.driver, form_selector)
+            validation = session.driver.execute_script(
+                "const form = arguments[0]; const invalid = Array.from(form.elements)"
+                ".filter(el => el.willValidate && !el.checkValidity())"
+                ".map(el => ({name: el.name || '', id: el.id || '', message: el.validationMessage || ''}));"
+                "return {valid: form.checkValidity(), invalid};",
+                form,
+            )
+            if not validation["valid"]:
+                session.driver.execute_script("arguments[0].reportValidity();", form)
+            else:
+                before_url = session.driver.current_url
+                session.driver.execute_script(_SUBMIT_WATCH_SCRIPT, form, token)
+                if submit_selector:
+                    button = WebDriverWait(session.driver, 10).until(
+                        conditions.element_to_be_clickable((By.CSS_SELECTOR, submit_selector))
+                    )
+                    button.click()
+                else:
+                    session.driver.execute_script(
+                        "if (arguments[0].requestSubmit) arguments[0].requestSubmit(); else arguments[0].submit();",
+                        form,
+                    )
+                _wait_after_action(session.driver, wait_seconds)
+                try:
+                    # Read from the form's own document, before the driver leaves it.
+                    outcome = session.driver.execute_script(_SUBMIT_RESULT_SCRIPT, token) or {}
+                except Exception:
+                    # The document being watched is gone, which is itself the
+                    # strongest evidence that the form navigated away.
+                    outcome = {}
+        finally:
+            _release_action_frame(session.driver, frame_selector, form_selector)
         if not validation["valid"]:
-            session.driver.execute_script("arguments[0].reportValidity();", form)
             return {
                 **_page_summary(session.driver, session_id),
                 "success": False,
@@ -3224,36 +4604,11 @@ def submit_form(
                 "submit_triggered": False,
                 "validation_errors": validation["invalid"],
                 "submitted_form": form_selector,
+                "frame_selector": frame_selector,
             }
-        before_url = session.driver.current_url
-        before_title = session.driver.title
-        session.driver.execute_script(
-            "window.__webSearchNeoSubmitCount = 0; arguments[0].addEventListener('submit', "
-            "() => { window.__webSearchNeoSubmitCount += 1; }, {once: true});",
-            form,
-        )
-        if submit_selector:
-            button = WebDriverWait(session.driver, 10).until(
-                conditions.element_to_be_clickable((By.CSS_SELECTOR, submit_selector))
-            )
-            button.click()
-        else:
-            session.driver.execute_script(
-                "if (arguments[0].requestSubmit) arguments[0].requestSubmit(); else arguments[0].submit();",
-                form,
-            )
-        _wait_after_action(session.driver, wait_seconds)
-        after_url = session.driver.current_url
-        after_title = session.driver.title
-        try:
-            submit_event_fired = bool(
-                session.driver.execute_script(
-                    "return window.__webSearchNeoSubmitCount && window.__webSearchNeoSubmitCount > 0;"
-                )
-            )
-        except Exception:
-            submit_event_fired = False
-        navigation_observed = before_url != after_url or before_title != after_title
+        document_replaced = not bool(outcome.get("same_document"))
+        submit_event_fired = bool(outcome.get("fired") or outcome.get("stored"))
+        navigation_observed = document_replaced or before_url != session.driver.current_url
         submit_triggered = submit_event_fired or navigation_observed
         return {
             **_page_summary(session.driver, session_id),
@@ -3261,10 +4616,12 @@ def submit_form(
             "validation_passed": bool(validation["valid"]),
             "submit_triggered": submit_triggered,
             "submit_event_fired": submit_event_fired,
+            "submit_default_prevented": bool(outcome.get("prevented")),
             "navigation_observed": navigation_observed,
             "url_before": before_url,
             "validation_errors": [],
             "submitted_form": form_selector,
+            "frame_selector": frame_selector,
         }
 
 
@@ -3394,9 +4751,21 @@ def get_status(session_id: str = "default") -> dict[str, Any]:
 
 
 def upload_file(
-    selector: str, file_paths: list[str], session_id: str = "default"
+    selector: str,
+    file_paths: list[str],
+    session_id: str = "default",
+    frame_selector: str | None = None,
 ) -> dict[str, Any]:
-    """Upload one or more local files to an input[type=file]."""
+    """Attach local files to an input[type=file], replacing whatever it held.
+
+    Chrome appends to an input that accepts several files, so the input is
+    cleared first: afterwards it holds exactly ``file_paths``. ``files_uploaded``
+    maps the selector to the names the input actually reports holding - the same
+    shape ``fill`` returns - rather than to what this call asked for.
+
+    ``frame_selector`` names the frame the selector is looked up in, exactly as it
+    does for ``find`` and ``page_text``.
+    """
     if not file_paths:
         raise ValueError("file_paths must not be empty")
     session = _get_session(session_id)
@@ -3407,18 +4776,19 @@ def upload_file(
             raise ValueError(f"Upload path is not a file: {path}")
         resolved.append(str(path))
     with session.lock:
-        element = _resolve_element(session.driver, selector)
-        if (element.get_attribute("type") or "").lower() != "file":
-            raise ValueError("Selector does not point to an input[type=file]")
-        if len(resolved) > 1 and element.get_attribute("multiple") is None:
-            raise ValueError("Input does not accept multiple files")
-        element.send_keys("\n".join(resolved))
+        _enter_action_frame(session.driver, frame_selector, selector)
+        try:
+            element = _resolve_element(session.driver, selector)
+            attached = _attach_files(session.driver, element, resolved)
+        finally:
+            _release_action_frame(session.driver, frame_selector, selector)
         return {
             **_page_summary(session.driver, session_id),
-            "success": True,
+            "success": len(attached) == len(resolved),
             "selector": selector,
-            "files_uploaded": len(resolved),
-            "file_names": [Path(path).name for path in resolved],
+            "files_uploaded": {selector: attached},
+            "file_names": attached,
+            "frame_selector": frame_selector,
         }
 
 
@@ -3449,6 +4819,16 @@ def _reset_session_runtime_state(session: BrowserSession) -> None:
                     "clickCount": 1,
                 },
             )
+        if session.held_touches:
+            driver.execute_cdp_cmd(
+                "Input.dispatchTouchEvent",
+                {
+                    "type": "touchEnd",
+                    "touchPoints": list(session.held_touches.values()),
+                    "modifiers": 0,
+                },
+            )
+            session.held_touches.clear()
         if session.render_mode != "normal":
             _select_frame(driver, session.render_frame_selector)
             try:
@@ -3465,28 +4845,48 @@ def _reset_session_runtime_state(session: BrowserSession) -> None:
             pass
 
 
-def _shutdown_session(session: BrowserSession, close_tab: bool | None = None) -> bool:
-    """Release one session's tab and browser; report whether the tab was closed.
+def _shutdown_session(
+    session: BrowserSession, close_tab: bool | None = None
+) -> tuple[bool, str | None]:
+    """Release one session's tab and browser; report what could not be released.
 
     Cleanup must never raise - a failed teardown may not take the caller down with
-    it - but a silent failure leaks a tab or a whole Chrome process, so the reason
-    is logged instead of being swallowed.
+    it - but it must not go quiet either. A debugger left attached keeps the "is
+    being debugged" banner on a tab the user has been given back, and only they
+    can clear it, so the caller is told rather than reassured.
+
+    Each step is attempted on its own: one failure used to skip the two after it,
+    which turned a hiccup while releasing held keys into a leaked tab as well.
     """
+    problems: list[str] = []
+
+    def attempt(step: str, action: Any) -> Any:
+        try:
+            return action()
+        except Exception as exc:
+            problems.append(f"{step} failed ({type(exc).__name__}: {exc})")
+            logger.warning(
+                "Browser session cleanup: %s failed: %s: %s", step, type(exc).__name__, exc
+            )
+            return None
+
     tab_closed = False
     should_close_tab = session.owns_tab if close_tab is None else bool(close_tab)
-    try:
-        _reset_session_runtime_state(session)
-        if should_close_tab and hasattr(session.driver, "close_tab"):
-            tab_closed = bool(session.driver.close_tab().get("removed"))
-        if session.owns_browser:
-            session.driver.quit()
-        else:
-            session.driver.service.stop()
-    except Exception as exc:
-        logger.warning(
-            "Browser session cleanup failed: %s: %s", type(exc).__name__, exc
-        )
-    return tab_closed
+    attempt("releasing held input", lambda: _reset_session_runtime_state(session))
+    if should_close_tab and hasattr(session.driver, "close_tab"):
+        removed = attempt("closing the tab", session.driver.close_tab)
+        tab_closed = bool((removed or {}).get("removed"))
+        if not tab_closed:
+            problems.append("the tab is still open")
+    if session.owns_browser:
+        attempt("detaching from Chrome", session.driver.quit)
+    else:
+        attempt("stopping the driver service", session.driver.service.stop)
+    if session.profile_mode == "current":
+        # Let another agent have the tab even if the teardown above went badly:
+        # a claim outliving the session that made it is a tab nobody can use.
+        _release_claimed_tab(session.current_tab_id)
+    return tab_closed, "; ".join(problems) or None
 
 
 def close_session(session_id: str = "default", close_tab: bool | None = None) -> dict[str, Any]:
@@ -3502,25 +4902,50 @@ def close_session(session_id: str = "default", close_tab: bool | None = None) ->
         remaining = sorted(_sessions)
     closed = session is not None
     tab_closed = False
+    problem: str | None = None
     if session is not None:
         with session.lock:
-            tab_closed = _shutdown_session(session, close_tab)
+            tab_closed, problem = _shutdown_session(session, close_tab)
     return {
         "session_id": session_id,
         "closed": closed,
         "tab_closed": tab_closed,
         "active_sessions": remaining,
+        # Closing something that is not there is a no-op rather than a failure,
+        # but saying nothing lets a typo in a session id read as a clean close.
+        **(
+            {}
+            if closed
+            else {"note": f"No session named '{session_id}' was open, so nothing was closed."}
+        ),
+        **({"released": False, "warning": problem} if problem else {}),
     }
 
 
-def close_all_sessions() -> None:
-    """Close every session, including the Chrome tabs the server itself opened."""
+def close_all_sessions() -> dict[str, Any]:
+    """Close every session, including the Chrome tabs the server itself opened.
+
+    Reports what would not release, so ``close_all`` can name a leaked tab
+    instead of answering a flat "closed_all: true" over the top of it.
+    """
     with _sessions_lock:
-        sessions = list(_sessions.values())
+        sessions = sorted(_sessions.items())
         _sessions.clear()
-    for session in sessions:
+    tabs_closed = 0
+    problems: dict[str, str] = {}
+    for session_id, session in sessions:
         with session.lock:
-            _shutdown_session(session)
+            tab_closed, problem = _shutdown_session(session)
+        tabs_closed += int(tab_closed)
+        if problem:
+            problems[session_id] = problem
+    return {
+        "closed_all": not problems,
+        "closed_sessions": [session_id for session_id, _ in sessions],
+        "tabs_closed": tabs_closed,
+        "active_sessions": [],
+        **({"warnings": problems} if problems else {}),
+    }
 
 
 def start_current_chrome_bridge() -> dict[str, Any]:

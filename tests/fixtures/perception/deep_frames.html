@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Nine frames deep</title><link rel="icon" href="data:,"></head>
+<body>
+<div id="root"></div>
+<script>
+  // Nine same-origin frames, one inside the next. Each topic used to stop at its
+  // own depth, so the same button was reported, denied, and declared gone
+  // depending on which one you asked.
+  function build(parent, depth) {
+    const frame = document.createElement('iframe');
+    frame.width = 320;
+    frame.height = 200;
+    parent.appendChild(frame);
+    const doc = frame.contentDocument;
+    doc.open();
+    doc.write(depth > 0
+      ? '<body><div id="host"></div></body>'
+      : '<body><button id="deepest">Deepest button</button></body>');
+    doc.close();
+    if (depth > 0) build(doc.getElementById('host'), depth - 1);
+  }
+  build(document.getElementById('root'), 8);
+</script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Live feed</title></head>
+<body>
+<h1>Live feed</h1>
+<!-- The page keeps a counter in its title, the way a mail or chat tab does. The
+     "Send" control is not the form's submitter, so pressing it submits nothing. -->
+<form id="feedback" action="/submit" method="post">
+  <input id="message" name="message" value="hello">
+  <button id="fake-send" type="button">Send</button>
+</form>
+<script>
+  let ticks = 0;
+  setInterval(() => { document.title = 'Live feed (' + (++ticks) + ')'; }, 100);
+</script>
+</body>
+</html>

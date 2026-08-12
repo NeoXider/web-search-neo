@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixture: transformed iframe host</title>
+<link rel="icon" href="data:,">
+
+<style>
+  html, body { margin: 0; padding: 0; background: #0b0e14; color: #d7dde8;
+               font: 13px/1.4 monospace; }
+  /* Every frame holds the same pointer harness. What differs is the transform
+     between the frame's own coordinates and the top-level page CDP shoots at:
+     a plain offset, a scale, a rotation, and a scale inherited from a wrapper.
+     A pointer path that only adds the frame's rect lands right in the first and
+     nowhere near the rest. */
+  iframe { width: 620px; height: 420px; border: 0; display: block; background: #000; }
+  .slot { position: absolute; }
+  #plain-slot   { left: 40px;  top: 40px; }
+  #scaled-slot  { left: 40px;  top: 520px; transform: scale(0.5); transform-origin: 0 0; }
+  #rotated-slot { left: 760px; top: 60px; transform: rotate(20deg); transform-origin: 0 0; }
+  #wrapper      { position: absolute; left: 760px; top: 620px;
+                  transform: scale(0.75); transform-origin: 0 0; }
+  #wrapper .inner { padding: 10px; }
+  #page { height: 2400px; }
+</style>
+</head>
+<body>
+<div id="page">
+  <div class="slot" id="plain-slot"><iframe id="plain" src="pointer.html" title="plain"></iframe></div>
+  <div class="slot" id="scaled-slot"><iframe id="scaled" src="pointer.html" title="scaled"></iframe></div>
+  <div class="slot" id="rotated-slot"><iframe id="rotated" src="pointer.html" title="rotated"></iframe></div>
+  <div id="wrapper"><div class="inner"><iframe id="nested" src="pointer.html" title="nested"></iframe></div></div>
+</div>
+</body>
+</html>
