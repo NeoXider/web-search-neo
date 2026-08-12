@@ -24,6 +24,13 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as conditions
 from selenium.webdriver.support.ui import Select, WebDriverWait
 
+from chrome_bridge import (
+    ChromeBridgeDriver,
+    ChromeBridgeError,
+    get_chrome_bridge,
+    list_current_chrome_tabs,
+)
+from chrome_bootstrap import setup_current_chrome
 from web_client import validate_http_url
 
 
@@ -33,11 +40,13 @@ _SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 @dataclass
 class BrowserSession:
-    driver: webdriver.Chrome
+    driver: Any
     headless: bool
     profile_mode: str = "temporary"
     profile_id: str | None = None
     debugger_address: str | None = None
+    current_tab_id: int | None = None
+    tab_group: str | None = None
     owns_browser: bool = True
     held_keys: dict[str, str] = field(default_factory=dict)
     held_buttons: set[str] = field(default_factory=set)
@@ -56,6 +65,7 @@ _sessions_lock = threading.RLock()
 _sessions_condition = threading.Condition(_sessions_lock)
 _pending_sessions: set[str] = set()
 _pending_browser_keys: set[str] = set()
+_pending_current_tab_ids: set[int] = set()
 _browser_available: bool | None = None
 _browser_error: str | None = None
 
@@ -103,22 +113,52 @@ def _profile_configuration(
     debugger_address: str | None,
 ) -> tuple[str, str | None, str | None, str | None]:
     mode = profile_mode.strip().lower()
-    if mode not in {"temporary", "persistent", "attach"}:
-        raise ValueError("profile_mode must be 'temporary', 'persistent', or 'attach'")
+    if mode == "extension":
+        mode = "current"
+    if mode not in {"temporary", "persistent", "attach", "current"}:
+        raise ValueError(
+            "profile_mode must be 'auto', 'current', 'temporary', 'persistent', or 'attach'"
+        )
     if mode == "temporary":
         return mode, None, None, None
     if mode == "persistent":
         selected_profile = _validate_session_id(profile_id or session_id)
         return mode, selected_profile, None, f"persistent:{selected_profile}"
-    address = _validate_debugger_address(debugger_address)
-    return mode, None, address, f"attach:{address}"
+    if mode == "attach":
+        address = _validate_debugger_address(debugger_address)
+        return mode, None, address, f"attach:{address}"
+    return mode, None, None, None
+
+
+def _resolve_profile_mode(profile_mode: str, headless: bool | None) -> str:
+    mode = profile_mode.strip().lower()
+    if mode == "extension":
+        mode = "current"
+    if mode == "auto":
+        if headless is True:
+            return "temporary"
+        return "current" if get_chrome_bridge().wait_connected(1.5) else "temporary"
+    if mode not in {"current", "temporary", "persistent", "attach"}:
+        raise ValueError(
+            "profile_mode must be 'auto', 'current', 'temporary', 'persistent', or 'attach'"
+        )
+    if mode == "current" and headless is True:
+        raise ValueError("profile_mode='current' controls a visible Chrome and cannot be headless")
+    return mode
+
+
+def resolve_profile_mode(profile_mode: str, headless: bool | None = None) -> str:
+    """Resolve auto once so a multi-page request cannot split across browser modes."""
+    return _resolve_profile_mode(profile_mode, headless)
 
 
 def _resolve_headless(profile_mode: str, headless: bool | None) -> bool:
     """Default new browser sessions to a visible window unless explicitly hidden."""
     mode = profile_mode.strip().lower()
+    if mode in {"extension", "current"}:
+        return False
     if mode not in {"temporary", "persistent", "attach"}:
-        raise ValueError("profile_mode must be 'temporary', 'persistent', or 'attach'")
+        raise ValueError("profile_mode must be 'temporary', 'persistent', 'attach', or 'current'")
     if headless is None:
         return False
     return bool(headless)
@@ -181,12 +221,24 @@ def create_driver(
     profile_mode: str = "temporary",
     profile_id: str | None = None,
     debugger_address: str | None = None,
-) -> webdriver.Chrome:
+    current_tab_id: int | None = None,
+    tab_group: str = "AI",
+) -> Any:
     """Create Chrome through Selenium Manager, optionally visible for human handoff."""
     global _browser_available, _browser_error
     width, height = _bounded_size(width, height)
+    resolved_mode = _resolve_profile_mode(profile_mode, headless)
+    if resolved_mode == "current":
+        driver = ChromeBridgeDriver(
+            get_chrome_bridge(), tab_id=current_tab_id, tab_group=tab_group
+        )
+        driver.set_page_load_timeout(30)
+        driver.set_script_timeout(15)
+        _browser_available = True
+        _browser_error = None
+        return driver
     mode, selected_profile, address, _browser_key = _profile_configuration(
-        "driver", profile_mode, profile_id, debugger_address
+        "driver", resolved_mode, profile_id, debugger_address
     )
     options = Options()
     browser_user_agent = None
@@ -266,10 +318,13 @@ def _create_session(
     width: int,
     height: int,
     headless: bool | None,
-    profile_mode: str = "temporary",
+    profile_mode: str = "auto",
     profile_id: str | None = None,
     debugger_address: str | None = None,
+    current_tab_id: int | None = None,
+    tab_group: str = "AI",
 ) -> BrowserSession:
+    profile_mode = _resolve_profile_mode(profile_mode, headless)
     mode, selected_profile, address, browser_key = _profile_configuration(
         session_id, profile_mode, profile_id, debugger_address
     )
@@ -284,6 +339,10 @@ def _create_session(
                 or existing.profile_mode != mode
                 or existing.profile_id != selected_profile
                 or existing.debugger_address != address
+                or (
+                    current_tab_id is not None
+                    and existing.current_tab_id != current_tab_id
+                )
             ):
                 raise ValueError(
                     "Session already exists with different browser/profile options; close it first"
@@ -293,6 +352,21 @@ def _create_session(
             raise RuntimeError(
                 f"Maximum of {MAX_SESSIONS} browser sessions reached; close one first"
             )
+        selected_current_tab_id = int(current_tab_id) if mode == "current" and current_tab_id is not None else None
+        if selected_current_tab_id is not None:
+            active_current_tabs = {
+                int(item.current_tab_id)
+                for item in _sessions.values()
+                if item.profile_mode == "current" and item.current_tab_id is not None
+            }
+            if (
+                selected_current_tab_id in active_current_tabs
+                or selected_current_tab_id in _pending_current_tab_ids
+            ):
+                raise RuntimeError(
+                    f"Current Chrome tab {selected_current_tab_id} is already claimed by another session"
+                )
+            _pending_current_tab_ids.add(selected_current_tab_id)
         if browser_key:
             active_keys = {
                 (
@@ -309,6 +383,7 @@ def _create_session(
                 )
             _pending_browser_keys.add(browser_key)
         _pending_sessions.add(session_id)
+    session: BrowserSession | None = None
     try:
         driver = create_driver(
             width,
@@ -317,6 +392,8 @@ def _create_session(
             mode,
             selected_profile,
             address,
+            current_tab_id,
+            tab_group,
         )
         session = BrowserSession(
             driver=driver,
@@ -324,16 +401,22 @@ def _create_session(
             profile_mode=mode,
             profile_id=selected_profile,
             debugger_address=address,
+            current_tab_id=getattr(driver, "tab_id", None),
+            tab_group=(getattr(driver, "actual_tab_group", None) if mode == "current" else None),
             owns_browser=mode != "attach",
         )
     finally:
         with _sessions_condition:
+            if session is not None:
+                _sessions[session_id] = session
             _pending_sessions.discard(session_id)
             if browser_key:
                 _pending_browser_keys.discard(browser_key)
+            if mode == "current" and current_tab_id is not None:
+                _pending_current_tab_ids.discard(int(current_tab_id))
             _sessions_condition.notify_all()
-    with _sessions_lock:
-        _sessions[session_id] = session
+    if session is None:
+        raise RuntimeError("Browser session creation failed")
     return session
 
 
@@ -356,8 +439,11 @@ def _wait_until_ready(driver: webdriver.Chrome, timeout_seconds: float) -> None:
     )
 
 
-def _set_viewport(driver: webdriver.Chrome, width: int, height: int) -> None:
+def _set_viewport(driver: Any, width: int, height: int) -> None:
     """Set exact CSS viewport dimensions instead of approximate outer-window size."""
+    if getattr(driver, "is_extension_bridge", False):
+        # Never resize or emulate the user's already-open personal Chrome window.
+        return
     driver.execute_cdp_cmd(
         "Emulation.setDeviceMetricsOverride",
         {
@@ -435,9 +521,11 @@ def open_page(
     height: int = 900,
     timeout_seconds: float = 20.0,
     headless: bool | None = None,
-    profile_mode: str = "temporary",
+    profile_mode: str = "auto",
     profile_id: str | None = None,
     debugger_address: str | None = None,
+    current_tab_id: int | None = None,
+    tab_group: str = "AI",
 ) -> dict[str, Any]:
     """Open a URL in a reusable rendered browser session."""
     normalized = validate_http_url(url)
@@ -451,6 +539,8 @@ def open_page(
         profile_mode,
         profile_id,
         debugger_address,
+        current_tab_id,
+        tab_group,
     )
     try:
         with session.lock:
@@ -466,10 +556,56 @@ def open_page(
             "profile_mode": session.profile_mode,
             "profile_id": session.profile_id,
             "debugger_address": session.debugger_address,
+            "current_tab_id": session.current_tab_id,
+            "tab_group": session.tab_group,
         }
-    except WebDriverException:
+    except (WebDriverException, ChromeBridgeError, TimeoutError, ConnectionError, OSError):
         close_session(session_id)
         raise
+
+
+def get_current_tabs(wait_seconds: float = 1.0) -> dict[str, Any]:
+    """List normal web tabs exposed by the companion extension."""
+    return list_current_chrome_tabs(max(0.0, min(float(wait_seconds), 5.0)))
+
+
+def setup_current_chrome_companion(
+    confirm_install: bool = False,
+    timeout_seconds: float = 30.0,
+    window_title: str | None = None,
+) -> dict[str, Any]:
+    """Install or enable the current-Chrome companion after explicit consent."""
+    return setup_current_chrome(confirm_install, timeout_seconds, window_title)
+
+
+def attach_current_tab(
+    tab_id: int,
+    session_id: str = "default",
+) -> dict[str, Any]:
+    """Attach a named MCP session to an existing Chrome tab without navigating it."""
+    session_id = _validate_session_id(session_id)
+    session = _create_session(
+        session_id,
+        1440,
+        900,
+        False,
+        "current",
+        None,
+        None,
+        int(tab_id),
+        "AI",
+    )
+    with session.lock:
+        _register_render_bootstrap(session)
+        return {
+            **_page_summary(session.driver, session_id),
+            "success": True,
+            "headless": False,
+            "window_mode": "visible",
+            "profile_mode": "current",
+            "current_tab_id": session.current_tab_id,
+            "tab_group": session.tab_group,
+        }
 
 
 _INSPECT_SCRIPT = r"""
@@ -688,11 +824,14 @@ def fill_fields(
                     if element.is_selected() != desired:
                         raise ValueError("Radio state did not change")
                 elif tag == "select":
-                    select = Select(element)
-                    try:
-                        select.select_by_value(str(value))
-                    except Exception:
-                        select.select_by_visible_text(str(value))
+                    if hasattr(session.driver, "select_option"):
+                        session.driver.select_option(selector, str(value))
+                    else:
+                        select = Select(element)
+                        try:
+                            select.select_by_value(str(value))
+                        except Exception:
+                            select.select_by_visible_text(str(value))
                 else:
                     element.clear()
                     element.send_keys(str(value))
@@ -784,6 +923,23 @@ _KEY_ALIASES = {
 }
 
 
+def _perform_key_events(driver: Any, events: list[dict[str, Any]]) -> None:
+    """Dispatch an ordered key event stream through CDP or Selenium ActionChains."""
+    if hasattr(driver, "perform_key_events"):
+        driver.perform_key_events(events)
+        return
+    actions = ActionChains(driver)
+    for event in events:
+        event_type = event["type"]
+        if event_type == "down":
+            actions.key_down(event["key"])
+        elif event_type == "up":
+            actions.key_up(event["key"])
+        elif event_type == "pause":
+            actions.pause(float(event.get("seconds", 0.0)))
+    actions.perform()
+
+
 def _normalize_game_key(key: str) -> str:
     value = str(key).strip()
     if len(value) == 1 and value.isprintable():
@@ -844,18 +1000,18 @@ def press_keys(
                 driver.execute_script("window.focus();")
             runs = repetitions if selected_action == "tap" else 1
             for _ in range(runs):
-                actions = ActionChains(driver)
+                events: list[dict[str, Any]] = []
                 if selected_action in {"tap", "hold"}:
                     for key_id, key in zip(key_ids, normalized):
                         if selected_action == "tap" or key_id not in session.held_keys:
-                            actions.key_down(key)
+                            events.append({"type": "down", "key": key})
                     if selected_action == "tap" and hold:
-                        actions.pause(hold)
+                        events.append({"type": "pause", "seconds": hold})
                 if selected_action in {"tap", "release"}:
                     for key_id, key in reversed(list(zip(key_ids, normalized))):
                         if selected_action == "tap" or key_id in session.held_keys:
-                            actions.key_up(key)
-                actions.perform()
+                            events.append({"type": "up", "key": key})
+                _perform_key_events(driver, events)
             if selected_action == "hold":
                 session.held_keys.update(dict(zip(key_ids, normalized)))
             elif selected_action == "release":
@@ -1506,10 +1662,13 @@ def release_inputs(session_id: str = "default") -> dict[str, Any]:
     with session.lock:
         driver = session.driver
         if session.held_keys:
-            actions = ActionChains(driver)
-            for key in reversed(list(session.held_keys.values())):
-                actions.key_up(key)
-            actions.perform()
+            _perform_key_events(
+                driver,
+                [
+                    {"type": "up", "key": key}
+                    for key in reversed(list(session.held_keys.values()))
+                ],
+            )
             session.held_keys.clear()
         button_bits = {"left": 1, "right": 2, "middle": 4}
         for button in list(session.held_buttons):
@@ -1643,27 +1802,77 @@ def get_status(session_id: str = "default") -> dict[str, Any]:
         session = _sessions.get(session_id)
         active_ids = sorted(_sessions)
     if session is None:
+        bridge_status = get_chrome_bridge().status(0.0)
         return {
-            "available": _browser_available,
+            "available": bool(bridge_status["connected"] or _browser_available),
             "availability_error": _browser_error,
             "session_open": False,
             "session_id": session_id,
             "active_sessions": active_ids,
-            "engine": "Chrome via Selenium Manager",
+            "engine": "Chrome companion extension or Selenium Manager",
+            "current_chrome": bridge_status,
         }
     with session.lock:
+        bridge_status = get_chrome_bridge().status(0.0)
+        if session.profile_mode == "current" and not bridge_status["connected"]:
+            return {
+                "available": False,
+                "availability_error": "Chrome companion extension disconnected",
+                "session_open": True,
+                "session_id": session_id,
+                "active_sessions": active_ids,
+                "engine": "Chrome companion extension",
+                "headless": False,
+                "window_mode": "visible",
+                "profile_mode": "current",
+                "profile_id": None,
+                "debugger_address": None,
+                "current_tab_id": session.current_tab_id,
+                "tab_group": session.tab_group,
+                "current_chrome": bridge_status,
+            }
+        try:
+            summary = _page_summary(session.driver, session_id)
+        except (ChromeBridgeError, TimeoutError, ConnectionError, OSError) as exc:
+            return {
+                "available": False,
+                "availability_error": f"{type(exc).__name__}: {exc}",
+                "session_open": True,
+                "session_id": session_id,
+                "active_sessions": active_ids,
+                "engine": (
+                    "Chrome companion extension"
+                    if session.profile_mode == "current"
+                    else "Chrome via Selenium Manager"
+                ),
+                "headless": session.headless,
+                "window_mode": "headless" if session.headless else "visible",
+                "profile_mode": session.profile_mode,
+                "profile_id": session.profile_id,
+                "debugger_address": session.debugger_address,
+                "current_tab_id": session.current_tab_id,
+                "tab_group": session.tab_group,
+                "current_chrome": bridge_status,
+            }
         return {
             "available": True,
             "availability_error": None,
             "session_open": True,
             "active_sessions": active_ids,
-            "engine": "Chrome via Selenium Manager",
+            "engine": (
+                "Chrome companion extension"
+                if session.profile_mode == "current"
+                else "Chrome via Selenium Manager"
+            ),
             "headless": session.headless,
             "window_mode": "headless" if session.headless else "visible",
             "profile_mode": session.profile_mode,
             "profile_id": session.profile_id,
             "debugger_address": session.debugger_address,
-            **_page_summary(session.driver, session_id),
+            "current_tab_id": session.current_tab_id,
+            "tab_group": session.tab_group,
+            "current_chrome": bridge_status,
+            **summary,
         }
 
 
@@ -1701,10 +1910,13 @@ def _reset_session_runtime_state(session: BrowserSession) -> None:
     driver = session.driver
     try:
         if session.held_keys:
-            actions = ActionChains(driver)
-            for key in reversed(list(session.held_keys.values())):
-                actions.key_up(key)
-            actions.perform()
+            _perform_key_events(
+                driver,
+                [
+                    {"type": "up", "key": key}
+                    for key in reversed(list(session.held_keys.values()))
+                ],
+            )
             session.held_keys.clear()
         button_bits = {"left": 1, "right": 2, "middle": 4}
         for button in list(session.held_buttons):
@@ -1770,6 +1982,13 @@ def close_all_sessions() -> None:
                     session.driver.service.stop()
             except Exception:
                 pass
+
+
+def start_current_chrome_bridge() -> dict[str, Any]:
+    """Start the loopback listener early so the extension is ready before the first action."""
+    bridge = get_chrome_bridge()
+    bridge.start()
+    return bridge.status(0.0)
 
 
 atexit.register(close_all_sessions)

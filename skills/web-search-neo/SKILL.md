@@ -1,6 +1,6 @@
 ---
 name: web-search-neo
-description: Use the Web Search Neo MCP server for free web search without API keys, resilient multi-engine fallback, HTTP page fetching, rendered Chrome automation, authorized persistent or attached browser sessions, form inspection/filling/upload/submission, screenshots, and deterministic canvas/WebGL game testing. Trigger when a task needs current web results, visible browser work, an already signed-in managed Chrome profile, DOM controls, file upload, or atomic keyboard/mouse input and render stepping through the two-tool web_info/web_action contract.
+description: Use the Web Search Neo MCP server for free web search without API keys, resilient multi-engine fallback, HTTP page fetching, the user's current signed-in Chrome with AI-group tabs, isolated browser profiles, form inspection/filling/upload/submission, screenshots, and deterministic canvas/WebGL game testing. Trigger when a task needs current web results, visible work in existing Chrome tabs, authorized browser state, DOM controls, file upload, or atomic keyboard/mouse input and render stepping through the two-tool web_info/web_action contract.
 ---
 
 # Web Search Neo
@@ -17,6 +17,7 @@ Use these observation topics directly:
 
 - `search_status`: configured and live search providers, latency, cooldowns, and challenges.
 - `browser_status`: Chrome capability and session state.
+- `browser_tabs`: open web tabs in the user's current Chrome, including IDs and tab groups.
 - `page_elements`: links, forms, fields, and buttons with CSS selectors.
 - `game_probe`: canvas/WebGL/iframe surfaces, focus, FPS, console issues, and held input.
 - `screenshot`: current rendered image.
@@ -32,11 +33,14 @@ Use `fetch_text`, `fetch_links`, or `fetch_many` when exact URLs are already kno
 
 ## Choose a browser profile
 
+- Use `current` by default. It controls the user's already-open signed-in Chrome through the companion extension. New tabs enter group `AI`; an `attach_tab` action claims an existing `tab_id` without navigating or moving it.
+- If the current-Chrome companion is disconnected, read `browser_status`. Call `setup_current_chrome` without confirmation first. Only after the user explicitly approves installing/enabling the extension may you repeat it with `confirm_install=true`.
+- Use `auto` only when falling back to a separate visible temporary Chrome is acceptable.
 - Use `temporary` for clean disposable work. It opens visibly by default; set `headless=true` only when background operation is explicitly wanted.
 - Use `persistent` with a stable `profile_id` for a separate MCP-owned profile that retains logins. It also opens visibly by default.
 - Use `attach` with `debugger_address="127.0.0.1:<port>"` for a dedicated Chrome launched with remote debugging. It defaults to visible and remains open after MCP detaches.
 
-Do not imply that an arbitrary normal Chrome window can be attached retroactively. Reuse one `session_id` for all operations on the same page and close owned sessions when finished.
+Do not confuse `attach` (DevTools port) with `current` (companion extension). Reuse one `session_id` for all operations on the same page. Closing a current-Chrome session leaves the user's tab open; close owned Selenium sessions when finished.
 
 ## Automate forms safely
 

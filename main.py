@@ -326,11 +326,15 @@ async def browser_open_page(
     height: int = 900,
     timeout_seconds: float = 20.0,
     headless: bool | None = None,
-    profile_mode: Literal["temporary", "persistent", "attach"] = "temporary",
+    profile_mode: Literal[
+        "auto", "current", "temporary", "persistent", "attach"
+    ] = "current",
     profile_id: str | None = None,
     debugger_address: str | None = None,
+    current_tab_id: int | None = None,
+    tab_group: str = "AI",
 ) -> dict[str, Any]:
-    """Open visible Chrome by default; pass headless=true for background operation."""
+    """Open in the current Chrome AI group by default; use auto for Selenium fallback."""
     return await asyncio.to_thread(
         browser_tools.open_page,
         url,
@@ -342,6 +346,8 @@ async def browser_open_page(
         profile_mode,
         profile_id,
         debugger_address,
+        current_tab_id,
+        tab_group,
     )
 
 
@@ -353,13 +359,21 @@ async def browser_open_pages(
     height: int = 900,
     timeout_seconds: float = 20.0,
     headless: bool | None = None,
+    profile_mode: Literal[
+        "auto", "current", "temporary", "persistent", "attach"
+    ] = "current",
+    tab_group: str = "AI",
 ) -> dict[str, Any]:
-    """Open up to four visible pages concurrently; pass headless=true to hide them."""
+    """Open up to four pages, using the current Chrome AI group by default."""
     if not urls or len(urls) > browser_tools.MAX_SESSIONS:
         raise ValueError(f"Provide 1-{browser_tools.MAX_SESSIONS} URLs")
     ids = session_ids or [f"page-{index + 1}" for index in range(len(urls))]
     if len(ids) != len(urls) or len(set(ids)) != len(ids):
         raise ValueError("session_ids must be unique and match the number of URLs")
+
+    resolved_profile_mode = await asyncio.to_thread(
+        browser_tools.resolve_profile_mode, profile_mode, headless
+    )
 
     async def open_one(url: str, session_id: str) -> dict[str, Any]:
         try:
@@ -371,6 +385,11 @@ async def browser_open_pages(
                 height,
                 timeout_seconds,
                 headless,
+                resolved_profile_mode,
+                None,
+                None,
+                None,
+                tab_group,
             )
             return {"success": True, **page, "error": None}
         except Exception as exc:
@@ -389,6 +408,38 @@ async def browser_open_pages(
         "failure_count": sum(1 for page in pages if not page["success"]),
         "pages": pages,
     }
+
+
+@mcp.tool()
+async def browser_list_tabs(wait_seconds: float = 1.0) -> dict[str, Any]:
+    """List web tabs in the user's already-open Chrome, including tab group names."""
+    return await asyncio.to_thread(browser_tools.get_current_tabs, wait_seconds)
+
+
+@mcp.tool()
+async def browser_setup_current_chrome(
+    confirm_install: bool = False,
+    timeout_seconds: float = 30.0,
+    window_title: str | None = None,
+) -> dict[str, Any]:
+    """Install/enable the companion in current Chrome; requires explicit consent."""
+    return await asyncio.to_thread(
+        browser_tools.setup_current_chrome_companion,
+        confirm_install,
+        timeout_seconds,
+        window_title,
+    )
+
+
+@mcp.tool()
+async def browser_attach_tab(
+    tab_id: int,
+    session_id: str = "default",
+) -> dict[str, Any]:
+    """Attach a reusable MCP session to one existing Chrome tab without navigating it."""
+    return await asyncio.to_thread(
+        browser_tools.attach_current_tab, tab_id, session_id
+    )
 
 
 @mcp.tool()
@@ -678,6 +729,8 @@ _ACTION_HANDLERS = {
     "fetch_many": fetch_urls_text,
     "open": browser_open_page,
     "open_many": browser_open_pages,
+    "attach_tab": browser_attach_tab,
+    "setup_current_chrome": browser_setup_current_chrome,
     "wait": browser_wait_for,
     "wait_challenge": browser_wait_for_challenge,
     "fill": browser_fill_fields,
@@ -699,6 +752,8 @@ _ACTION_TOOL_NAMES = {
     "fetch_many": "fetch_urls_text",
     "open": "browser_open_page",
     "open_many": "browser_open_pages",
+    "attach_tab": "browser_attach_tab",
+    "setup_current_chrome": "browser_setup_current_chrome",
     "wait": "browser_wait_for",
     "wait_challenge": "browser_wait_for_challenge",
     "fill": "browser_fill_fields",
@@ -722,6 +777,7 @@ def _capabilities(action_name: str | None = None) -> dict[str, Any]:
             "action_schema": "Detailed parameters for one action type; pass params.action.",
             "search_status": "Configured/live search providers, latency, cooldowns, challenges.",
             "browser_status": "Chrome availability and named session state.",
+            "browser_tabs": "Open tabs in the user's current Chrome with IDs and groups.",
             "page_elements": "Rendered links, forms, fields, and buttons with CSS selectors.",
             "game_probe": "Canvas/WebGL/iframe surfaces, FPS, focus, console, held input.",
             "screenshot": "PNG Image response for a browser session.",
@@ -757,9 +813,16 @@ def _capabilities(action_name: str | None = None) -> dict[str, Any]:
                     "profile_mode",
                     "profile_id",
                     "debugger_address",
+                    "current_tab_id",
+                    "tab_group",
                 ],
             },
-            "open_many": {"required": ["urls"], "optional": ["session_ids", "width", "height", "timeout_seconds", "headless"]},
+            "open_many": {"required": ["urls"], "optional": ["session_ids", "width", "height", "timeout_seconds", "headless", "profile_mode", "tab_group"]},
+            "attach_tab": {"required": ["tab_id"], "optional": ["session_id"]},
+            "setup_current_chrome": {
+                "optional": ["confirm_install", "timeout_seconds", "window_title"],
+                "confirmation": "Call first without confirmation; proceed only after the user explicitly approves extension installation.",
+            },
             "wait": {"required": ["selector"], "optional": ["session_id", "state", "timeout_seconds"]},
             "wait_challenge": {"optional": ["session_id", "timeout_seconds"]},
             "fill": {"required": ["fields"], "optional": ["files", "session_id"]},
@@ -867,7 +930,7 @@ def _capabilities(action_name: str | None = None) -> dict[str, Any]:
     document["action_groups"] = {
         "search": ["search"],
         "fetch": ["fetch_text", "fetch_links", "fetch_many"],
-        "session": ["open", "open_many", "close", "close_all"],
+        "session": ["setup_current_chrome", "open", "open_many", "attach_tab", "close", "close_all"],
         "page": ["wait", "wait_challenge", "fill", "upload", "click", "submit"],
         "game": ["input", "render", "step", "release_inputs"],
     }
@@ -887,6 +950,7 @@ async def web_info(
         "action_schema",
         "search_status",
         "browser_status",
+        "browser_tabs",
         "page_elements",
         "game_probe",
         "screenshot",
@@ -911,6 +975,8 @@ async def web_info(
         return await get_search_engines_status(**arguments)
     if topic == "browser_status":
         return await browser_get_status(**arguments)
+    if topic == "browser_tabs":
+        return await browser_list_tabs(**arguments)
     if topic == "page_elements":
         return await browser_get_page_elements(**arguments)
     if topic == "game_probe":
@@ -993,6 +1059,7 @@ async def web_action(
 
 
 def main() -> None:
+    browser_tools.start_current_chrome_bridge()
     active_mcp = (
         legacy_mcp
         if os.getenv("WEB_SEARCH_NEO_LEGACY_TOOLS", "").strip() == "1"

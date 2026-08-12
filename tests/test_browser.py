@@ -22,6 +22,7 @@ import main
 def _open_or_skip(url: str, session_id: str, **kwargs):
     # Keep the deterministic suite in the background while production defaults visible.
     kwargs.setdefault("headless", True)
+    kwargs.setdefault("profile_mode", "temporary")
     try:
         return browser_tools.open_page(url, session_id=session_id, **kwargs)
     except WebDriverException as exc:
@@ -187,6 +188,7 @@ def test_async_bulk_open_creates_two_independent_named_sessions(local_site):
             width=700,
             height=500,
             headless=True,
+            profile_mode="temporary",
         )
     )
 
@@ -723,6 +725,8 @@ def test_navigation_resets_render_gate_and_held_inputs(local_site):
     result = browser_tools.open_page(
         f"{local_site.base_url}/form?session=navigation-reset",
         "navigation-reset",
+        headless=True,
+        profile_mode="temporary",
     )
 
     session = browser_tools._get_session("navigation-reset")

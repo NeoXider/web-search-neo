@@ -34,6 +34,7 @@ def main_smoke() -> int:
                 session_ids=["live-example", "live-python"],
                 width=900,
                 height=600,
+                profile_mode="temporary",
             )
         )
         report["parallel_pages"] = parallel
@@ -46,6 +47,7 @@ def main_smoke() -> int:
             1100,
             700,
             20,
+            profile_mode="temporary",
         )
         report["form_fill"] = browser_tools.fill_fields(
             {

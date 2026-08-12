@@ -6,8 +6,10 @@ This guide installs the MCP server from source and connects it to LM Studio or a
 
 - Python 3.10, 3.11, 3.12, or 3.13 available as `python` on `PATH`.
 - Git.
-- Google Chrome for rendered browser automation. Search and plain HTTP fetch tools do not require Chrome.
-- Windows, Linux, or macOS supported by Selenium Manager.
+- Google Chrome 116+ for rendered browser automation. Search and plain HTTP fetch tools do not require Chrome.
+- Windows, Linux, or macOS supported by Selenium Manager. Automatic companion
+  setup uses Windows UI Automation; manual unpacked installation works anywhere
+  Chrome supports extensions.
 
 Check the commands before continuing:
 
@@ -108,7 +110,59 @@ Some clients do not support a separate working-directory field. In that case kee
 }
 ```
 
-## 6. Choose a browser mode
+## 6. Connect the current signed-in Chrome (default)
+
+`profile_mode="current"` is the default. It controls tabs in the Chrome you already
+use, preserves the page's existing login, opens new tabs into a visible purple
+group named `AI`, and leaves tabs open when MCP sessions close.
+
+Start/restart the MCP first, then ask it for setup state:
+
+```json
+{
+  "actions": [{"action": "setup_current_chrome"}]
+}
+```
+
+If the companion is not already connected, that first call changes no Chrome
+setting and returns `confirmation_required=true`. After the user explicitly
+approves installing the extension, send:
+
+```json
+{
+  "actions": [{
+    "action": "setup_current_chrome",
+    "confirm_install": true,
+    "timeout_seconds": 30
+  }]
+}
+```
+
+On Windows the action opens `chrome://extensions`, enables Developer mode, loads
+the repository's `chrome-extension` folder, and waits for the companion. Chrome
+still displays the unpacked extension and its permissions. If UI Automation isn't
+available, install manually:
+
+1. Open `chrome://extensions`.
+2. Enable **Developer mode**.
+3. Choose **Load unpacked** and select the repository's `chrome-extension` folder.
+4. Leave **Web Search Neo Companion** enabled and restart/toggle the MCP server.
+
+Verify it with `web_info(topic="browser_status")`; `current_chrome.connected`
+should be `true`. List tabs with `web_info(topic="browser_tabs")`, then claim an
+existing returned ID with an `attach_tab` action. A normal `open` creates a new
+tab in group `AI` unless another `tab_group` is supplied.
+
+The bridge listens only on `127.0.0.1:8765` and accepts the fixed bundled extension
+ID. If that port conflicts, change `WEB_SEARCH_NEO_BRIDGE_PORT` for the MCP and the
+`BRIDGE_URL` constant in `chrome-extension/service-worker.js`, then reload the
+unpacked extension.
+
+Enable the companion in one Chrome profile at a time. The first connected profile
+is retained; additional companion connections are rejected so the MCP cannot
+silently jump to another signed-in account.
+
+## 7. Choose an isolated or managed browser mode
 
 ### Visible disposable browser
 
@@ -164,9 +218,12 @@ powershell -ExecutionPolicy Bypass -File scripts\start_managed_chrome.ps1 -Profi
 
 All newly created MCP-owned `temporary` and `persistent` sessions are visible when `headless` is omitted. Set `headless=true` only for background operation. For `attach`, the launcher's `-WindowMode` controls the already-running Chrome; attach cannot change its visibility afterward.
 
+Use `profile_mode="auto"` to prefer the current Chrome but fall back to a separate
+visible temporary window. The default `current` mode does not fall back silently.
+
 Chrome 136+ requires remote debugging to use a non-default data directory. You cannot safely retrofit attach mode onto an arbitrary normal Chrome window that was started without a DevTools port. The launcher handles both requirements with a separate durable profile.
 
-## 7. Verify the installation
+## 8. Verify the installation
 
 Install development requirements and run the deterministic suite:
 
@@ -176,6 +233,13 @@ python -m pytest
 ```
 
 The tests use a local web server and do not rely on search-engine availability.
+
+Maintainers can smoke-test the real unpacked extension in a disposable Chromium
+profile without touching their normal Chrome:
+
+```powershell
+python scripts\companion_live_smoke.py --chromium-binary C:\path\to\chromium.exe
+```
 
 Check providers from an MCP client with:
 
@@ -214,6 +278,14 @@ Confirm Google Chrome is installed and can launch normally. The first Selenium M
 ### Attach mode cannot connect
 
 Open `http://127.0.0.1:9222/json/version` locally. If it is unavailable, restart the managed Chrome launcher and make sure another process is not using the port.
+
+### Current Chrome companion cannot connect
+
+Call `web_info(topic="browser_status")`. Confirm that the MCP server is still
+running, **Web Search Neo Companion** is enabled at `chrome://extensions`, and the
+toolbar badge shows `ON`. If port 8765 is occupied, stop the other process or set
+the same free `WEB_SEARCH_NEO_BRIDGE_PORT` for the MCP and extension source before
+loading it.
 
 ### A canvas/WebGL game loads but cannot be controlled
 
