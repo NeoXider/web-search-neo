@@ -13,6 +13,7 @@ import time
 
 import pytest
 from selenium.common.exceptions import WebDriverException
+from selenium.webdriver.common.by import By
 
 import browser_tools
 import page_perception
@@ -691,3 +692,272 @@ def test_the_console_note_matches_what_this_backend_actually_captured(local_site
         assert "reload the page" not in payload["note"].lower()
     finally:
         browser_tools.close_session("defect-console-note")
+
+
+# ---------------------------------------------------------------------------
+# A reported centre has to be a place the click actually goes
+# ---------------------------------------------------------------------------
+
+# Each entry is one frame in transformed_frames.html and the shape between its
+# own coordinates and the page. The perception layer used to translate a frame's
+# boxes by its content-box origin alone, so everything here but a plain offset
+# came out somewhere the button is not - and the ones that still landed on it did
+# so only because the button was big enough to absorb the error.
+_FRAME_SHAPES = [
+    ("#plain", "no transform"),
+    ("#xrot", "transform: rotate(12deg)"),
+    ("#xscl", "transform: scale(0.6)"),
+    ("#xtra", "transform: translate(30px, 12px)"),
+    ("#prot", "the rotate property"),
+    ("#pscl", "the scale property"),
+    ("#ptra", "the translate property"),
+    ("#zoomed", "zoom: 0.7"),
+    ("#anc", "a transformed ancestor"),
+    ("#innerxf", "a transformed target inside a plain frame"),
+    ("#persp", "a perspective chain"),
+    ("#outer >>> #deep", "a frame nested inside a transformed frame"),
+    ("#xsclrot", "transform: scale(0.6) rotate(8deg)"),
+]
+
+# The aim target's own untransformed centre, in its own document's coordinates.
+_AIM_CENTRE = (47, 45)
+
+_AIM_READY = """(() => {
+  const ready = win => {
+    for (const frame of win.document.querySelectorAll('iframe')) {
+      if (!frame.contentWindow || !frame.contentWindow.__aim) return false;
+      if (!ready(frame.contentWindow)) return false;
+    }
+    return true;
+  };
+  return ready(window);
+})()"""
+
+_AIM_RESET = """
+const blank = () => ({verdict: 'none', hits: 0, x: null, y: null});
+const walk = win => {
+  try { win.__aim = blank(); } catch (error) { return; }
+  for (const frame of win.document.querySelectorAll('iframe')) {
+    try { if (frame.contentWindow) walk(frame.contentWindow); } catch (error) {}
+  }
+};
+walk(window);
+"""
+
+
+def _aim_verdict(driver, frame_path: str) -> str:
+    """What the page itself says about the click: which element received it.
+
+    Read from the document that owns the button, because that is the only party
+    that knows. Every other answer here - the tool's own centre, the tool's own
+    idea of where the frame is - is the thing under test.
+    """
+    hops = [hop.strip() for hop in frame_path.split(">>>")]
+    driver.switch_to.default_content()
+    verdict = driver.execute_script("return window.__aim.verdict;")
+    try:
+        for hop in hops:
+            driver.switch_to.frame(driver.find_element(By.CSS_SELECTOR, hop))
+            record = driver.execute_script("return window.__aim;")
+            if record["verdict"] != "none":
+                verdict = record["verdict"]
+    finally:
+        driver.switch_to.default_content()
+    return verdict
+
+
+def _aim_report(driver, session_id: str, centres: dict[str, dict]) -> list[str]:
+    """Click every reported centre and collect the frames that did not receive it."""
+    failures: list[str] = []
+    for frame_path, shape in _FRAME_SHAPES:
+        centre = centres.get(frame_path)
+        if centre is None:
+            failures.append(f"{shape} ({frame_path}): no button was reported at all")
+            continue
+        driver.switch_to.default_content()
+        driver.execute_script(_AIM_RESET)
+        try:
+            browser_tools.pointer_action(
+                "click",
+                centre["x"],
+                centre["y"],
+                session_id,
+                wait_seconds=0,
+                include_summary=False,
+            )
+        except ValueError as exc:
+            failures.append(f"{shape} ({frame_path}): the centre was refused - {exc}")
+            continue
+        verdict = _aim_verdict(driver, frame_path)
+        if verdict != "HIT":
+            failures.append(
+                f"{shape} ({frame_path}): clicking the reported centre "
+                f"({centre['x']}, {centre['y']}) hit {verdict}"
+            )
+    return failures
+
+
+def test_a_reported_centre_in_the_outline_is_where_the_click_lands(local_site):
+    """Every shape a frame can take, judged by the document that gets the event.
+
+    One session and one loop rather than a case per browser: every failure is
+    collected, because the interesting answer is *which* transforms are wrong,
+    and a test that stops at the first one hides the rest.
+    """
+    driver = _open_or_skip(
+        _fixture(local_site, "transformed_frames.html"), "defect-frame-centre"
+    )
+    try:
+        assert _settle(driver, _AIM_READY), "the fixture's frames never finished loading"
+        outline = page_perception.outline(driver, format="json", limit=600)
+        centres = {
+            node["frame"]: node["center"]
+            for node in _nodes(outline)
+            if node.get("name") == "Aim here" and node.get("frame")
+        }
+        failures = _aim_report(driver, "defect-frame-centre", centres)
+        assert not failures, "the outline's centre missed:\n  " + "\n  ".join(failures)
+    finally:
+        browser_tools.close_session("defect-frame-centre")
+
+
+def test_a_reported_centre_in_find_is_where_the_click_lands(local_site):
+    """find reports the same boxes as the outline, so it has the same duty."""
+    driver = _open_or_skip(
+        _fixture(local_site, "transformed_frames.html"), "defect-find-centre"
+    )
+    try:
+        assert _settle(driver, _AIM_READY), "the fixture's frames never finished loading"
+        found = page_perception.find(driver, "Aim here", role="button", limit=25)
+        centres = {
+            match["frame"]: match["center"]
+            for match in found["matches"]
+            if match.get("frame")
+        }
+        failures = _aim_report(driver, "defect-find-centre", centres)
+        assert not failures, "find's centre missed:\n  " + "\n  ".join(failures)
+    finally:
+        browser_tools.close_session("defect-find-centre")
+
+
+def test_a_box_that_only_approximates_its_projection_says_so(local_site):
+    """A perspective chain has no affine map onto the page.
+
+    The input layer already reports its mapping there as an approximation. The
+    outline used to hand over the same guess as an ordinary number, which is the
+    one case a caller cannot check for themselves - so it is labelled per node,
+    and only there: a flag on every frame would say nothing.
+    """
+    driver = _open_or_skip(
+        _fixture(local_site, "transformed_frames.html"), "defect-frame-approx"
+    )
+    try:
+        assert _settle(driver, _AIM_READY), "the fixture's frames never finished loading"
+        outline = page_perception.outline(driver, format="json", limit=600)
+        aims = [node for node in _nodes(outline) if node.get("name") == "Aim here"]
+        approximate = {
+            node.get("frame") for node in aims if node.get("page_rect_approximate")
+        }
+        assert approximate == {"#persp"}, (
+            f"only the perspective frame projects non-affinely, but {approximate} "
+            "were marked"
+        )
+
+        text = page_perception.outline(driver, format="text", limit=600)["outline"]
+        marked = [line for line in text.splitlines() if "approximate-box" in line]
+        assert len(marked) == 1 and "Aim here" in marked[0]
+
+        found = page_perception.find(driver, "Aim here", role="button", limit=25)
+        flagged = {
+            match.get("frame") for match in found["matches"]
+            if match.get("page_rect_approximate")
+        }
+        assert flagged == {"#persp"}, "find and the outline disagree about the same box"
+    finally:
+        browser_tools.close_session("defect-frame-approx")
+
+
+def test_a_rotated_frame_reports_a_bounding_box_and_an_exact_centre(local_site):
+    """What ``page_rect`` means once a frame is turned, said out loud.
+
+    A rotated rectangle has no axis-aligned rectangle of its own, so ``page_rect``
+    is the bounding box of the mapped corners - larger than the element, and not
+    a thing to aim at. ``center`` is the mapped centre, and the click test above
+    is what proves it exact.
+    """
+    driver = _open_or_skip(
+        _fixture(local_site, "transformed_frames.html"), "defect-frame-bbox"
+    )
+    try:
+        assert _settle(driver, _AIM_READY), "the fixture's frames never finished loading"
+        outline = page_perception.outline(driver, format="json", limit=600)
+        aims = {
+            node["frame"]: node
+            for node in _nodes(outline)
+            if node.get("name") == "Aim here" and node.get("frame")
+        }
+        rotated = aims["#xrot"]
+        # The button is 46x22 in its own document and the frame is not scaled, so
+        # any growth here is the rotation's, and a translation-only path had none.
+        assert (rotated["rect"]["w"], rotated["rect"]["h"]) == (46, 22)
+        assert rotated["page_rect"]["w"] > 46 and rotated["page_rect"]["h"] > 22
+        centre = rotated["center"]
+        box = rotated["page_rect"]
+        assert box["x"] < centre["x"] < box["x"] + box["w"]
+        assert box["y"] < centre["y"] < box["y"] + box["h"]
+
+        # A frame that is only offset has nothing to bound: the box is the box.
+        plain = aims["#plain"]
+        assert (plain["page_rect"]["w"], plain["page_rect"]["h"]) == (46, 22)
+    finally:
+        browser_tools.close_session("defect-frame-bbox")
+
+
+def test_perception_and_input_aim_through_the_same_frame_map(local_site):
+    """A drift guard, not the proof - the proof is the click test above.
+
+    Both layers answer "where is this frame-local point on the page", and they
+    used to answer differently: input composed the frame's transform chain while
+    perception added the frame's origin. Two implementations of one question
+    drift, so this fails the moment they stop being the same function.
+    """
+    driver = _open_or_skip(
+        _fixture(local_site, "transformed_frames.html"), "defect-frame-agree"
+    )
+    try:
+        assert _settle(driver, _AIM_READY), "the fixture's frames never finished loading"
+        outline = page_perception.outline(driver, format="json", limit=600)
+        aims = {
+            node["frame"]: node
+            for node in _nodes(outline)
+            if node.get("name") == "Aim here" and node.get("frame")
+        }
+        disagreements = []
+        for frame_path, shape in _FRAME_SHAPES:
+            # Input is aimed by a CSS selector resolved in the top document, so a
+            # nested frame is not something it can be asked about at all.
+            if ">>>" in frame_path or frame_path not in aims:
+                continue
+            node = aims[frame_path]
+            if frame_path == "#innerxf":
+                # This target carries its own transform, so its centre is not the
+                # untransformed one; the frame map is not what moved it.
+                local_x = node["rect"]["x"] + node["rect"]["w"] / 2
+                local_y = node["rect"]["y"] + node["rect"]["h"] / 2
+            else:
+                local_x, local_y = _AIM_CENTRE
+            driver.switch_to.default_content()
+            page_x, page_y = browser_tools._frame_map(driver, frame_path).to_page(
+                local_x, local_y
+            )
+            centre = node["center"]
+            if abs(page_x - centre["x"]) > 1 or abs(page_y - centre["y"]) > 1:
+                disagreements.append(
+                    f"{shape} ({frame_path}): input aims at ({page_x:.1f}, "
+                    f"{page_y:.1f}), perception reports ({centre['x']}, {centre['y']})"
+                )
+        assert not disagreements, "the two layers disagree:\n  " + "\n  ".join(
+            disagreements
+        )
+    finally:
+        browser_tools.close_session("defect-frame-agree")

@@ -623,7 +623,7 @@ Four observation topics describe an open session, from semantic structure down t
 {"topic":"page_outline","params":{"session_id":"demo","output":"json","limit":80}}
 ```
 
-The outline and `find` walk open shadow roots and same-origin iframes, including nested ones, and translate every box into top-document coordinates so a reported `center` can be clicked or pointed at directly. A cross-origin frame appears as one node with `same_origin: false`; read it by passing its selector as `frame_selector`. Closed shadow roots are counted in `closed_shadow_roots` rather than entered. A node inside a frame reports the `frame` path that reaches it, verified to match exactly one element and written as a `#host >>> #inner` piercing path when the frame is itself nested or inside a shadow root; a frame with no such path is marked `frame_addressable: false` instead of being given a selector that would land in the wrong one.
+The outline and `find` walk open shadow roots and same-origin iframes, including nested ones, and map every box into top-document coordinates so a reported `center` can be clicked or pointed at directly. A frame is mapped through the full transform of itself and its ancestors — `transform`, the individual `rotate`/`scale`/`translate` properties, and CSS `zoom` — because a frame scaled to fit its container is ordinary on a checkout page, and translating by its origin alone put the reported centre tens of pixels from the control. `center` is the point to aim at; `page_rect` is the smallest rectangle containing the mapped corners, which for a rotated frame is larger than the element itself and is not something to click. A chain that is not affine — a 3D `perspective` — can only be approximated flat, and those nodes say so with `page_rect_approximate` rather than presenting the guess as an ordinary number. A cross-origin frame appears as one node with `same_origin: false`; read it by passing its selector as `frame_selector`. Closed shadow roots are counted in `closed_shadow_roots` rather than entered. A node inside a frame reports the `frame` path that reaches it, verified to match exactly one element and written as a `#host >>> #inner` piercing path when the frame is itself nested or inside a shadow root; a frame with no such path is marked `frame_addressable: false` instead of being given a selector that would land in the wrong one.
 
 `page_text` never answers with a blank page, and never hands a fragment over as if it were the page:
 
@@ -1008,7 +1008,7 @@ python -m pytest
 python -m pytest --cov=. --cov-report=term-missing
 ```
 
-The deterministic suite is 571 tests, grouped by what they protect:
+The deterministic suite is 576 tests, grouped by what they protect:
 
 | Area | Covered |
 | --- | --- |

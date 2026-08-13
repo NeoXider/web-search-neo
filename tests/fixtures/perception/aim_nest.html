@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixture: nested aim host</title>
+<link rel="icon" href="data:,">
+<style>
+  html, body { margin: 0; padding: 0; background: #1a2230; overflow: hidden; }
+  /* A second hop with a transform of its own: the map onto the page is the
+     composition of both, which is exactly what a single frame's arithmetic
+     cannot express. */
+  #deep { position: absolute; left: 40px; top: 30px; width: 150px; height: 100px;
+          border: 0; background: #101820; transform: scale(0.8); }
+</style>
+</head>
+<body>
+<iframe id="deep" src="aim_target.html" title="deep"></iframe>
+<script>
+  window.__aim = {verdict: 'none', hits: 0, x: null, y: null};
+  document.addEventListener('click', event => {
+    const target = event.target;
+    const name = target ? (target.id || target.tagName.toLowerCase()) : 'nothing';
+    window.__aim.verdict = 'MISS:' + name;
+    window.__aim.hits += 1;
+    window.__aim.x = event.clientX;
+    window.__aim.y = event.clientY;
+  }, true);
+</script>
+</body>
+</html>

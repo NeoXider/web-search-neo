@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixture: aim target</title>
+<link rel="icon" href="data:,">
+<style>
+  html, body { margin: 0; padding: 0; background: #101820; }
+  /* The backdrop fills the frame so a near miss lands on something this
+     document owns and can name, instead of falling through to the host page
+     and looking like the click was never delivered at all. */
+  #backdrop { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+  #aim { position: absolute; left: 24px; top: 34px; width: 46px; height: 22px;
+         margin: 0; padding: 0; font: 11px/1 monospace; }
+  #wrap { position: absolute; left: 0; top: 0; }
+</style>
+</head>
+<body>
+<div id="backdrop"></div>
+<div id="wrap"><button id="aim">Aim here</button></div>
+<script>
+  // The page's own verdict on where the pointer landed. A tool that reports a
+  // clickable centre is only right if the element under that centre is this
+  // button, and only the document that receives the event can say so.
+  window.__aim = {verdict: 'none', hits: 0, x: null, y: null};
+  document.addEventListener('click', event => {
+    const target = event.target;
+    const name = target ? (target.id || target.tagName.toLowerCase()) : 'nothing';
+    window.__aim.verdict = name === 'aim' ? 'HIT' : 'MISS:' + name;
+    window.__aim.hits += 1;
+    window.__aim.x = event.clientX;
+    window.__aim.y = event.clientY;
+  }, true);
+  // A frame may be asked to carry its own transform on the target rather than
+  // on the frame, which is a different arithmetic: the element's own box is
+  // already transformed by the time getBoundingClientRect answers.
+  const inner = new URL(location.href).searchParams.get('inner');
+  if (inner) {
+    const wrap = document.getElementById('wrap');
+    wrap.style.transformOrigin = '0 0';
+    wrap.style.transform = inner;
+  }
+</script>
+</body>
+</html>

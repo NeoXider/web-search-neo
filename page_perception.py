@@ -504,18 +504,156 @@ function wsnSelector(el) {
   return local;
 }
 
-function wsnFrameOffset(el, rect) {
+// Where a point inside a frame lands, one hop at a time. Both layers ask this:
+// perception, to report a box in the top document's terms, and input, to aim an
+// event at one. A second copy of this arithmetic drifts, and the two layers then
+// disagree about the same pixel - which is exactly how a reported centre came to
+// be a place the click never went.
+//
+// A frame's content is not merely offset from its host: a `transform` between
+// the two rotates and scales everything inside it, so only a full affine map -
+// an origin plus the images of the two unit vectors - can carry a point across.
+//
+// `transform` is not the whole story either. The CSS Transforms 2 individual
+// properties - `rotate`, `scale`, `translate` - never appear in the computed
+// `transform` (Chrome reports `transform: none` for `rotate: 20deg`), and `zoom`
+// is not a transform at all, so a map that reads only `transform` comes out as
+// the identity while the frame is turned and resized on screen. The individual
+// properties are composed in the spec's order - translate, rotate, scale, then
+// `transform` - and `zoom` multiplies in as a scalar, which commutes with the
+// rest so the whole chain's factor can be applied once at the end. `translate`
+// is left out on purpose: it is a pure translation, and every translation in the
+// chain is recovered from the painted box below.
+//
+// A 3D/perspective chain is not affine and says so in `flat` instead of being
+// quietly reported as something a caller can aim at.
+const WSN_IDENTITY_MAP = {x: 0, y: 0, ax: 1, ay: 0, bx: 0, by: 1, flat: true};
+
+function wsnRotateFunction(value) {
+  const parts = value.trim().split(/\s+/);
+  const angle = parts.pop();
+  if (!parts.length || parts[0] === 'z') return 'rotate(' + angle + ')';
+  const axis = parts.length === 1 ? {x: '1,0,0', y: '0,1,0'}[parts[0]] : parts.join(',');
+  return axis ? 'rotate3d(' + axis + ',' + angle + ')' : 'rotate(' + angle + ')';
+}
+
+function wsnScaleFunction(value) {
+  const parts = value.trim().split(/\s+/);
+  const sx = parts[0];
+  const sy = parts[1] || parts[0];
+  const sz = parts[2] || '1';
+  return parseFloat(sz) === 1
+    ? 'scale(' + sx + ',' + sy + ')'
+    : 'scale3d(' + sx + ',' + sy + ',' + sz + ')';
+}
+
+// `is2D` answers how a matrix was spelled, not what it does: a rotate3d about
+// z is flagged 3D while projecting exactly like a 2D rotation. What matters is
+// whether the x/y projection depends on z, so the numbers are asked directly.
+function wsnProjectsFlat(matrix) {
+  return !matrix.m13 && !matrix.m14 && !matrix.m23 && !matrix.m24 &&
+    !matrix.m31 && !matrix.m32 && !matrix.m34;
+}
+
+function wsnFrameMap(el) {
+  // The map from this frame's own viewport coordinates to those of the document
+  // that holds it - one hop. Compose it with the host's map to reach the page.
   const view = el.ownerDocument ? el.ownerDocument.defaultView : null;
-  let left = 0;
-  let top = 0;
-  if (view && view.getComputedStyle) {
-    const style = view.getComputedStyle(el);
-    if (style) {
-      left = (parseFloat(style.borderLeftWidth) || 0) + (parseFloat(style.paddingLeft) || 0);
-      top = (parseFloat(style.borderTopWidth) || 0) + (parseFloat(style.paddingTop) || 0);
+  const styleOf = node => (view && view.getComputedStyle ? view.getComputedStyle(node) : null);
+  let linear = new DOMMatrix();
+  let flat = true;
+  let zoom = 1;
+  for (let node = el; node; node = node.parentElement) {
+    const style = styleOf(node);
+    if (!style) continue;
+    const list = [];
+    if (style.rotate && style.rotate !== 'none') list.push(wsnRotateFunction(style.rotate));
+    if (style.scale && style.scale !== 'none') list.push(wsnScaleFunction(style.scale));
+    if (style.transform && style.transform !== 'none') list.push(style.transform);
+    if (list.length) {
+      // Every entry is Chrome's own computed serialisation, in the same grammar
+      // DOMMatrix parses, so a throw here would mean a spelling nobody knows
+      // about yet - worth hearing about rather than quietly aiming through.
+      const step = new DOMMatrix(list.join(' '));
+      if (!wsnProjectsFlat(step)) flat = false;
+      linear = step.multiply(linear);
     }
+    // `zoom` is inherited by multiplication rather than by computed value, so the
+    // effective factor is the product of the chain. It is a uniform scale, which
+    // commutes with everything above, so applying it once at the end is exact.
+    const nodeZoom = parseFloat(style.zoom);
+    if (nodeZoom > 0 && nodeZoom !== 1) zoom *= nodeZoom;
   }
-  return {x: rect.x + left, y: rect.y + top};
+  if (zoom !== 1) linear = linear.scale(zoom, zoom);
+  linear.e = 0;
+  linear.f = 0;
+  const width = el.offsetWidth;
+  const height = el.offsetHeight;
+  const corners = [[0, 0], [width, 0], [width, height], [0, height]].map(
+    pair => linear.transformPoint(new DOMPoint(pair[0], pair[1]))
+  );
+  const rect = el.getBoundingClientRect();
+  const shiftX = rect.left - Math.min.apply(null, corners.map(point => point.x));
+  const shiftY = rect.top - Math.min.apply(null, corners.map(point => point.y));
+  const own = styleOf(el);
+  const insetX = own
+    ? (parseFloat(own.borderLeftWidth) || 0) + (parseFloat(own.paddingLeft) || 0) : 0;
+  const insetY = own
+    ? (parseFloat(own.borderTopWidth) || 0) + (parseFloat(own.paddingTop) || 0) : 0;
+  const origin = linear.transformPoint(new DOMPoint(insetX, insetY));
+  const unitX = linear.transformPoint(new DOMPoint(insetX + 1, insetY));
+  const unitY = linear.transformPoint(new DOMPoint(insetX, insetY + 1));
+  return {
+    x: origin.x + shiftX, y: origin.y + shiftY,
+    ax: unitX.x - origin.x, ay: unitX.y - origin.y,
+    bx: unitY.x - origin.x, by: unitY.y - origin.y,
+    flat: flat
+  };
+}
+
+function wsnComposeMap(outer, inner) {
+  // `outer` after `inner`: a point in the inner frame goes through the inner map
+  // into its host's coordinates, and through the outer map from there.
+  return {
+    x: outer.x + outer.ax * inner.x + outer.bx * inner.y,
+    y: outer.y + outer.ay * inner.x + outer.by * inner.y,
+    ax: outer.ax * inner.ax + outer.bx * inner.ay,
+    ay: outer.ay * inner.ax + outer.by * inner.ay,
+    bx: outer.ax * inner.bx + outer.bx * inner.by,
+    by: outer.ay * inner.bx + outer.by * inner.by,
+    flat: outer.flat && inner.flat
+  };
+}
+
+function wsnMapPoint(map, x, y) {
+  return {x: map.x + map.ax * x + map.bx * y, y: map.y + map.ay * x + map.by * y};
+}
+
+// A rotated box has no axis-aligned rectangle of its own, so `page_rect` is the
+// bounding box of its mapped corners - the smallest rectangle that contains it -
+// while `center` is the mapped centre, which is the point a caller aims at and
+// is exact whatever the rotation.
+function wsnMapBox(map, box) {
+  const right = box.left + box.width;
+  const bottom = box.top + box.height;
+  const corners = [
+    wsnMapPoint(map, box.left, box.top), wsnMapPoint(map, right, box.top),
+    wsnMapPoint(map, right, bottom), wsnMapPoint(map, box.left, bottom)
+  ];
+  const xs = corners.map(point => point.x);
+  const ys = corners.map(point => point.y);
+  const left = Math.min.apply(null, xs);
+  const top = Math.min.apply(null, ys);
+  const middle = wsnMapPoint(map, box.left + box.width / 2, box.top + box.height / 2);
+  return {
+    page_rect: {
+      x: Math.round(left),
+      y: Math.round(top),
+      w: Math.round(Math.max.apply(null, xs) - left),
+      h: Math.round(Math.max.apply(null, ys) - top)
+    },
+    center: {x: Math.round(middle.x), y: Math.round(middle.y)}
+  };
 }
 
 function wsnRefFor(el, registry) {
@@ -756,7 +894,7 @@ const ctx = {
   registry: registry,
   hosts: null,
   frames: {same_origin: 0, cross_origin: 0, unaddressable: 0, too_deep: 0},
-  offsets: {x: 0, y: 0, frame: null},
+  offsets: {map: WSN_IDENTITY_MAP, frame: null},
   view: {width: window.innerWidth, height: window.innerHeight},
   counts: {
     nodes: 0, interactive: 0, headings: 0, landmarks: 0, links: 0,
@@ -821,12 +959,12 @@ function wsnContainer(el, context) {
   }
 }
 
-function wsnWalkRoot(root, depth, context, offsetX, offsetY, frameInfo) {
+function wsnWalkRoot(root, depth, context, map, frameInfo) {
   const previousHosts = context.hosts;
   const previousOffsets = context.offsets;
   const previousRegistry = context.registry;
   context.hosts = wsnShadowAncestors(root);
-  context.offsets = {x: offsetX, y: offsetY, frame: frameInfo || null};
+  context.offsets = {map: map, frame: frameInfo || null};
   // A shadow root belongs to the document that hosts it; a frame document is its
   // own, and its refs have to be minted there to be resolvable there.
   if (root.nodeType === 9) {
@@ -871,7 +1009,7 @@ function wsnVisitElement(el, depth, context) {
   }
   if (wsnContainer(el, context)) {
     if (el.shadowRoot) {
-      wsnWalkRoot(el.shadowRoot, depth, context, context.offsets.x, context.offsets.y,
+      wsnWalkRoot(el.shadowRoot, depth, context, context.offsets.map,
                   context.offsets.frame);
     } else {
       wsnWalkChildren(el, depth, context);
@@ -886,7 +1024,7 @@ function wsnVisitElement(el, depth, context) {
 
 function wsnDescend(el, depth, context, node) {
   if (el.shadowRoot) {
-    wsnWalkRoot(el.shadowRoot, depth, context, context.offsets.x, context.offsets.y,
+    wsnWalkRoot(el.shadowRoot, depth, context, context.offsets.map,
                 context.offsets.frame);
     return;
   }
@@ -919,12 +1057,8 @@ function wsnEmit(el, role, depth, context) {
   }
   const offsets = context.offsets;
   const local = {x: Math.round(box.left), y: Math.round(box.top), w: width, h: height};
-  const page = {
-    x: Math.round(box.left + offsets.x),
-    y: Math.round(box.top + offsets.y),
-    w: width,
-    h: height
-  };
+  const mapped = wsnMapBox(offsets.map, box);
+  const page = mapped.page_rect;
   const tag = el.tagName.toLowerCase();
   const interactive = WSN_INTERACTIVE_ROLES.has(role);
   const node = {
@@ -937,7 +1071,7 @@ function wsnEmit(el, role, depth, context) {
     states: wsnStates(el),
     rect: local,
     page_rect: page,
-    center: {x: page.x + Math.round(page.w / 2), y: page.y + Math.round(page.h / 2)},
+    center: mapped.center,
     visible: visible,
     interactive: interactive,
     in_viewport: width > 0 && height > 0 && page.x + page.w > 0 && page.y + page.h > 0
@@ -958,6 +1092,10 @@ function wsnEmit(el, role, depth, context) {
     // frame happens to match first, so it is handed over labelled, not silently.
     if (!offsets.frame.addressable) node.frame_addressable = false;
   }
+  // A perspective chain does not project onto the page as an affine map, so the
+  // box above is its best flat approximation and can be a few pixels out. Saying
+  // so per node beats handing over a plausible number with nothing to doubt.
+  if (!offsets.map.flat) node.page_rect_approximate = true;
   node.occluded = context.occlusion ? wsnOccluded(el, local) : null;
   context.out.push(node);
   context.counts.nodes += 1;
@@ -968,13 +1106,13 @@ function wsnEmit(el, role, depth, context) {
   if (WSN_LANDMARK_ROLES.has(role)) context.counts.landmarks += 1;
   if (role === 'iframe') {
     context.counts.frames += 1;
-    wsnDescendFrame(el, node, depth, context, local);
+    wsnDescendFrame(el, node, depth, context);
     return;
   }
   wsnDescend(el, depth + 1, context, node);
 }
 
-function wsnDescendFrame(el, node, depth, context, local) {
+function wsnDescendFrame(el, node, depth, context) {
   let doc = null;
   try {
     doc = el.contentDocument;
@@ -1024,12 +1162,14 @@ function wsnDescendFrame(el, node, depth, context, local) {
   } catch (error) {
     // Ignore cross-origin probing failures.
   }
-  const origin = wsnFrameOffset(el, local);
-  wsnWalkRoot(doc, depth + 1, context, context.offsets.x + origin.x,
-              context.offsets.y + origin.y, frameInfo);
+  // The frame's own map carries a point from its content out to this document;
+  // composing it with the map already in hand carries it the rest of the way to
+  // the page, however many transformed hops that is.
+  const inner = wsnComposeMap(context.offsets.map, wsnFrameMap(el));
+  wsnWalkRoot(doc, depth + 1, context, inner, frameInfo);
 }
 
-wsnWalkRoot(document, 0, ctx, 0, 0, null);
+wsnWalkRoot(document, 0, ctx, WSN_IDENTITY_MAP, null);
 wsnFlushText(ctx);
 
 return {
@@ -1093,6 +1233,11 @@ def _format_outline_text(nodes: list[dict[str, Any]]) -> str:
             box = _format_rect(node.get("page_rect"))
             if box:
                 parts.append(box)
+                # The box is a flat approximation of a perspective projection, so
+                # it is the one box on this page a caller should not aim at
+                # without checking. Marked here rather than left to look exact.
+                if node.get("page_rect_approximate"):
+                    parts.append("approximate-box")
         if node.get("occluded"):
             parts.append("occluded")
         if node.get("visible") is False:
@@ -1118,6 +1263,20 @@ def outline(
     epoch differs from the page's ``dom_epoch``; the action tools follow the ref
     into its document. Its ``frame`` path is verified to address exactly one frame,
     and is marked ``frame_addressable: false`` when no such path exists.
+
+    ``rect`` is the element's box in its own document. ``page_rect`` and ``center``
+    are that box carried into the top document through every frame hop, including
+    any CSS transform, individual ``rotate``/``scale``/``translate`` property or
+    ``zoom`` between the two - the same map the input tools aim through, so the
+    two agree on where a thing is. A rotated box has no axis-aligned rectangle of
+    its own, so ``page_rect`` is the bounding box of its mapped corners - the
+    smallest rectangle containing it, which is wider than the element - while
+    ``center`` is the mapped centre and is exact: it is the point to click.
+
+    Under a 3D/perspective chain the projection is not affine, so both are the
+    best flat approximation of it and can be a few pixels out; those nodes carry
+    ``page_rect_approximate: true`` (``approximate-box`` in text) rather than a
+    plausible number with nothing to doubt.
     """
     node_limit = max(1, min(int(limit), _MAX_OUTLINE_NODES))
     selected = str(format or "text").strip().lower()
@@ -1666,12 +1825,12 @@ function wsnCollect(root, offsets, out, depth) {
         doc = null;
       }
       if (doc) {
-        const box = el.getBoundingClientRect();
-        const origin = wsnFrameOffset(el, {x: box.left, y: box.top});
         // wsnSelector is absolute from the top document already; a frame with no
         // verifiable path is reported as having none rather than as a bare tag
-        // that would address a different document.
-        wsnCollect(doc, {x: offsets.x + origin.x, y: offsets.y + origin.y,
+        // that would address a different document. The map is the outline's:
+        // this frame's own hop composed with everything above it, so a box comes
+        // out where the page paints it and not merely where its host sits.
+        wsnCollect(doc, {map: wsnComposeMap(offsets.map, wsnFrameMap(el)),
                          frame: wsnSelector(el) || null}, out, depth + 1);
       }
       continue;
@@ -1693,7 +1852,7 @@ const actionish = queryTokens.some(token => WSN_ACTION_WORDS.has(token));
 
 let framesTooDeep = 0;
 const candidates = [];
-wsnCollect(document, {x: 0, y: 0, frame: null}, candidates, 0);
+wsnCollect(document, {map: WSN_IDENTITY_MAP, frame: null}, candidates, 0);
 
 const view = {width: window.innerWidth, height: window.innerHeight};
 const scored = [];
@@ -1767,12 +1926,8 @@ for (let index = 0; index < candidates.length; index += 1) {
   if (matchScore <= 0) continue;
   let score = matchScore;
   const local = {x: Math.round(box.left), y: Math.round(box.top), w: width, h: height};
-  const page = {
-    x: Math.round(box.left + offsets.x),
-    y: Math.round(box.top + offsets.y),
-    w: width,
-    h: height
-  };
+  const mapped = wsnMapBox(offsets.map, box);
+  const page = mapped.page_rect;
   const inViewport = width > 0 && height > 0 && page.x + page.w > 0 && page.y + page.h > 0
     && page.x < view.width && page.y < view.height;
   if (inViewport) score += 18;
@@ -1796,7 +1951,8 @@ for (let index = 0; index < candidates.length; index += 1) {
     matched_field: matchedField,
     rect: local,
     page_rect: page,
-    center: {x: page.x + Math.round(page.w / 2), y: page.y + Math.round(page.h / 2)},
+    center: mapped.center,
+    approximate: !offsets.map.flat,
     visible: visible,
     occluded: occluded,
     interactive: interactive,
@@ -1838,22 +1994,28 @@ const ambiguous = !lowConfidence && qualified.length > 1
   && (qualified[0].match_score - qualified[1].match_score) < 5
   && (qualified[0].score - qualified[1].score) < 5;
 
-const matches = selected.map(item => ({
-  // Minted in the element's own document: a handle from another browsing context
-  // resolves to nothing the driver can act on.
-  ref: wsnHandleFor(item.el),
-  role: item.role,
-  name: item.name,
-  score: item.score,
-  match_score: item.match_score,
-  matched_field: item.matched_field,
-  rect: item.rect,
-  page_rect: item.page_rect,
-  center: item.center,
-  visible: item.visible,
-  occluded: item.occluded,
-  frame: item.frame
-}));
+const matches = selected.map(item => {
+  const match = {
+    // Minted in the element's own document: a handle from another browsing context
+    // resolves to nothing the driver can act on.
+    ref: wsnHandleFor(item.el),
+    role: item.role,
+    name: item.name,
+    score: item.score,
+    match_score: item.match_score,
+    matched_field: item.matched_field,
+    rect: item.rect,
+    page_rect: item.page_rect,
+    center: item.center,
+    visible: item.visible,
+    occluded: item.occluded,
+    frame: item.frame
+  };
+  // A perspective chain projects onto the page without an affine map, so the box
+  // is its flat approximation; the outline says the same thing on the same key.
+  if (item.approximate) match.page_rect_approximate = true;
+  return match;
+});
 
 return {
   url: String(location.href),
@@ -1907,6 +2069,12 @@ def find(
     are the closest things found, offered as a guess. ``ambiguous`` is a different
     failure and has its own flag: the top two matched equally well *and* ranked
     equally, so which came first was decided by document order alone.
+
+    ``rect``, ``page_rect``, ``center`` and ``page_rect_approximate`` mean exactly
+    what they mean in ``outline``: ``center`` is the element's centre carried into
+    the top document through every frame transform and is the point to click,
+    ``page_rect`` is the bounding box of the mapped corners, and the flag marks a
+    box that only approximates a perspective projection.
 
     ``candidates`` were examined, ``scored`` resembled the query at all (weak
     role-word brushes included), ``matched`` cleared ``match_threshold``, and

@@ -514,9 +514,13 @@ To address such a field by structure rather than by ref, use a piercing path:
 }
 ```
 
-Same-origin iframes are walked in the same traversal, and every box is
-translated into top-level page coordinates, so a reported `center` can be
-clicked directly. A cross-origin frame appears as a single node with
+Same-origin iframes are walked in the same traversal, and every box is mapped
+into top-level page coordinates through the frame's whole transform chain, so a
+reported `center` can be clicked directly — including inside a payment or preview
+frame scaled to fit its container, where translating by the frame's origin alone
+used to put the reported centre tens of pixels away from the control. Aim at
+`center`: `page_rect` is the smallest rectangle containing the mapped corners,
+so a rotated frame makes it larger than the element. A cross-origin frame appears as a single node with
 `same_origin: false`; read it by passing its selector as `frame_selector`:
 
 ```json

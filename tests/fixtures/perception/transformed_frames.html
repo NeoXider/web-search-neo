@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixture: frames under every kind of transform</title>
+<link rel="icon" href="data:,">
+<style>
+  html, body { margin: 0; padding: 0; background: #0b0e14; color: #d7dde8;
+               font: 12px/1.3 monospace; overflow: hidden; width: 1024px; height: 768px; }
+  /* Every frame holds the same aim target at the same frame-local position.
+     What differs is the map between the frame's own coordinates and the top
+     document a reported centre is supposed to be clickable in: a plain offset,
+     each spelling of a transform, the individual transform properties, `zoom`,
+     a transform on an ancestor, a second frame hop, a transform on the target
+     rather than on the frame, and a perspective chain that is not affine at
+     all. A perception path that only adds the frame's offset is right for the
+     first one and wrong for most of the rest. */
+  iframe { width: 150px; height: 100px; border: 0; background: #101820; display: block; }
+  .slot { position: absolute; }
+
+  #plain-slot    { left: 8px;   top: 8px; }
+  #xrot-slot     { left: 200px; top: 8px; }
+  #xrot          { transform: rotate(12deg); transform-origin: 0 0; }
+  #xscl-slot     { left: 360px; top: 8px; }
+  #xscl          { transform: scale(0.6); }
+  #xtra-slot     { left: 500px; top: 8px; }
+  #xtra          { transform: translate(30px, 12px); }
+  #prot-slot     { left: 700px; top: 30px; }
+  #prot          { rotate: 12deg; }
+
+  #pscl-slot     { left: 8px;   top: 180px; }
+  #pscl          { scale: 0.6; }
+  #ptra-slot     { left: 170px; top: 180px; }
+  #ptra          { translate: 20px 10px; }
+  #zoomed-slot   { left: 360px; top: 180px; }
+  #zoom-wrap     { zoom: 0.7; }
+  #anc-slot      { left: 500px; top: 180px; }
+  #anc-wrap      { transform: scale(0.6) rotate(8deg); transform-origin: 0 0; }
+  #innerxf-slot  { left: 640px; top: 180px; }
+  #persp-slot    { left: 820px; top: 180px; }
+  #persp         { transform: perspective(300px) rotateY(35deg); }
+
+  #outer-slot    { left: 30px;  top: 330px; }
+  #outer         { width: 260px; height: 170px;
+                   transform: scale(0.7) rotate(6deg); transform-origin: 0 0; }
+  #xsclrot-slot  { left: 280px; top: 330px; }
+  #xsclrot       { transform: scale(0.6) rotate(8deg); }
+</style>
+</head>
+<body>
+<div class="slot" id="plain-slot"><iframe id="plain" src="aim_target.html" title="plain"></iframe></div>
+<div class="slot" id="xrot-slot"><iframe id="xrot" src="aim_target.html" title="rotate transform"></iframe></div>
+<div class="slot" id="xscl-slot"><iframe id="xscl" src="aim_target.html" title="scale transform"></iframe></div>
+<div class="slot" id="xtra-slot"><iframe id="xtra" src="aim_target.html" title="translate transform"></iframe></div>
+<div class="slot" id="prot-slot"><iframe id="prot" src="aim_target.html" title="rotate property"></iframe></div>
+
+<div class="slot" id="pscl-slot"><iframe id="pscl" src="aim_target.html" title="scale property"></iframe></div>
+<div class="slot" id="ptra-slot"><iframe id="ptra" src="aim_target.html" title="translate property"></iframe></div>
+<div class="slot" id="zoomed-slot"><div id="zoom-wrap"><iframe id="zoomed" src="aim_target.html" title="zoom"></iframe></div></div>
+<div class="slot" id="anc-slot"><div id="anc-wrap"><iframe id="anc" src="aim_target.html" title="transformed ancestor"></iframe></div></div>
+<div class="slot" id="innerxf-slot"><iframe id="innerxf" src="aim_target.html?inner=scale(0.8)%20rotate(15deg)" title="transformed target"></iframe></div>
+<div class="slot" id="persp-slot"><iframe id="persp" src="aim_target.html" title="perspective"></iframe></div>
+
+<div class="slot" id="outer-slot"><iframe id="outer" src="aim_nest.html" title="outer"></iframe></div>
+<div class="slot" id="xsclrot-slot"><iframe id="xsclrot" src="aim_target.html" title="scale and rotate"></iframe></div>
+
+<script>
+  // The top document's own verdict, so a click that fell between the frames is
+  // reported as landing here rather than as never having happened.
+  window.__aim = {verdict: 'none', hits: 0, x: null, y: null};
+  document.addEventListener('click', event => {
+    const target = event.target;
+    const name = target ? (target.id || target.tagName.toLowerCase()) : 'nothing';
+    window.__aim.verdict = 'MISS:' + name;
+    window.__aim.hits += 1;
+    window.__aim.x = event.clientX;
+    window.__aim.y = event.clientY;
+  }, true);
+</script>
+</body>
+</html>

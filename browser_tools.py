@@ -3493,89 +3493,19 @@ def pointer_action(
 # CDP input is addressed in top-level page pixels, so a point inside a frame has
 # to be carried through everything that stands between the two: the origin of the
 # frame's *content* box - the border box misses by exactly the border and padding
-# - and any CSS transform on the frame or on an ancestor. The linear part of that
-# chain is the product of the ancestors' `transform` matrices; transform-origin,
-# scrolling and layout only add translation, and that is recovered from the box
-# the browser actually painted, so scale, rotation and skew all come out right.
-# A 3D/perspective chain is not affine and says so instead of being mis-aimed.
-#
-# `transform` is not the whole story. The CSS Transforms 2 individual properties
-# - `rotate`, `scale`, `translate` - never appear in the computed `transform`
-# (Chrome reports `transform: none` for `rotate: 20deg`), and `zoom` is not a
-# transform at all, so a map that reads only `transform` comes out as the
-# identity while the frame is turned and resized on screen. The individual
-# properties are composed in the spec's order - translate, rotate, scale, then
-# `transform` - and `zoom` multiplies in as a scalar, which commutes with the
-# rest so the whole chain's factor can be applied once at the end. `translate`
-# is left out on purpose: it is a pure translation, and every translation in the
-# chain is recovered from the painted box below.
-_FRAME_MAP_SCRIPT = """
-const frame = arguments[0];
-const rotateFunction = value => {
-  const parts = value.trim().split(/\\s+/);
-  const angle = parts.pop();
-  if (!parts.length || parts[0] === 'z') return 'rotate(' + angle + ')';
-  const axis = parts.length === 1 ? {x: '1,0,0', y: '0,1,0'}[parts[0]] : parts.join(',');
-  return axis ? 'rotate3d(' + axis + ',' + angle + ')' : 'rotate(' + angle + ')';
-};
-const scaleFunction = value => {
-  const parts = value.trim().split(/\\s+/);
-  const [sx, sy, sz] = [parts[0], parts[1] || parts[0], parts[2] || '1'];
-  return parseFloat(sz) === 1
-    ? 'scale(' + sx + ',' + sy + ')'
-    : 'scale3d(' + sx + ',' + sy + ',' + sz + ')';
-};
-// `is2D` answers how a matrix was spelled, not what it does: a rotate3d about
-// z is flagged 3D while projecting exactly like a 2D rotation. What matters is
-// whether the x/y projection depends on z, so the numbers are asked directly.
-const projectsFlat = matrix =>
-  !matrix.m13 && !matrix.m14 && !matrix.m23 && !matrix.m24 &&
-  !matrix.m31 && !matrix.m32 && !matrix.m34;
-let linear = new DOMMatrix();
-let flat = true;
-let zoom = 1;
-for (let node = frame; node; node = node.parentElement) {
-  const style = getComputedStyle(node);
-  const list = [];
-  if (style.rotate && style.rotate !== 'none') list.push(rotateFunction(style.rotate));
-  if (style.scale && style.scale !== 'none') list.push(scaleFunction(style.scale));
-  if (style.transform && style.transform !== 'none') list.push(style.transform);
-  if (list.length) {
-    // Every entry is Chrome's own computed serialisation, in the same grammar
-    // DOMMatrix parses, so a throw here would mean a spelling nobody knows
-    // about yet - worth hearing about rather than quietly aiming through.
-    const step = new DOMMatrix(list.join(' '));
-    if (!projectsFlat(step)) flat = false;
-    linear = step.multiply(linear);
-  }
-  // `zoom` is inherited by multiplication rather than by computed value, so the
-  // effective factor is the product of the chain. It is a uniform scale, which
-  // commutes with everything above, so applying it once at the end is exact.
-  const nodeZoom = parseFloat(style.zoom);
-  if (nodeZoom > 0 && nodeZoom !== 1) zoom *= nodeZoom;
-}
-if (zoom !== 1) linear = linear.scale(zoom, zoom);
-linear.e = 0;
-linear.f = 0;
-const width = frame.offsetWidth;
-const height = frame.offsetHeight;
-const corners = [[0, 0], [width, 0], [width, height], [0, height]].map(
-  ([x, y]) => linear.transformPoint(new DOMPoint(x, y))
-);
-const rect = frame.getBoundingClientRect();
-const shiftX = rect.left - Math.min(...corners.map(point => point.x));
-const shiftY = rect.top - Math.min(...corners.map(point => point.y));
-const style = getComputedStyle(frame);
-const insetX = parseFloat(style.borderLeftWidth || 0) + parseFloat(style.paddingLeft || 0);
-const insetY = parseFloat(style.borderTopWidth || 0) + parseFloat(style.paddingTop || 0);
-const origin = linear.transformPoint(new DOMPoint(insetX, insetY));
-const unitX = linear.transformPoint(new DOMPoint(insetX + 1, insetY));
-const unitY = linear.transformPoint(new DOMPoint(insetX, insetY + 1));
+# - and any CSS transform, individual `rotate`/`scale`/`translate` property or
+# `zoom` on the frame or on an ancestor. `wsnFrameMap` in the shared page-side
+# library is that map, and the outline and find report their boxes through the
+# very same function: two implementations of "where is this frame-local point on
+# the page" drift apart, and then the centre a caller is told to click is not the
+# pixel this module aims at.
+_FRAME_MAP_SCRIPT = page_perception.JS_LIBRARY + """
+const mapped = wsnFrameMap(arguments[0]);
 return {
-  x: origin.x + shiftX, y: origin.y + shiftY,
-  ax: unitX.x - origin.x, ay: unitX.y - origin.y,
-  bx: unitY.x - origin.x, by: unitY.y - origin.y,
-  flat: flat,
+  x: mapped.x, y: mapped.y,
+  ax: mapped.ax, ay: mapped.ay,
+  bx: mapped.bx, by: mapped.by,
+  flat: mapped.flat,
   page_width: window.innerWidth, page_height: window.innerHeight
 };
 """
