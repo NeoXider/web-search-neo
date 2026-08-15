@@ -1,0 +1,71 @@
+:root {
+  color-scheme: light dark;
+  font: 13px/1.4 system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+  min-width: 310px;
+  background: #0f172a;
+  color: #e2e8f0;
+}
+
+main { padding: 16px; }
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  margin-bottom: 16px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 16px;
+}
+
+p { margin: 0; }
+
+.status { color: #94a3b8; }
+.status[data-state="connected"] { color: #4ade80; }
+.status[data-state="waiting"] { color: #fbbf24; }
+.status[data-state="disabled"] { color: #94a3b8; }
+.status[data-state="error"] { color: #f87171; }
+
+.switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px;
+  border: 1px solid #334155;
+  border-radius: 10px;
+  background: #172033;
+}
+
+.switch-row span { display: grid; gap: 2px; }
+.switch-row small { color: #94a3b8; }
+.switch-row input { width: 36px; height: 20px; accent-color: #22c55e; }
+
+dl { margin: 14px 0; }
+dl div { display: flex; justify-content: space-between; padding: 4px 0; }
+dt { color: #94a3b8; }
+dd { margin: 0; }
+dd[data-state="current"] { color: #4ade80; }
+dd[data-state="update"] { color: #fbbf24; }
+dd[data-state="error"] { color: #f87171; }
+
+.actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+button {
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: #2563eb;
+  color: white;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+button.secondary { background: #334155; }
+button:disabled { cursor: default; opacity: .5; }
+.message { min-height: 18px; margin-top: 8px; color: #94a3b8; }

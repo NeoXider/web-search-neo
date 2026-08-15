@@ -4,6 +4,7 @@ import contextlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import socket
 import subprocess
@@ -50,6 +51,7 @@ const listener = name => ({
   addListener: handler => { (listeners[name] = listeners[name] || []).push(handler); },
 });
 const sessionStore = {};
+const localStore = {};
 const alarms = [];
 const timers = [];
 let reloads = 0;
@@ -67,7 +69,23 @@ globalThis.__setToken = source => { tokenSource = source; };
 globalThis.__fetchCalls = () => fetchCalls;
 globalThis.__fire = (name, detail) => (listeners[name] || []).forEach(handler => handler(detail));
 globalThis.__seedSession = items => Object.assign(sessionStore, items);
+globalThis.__seedLocal = items => Object.assign(localStore, items);
 globalThis.__session = () => sessionStore;
+globalThis.__local = () => localStore;
+globalThis.__message = request => new Promise((resolve, reject) => {
+  const handlers = listeners.runtimeMessage || [];
+  if (!handlers.length) return reject(new Error("no runtime message listener"));
+  const timer = realSetTimeout(() => reject(new Error("message response timed out")), 3000);
+  const sendResponse = value => {
+    realClearTimeout(timer);
+    resolve(value);
+  };
+  for (const handler of handlers) {
+    if (handler(request, {}, sendResponse) !== false) return;
+  }
+  realClearTimeout(timer);
+  reject(new Error("message was not handled"));
+});
 globalThis.__alarms = () => alarms.slice();
 globalThis.__reloads = () => reloads;
 // Forget (and cancel) whatever was already pending so the next assertion reads
@@ -126,10 +144,12 @@ globalThis.chrome = {
     reload: () => { reloads += 1; },
     onInstalled: listener("installed"),
     onStartup: listener("startup"),
+    onMessage: listener("runtimeMessage"),
   },
   action: {
     setBadgeBackgroundColor: noop,
     setBadgeText: noop,
+    setTitle: noop,
     onClicked: listener("clicked"),
   },
   alarms: {
@@ -138,6 +158,10 @@ globalThis.chrome = {
     onAlarm: listener("alarm"),
   },
   storage: {
+    local: {
+      get: async key => (key in localStore ? {[key]: localStore[key]} : {}),
+      set: async items => { Object.assign(localStore, items); },
+    },
     session: {
       get: async key => (key in sessionStore ? {[key]: sessionStore[key]} : {}),
       set: async items => { Object.assign(sessionStore, items); },
@@ -557,6 +581,115 @@ const failOnce = async () => {
   return {wait: globalThis.__scheduledWait(), via_alarm: globalThis.__alarms().length > 0};
 };
 """
+
+
+@requires_node
+def test_popup_can_disable_reenable_and_release_the_companion() -> None:
+    outcome = _node_worker_eval(
+        """
+        await globalThis.__sleep(30);
+        const initially = await globalThis.__message({type: "companion.status"});
+        let detaches = 0;
+        chrome.debugger.detach = async () => { detaches += 1; };
+
+        const enabling = await globalThis.__message({
+          type: "companion.setEnabled", enabled: true,
+        });
+        await globalThis.__waitFor(() => globalThis.__sockets.length === 1, "enable to connect");
+        const socket = globalThis.__sockets[0];
+        socket.onopen();
+        const hello = JSON.parse(socket.sent[0]);
+        socket.onmessage({data: JSON.stringify({
+          type: "hello_ack",
+          protocol: hello.protocol,
+          proof: await globalThis.__hmac(hello.token, hello.nonce),
+        })});
+        const connected = await globalThis.__message({type: "companion.status"});
+        const disabled = await globalThis.__message({
+          type: "companion.setEnabled", enabled: false,
+        });
+        return {
+          initially, enabling, connected, disabled, detaches,
+          stored: globalThis.__local().companion_enabled,
+          socketState: socket.readyState,
+        };
+        """,
+        prelude=(
+            "globalThis.__seedLocal({companion_enabled: false});\n"
+            "globalThis.__seedSession({bridge_state: {attachedTabs: [7]}});\n"
+            f"globalThis.__setToken('export const BRIDGE_TOKEN = \"{TEST_TOKEN}\";');"
+        ),
+    )
+    assert outcome["initially"]["enabled"] is False
+    assert outcome["initially"]["connected"] is False
+    assert outcome["enabling"]["enabled"] is True
+    assert outcome["connected"]["connected"] is True
+    assert outcome["disabled"]["enabled"] is False
+    assert outcome["disabled"]["detached_tabs"] == 1
+    assert outcome["detaches"] == 1
+    assert outcome["stored"] is False
+    assert outcome["socketState"] == 3
+
+
+def test_popup_controls_have_unique_ids() -> None:
+    popup = (PROJECT_ROOT / "chrome-extension" / "popup.html").read_text(encoding="utf-8")
+    ids = re.findall(r'\bid="([^"]+)"', popup)
+    assert len(ids) == len(set(ids))
+    assert {"release-status", "release-tabs", "check-release", "open-github"} <= set(ids)
+
+
+@requires_node
+def test_popup_checks_the_release_version_and_opens_github() -> None:
+    popup_script = (PROJECT_ROOT / "chrome-extension" / "popup.js").as_uri()
+    module = f"""
+const callbacks = {{}};
+const ids = [
+  "enabled", "reconnect", "release-tabs", "status", "tabs", "bridge", "version",
+  "release-status", "message", "check-release", "open-github",
+];
+const nodes = new Map(ids.map(id => [id, {{
+  textContent: "", title: "", dataset: {{}}, checked: false, disabled: false,
+  addEventListener(type, callback) {{ callbacks[`${{id}}:${{type}}`] = callback; }},
+}}]));
+globalThis.document = {{querySelector: selector => nodes.get(selector.slice(1))}};
+let opened = null;
+globalThis.chrome = {{
+  runtime: {{sendMessage: async () => ({{
+    enabled: true, connected: true, connecting: false, controlled_tabs: 2,
+    bridge_url: "ws://127.0.0.1:8765", version: "1.3.4",
+  }})}},
+  tabs: {{create: options => {{ opened = options.url; }}}},
+}};
+globalThis.fetch = async () => ({{
+  ok: true,
+  json: async () => ([{{tag_name: "v1.3.4", html_url: "https://github.com/NeoXider/web-search-neo/releases/tag/v1.3.4"}}]),
+}});
+globalThis.setInterval = () => 0;
+await import({json.dumps(popup_script)});
+await new Promise(resolve => setTimeout(resolve, 20));
+await callbacks["open-github:click"]();
+await callbacks["check-release:click"]();
+await new Promise(resolve => setTimeout(resolve, 20));
+process.stdout.write(JSON.stringify({{
+  release: nodes.get("release-status").textContent,
+  releaseState: nodes.get("release-status").dataset.state,
+  opened,
+}}));
+"""
+    completed = subprocess.run(
+        [NODE, "--input-type=module", "-e", module],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stderr
+    outcome = json.loads(completed.stdout)
+    assert outcome == {
+        "release": "Up to date (v1.3.4)",
+        "releaseState": "current",
+        "opened": "https://github.com/NeoXider/web-search-neo",
+    }
 
 
 @requires_node
@@ -1700,6 +1833,41 @@ def test_a_tab_that_could_not_be_configured_is_not_recorded_as_attached() -> Non
     assert outcome["methods"].index("Emulation.setFocusEmulationEnabled") < outcome[
         "methods"
     ].index("Runtime.evaluate")
+
+
+@requires_node
+def test_a_stored_attachment_that_chrome_dropped_is_repaired() -> None:
+    """The MV3 shelf may say attached after Chrome dropped the debugger itself."""
+    outcome = _node_worker_eval(
+        _WORKER_READY
+        + _TAB_WORLD
+        + _VERIFIED_SOCKET
+        + """
+        let attaches = 0;
+        let firstProbe = true;
+        const methods = [];
+        chrome.debugger.attach = async () => { attaches += 1; };
+        chrome.debugger.sendCommand = async (target, method) => {
+          methods.push(method);
+          if (method === "Runtime.enable" && firstProbe) {
+            firstProbe = false;
+            throw new Error("Debugger is not attached to the tab with id: 7");
+          }
+          return {};
+        };
+        const socket = await openSocket();
+        const answer = await ask(socket, "cdp.send",
+          {tabId: 7, method: "Runtime.evaluate", params: {expression: "1"}});
+        return {answer, attaches, methods, stored: globalThis.__session().bridge_state};
+        """,
+        prelude="globalThis.__seedSession({bridge_state: {attachedTabs: [7]}});",
+    )
+    assert answer_error(outcome["answer"]) is None
+    assert outcome["attaches"] == 1
+    assert outcome["methods"].count("Runtime.enable") == 2
+    assert "Emulation.setFocusEmulationEnabled" in outcome["methods"]
+    assert outcome["methods"][-1] == "Runtime.evaluate"
+    assert outcome["stored"]["attachedTabs"] == [7]
 
 
 @requires_node

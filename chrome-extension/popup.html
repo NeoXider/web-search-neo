@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Web Search Neo</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <img src="icons/slime-48.png" alt="" width="40" height="40">
+        <div>
+          <h1>Web Search Neo</h1>
+          <p id="status" class="status" data-state="loading">Checking connection…</p>
+        </div>
+      </header>
+
+      <label class="switch-row">
+        <span>
+          <strong>Companion enabled</strong>
+          <small>Allow the local MCP to control Chrome tabs</small>
+        </span>
+        <input id="enabled" type="checkbox" role="switch" disabled>
+      </label>
+
+      <dl>
+        <div><dt>Controlled tabs</dt><dd id="tabs">—</dd></div>
+        <div><dt>Bridge</dt><dd id="bridge">127.0.0.1:8765</dd></div>
+        <div><dt>Version</dt><dd id="version">—</dd></div>
+        <div><dt>GitHub release</dt><dd id="release-status">Checking…</dd></div>
+      </dl>
+
+      <div class="actions">
+        <button id="reconnect" type="button">Reconnect</button>
+        <button id="release-tabs" type="button" class="secondary">Release tabs</button>
+        <button id="check-release" type="button" class="secondary">Check update</button>
+        <button id="open-github" type="button" class="secondary">Open GitHub</button>
+      </div>
+      <p id="message" class="message" aria-live="polite"></p>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

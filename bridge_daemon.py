@@ -240,6 +240,19 @@ class BridgeDaemon:
                 LOGGER.warning(
                     "Bridge daemon shutdown failed: %s: %s", type(exc).__name__, exc
                 )
+        # ``Server.shutdown`` stops accepting new sockets, but websockets keeps
+        # existing handlers alive until their peers leave.  A client linked to
+        # that retired handler therefore has no signal to reconnect to the
+        # replacement daemon: it can sit on the dead generation until the next
+        # ping timeout, silently losing every tab claim in the meantime.  Take a
+        # snapshot under the lock and close outside it, because each handler's
+        # ``finally`` block needs the same lock to remove itself and its routes.
+        with self._lock:
+            connections = [client.connection for client in self._clients]
+            if self._extension is not None:
+                connections.append(self._extension)
+        for connection in connections:
+            close_quietly(connection, 1001, "Bridge daemon is shutting down")
 
     @property
     def startup_error(self) -> str | None:

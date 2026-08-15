@@ -48,6 +48,7 @@ const AUTH_RETRY_MAX_MS = 120000;
 const WORKER_IDLE_MS = 30000;
 const TIMER_SAFE_MS = 25000;
 const RECONNECT_ALARM = "bridge-reconnect";
+const ENABLED_KEY = "companion_enabled";
 // Long enough for the answer to a reload request to reach the socket before the
 // worker that wrote it disappears.
 const RELOAD_GRACE_MS = 250;
@@ -81,6 +82,8 @@ let reconnectTimer = null;
 let keepaliveTimer = null;
 let lastAttemptAt = 0;
 let backoff = {transport: 0, auth: 0, nextAttemptAt: 0};
+let enabled = true;
+let enabledPromise = null;
 // The read-or-mint of the run id, shared by every caller, and the value this
 // particular worker minted (null in a worker that only ever read one).
 let runPromise = null;
@@ -284,7 +287,23 @@ async function sendSafe(tabId, method, params = {}) {
 async function ensureDebugger(tabId) {
   await restoreState();
   bufferFor(tabId);
-  if (attachedTabs.has(tabId)) return;
+  if (attachedTabs.has(tabId)) {
+    try {
+      // chrome.storage.session outlives an MV3 worker. Usually Chrome keeps the
+      // debugger attachment too, but it can drop just that attachment (a tab
+      // crash, an extension reload, or the old MCP session letting go) while
+      // the stored Set still says it is present. Trusting the shelf then makes
+      // every later command fail with "Debugger is not attached" and, because
+      // this early return never repairs it, the tab stays unusable forever.
+      await chrome.debugger.sendCommand({tabId}, "Runtime.enable");
+      return;
+    } catch (error) {
+      console.warn(`bridge: forgot a stale debugger attachment for tab ${tabId}`, error);
+      // Preserve already-recorded events, but make capture and child sessions
+      // earn their state again after the fresh debugger attachment below.
+      forgetTab(tabId, false);
+    }
+  }
   try {
     await chrome.debugger.attach({tabId}, DEBUGGER_VERSION);
   } catch (error) {
@@ -782,8 +801,93 @@ export async function handleCommand(connection, message) {
 }
 
 function setBadge(online) {
-  chrome.action.setBadgeBackgroundColor({color: online ? "#16a34a" : "#dc2626"});
+  const color = !enabled ? "#64748b" : online ? "#16a34a" : "#dc2626";
+  chrome.action.setBadgeBackgroundColor({color});
   chrome.action.setBadgeText({text: online ? "ON" : "OFF"});
+  chrome.action.setTitle({
+    title: !enabled
+      ? "Web Search Neo Companion — disabled"
+      : online
+        ? "Web Search Neo Companion — connected"
+        : "Web Search Neo Companion — waiting for MCP",
+  });
+}
+
+async function loadEnabled() {
+  if (!enabledPromise) {
+    enabledPromise = Promise.resolve(chrome.storage.local.get(ENABLED_KEY))
+      .then(stored => {
+        enabled = stored?.[ENABLED_KEY] !== false;
+        return enabled;
+      })
+      .catch(error => {
+        console.warn("bridge: could not read the enabled setting", error);
+        enabled = true;
+        return enabled;
+      });
+  }
+  return enabledPromise;
+}
+
+function connectionStatus() {
+  return {
+    enabled,
+    connected: Boolean(socket && socket.readyState === WebSocket.OPEN && verified),
+    connecting,
+    bridge_url: BRIDGE_URL,
+    controlled_tabs: attachedTabs.size,
+    next_attempt_at: enabled ? backoff.nextAttemptAt || 0 : 0,
+    version: chrome.runtime.getManifest().version,
+  };
+}
+
+async function detachAllTabs() {
+  await restoreState();
+  const tabIds = [...attachedTabs];
+  for (const tabId of tabIds) {
+    await chrome.debugger.detach({tabId}).catch(() => {});
+    forgetTab(tabId, false);
+  }
+  return tabIds.length;
+}
+
+async function setEnabled(value) {
+  enabled = Boolean(value);
+  enabledPromise = Promise.resolve(enabled);
+  await chrome.storage.local.set({[ENABLED_KEY]: enabled});
+  if (!enabled) {
+    clearReconnect();
+    clearInterval(keepaliveTimer);
+    keepaliveTimer = null;
+    const active = socket;
+    socket = null;
+    verified = false;
+    connecting = false;
+    if (active) active.close();
+    const detached_tabs = await detachAllTabs();
+    await resetBackoff();
+    setBadge(false);
+    return {...connectionStatus(), detached_tabs};
+  }
+  setBadge(false);
+  connectNow();
+  return connectionStatus();
+}
+
+function reconnectNow() {
+  if (!enabled) return connectionStatus();
+  clearReconnect();
+  clearInterval(keepaliveTimer);
+  keepaliveTimer = null;
+  const active = socket;
+  socket = null;
+  verified = false;
+  connecting = false;
+  if (active) active.close();
+  lastAttemptAt = 0;
+  setBadge(false);
+  connectNow();
+  return connectionStatus();
 }
 
 // Two schedules, because the two failures mean different things: nobody is
@@ -834,6 +938,10 @@ function resetBackoff() {
 // connect() is async, so every entry point funnels through here to keep a
 // rejected promise from silently stopping the reconnect chain.
 function startConnect() {
+  if (!enabled) {
+    setBadge(false);
+    return;
+  }
   lastAttemptAt = Date.now();
   clearReconnect();
   connect().catch(error => {
@@ -855,6 +963,10 @@ function startConnect() {
 // stops a signal that repeats, or two arriving together, from turning back into
 // a fixed short loop: inside the floor the pending retry is only pulled forward.
 function connectNow() {
+  if (!enabled) {
+    setBadge(false);
+    return;
+  }
   resetBackoff();
   const sinceLast = Date.now() - lastAttemptAt;
   if (sinceLast < RECONNECT_BASE_MS) {
@@ -871,6 +983,10 @@ function connectNow() {
 // again after a browser restart, which is exactly when an immediate attempt is
 // warranted.
 async function resumeConnect() {
+  if (!(await loadEnabled())) {
+    setBadge(false);
+    return;
+  }
   try {
     const stored = (await chrome.storage.session.get(BACKOFF_KEY))?.[BACKOFF_KEY];
     if (stored) {
@@ -1001,6 +1117,11 @@ async function hmacSha256(token, message) {
 }
 
 export async function connect() {
+  if (!(await loadEnabled())) {
+    connecting = false;
+    setBadge(false);
+    return;
+  }
   if (connecting) return;
   if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
   connecting = true;
@@ -1014,6 +1135,11 @@ export async function connect() {
     expectedProof = await hmacSha256(token, nonce);
     // Read last, and before the socket exists, because onopen cannot await.
     run = await browserRun();
+    if (!enabled) {
+      connecting = false;
+      setBadge(false);
+      return;
+    }
   } catch (error) {
     // Chrome logs the failed read of bridge-token.js on its own; what it cannot
     // say is what to do about it. Once per streak is enough, because the retry
@@ -1086,6 +1212,10 @@ export async function connect() {
     clearInterval(keepaliveTimer);
     verified = false;
     socket = null;
+    if (!enabled) {
+      resetBackoff();
+      return;
+    }
     retryAfterFailure(rejected ? "auth" : "transport");
   };
   socket.onerror = () => active.close();
@@ -1122,22 +1252,51 @@ function completeHandshake(connection, message, expectedProof) {
   }, KEEPALIVE_MS);
 }
 
-chrome.runtime.onInstalled.addListener(connectNow);
+chrome.runtime.onInstalled.addListener(() => loadEnabled().then(active => {
+  setBadge(false);
+  if (active) connectNow();
+}));
 // The run check runs first so the hello that follows carries this run's id, and
 // connecting is not made conditional on it: a browser that is up is worth
 // reaching even if the session store refused to answer.
 chrome.runtime.onStartup.addListener(() => {
-  startBrowserRun()
-    .catch(error => console.warn("bridge: could not start a browser run", error))
-    .then(connectNow);
+  loadEnabled().then(active => {
+    setBadge(false);
+    if (!active) return;
+    startBrowserRun()
+      .catch(error => console.warn("bridge: could not start a browser run", error))
+      .then(connectNow);
+  });
 });
 chrome.action.onClicked.addListener(connectNow);
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  const type = message && typeof message === "object" ? message.type : "";
+  let operation = null;
+  if (type === "companion.status") {
+    operation = loadEnabled().then(() => connectionStatus());
+  } else if (type === "companion.setEnabled") {
+    operation = loadEnabled().then(() => setEnabled(message.enabled));
+  } else if (type === "companion.reconnect") {
+    operation = loadEnabled().then(() => reconnectNow());
+  } else if (type === "companion.releaseTabs") {
+    operation = detachAllTabs().then(detached_tabs => ({...connectionStatus(), detached_tabs}));
+  } else {
+    return false;
+  }
+  operation.then(sendResponse).catch(error => {
+    sendResponse({error: `${error?.name || "Error"}: ${error?.message || error}`});
+  });
+  return true;
+});
 // The alarm carries no urgency of its own; it exists to bring the worker back
 // for a wait that outlasts it, so it lands on the ordinary attempt path.
 if (alarmsAvailable) {
   chrome.alarms.onAlarm.addListener(alarm => {
-    if (alarm.name === RECONNECT_ALARM) startConnect();
+    if (alarm.name === RECONNECT_ALARM && enabled) startConnect();
   });
 }
 restoreState();
-resumeConnect();
+loadEnabled().then(active => {
+  setBadge(false);
+  if (active) resumeConnect();
+});

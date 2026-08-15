@@ -260,8 +260,12 @@ DevTools port cannot be given one later. So three steps stay with the user:
 2. Switch on **Developer mode**, then choose **Load unpacked**.
 3. Select this repository's `chrome-extension` folder.
 
-Keep **Web Search Neo Companion** enabled. Its toolbar badge reads `ON` while the
-companion is connected and authenticated to the [bridge daemon](#the-bridge-daemon),
+Keep **Web Search Neo Companion** enabled. Click its toolbar icon to open the
+companion panel: it shows the bridge state and controlled-tab count, and offers
+**Reconnect**, **Release tabs**, a GitHub release/version check, a repository link,
+and a persistent on/off switch. Turning the switch
+off closes the bridge and detaches every controlled tab. Its toolbar badge reads
+`ON` while the companion is connected and authenticated to the [bridge daemon](#the-bridge-daemon),
 which is between agent calls too, not only while one is running. Nobody has to
 create or copy a token: it is written whenever the bridge comes up and on every
 `setup_current_chrome` call.
@@ -273,7 +277,7 @@ is no automatic substitute. If you would rather not install an extension at all,
 `profile_mode="temporary"` and `profile_mode="persistent"` drive a Selenium
 browser that needs no companion.
 
-The bundled companion is version 1.3.2. Chrome does not refresh an unpacked
+The bundled companion is version 1.3.4. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. Upgrading *onto*
@@ -292,7 +296,7 @@ case, because that build cannot even authenticate:
 
 The bridge accepts only the fixed bundled extension ID, binds only to loopback, and never reads Chrome profile files, cookies, or saved passwords directly. The extension uses Chrome's standard [tabs](https://developer.chrome.com/docs/extensions/reference/api/tabs), [tab groups](https://developer.chrome.com/docs/extensions/reference/api/tabGroups), and [debugger](https://developer.chrome.com/docs/extensions/reference/api/debugger) APIs, plus `storage` for its own session state and [alarms](https://developer.chrome.com/docs/extensions/reference/api/alarms) for the long waits in its reconnect backoff, with the permissions shown by Chrome.
 
-A badge reading `OFF` means this companion is not connected and authenticated, which is usually — but not only — because nothing is listening on the bridge port: no daemon has been started since the machine booted, the last one exited after its idle window, or it was stopped with `--bridge --stop`. That is the normal state of a machine on which no MCP server has run yet, not a fault — but it is no longer the state between two agent calls, which is what it was when the port lived inside the MCP server. The badge also reads `OFF` in two cases where the port is very much held: when the daemon refused this companion's token, and when a companion in a second Chrome profile authenticated later and displaced it. So `OFF` is not by itself a reason to start a daemon — read `web_info(topic="browser_status")` and `bridge-daemon.log` before concluding the port is free. While nothing listens, the worker retries with an exponential backoff — about 1.5 seconds after the first failure, doubling to a ceiling of one minute, and dropping back to the floor the moment a handshake verifies. Chrome suspends an idle service worker after roughly thirty seconds, which is why the longer waits are `chrome.alarms` rather than timers: a timer that long would die with the worker. Chrome also logs every refused attempt as an extension error of ours and an extension cannot suppress that, so a red **Errors** button on the card of an idle machine is expected; before 1.3.1 the worker retried every two seconds and could fill that page with hundreds of identical `ERR_CONNECTION_REFUSED` lines. Starting the browser, reloading the extension, or clicking its toolbar icon resets the schedule and retries immediately.
+A badge reading `OFF` means this companion is not connected and authenticated, which is usually — but not only — because nothing is listening on the bridge port: no daemon has been started since the machine booted, the last one exited after its idle window, or it was stopped with `--bridge --stop`. That is the normal state of a machine on which no MCP server has run yet, not a fault — but it is no longer the state between two agent calls, which is what it was when the port lived inside the MCP server. The badge also reads `OFF` in two cases where the port is very much held: when the daemon refused this companion's token, and when a companion in a second Chrome profile authenticated later and displaced it. So `OFF` is not by itself a reason to start a daemon — read `web_info(topic="browser_status")` and `bridge-daemon.log` before concluding the port is free. While nothing listens, the worker retries with an exponential backoff — about 1.5 seconds after the first failure, doubling to a ceiling of one minute, and dropping back to the floor the moment a handshake verifies. Chrome suspends an idle service worker after roughly thirty seconds, which is why the longer waits are `chrome.alarms` rather than timers: a timer that long would die with the worker. Chrome also logs every refused attempt as an extension error of ours and an extension cannot suppress that, so a red **Errors** button on the card of an idle machine is expected; before 1.3.1 the worker retried every two seconds and could fill that page with hundreds of identical `ERR_CONNECTION_REFUSED` lines. Starting the browser or reloading the extension resets the schedule, and the popup's **Reconnect** button retries immediately.
 
 Keep the companion enabled in one Chrome profile at a time. The bridge holds exactly one companion connection and the most recent authenticated one wins, so a second profile with the companion enabled quietly takes the agent's tabs with it.
 
