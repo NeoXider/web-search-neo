@@ -786,8 +786,8 @@ Both topics work in companion `current` mode and in the Selenium-backed modes; t
 ## Forms and multi-step flows
 
 The short version: open the page, read it, `fill` everything in one call, attach
-files through `files` or the `upload` action, `submit`, then prove the outcome
-with `page_text` or a screenshot.
+files through `files` or the `upload` action, reread every consequential live
+choice, submit exactly once, then prove the outcome with fresh DOM/text.
 
 ```json
 {
@@ -809,6 +809,14 @@ with `page_text` or a screenshot.
 - `fill`, `click`, `submit`, `upload` and `wait` take `frame_selector`, so a form inside an iframe is addressable by name and not only through a ref.
 - `wait` takes `present`, `visible`, or `clickable`, and its `timeout_seconds` is clamped to 30 — but the result now reports the *effective* value, so a hopeful `120` comes back as `30.0` rather than leaving you to wonder. A timeout names the seconds actually waited in its message. For a longer wait, loop the call.
 - After any navigation or step change, read `page_outline` again: old ref handles are stale by definition. `dom_epoch` only tests one direction of that. A different epoch proves your refs are dead; the same epoch proves nothing, because the epoch belongs to the document and a wizard step that swaps its own markup in place keeps it while every ref it issued goes with the old nodes. A ref read inside a frame carries that frame's epoch rather than the page's, so a mismatch there is normal and not staleness at all.
+
+For an application, payment, message, deletion, or other consequential terminal
+action, keep `submit_attempted=false`. From a fresh `page_elements` read match the
+exact target (`href` where available) and verify each critical selected value in
+the live control; remembered defaults are not evidence. Set the flag as the
+terminal button is clicked once. After any response or timeout, never retry that
+button before inspecting URL, text, elements, console, and network — the first
+click may already have succeeded. Stop immediately on terminal success text.
 
 **[→ Complex forms](docs/complex-forms.md)** covers the rest with worked calls:
 choosing between the three locator forms, finding a field by meaning when
@@ -970,13 +978,21 @@ Existing direct Python imports remain available. For temporary MCP-client migrat
 
 Browser state is keyed by `session_id`. The `open_many` action can create up to four independent sessions concurrently. A viewport screenshot with no dimensions preserves the current viewport in every mode. An explicit viewport `width`/`height` pair is exact in isolated Selenium modes and is refused in `current` mode, where the MCP never resizes the user's Chrome; use `mode="region"` there for an exact-size image. Full-page captures above `3840x10000` fail explicitly instead of returning an unlabelled partial image.
 
+Image-guided clicking is available through `pointer` with
+`pointer_action="click"` and viewport CSS `x`/`y`. Take a fresh viewport screenshot;
+if its PNG dimensions differ from the reported viewport dimensions, scale both
+axes proportionally. Full-page and region pixels do not map directly to the
+viewport: scroll the target into view and recapture. Any scroll, zoom, resize,
+navigation, animation, or rerender invalidates the old image coordinates.
+
 ## Optional agent skill
 
 `web_info(topic="skill")` returns a compact built-in playbook intended even for
 small local models: inspect → act → verify, schema discovery before guessing
 optional parameters, element pagination and lazy-page scrolling, the three
-screenshot modes, current-Chrome ownership, and an explicit final-submit guard.
-It is about 3.8 KB and can be fetched once at the start of an automation task.
+screenshot modes, safe visual-coordinate clicks, current-Chrome CSS-only action
+locators, exact href/value matching, and a one-shot final-submit guard. It is
+about 5.5 KB and can be fetched once at the start of an automation task.
 
 `web_info()` called with no arguments still returns the entire agent-facing contract: every action with its summary and required parameter names, the observation topics, ready-made recipes, the common mistakes, the hard limits, and runnable examples. Optional parameters — for an action or for a topic — come from `action_schema`, one at a time. An agent that reads either contract needs no external instructions, so the bundled filesystem skill is a convenience, not a requirement.
 

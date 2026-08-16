@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 
 import pytest
 from selenium.common.exceptions import WebDriverException
@@ -351,17 +352,41 @@ def test_scroll_screenshot_pagination_and_skill_are_published_for_small_models()
     assert [step["step"] for step in skill["loop"]] == ["inspect", "act", "verify"]
     assert "Positive" in skill["scroll"]["direction"]
     assert "selector filter" in skill["elements"]["filtering"]
-    assert "not CSS" in skill["elements"]["refs"]
+    assert "href" in skill["elements"]["duplicates"]
+    assert "never choose" in skill["elements"]["duplicates"]
+    assert "plain CSS" in skill["current_chrome"]["action_locators"]
+    assert "Never send ref:" in skill["current_chrome"]["action_locators"]
+    assert "different session_id" in skill["current_chrome"]["session_rule"]
     assert "timeout_seconds" in skill["schema"]["timeouts"]
     assert "wait_seconds" in skill["schema"]["timeouts"]
     assert "timeout_ms does not exist" in skill["schema"]["timeouts"]
     assert "background" in skill["focus"]["default"]
     assert "Only web_action show" in skill["focus"]["opt_in"]
     assert "never minimizes, maximizes, restores, or resizes" in skill["focus"]["window_state"]
+    assert skill["visual_click"]["example"]["pointer_action"] == "click"
+    assert "viewport CSS pixels" in skill["visual_click"]["call"]
+    assert "scale" in skill["visual_click"]["mapping"]
+    assert "recapture" in skill["visual_click"]["mapping"]
+    assert "slow or unavailable" in skill["screenshots"]["semantics"]
+    assert "visible option row" in skill["forms"]["choice_widget"]
+    assert "boilerplate" in skill["forms"]["question_rule"]
     assert len(skill["forms"]["final_submit_guard"]) == 3
-    assert len(json.dumps(skill)) < 4_000
+    submit_guard = " ".join(skill["forms"]["final_submit_guard"])
+    assert "submit_attempted=false" in submit_guard
+    assert "exactly once" in submit_guard
+    assert "never click it again" in submit_guard
+    assert len(json.dumps(skill)) < 5_500
     skill_schema = asyncio.run(main.web_info("action_schema", {"action": "skill"}))
     assert skill_schema["params_schema"].get("properties", {}) == {}
+
+    filesystem_skill = (
+        Path(main.__file__).parent / "skills" / "web-search-neo" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    assert 'web_info(topic="skill")' in filesystem_skill
+    assert "only action locator" in filesystem_skill
+    assert "submit_attempted=false" in filesystem_skill
+    assert '"pointer_action":"click"' in filesystem_skill
+    assert "default headless" in filesystem_skill
 
 
 def test_show_schema_and_dispatch_make_foreground_an_explicit_opt_in(monkeypatch):

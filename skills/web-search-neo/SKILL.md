@@ -5,16 +5,21 @@ description: Use the Web Search Neo MCP server for free web search without API k
 
 # Web Search Neo
 
-This file is optional. The server carries its own contract: `web_info()` with no arguments
-returns every action with its summary and its required parameter names, the observation
-topics, recipes, pitfalls, limits, and examples. Optional names, types, and defaults are not
-in it. Read it first, then use `web_info(topic="action_schema", params={"action": "<name>"})`
-for one full schema — which also answers for an observation topic, so
+This file is optional. Start with the server's compact runtime playbook,
+`web_info(topic="skill")`. Use `web_info()` with no arguments only when you need its full
+action/topic index, recipes, limits, and pitfalls. Optional names, types, and defaults are
+not in that index. Before sending an optional parameter, read
+`web_info(topic="action_schema", params={"action": "<name>"})` — it also answers for an observation topic, so
 `params={"action": "network"}` lists what `network` accepts. Ask before guessing: a topic
 refuses any parameter it does not list.
 
 Two tools only. `web_info` reads state; `web_action` performs 1-32 ordered operations.
-One `session_id` is one page — reuse it.
+One `session_id` controls one page. Reuse it to continue on that page; use a different id
+when a second reference page must remain open.
+
+For reliable small-model automation, repeat one rigid loop: inspect fresh DOM, act once,
+then verify fresh DOM/text. Tool success proves an event was dispatched, not that the user
+outcome happened. After navigation or rerender, discard old selectors, refs, and images.
 
 ## Observation topics
 
@@ -30,8 +35,11 @@ One `session_id` is one page — reuse it.
   equally and order alone chose; say which you mean. `role` filters.
 - `page_elements`: flat selectors — CSS, a piercing path inside a shadow root or frame, or
   `""` when none is unique — plus `<select>` options, form metadata, and
-  `visible`/`hidden_reason` per entry. It takes no `frame_selector`: it always answers for
-  the whole page. Only `[contenteditable="true"]` is listed as a field, so a bare
+  `visible`/`hidden_reason` per entry. It has no selector filter and takes no
+  `frame_selector`: it always counts the whole existing DOM, including rendered controls
+  below the viewport. Paginate each category with `limit` plus `offset` until
+  `range.<category>.next_offset` is null. Scroll only to materialize lazy/infinite content,
+  then reread from `offset=0`. Only `[contenteditable="true"]` is listed as a field, so a bare
   `<div contenteditable>` shows up in `page_outline` and here not at all.
 - `console`: console output and uncaught errors with stack frames. Pages through history
   with `since_seq` and `limit`, and keeps its own place, so it never competes with
@@ -48,12 +56,14 @@ is a stub, so pass its selector as `frame_selector` to read it.
 
 ## Locators
 
-Plain CSS works everywhere and stays the default. `fill`, `upload`, `click`, `wait`, and the
-`form_selector` of `submit` also accept a ref handle such as `ref:3f9a1c04b7e25d18:12` from the
-outline or `find`, and a piercing path such as `#host >>> .inner` that steps through an open
-shadow root or a same-origin iframe per segment. `submit_selector` still needs plain CSS.
-Those two forms need a live element handle, so they resolve in `temporary`, `persistent`,
-and `attach` sessions, not in companion `current` mode.
+Plain CSS works everywhere and stays the default. In companion `current` Chrome, it is the
+only action locator: never send `ref:` or a `>>>` piercing path to `click`, `fill`, `wait`,
+`upload`, `submit.form_selector`, or an input action. Outline refs and piercing paths are
+still useful for observation there, but they are not action locators.
+
+In `temporary`, `persistent`, and `attach` sessions, `fill`, `upload`, `click`, `wait`, and
+`submit.form_selector` may also accept a fresh ref such as `ref:3f9a1c04b7e25d18:12` or a
+piercing path such as `#host >>> .inner`. `submit_selector` always needs plain CSS.
 
 A `frame_selector` always names exactly one frame: CSS matching two is refused with the
 count, everywhere. The accepted *forms* differ. `fill`, `click`, `wait`, `submit`, `upload`,
@@ -68,6 +78,10 @@ Pass a ref back exactly as it was returned: the first field is the document it c
 a handle from a page you have since navigated away from resolves to nothing and the action
 tells you to read `page_outline` again, instead of silently acting on a different element.
 Re-read after any navigation or re-render.
+
+Repeated visible text is not identity. Compare the exact `href`, control `value`, or a
+stable returned attribute from a fresh `page_elements` read. Never choose by array index,
+`nth-child`, or an old long CSS path alone.
 
 ## Search and fetch
 
@@ -98,9 +112,11 @@ stay reachable, so local services work unchanged.
   bundled build is reloaded automatically, reported as `self_update`. When it does return
   `manual_steps`, show them to the user word for word and wait: nothing can install the
   extension, or reload a build older than 1.3.1, on their behalf.
-- `auto` falls back to a visible temporary window; `temporary` and `persistent` are
-  MCP-owned and visible unless `headless=true`; `attach` uses a Chrome you started with a
-  DevTools port and stays open afterwards.
+- `auto` falls back to a headless temporary browser; `temporary` and `persistent` also
+  default headless. `headless=false` explicitly permits a visible MCP-owned window.
+  `attach` uses a Chrome you started with a DevTools port and preserves its window mode.
+- No normal action should steal focus. `show` is the sole foreground opt-in; call it only
+  when the user explicitly asks to see the controlled tab. It never changes window state.
 
 ## Forms
 
@@ -132,10 +148,49 @@ an empty list is not proof of absence. All ride on page summaries — `open`, `f
 Focus therefore ends on the body: a following `press_keys(["ENTER"])` needs `target_selector`
 to reach a field, and `submit` needs no focus at all.
 
-Open the page, read `page_outline` or `page_elements`, then send ordered `fill`, `upload`,
-`click`, and `submit`. Inspect every result: `success=false`, a validation error, or
-`challenge_detected` means the work is not done. Confirm consequential actions with a fresh
-read or a screenshot. If a submit silently fails, check `console` and `network`.
+For a choice widget, do not trust its remembered/default value. Open it, reread the options,
+match exact visible text/value, click the visible option row instead of its hidden
+radio/input, then reread the collapsed control after the rerender. A heading such as
+"answer questions" is boilerplate, not proof of a question: only live enabled form
+controls are questions.
+
+For any consequential submit use this low-freedom guard:
+
+1. Keep a local state `submit_attempted=false`.
+2. From a fresh DOM, confirm the exact target (`href` where available) and every critical
+   live choice: resume, account, price, recipient, consent, or irreversible option.
+3. If anything is ambiguous, stop. Otherwise set `submit_attempted=true` as the terminal
+   submit is clicked exactly once.
+4. After any result or timeout, never click the same submit again. Inspect fresh URL, text,
+   elements, console, and network; the first click may already have succeeded.
+5. Stop immediately on terminal success text. Only a clearly separate intermediate
+   questionnaire may have its own later final submit, after its live controls are inspected.
+
+Inspect every batch result: `success=false`, validation error, or `challenge_detected` means
+the step is not complete. Use DOM/text to prove labels and selected values. If submission
+silently fails, check `console` and `network`.
+
+## Visual coordinate clicks
+
+Screenshot modes are `viewport` (default), `full_page`, and `region`. Omit viewport
+`width`/`height` to keep the actual window; current Chrome refuses explicit resize.
+`region` requires page-CSS `x/y/width/height`; `full_page` errors above 3840x10000 instead
+of silently returning a partial capture.
+
+Yes: take a fresh viewport `screenshot`, then send, for example,
+`{"action":"pointer","pointer_action":"click","x":640,"y":360}`. Coordinates are
+viewport CSS pixels (or frame-local CSS pixels with `frame_selector`), not arbitrary
+full-page image coordinates.
+
+Only a viewport screenshot maps directly. Compare its PNG width/height with the reported
+`viewport_width`/`viewport_height`; if they differ, scale each image axis proportionally.
+A full-page or region image can contain offscreen pixels, so first scroll the target into
+view and take a new viewport screenshot. After scroll, zoom, resize, navigation, animation,
+or rerender, discard the old image and recapture. Verify the click from fresh DOM/text.
+
+In background `current` Chrome, screenshots can be slow or unavailable while Chrome is not
+painting an obscured window. DOM inspection and pointer actions still work; do not treat a
+screenshot timeout as page failure or call `show` unless foreground was explicitly requested.
 
 ## Input and games
 
