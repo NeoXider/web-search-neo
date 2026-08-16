@@ -221,7 +221,7 @@ limits, and worked examples. `web_info(topic="action_schema", params={"action":
 | --- | --- |
 | Free search | Uses public search routes through the maintained [DDGS](https://github.com/deedy5/ddgs) library; no paid search plan or API key. |
 | Resilient fallback | Provider health, cooldowns, bounded retries, caching, and an overall deadline prevent one challenged engine from stalling the agent. |
-| Your current Chrome by default | New tabs open in the `🟢 AI` tab group of the Chrome you already use, so existing logins remain available and every action is visible. |
+| Your current Chrome by default | New tabs open in the `🟢 AI` tab group of the Chrome you already use, so existing logins remain available while automation stays in the background unless `show` is explicitly requested. |
 | Reusable authorization | List and claim existing tabs, use the current signed-in Chrome, a persistent MCP-owned profile, or a DevTools attach window. |
 | Authenticated companion | Server and extension prove knowledge of a machine-local secret to each other before a single command crosses the loopback bridge. |
 | One bridge, many clients | The companion port belongs to a standalone bridge process, not to whichever agent happens to be running, so Claude Code and LM Studio can drive the same Chrome at the same time and the badge stays `ON` between calls. |
@@ -277,7 +277,7 @@ is no automatic substitute. If you would rather not install an extension at all,
 `profile_mode="temporary"` and `profile_mode="persistent"` drive a Selenium
 browser that needs no companion.
 
-The bundled companion is version 1.3.4. Chrome does not refresh an unpacked
+The bundled companion is version 1.3.5. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. Upgrading *onto*
@@ -328,6 +328,14 @@ elsewhere, and never inheriting the stdio that carries MCP — and it outlives t
 server that started it. Nothing is registered for autostart: no service, no
 scheduled task, no login item. It exists once an MCP server has run, or once you
 have run one yourself, and it goes away again on its own.
+
+On Windows the launcher deliberately bypasses a uv virtual-environment
+`python.exe`/`pythonw.exe` redirector and starts the base `pythonw.exe` with
+`CREATE_NO_WINDOW`, while preserving the venv through `__PYVENV_LAUNCHER__`.
+This matters because a redirector can start the real console interpreter after
+the original creation flags are gone; combining `DETACHED_PROCESS` with
+`CREATE_NO_WINDOW` does not fix it, because Windows ignores the latter flag in
+that combination.
 
 Two entry points are yours:
 
@@ -471,9 +479,13 @@ Yes — the agent can work in your normal already-open Chrome while you watch it
 ```
 
 From there, inspect with `page_outline`, `page_text`, `find`, or `page_elements`,
-then send ordered `fill`, `upload`, `click`, and `submit` actions through
-`web_action` using the same `session_id`. Screenshots are returned by the
-`screenshot` info topic.
+then send ordered `fill`, `upload`, `click`, `scroll`, and `submit` actions through
+`web_action` using the same `session_id`. `scroll` defaults to the viewport centre,
+uses positive `delta_y` for down and negative for up, and returns before/after page
+scroll metrics. Screenshots are returned by the `screenshot` info topic: its default
+is the actual current viewport, `mode="full_page"` captures the document, and
+`mode="region"` captures an exact `x`/`y`/`width`/`height` CSS-pixel rectangle
+without resizing Chrome.
 
 A session tracks whether it owns its tab, and never navigates one it borrowed.
 An `open` on a session that claimed a tab through `attach_tab` opens the agent's
@@ -511,17 +523,17 @@ a page summary off whatever tab had inherited the id and answer `session_open:
 true` — the same identity bug, in the topic an agent uses to check for it.
 
 If the companion isn't ready, read `web_info(topic="browser_status")` and run the
-`setup_current_chrome` action for the exact steps. Use `profile_mode="auto"` only
-when opening a separate visible Selenium window is an acceptable fallback.
+`setup_current_chrome` action for the exact steps. `profile_mode="auto"` falls
+back to a separate headless Selenium session, so it does not raise another window.
 
 ### Chrome profile modes
 
 | Mode | Authorization and lifetime | Best for |
 | --- | --- | --- |
 | `current` (default) | Companion extension controls the user's open Chrome. New tabs enter the `🟢 AI` group in the background; claimed tabs stay where they are. | Authorized sites, work alongside the user, existing tabs. |
-| `auto` | Prefer `current`; fall back to a visible temporary Selenium profile if the companion is unavailable. | Portable clients that accept a fallback window. |
-| `temporary` | Clean disposable profile; cookies disappear when the session closes. | Search, scraping, isolated tests. |
-| `persistent` | MCP owns a durable profile under `%LOCALAPPDATA%\WebSearchNeo\profiles\<profile_id>`. | Repeated automation with a separate signed-in profile. |
+| `auto` | Prefer `current`; fall back to a headless temporary Selenium profile if the companion is unavailable. | Portable background clients. |
+| `temporary` | Clean disposable profile, headless by default; cookies disappear when the session closes. | Search, scraping, isolated tests. |
+| `persistent` | MCP owns a durable profile under `%LOCALAPPDATA%\WebSearchNeo\profiles\<profile_id>`, headless by default. | Repeated automation with a separate signed-in profile. |
 | `attach` | MCP connects to a Chrome process that you started with a DevTools port and does not close it on detach. | Watching the agent work in an already authorized managed Chrome window. |
 
 #### Working in the same Chrome as the user
@@ -531,8 +543,9 @@ an existing window — the group's own window when there is one, otherwise any
 window that is neither focused nor minimized. It does not open a window of its
 own, because on Windows a new window raises itself into the taskbar; the one
 exception is a Chrome left running with no window at all, where a tab has nowhere
-else to go. Navigation does not activate a tab either. Only an explicit "show me
-this" does.
+else to go. Navigation and keyboard input do not activate a tab or focus its OS
+window either. Only `web_action` with the explicit `show` action requests the
+foreground; it never minimizes, maximizes, restores, or resizes a window.
 
 Chrome starves a tab nobody is looking at, which would make that useless: a
 hidden tab gets no `requestAnimationFrame` callbacks at all, timers are clamped
@@ -542,9 +555,9 @@ turns on focus emulation for every tab it drives, which restores all three
 (49 fps, 4.5 ms timers, input delivered). The page believes it is focused and
 visible while it is not, and stops believing it the moment the debugger detaches.
 
-Two consequences worth knowing. Typing into a background tab takes the keyboard
-away from whatever tab is in front, so the user may see their caret drop.
-And a screenshot of a tab in a window that another window covers can take tens of
+Two consequences worth knowing. A targeted keyboard action can change DOM focus
+inside the controlled background page, but it does not take OS focus or change the
+active user tab. A screenshot of a tab in a window that another window covers can take tens of
 seconds — Chrome has no fresh pixels to hand over — so `screenshot` waits up to
 45 s there and, if it gives up, says that the window is obscured and that reading
 and typing are unaffected.
@@ -565,10 +578,10 @@ error that says to open the page again, and nothing is sent to the new browser o
 the way out. The companion updating itself counts as a new run, since its reload
 drops every debugger attachment anyway.
 
-For isolated or background work, opt into Selenium explicitly:
-`profile_mode="temporary"` with `headless=false` gives a clean visible
-disposable Chrome and with `headless=true` a clean headless one;
-`profile_mode="persistent"` keeps a durable MCP-owned profile. For `attach`, the
+For isolated work, opt into Selenium explicitly. `profile_mode="temporary"` and
+`profile_mode="persistent"` are headless when `headless` is omitted; pass
+`headless=false` only when a visible MCP-owned Chrome is intentional. Persistent
+mode keeps a durable MCP-owned profile. For `attach`, the
 launcher — not the `headless` argument — determines whether the already-running
 Chrome is visible or headless.
 
@@ -621,7 +634,7 @@ Four observation topics describe an open session, from semantic structure down t
 | `page_outline` | An indented tree of roles, accessible names, states, `ref:<epoch>:N` handles, and boxes. `limit=200` nodes, `output="text"` by default; `output="json"` returns one object per node with `rect`, `page_rect`, `center`, `visible`, `in_viewport`, and `occluded`. |
 | `page_text` | The rendered text, with headings, list items, and table cells preserved. `mode="full"` is the whole `<body>`, same-origin frames and open dialogs included; `mode="main"` narrows to the main-content sub-tree and drops navigation, header, footer, aside, and form chrome. `max_chars=20000`, `include_links=false`. |
 | `find` | Ranked matches for a plain-language `query` such as `"submit application"`, each with a `ref`, role, name, box, a `match_score` (query against the element alone) and the ranking `score` that adds context. `limit=5`, capped at 25; `visible_only=true` by default, so a control the page has not revealed yet is not a candidate; `role` filters rather than nudges. `low_confidence` means nothing on the page answers the query — the closest few still come back, as the guesses they are — and `ambiguous` means the top two matched *and* ranked equally, so document order picked the winner. `candidates`/`scored`/`matched`/`returned`, `truncated` and `aria_hidden_skipped` account for what was examined, cut, and skipped as hidden from assistive technology. |
-| `page_elements` | The flat lists of links, forms, fields with `<select>` options, and buttons, addressed by CSS selector — or by a piercing path when they live in an open shadow root or a same-origin frame, or by an empty string when nothing addresses them uniquely, which is the honest answer and not a bug to work around. Each entry carries `visible` and, when it is not, a `hidden_reason`; visible entries come first, so `limit` never drops the reachable control in favour of a hidden one. `found` and `truncated` say whether the list is the whole of what is there. Alone among the four it takes no `frame_selector`: it always answers for the whole page, walking into open shadow roots and same-origin frames itself and prefixing the selectors it finds there. |
+| `page_elements` | The flat lists of links, forms, fields with `<select>` options, and buttons, addressed by CSS selector — or by a piercing path when they live in an open shadow root or a same-origin frame, or by an empty string when nothing addresses them uniquely, which is the honest answer and not a bug to work around. It covers the whole existing DOM, not only the viewport, so a rendered button below the fold is returned before any scroll. Each entry carries `visible` and, when it is not, a `hidden_reason`; visible entries come first. `limit` is capped at 1,000 per category; continue with `offset` and `range.<category>.next_offset` until it is `null`. `found`, `returned`, `truncated`, and `collector_truncated` account for the result and the 20,000-element safety cap. Lazy, infinite, and virtualized controls do not exist until the page creates them: `scroll`, wait, then reread from `offset=0`. Alone among the four it takes no `frame_selector`: it always walks the whole page, open shadow roots, and same-origin frames. |
 
 ```json
 {"topic":"page_outline","params":{"session_id":"demo","output":"json","limit":80}}
@@ -938,12 +951,12 @@ cheapest of the four. Absolute numbers depend on the machine; the ratios do not.
 
 | Tool | Responsibility |
 | --- | --- |
-| `web_info` | Return the whole contract, or one action schema on demand; read search, current Chrome tabs, browser, page outline/text/find, console, network, game, screenshot, or time state. |
+| `web_info` | Return the whole contract, the built-in automation skill, or one action schema on demand; read search, current Chrome tabs, browser, page outline/text/find, console, network, game, screenshot, or time state. |
 | `web_action` | Execute one or up to 32 ordered setup, search, fetch, tab attach/open, form, input, render, and close actions. Supports fail-fast or `continue_on_error=true`. |
 
 Start with `web_info()`. With no arguments it returns `actions` with each action's summary and its required parameter names, `action_groups`, `info_topics`, `recipes`, `pitfalls`, `limits`, and worked `examples`. Optional names, types, and defaults are deliberately left out of it. Request only the needed, generated JSON Schema with `web_info(topic="action_schema", params={"action": "input"})`, then invoke it through `web_action`. The same call describes an observation topic — `params={"action": "find"}` returns `find`'s parameters — which matters because a topic refuses any argument it does not list, and that list appears nowhere else. This follows the on-demand Tool Search principle used by [official Unreal MCP](https://dev.epicgames.com/documentation/unreal-engine/unreal-mcp-in-unreal-editor): keep the eager tool list small, disclose schemas only when needed, and dispatch actions through a meta-tool. Web Search Neo combines Unreal's list/describe discovery tools into one `web_info`, so only two tools are advertised.
 
-Measured on the current build, summing each advertised tool's `name`, `description`, and serialized `inputSchema`: the compact surface is 1,091 characters across two tools, against 22,721 characters across the 40 tools of legacy mode. The self-describing contract behind `web_info()` is 7,833 characters, and it is fetched only when an agent asks for it. Each action in it lists its required parameter names; optional names, types, and defaults stay in `action_schema`, where they cost nothing until needed — and where an observation topic's parameters live too, since a topic accepts exactly the list it publishes and nothing else.
+Measured on the current build, summing each advertised tool's `name`, `description`, and serialized `inputSchema`: the compact surface is 1,112 characters across two tools, against 24,453 characters across the 43 tools of legacy mode. The self-describing contract behind `web_info()` is 9,095 characters, and it is fetched only when an agent asks for it. Each action in it lists its required parameter names; optional names, types, and defaults stay in `action_schema`, where they cost nothing until needed — and where an observation topic's parameters live too, since a topic accepts exactly the list it publishes and nothing else.
 
 Every action is declared once in a single registry that also generates its published schema, and arguments are validated against that same model before the handler runs. An unknown or malformed field returns the offending names and the list of allowed parameters instead of an internal `TypeError`:
 
@@ -955,11 +968,17 @@ web_info(topic='action_schema', params={'action': '<name>'}) for the full schema
 
 Existing direct Python imports remain available. For temporary MCP-client migration only, set `WEB_SEARCH_NEO_LEGACY_TOOLS=1` before starting the server to advertise the former narrow tool list instead of the compact default.
 
-Browser state is keyed by `session_id`. The `open_many` action can create up to four independent sessions concurrently. In isolated Selenium modes, non-full-page screenshots match the requested viewport dimensions exactly. In `current` mode the MCP intentionally preserves the user's existing Chrome viewport and captures it at its actual size.
+Browser state is keyed by `session_id`. The `open_many` action can create up to four independent sessions concurrently. A viewport screenshot with no dimensions preserves the current viewport in every mode. An explicit viewport `width`/`height` pair is exact in isolated Selenium modes and is refused in `current` mode, where the MCP never resizes the user's Chrome; use `mode="region"` there for an exact-size image. Full-page captures above `3840x10000` fail explicitly instead of returning an unlabelled partial image.
 
 ## Optional agent skill
 
-`web_info()` called with no arguments returns the entire agent-facing contract: every action with its summary and required parameter names, the observation topics, ready-made recipes, the common mistakes, the hard limits, and runnable examples. Optional parameters — for an action or for a topic — come from `action_schema`, one at a time. An agent that reads it needs no external instructions, so the bundled skill is a convenience, not a requirement.
+`web_info(topic="skill")` returns a compact built-in playbook intended even for
+small local models: inspect → act → verify, schema discovery before guessing
+optional parameters, element pagination and lazy-page scrolling, the three
+screenshot modes, current-Chrome ownership, and an explicit final-submit guard.
+It is about 3.8 KB and can be fetched once at the start of an automation task.
+
+`web_info()` called with no arguments still returns the entire agent-facing contract: every action with its summary and required parameter names, the observation topics, ready-made recipes, the common mistakes, the hard limits, and runnable examples. Optional parameters — for an action or for a topic — come from `action_schema`, one at a time. An agent that reads either contract needs no external instructions, so the bundled filesystem skill is a convenience, not a requirement.
 
 The repository still includes a short [Web Search Neo skill](skills/web-search-neo/SKILL.md) for clients that prefer a resident description of when to reach for the server at all.
 

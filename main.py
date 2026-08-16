@@ -23,7 +23,7 @@ import msp_search
 from web_client import request
 
 
-__version__ = "1.3.4"
+__version__ = "1.3.5"
 
 PROJECT_DIR = Path(__file__).resolve().parent
 log = logging.getLogger("web_search_neo")
@@ -460,6 +460,7 @@ async def browser_get_page_elements(
     include_forms: bool = True,
     include_buttons: bool = True,
     limit: int = 200,
+    offset: int = 0,
 ) -> dict[str, Any]:
     """Get rendered links, forms, fields, and buttons with CSS selectors."""
     return await asyncio.to_thread(
@@ -469,6 +470,7 @@ async def browser_get_page_elements(
         include_forms,
         include_buttons,
         limit,
+        offset,
     )
 
 
@@ -759,6 +761,37 @@ async def browser_pointer(
 
 
 @mcp.tool()
+async def browser_scroll(
+    delta_y: float,
+    session_id: str = "default",
+    delta_x: float = 0.0,
+    x: float | None = None,
+    y: float | None = None,
+    frame_selector: str | None = None,
+    wait_seconds: float = 0.1,
+    include_summary: bool = True,
+) -> dict[str, Any]:
+    """Scroll down with positive delta_y or up with negative delta_y.
+
+    Omit x/y to use the viewport centre; provide both to choose the scrollable
+    container under that point.
+    """
+    return await asyncio.to_thread(
+        functools.partial(
+            browser_tools.scroll_page,
+            delta_y,
+            session_id=session_id,
+            delta_x=delta_x,
+            x=x,
+            y=y,
+            frame_selector=frame_selector,
+            wait_seconds=wait_seconds,
+            include_summary=include_summary,
+        )
+    )
+
+
+@mcp.tool()
 async def browser_touch(
     touch_action: Literal["tap", "press", "move", "release", "swipe", "cancel"],
     points: list[dict[str, Any]] | None = None,
@@ -946,15 +979,30 @@ async def browser_submit_form(
 @mcp.tool()
 async def browser_screenshot(
     session_id: str = "default",
-    width: int = 1440,
-    height: int = 900,
+    width: int | None = None,
+    height: int | None = None,
     full_page: bool = False,
+    mode: Literal["viewport", "full_page", "region"] | None = None,
+    x: float | None = None,
+    y: float | None = None,
 ) -> Image:
-    """Return a PNG screenshot of the rendered page at the requested resolution."""
+    """Return a viewport, full-page, or page-region PNG screenshot."""
     png = await asyncio.to_thread(
-        browser_tools.screenshot, session_id, width, height, full_page
+        browser_tools.screenshot, session_id, width, height, full_page, mode, x, y
     )
     return Image(data=png, format="png")
+
+
+@mcp.tool()
+async def browser_automation_skill() -> dict[str, Any]:
+    """Return the built-in compact browser automation playbook."""
+    return _AUTOMATION_SKILL
+
+
+@mcp.tool()
+async def browser_show(session_id: str = "default") -> dict[str, Any]:
+    """Explicitly put one browser session in the foreground."""
+    return await asyncio.to_thread(browser_tools.show_session, session_id)
 
 
 @mcp.tool()
@@ -1036,6 +1084,12 @@ _ACTIONS: dict[str, ActionSpec] = {
             "session",
             "Publish the bridge secret and return the manual steps Chrome still requires.",
         ),
+        _action(
+            "show",
+            browser_show,
+            "session",
+            "Explicitly bring one session to the foreground; this may interrupt the user.",
+        ),
         _action("wait", browser_wait_for, "page", "Wait until an element is present, visible, or clickable."),
         _action(
             "wait_challenge",
@@ -1063,6 +1117,12 @@ _ACTIONS: dict[str, ActionSpec] = {
             browser_pointer,
             "game",
             "One pointer event: click, hover, drag, wheel, or a held button.",
+        ),
+        _action(
+            "scroll",
+            browser_scroll,
+            "page",
+            "Scroll the page or the container under a viewport point; positive delta_y moves down.",
         ),
         _action(
             "touch",
@@ -1171,8 +1231,74 @@ def _validate_arguments(tool_name: str, label: str, arguments: dict[str, Any]) -
     return validated.model_dump(exclude_unset=True)
 
 
+_AUTOMATION_SKILL = {
+    "name": "web-search-neo-browser",
+    "goal": "Drive one named browser session with an inspect -> act -> verify loop.",
+    "schema": {
+        "rule": "Before guessing any optional parameter, call web_info(topic='action_schema', params={'action': name}).",
+        "timeouts": "timeout_ms does not exist. The exact schema may name timeout_seconds for a wait or wait_seconds for post-action settling; unknown keys are refused.",
+    },
+    "loop": [
+        {
+            "step": "inspect",
+            "calls": ["page_outline or page_elements", "page_text when content matters"],
+            "rule": "Read the current DOM immediately before choosing a selector or final value.",
+        },
+        {
+            "step": "act",
+            "calls": ["fill/click/scroll/submit through web_action"],
+            "rule": "Reuse session_id; after navigation or rerender discard old selectors and refs.",
+        },
+        {
+            "step": "verify",
+            "calls": ["page_text/page_elements, screenshot when pixels matter"],
+            "rule": "Tool success means the event ran, not that the user's outcome happened.",
+        },
+    ],
+    "current_chrome": {
+        "setup": "Call setup_current_chrome if the companion is unavailable; show manual_steps verbatim.",
+        "existing_tab": "browser_tabs -> attach_tab(tab_id, session_id) claims without navigating.",
+        "new_tab": "open defaults to profile_mode=current and creates a background AI-group tab.",
+        "ownership": "close removes an agent-created tab but only detaches a claimed user tab.",
+    },
+    "focus": {
+        "default": "Open, attach, navigate, input, and screenshot stay background; new temporary/persistent browsers default headless.",
+        "opt_in": "Only web_action show(session_id) may request foreground focus.",
+        "window_state": "show activates the tab or calls Page.bringToFront; it never minimizes, maximizes, restores, or resizes.",
+    },
+    "elements": {
+        "scope": "page_elements counts the whole existing DOM, not only the viewport, including open shadow roots and same-origin frames.",
+        "pagination": "Use limit plus offset per category; follow range.<category>.next_offset until null.",
+        "filtering": "page_elements has no selector filter: get its lists and filter the returned links/fields/buttons yourself.",
+        "refs": "Although the parameter is named selector, click.selector, wait.selector, upload.selector, fill field keys, and submit.form_selector accept CSS, a fresh ref, or a piercing path outside current-Chrome mode; submit_selector is CSS-only. A ref is not CSS and goes stale after its DOM epoch/rerender, so reread.",
+        "dynamic": "Lazy/infinite/virtualized items do not exist yet: scroll, wait, then reread from offset=0 because the DOM may have changed.",
+        "safety_cap": "collector_truncated.<category>=true means the 20000-item collector cap hid a tail; found is then not the true total.",
+    },
+    "scroll": {
+        "direction": "Positive delta_y moves down; negative delta_y moves up.",
+        "point": "Omit x/y for viewport centre, or provide both to choose a nested scroll container.",
+        "after": "Wait, then reread page_elements from offset=0 when scrolling may have changed the DOM.",
+    },
+    "screenshots": {
+        "viewport": "Default; omit width/height to preserve actual size. Explicit size is Selenium-only and refused in current Chrome.",
+        "full_page": "mode=full_page (or full_page=true); errors above 3840x10000 instead of returning a partial image.",
+        "region": "mode=region requires page-CSS x/y/width/height and never resizes the browser.",
+    },
+    "forms": {
+        "prepare": "Inspect fields/options, fill, then reread the form and its selected/current values.",
+        "resume_rule": "Never infer a selected resume/account/option from a URL parameter, remembered default, or prior page; verify the visible selected value in the live form.",
+        "final_submit_guard": [
+            "Confirm the target vacancy/form and every user-critical selected value from the live page.",
+            "If a resume, account, price, recipient, or irreversible option is ambiguous, do not submit.",
+            "Only then run the final submit/click once; immediately verify the resulting page or message.",
+        ],
+    },
+}
+
+
 _INFO_TOPICS = {
     "capabilities": "This contract: topics, actions, recipes, and pitfalls.",
+    "skill": "Built-in browser automation playbook: inspect, act, verify, and guard final submits.",
     "action_schema": "Full JSON Schema for one action or topic; pass params.action.",
     "page_outline": "Roles, names, states, refs, and boxes - start looking here.",
     "page_text": "Readable text of the rendered page; params.mode=main|full.",
@@ -1181,7 +1307,7 @@ _INFO_TOPICS = {
     "console": "console.log/warn/error and uncaught errors; params.levels, params.contains.",
     "network": "HTTP requests with status, type, ms, size; params.only_errors=true.",
     "network_body": "One response body; params.request_id is the id from a network read with output='json'.",
-    "screenshot": "PNG image of the current page.",
+    "screenshot": "PNG viewport, full-page, or exact page-region image.",
     "game_probe": "Canvas/WebGL/iframe surfaces, FPS, focus, console, held input.",
     "browser_status": "Chrome availability and named session state.",
     "browser_tabs": "Tabs open in the user's Chrome, with ids and groups.",
@@ -1249,6 +1375,8 @@ _ACTION_NOTES = {
         "scope": "Always the whole page: this topic takes no frame_selector, and it is the only read topic reporting challenge_detected/captcha_widgets.",
         "captcha_scan_incomplete": "true means the captcha walk stopped early, so an empty captcha_widgets is not proof there is none. Every page summary carries this key.",
         "contenteditable": "Only [contenteditable=\"true\"] is listed; a bare contenteditable attribute is a field to page_outline and invisible here.",
+        "pagination": "The whole existing DOM is counted before each category is sliced. Use offset plus limit, then follow range.<category>.next_offset until null; reread after scrolling a lazy/infinite page.",
+        "limits": "limit is clamped to 1000 per top-level category and offset to 0-20000. collector_truncated.<category>=true means the 20000-item safety cap was hit and found is only the collected prefix. include_forms=false also omits fields.",
     },
     "page_text": {
         "fallback": "mode='main' on a page that is one big form would be empty, so it re-reads the whole body and says so with fallback_used=true and mode_used='full'.",
@@ -1263,13 +1391,18 @@ _ACTION_NOTES = {
     "open": {
         "profile_mode": {
             "current": "the user's signed-in Chrome through the companion extension (default)",
-            "auto": "current, falling back to a visible temporary profile",
+            "auto": "current, falling back to a headless temporary profile",
             "temporary": "clean disposable profile",
             "persistent": "durable server-owned profile, keeps logins",
             "attach": "a Chrome you started with a DevTools port",
         },
-        "headless": "headless=true is refused with current and makes auto resolve straight to temporary without trying current.",
+        "headless": "temporary/persistent default headless; headless=false explicitly opens a visible window. attach preserves the launcher's window mode when omitted. headless=true is refused with current and makes auto resolve straight to temporary.",
         "claimed_tab": "open on a session claimed by attach_tab does not navigate the user's tab: it takes a new one and reports the released id as left_claimed_tab.",
+    },
+    "show": {
+        "only_foreground": "This is the only action allowed to request browser or OS foreground focus; never call it unless foreground was explicitly requested.",
+        "window_state": "Current Chrome activates its tab/window; Selenium and attach use Page.bringToFront. No minimize, maximize, restore, resize, or other window-state request is sent.",
+        "result": "focus_requested=true confirms the explicit request was sent; warning names the user interruption risk.",
     },
     "attach_tab": {
         "ownership": "Refused, naming the holder, when another agent is already driving that tab. Pick another tab or open your own; do not retry.",
@@ -1325,6 +1458,19 @@ _ACTION_NOTES = {
         "frame_selector": _FRAME_CSS,
         "speed": _HOT_PATH_SPEED,
     },
+    "scroll": {
+        "direction": "positive delta_y scrolls down; negative delta_y scrolls up",
+        "point": "omit x/y for viewport centre; provide both to scroll the container painted under that point",
+        "result": "before/after are selected document window metrics; a nested container can move while those page metrics stay unchanged",
+        "lazy_pages": "page_elements already sees offscreen controls in the existing DOM. Scroll only to materialise lazy/infinite content, then read page_elements again.",
+        "frame_selector": _FRAME_CSS,
+    },
+    "screenshot": {
+        "modes": "viewport (default), full_page, region; full_page=true remains an alias for mode='full_page'",
+        "viewport": "omit width/height to preserve the actual viewport. An explicit pair resizes Selenium sessions exactly and is refused in current Chrome.",
+        "region": "requires x/y/width/height in page CSS pixels, captures without resizing, and works in current Chrome and Selenium",
+        "full_page": "captures the whole current layout up to 3840x10000; an oversize page errors instead of returning an unlabelled partial image",
+    },
     "pointer_lock": {
         "operation": "acquire|release|status",
         "note": "After acquire, move with coordinate_mode='relative'.",
@@ -1372,6 +1518,11 @@ _RECIPES = {
         "screenshot to confirm",
     ],
     "existing_tab": ["browser_tabs", "attach_tab {tab_id}", "page_elements", "act"],
+    "lazy_page": [
+        "page_elements (already includes offscreen existing DOM)",
+        "scroll {delta_y: positive}",
+        "page_elements again; paginate offset until next_offset=null",
+    ],
     "game": [
         "open {url}",
         "game_probe (read frame_selector and canvas rect)",
@@ -1384,14 +1535,18 @@ _RECIPES = {
 
 _PITFALLS = [
     "web_action success=true is not task success: check failure_count and every results[i].success.",
+    "Never guess optional names: call action_schema. timeout_ms does not exist; the exact action may use timeout_seconds or wait_seconds.",
+    "page_elements takes no selector filter: read its category lists and filter the returned objects yourself.",
     "Selectors die when the document changes; re-read page_elements after navigation.",
-    "A ref: id belongs to the page_outline you just read; after navigation or a re-render, read page_outline again.",
+    "Although a parameter may be named selector, click/wait/upload, fill field keys and submit.form_selector accept a fresh ref: from page_outline or a piercing path outside current mode; submit_selector is CSS-only. A ref belongs to one DOM epoch, so reread after rerender/navigation.",
     "challenge_detected means a CAPTCHA is in the way: use wait_challenge or let search fall back, never hammer clicks. captcha_widgets lists ones merely present; ignore those.",
     "find low_confidence=true means it is guessing: re-query with other words or a role, do not click matches[0].",
     "profile_mode=current drives the user's real Chrome; close closes a tab the agent opened and leaves an attach_tab tab open.",
+    "Automation stays background-only by default and never changes window state. show is the sole foreground opt-in; call it only when the user explicitly asks to see the session.",
     "In render=step nothing moves until input or step runs, so a screenshot taken first shows the old frame.",
     "Always release_inputs after hold, and return render to normal before you finish.",
     "Pointer coordinates are viewport-local; inside an iframe pass frame_selector and frame-local x/y.",
+    "scroll delta_y is positive to move down and negative to move up; reread page_elements after scrolling a lazy/infinite page.",
     "Plain http:// to public hosts is refused; use https. Loopback and private addresses stay allowed.",
 ]
 
@@ -1595,6 +1750,7 @@ def _capabilities(action_name: str | None = None) -> dict[str, Any]:
 
 
 _TOPIC_HANDLERS = {
+    "skill": browser_automation_skill,
     "search_status": get_search_engines_status,
     "browser_status": browser_get_status,
     "browser_tabs": browser_list_tabs,
@@ -1615,6 +1771,7 @@ async def web_info(
     topic: Literal[
         "capabilities",
         "action_schema",
+        "skill",
         "search_status",
         "browser_status",
         "browser_tabs",

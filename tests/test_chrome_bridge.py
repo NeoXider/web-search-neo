@@ -242,6 +242,88 @@ def _free_port() -> int:
         return int(candidate.getsockname()[1])
 
 
+def _capture_daemon_spawn(monkeypatch):
+    captured = {}
+
+    def popen(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(chrome_bridge.subprocess, "Popen", popen)
+    return captured
+
+
+def test_windows_daemon_bypasses_a_venv_redirector_without_a_console(
+    tmp_path, monkeypatch
+) -> None:
+    base = tmp_path / "base" / "python.exe"
+    base.parent.mkdir()
+    base.touch()
+    pythonw = base.with_name("pythonw.exe")
+    pythonw.touch()
+    venv_pythonw = str(tmp_path / ".venv" / "Scripts" / "pythonw.exe")
+    captured = _capture_daemon_spawn(monkeypatch)
+    monkeypatch.setattr(chrome_bridge, "_IS_WINDOWS", True)
+    monkeypatch.setattr(chrome_bridge.sys, "executable", venv_pythonw)
+    monkeypatch.setattr(chrome_bridge.sys, "_base_executable", str(base))
+    monkeypatch.setattr(chrome_bridge.sys, "prefix", str(tmp_path / ".venv"))
+    monkeypatch.setattr(chrome_bridge.sys, "base_prefix", str(base.parent))
+
+    chrome_bridge.spawn_bridge_daemon(18765)
+
+    assert captured["command"] == [
+        str(pythonw),
+        str(chrome_bridge.DAEMON_ENTRY),
+        "--bridge",
+    ]
+    options = captured["kwargs"]
+    assert options["env"]["__PYVENV_LAUNCHER__"] == venv_pythonw
+    assert options["env"]["WEB_SEARCH_NEO_BRIDGE_PORT"] == "18765"
+    assert options["creationflags"] == subprocess.CREATE_NO_WINDOW
+    assert "start_new_session" not in options
+    assert options["stdin"] is subprocess.DEVNULL
+    assert options["stdout"] is subprocess.DEVNULL
+    assert options["stderr"] is subprocess.DEVNULL
+    assert options["close_fds"] is True
+
+
+def test_windows_daemon_uses_the_base_console_interpreter_as_a_safe_fallback(
+    tmp_path, monkeypatch
+) -> None:
+    base = tmp_path / "base" / "python.exe"
+    base.parent.mkdir()
+    base.touch()
+    venv_python = str(tmp_path / ".venv" / "Scripts" / "python.exe")
+    captured = _capture_daemon_spawn(monkeypatch)
+    monkeypatch.setattr(chrome_bridge, "_IS_WINDOWS", True)
+    monkeypatch.setattr(chrome_bridge.sys, "executable", venv_python)
+    monkeypatch.setattr(chrome_bridge.sys, "_base_executable", str(base))
+    monkeypatch.setattr(chrome_bridge.sys, "prefix", str(tmp_path / ".venv"))
+    monkeypatch.setattr(chrome_bridge.sys, "base_prefix", str(base.parent))
+
+    chrome_bridge.spawn_bridge_daemon(18766)
+
+    assert captured["command"][0] == str(base)
+    assert captured["kwargs"]["creationflags"] == subprocess.CREATE_NO_WINDOW
+    assert captured["kwargs"]["env"]["__PYVENV_LAUNCHER__"] == venv_python
+
+
+def test_posix_daemon_launch_is_unchanged(monkeypatch) -> None:
+    captured = _capture_daemon_spawn(monkeypatch)
+    monkeypatch.setattr(chrome_bridge, "_IS_WINDOWS", False)
+    monkeypatch.setattr(chrome_bridge.sys, "executable", "/opt/venv/bin/python")
+    monkeypatch.delenv("__PYVENV_LAUNCHER__", raising=False)
+
+    chrome_bridge.spawn_bridge_daemon(18767)
+
+    assert captured["command"][0] == "/opt/venv/bin/python"
+    options = captured["kwargs"]
+    assert options["start_new_session"] is True
+    assert "creationflags" not in options
+    assert "__PYVENV_LAUNCHER__" not in options["env"]
+
+
 def _companion_socket(port: int):
     return connect(
         f"ws://127.0.0.1:{port}",

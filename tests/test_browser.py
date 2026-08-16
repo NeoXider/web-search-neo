@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
@@ -20,8 +21,84 @@ import browser_tools
 import main
 
 
+class _FakeSwitchTo:
+    def default_content(self):
+        return None
+
+
+class _FakeCaptureDriver:
+    def __init__(self, *, current: bool = False, page_size=(900, 1400)):
+        self.is_extension_bridge = current
+        self.page_size = page_size
+        self.calls = []
+        self.switch_to = _FakeSwitchTo()
+
+    def get_screenshot_as_png(self):
+        self.calls.append(("viewport", {}))
+        return b"viewport-png"
+
+    def execute_cdp_cmd(self, command, params):
+        self.calls.append((command, params))
+        if command == "Page.getLayoutMetrics":
+            return {
+                "cssContentSize": {
+                    "width": self.page_size[0],
+                    "height": self.page_size[1],
+                }
+            }
+        if command == "Page.captureScreenshot":
+            return {"data": base64.b64encode(b"captured-png").decode("ascii")}
+        return {}
+
+
+class _FakeScrollDriver:
+    is_extension_bridge = True
+
+    def __init__(self):
+        self.switch_to = _FakeSwitchTo()
+        self.scroll_y = 0.0
+        self.calls = []
+
+    def execute_script(self, script, *args):
+        if script == browser_tools._VIEWPORT_SCRIPT:
+            return {"width": 1000, "height": 600}
+        if script == browser_tools._SCROLL_METRICS_SCRIPT:
+            return {
+                "scroll_x": 0,
+                "scroll_y": self.scroll_y,
+                "max_scroll_x": 0,
+                "max_scroll_y": 2400,
+                "viewport_width": 1000,
+                "viewport_height": 600,
+                "page_width": 1000,
+                "page_height": 3000,
+                "at_top": self.scroll_y <= 0,
+                "at_bottom": self.scroll_y >= 2399,
+            }
+        raise AssertionError("unexpected script")
+
+    def execute_cdp_cmd(self, command, params):
+        self.calls.append((command, params))
+        if command == "Input.dispatchMouseEvent" and params["type"] == "mouseWheel":
+            self.scroll_y = max(0, min(2400, self.scroll_y + float(params["deltaY"])))
+        return {}
+
+
+class _FakeShowDriver:
+    def __init__(self):
+        self.calls = []
+
+    def activate_tab(self):
+        self.calls.append(("activate_tab", {}))
+        return {"activated": True}
+
+    def execute_cdp_cmd(self, command, params):
+        self.calls.append((command, params))
+        return {}
+
+
 def _open_or_skip(url: str, session_id: str, **kwargs):
-    # Keep the deterministic suite in the background while production defaults visible.
+    # Keep the deterministic suite explicitly headless, independent of defaults.
     kwargs.setdefault("headless", True)
     kwargs.setdefault("profile_mode", "temporary")
     try:
@@ -48,6 +125,113 @@ def _chrome_binary() -> str | None:
             if root
         )
     return next((str(path) for path in candidates if path and Path(path).is_file()), None)
+
+
+def test_scroll_defaults_to_viewport_centre_and_reports_page_metrics(monkeypatch):
+    driver = _FakeScrollDriver()
+    monkeypatch.setitem(
+        browser_tools._sessions,
+        "fake-scroll",
+        browser_tools.BrowserSession(driver=driver, headless=False),
+    )
+
+    result = browser_tools.scroll_page(
+        700,
+        session_id="fake-scroll",
+        delta_x=15,
+        wait_seconds=0,
+        include_summary=False,
+    )
+
+    assert result["x"] == 500
+    assert result["y"] == 300
+    assert result["delta_x"] == 15
+    assert result["delta_y"] == 700
+    assert result["before"]["scroll_y"] == 0
+    assert result["after"]["scroll_y"] == 700
+    wheel = next(params for command, params in driver.calls if command == "Input.dispatchMouseEvent")
+    assert wheel["type"] == "mouseWheel"
+    assert wheel["x"] == 500 and wheel["y"] == 300
+    assert wheel["deltaY"] == 700
+
+    with pytest.raises(ValueError, match="x and y"):
+        browser_tools.scroll_page(100, session_id="fake-scroll", x=10, wait_seconds=0)
+
+
+def test_screenshot_modes_preserve_current_chrome_and_send_exact_clips(monkeypatch):
+    current = _FakeCaptureDriver(current=True)
+    monkeypatch.setitem(
+        browser_tools._sessions,
+        "fake-current-shot",
+        browser_tools.BrowserSession(driver=current, headless=False),
+    )
+
+    assert browser_tools.screenshot("fake-current-shot") == b"viewport-png"
+    assert not any(command == "Emulation.setDeviceMetricsOverride" for command, _ in current.calls)
+    with pytest.raises(ValueError, match="preserves the user's Chrome window"):
+        browser_tools.screenshot("fake-current-shot", width=640, height=480)
+
+    region = browser_tools.screenshot(
+        "fake-current-shot", width=320, height=180, mode="region", x=12, y=34
+    )
+    assert region == b"captured-png"
+    capture = [
+        params for command, params in current.calls if command == "Page.captureScreenshot"
+    ][-1]
+    assert capture["captureBeyondViewport"] is True
+    assert capture["clip"] == {
+        "x": 12.0,
+        "y": 34.0,
+        "width": 320.0,
+        "height": 180.0,
+        "scale": 1,
+    }
+
+
+def test_screenshot_viewport_resize_and_full_page_limits_are_explicit(monkeypatch):
+    selenium = _FakeCaptureDriver(current=False, page_size=(900, 1400))
+    monkeypatch.setitem(
+        browser_tools._sessions,
+        "fake-selenium-shot",
+        browser_tools.BrowserSession(driver=selenium, headless=True),
+    )
+
+    assert browser_tools.screenshot(
+        "fake-selenium-shot", width=640, height=480, mode="viewport"
+    ) == b"viewport-png"
+    metrics = next(
+        params
+        for command, params in selenium.calls
+        if command == "Emulation.setDeviceMetricsOverride"
+    )
+    assert metrics["width"] == 640 and metrics["height"] == 480
+
+    assert browser_tools.screenshot(
+        "fake-selenium-shot", full_page=True
+    ) == b"captured-png"
+    full_clip = [
+        params["clip"]
+        for command, params in selenium.calls
+        if command == "Page.captureScreenshot"
+    ][-1]
+    assert full_clip == {
+        "x": 0,
+        "y": 0,
+        "width": 900.0,
+        "height": 1400.0,
+        "scale": 1,
+    }
+
+    selenium.page_size = (900, 10_001)
+    before = len(selenium.calls)
+    with pytest.raises(ValueError, match="no partial image was returned"):
+        browser_tools.screenshot("fake-selenium-shot", mode="full_page")
+    assert not any(
+        command == "Page.captureScreenshot" for command, _ in selenium.calls[before:]
+    )
+
+    with pytest.raises(ValueError, match="provided together"):
+        browser_tools.screenshot("fake-selenium-shot", width=640)
 
 
 def test_browser_full_form_upload_click_submit_and_screenshot(local_site, tmp_path):
@@ -103,10 +287,18 @@ def test_browser_full_form_upload_click_submit_and_screenshot(local_site, tmp_pa
     session = browser_tools._get_session("full-flow")
     assert session.driver.find_element("css selector", "#click-state").text == "clicked"
 
+    unchanged = browser_tools.screenshot("full-flow")
+    assert struct.unpack(">II", unchanged[16:24]) == (800, 600)
+
     png = browser_tools.screenshot("full-flow", width=640, height=480, full_page=False)
     assert png.startswith(b"\x89PNG\r\n\x1a\n")
     assert len(png) > 1_000
     assert struct.unpack(">II", png[16:24]) == (640, 480)
+
+    region = browser_tools.screenshot(
+        "full-flow", width=320, height=180, mode="region", x=0, y=0
+    )
+    assert struct.unpack(">II", region[16:24]) == (320, 180)
 
     submitted = browser_tools.submit_form(
         "#application",
@@ -547,15 +739,92 @@ def test_attach_mode_reuses_managed_chrome_without_closing_it(local_site, tmp_pa
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
-def test_automatic_window_mode_defaults_every_profile_visible():
-    assert browser_tools._resolve_headless("temporary", None) is False
-    assert browser_tools._resolve_headless("persistent", None) is False
+def test_automatic_window_mode_is_background_safe_and_explicitly_overridable():
+    assert browser_tools._resolve_headless("current", None) is False
+    assert browser_tools._resolve_headless("temporary", None) is True
+    assert browser_tools._resolve_headless("persistent", None) is True
     assert browser_tools._resolve_headless("attach", None) is False
     assert browser_tools._resolve_headless("temporary", False) is False
     assert browser_tools._resolve_headless("persistent", False) is False
+    assert browser_tools._resolve_headless("attach", False) is False
     assert browser_tools._resolve_headless("temporary", True) is True
     assert browser_tools._resolve_headless("persistent", True) is True
     assert browser_tools._resolve_headless("attach", True) is True
+
+
+def test_current_keyboard_input_uses_cdp_without_requesting_window_focus(monkeypatch):
+    class _NoScriptDriver:
+        def __init__(self):
+            self.switch_to = _FakeSwitchTo()
+            self.events = []
+
+        def execute_script(self, *_args, **_kwargs):
+            raise AssertionError("no script should run without a target")
+
+        def perform_key_events(self, events):
+            self.events.append(events)
+
+    driver = _NoScriptDriver()
+    monkeypatch.setitem(
+        browser_tools._sessions,
+        "background-keys",
+        browser_tools.BrowserSession(
+            driver=driver, headless=False, profile_mode="current"
+        ),
+    )
+
+    result = browser_tools.press_keys(
+        ["A"],
+        session_id="background-keys",
+        hold_seconds=0,
+        wait_seconds=0,
+        include_summary=False,
+    )
+
+    assert result["success"] is True
+    assert driver.events == [[
+        {"type": "down", "key": "A"},
+        {"type": "up", "key": "A"},
+    ]]
+    assert "window.focus" not in browser_tools._FOCUS_SCRIPT
+    assert "element.focus" in browser_tools._FOCUS_SCRIPT
+
+
+def test_show_is_the_explicit_foreground_path_for_current_and_selenium(monkeypatch):
+    monkeypatch.setattr(
+        browser_tools,
+        "_page_summary",
+        lambda _driver, session_id: {"session_id": session_id, "url": "https://example.test"},
+    )
+    current = _FakeShowDriver()
+    selenium = _FakeShowDriver()
+    monkeypatch.setitem(
+        browser_tools._sessions,
+        "show-current",
+        browser_tools.BrowserSession(
+            driver=current, headless=False, profile_mode="current"
+        ),
+    )
+    monkeypatch.setitem(
+        browser_tools._sessions,
+        "show-selenium",
+        browser_tools.BrowserSession(
+            driver=selenium, headless=True, profile_mode="temporary"
+        ),
+    )
+
+    current_result = browser_tools.show_session("show-current")
+    selenium_result = browser_tools.show_session("show-selenium")
+
+    assert current.calls == [("activate_tab", {})]
+    assert selenium.calls == [("Page.bringToFront", {})]
+    for result in (current_result, selenium_result):
+        assert result["success"] is True
+        assert result["focus_requested"] is True
+        assert "interrupt" in result["warning"]
+        assert "No minimize, maximize, restore, resize" in result["warning"]
+    assert current_result["focus_method"] == "tabs.activate"
+    assert selenium_result["focus_method"] == "Page.bringToFront"
 
 
 def test_latest_cached_chromedriver_uses_highest_version(tmp_path, monkeypatch):

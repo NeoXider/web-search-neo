@@ -69,6 +69,7 @@ class ChromeBridgeUnavailable(ChromeBridgeError):
 LOGGER = logging.getLogger("web_search_neo.bridge")
 PROJECT_DIR = Path(__file__).resolve().parent
 DAEMON_ENTRY = PROJECT_DIR / "main.py"
+_IS_WINDOWS = os.name == "nt"
 
 # Two daemons of the wrong version in a row means another checkout is fighting us
 # over the port, and replacing each other forever would be worse than saying so.
@@ -109,6 +110,37 @@ class _PendingRequest:
     transport_failure: bool = False
 
 
+def _daemon_interpreter(environment: dict[str, str]) -> str:
+    """Choose an interpreter that cannot make a console window on Windows.
+
+    A uv-created virtual environment uses the same console redirector for both
+    ``python.exe`` and ``pythonw.exe``. Starting that redirector without a
+    console is not enough: it launches the real base ``python.exe`` without the
+    caller's creation flags, and Windows gives that child a new console. Bypass
+    the redirector and run the base GUI interpreter directly. CPython's Windows
+    venv launcher uses ``__PYVENV_LAUNCHER__`` for the same hand-off, so setting
+    it here keeps the daemon in the current virtual environment.
+    """
+    executable = sys.executable
+    if not _IS_WINDOWS:
+        return executable
+
+    base_name = getattr(sys, "_base_executable", "") or executable
+    base_executable = Path(base_name)
+    pythonw = base_executable.with_name("pythonw.exe")
+    if pythonw.is_file():
+        executable = str(pythonw)
+    elif base_executable.is_file():
+        # Embedded/minimal distributions may omit pythonw.exe. Running the real
+        # console interpreter with CREATE_NO_WINDOW is still safe; importantly,
+        # it does not go through a redirector that can lose that flag.
+        executable = str(base_executable)
+
+    if executable != sys.executable and sys.prefix != sys.base_prefix:
+        environment["__PYVENV_LAUNCHER__"] = sys.executable
+    return executable
+
+
 def spawn_bridge_daemon(port: int) -> None:
     """Start the bridge daemon detached, so it outlives the process that needs it.
 
@@ -118,11 +150,14 @@ def spawn_bridge_daemon(port: int) -> None:
     if not sys.executable:
         LOGGER.warning("No interpreter to start the bridge daemon with")
         return
-    command = [sys.executable, str(DAEMON_ENTRY), "--bridge"]
     environment = dict(os.environ, WEB_SEARCH_NEO_BRIDGE_PORT=str(port))
+    command = [_daemon_interpreter(environment), str(DAEMON_ENTRY), "--bridge"]
     detach: dict[str, Any] = {}
-    if os.name == "nt":
-        detach["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW
+    if _IS_WINDOWS:
+        # CREATE_NO_WINDOW is ignored when combined with DETACHED_PROCESS. A
+        # Windows child already outlives its parent, and the three DEVNULL
+        # handles below keep it independent of the MCP stdio transport.
+        detach["creationflags"] = subprocess.CREATE_NO_WINDOW
     else:
         detach["start_new_session"] = True
     try:

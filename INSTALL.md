@@ -2,7 +2,7 @@
 
 This guide installs the MCP server from source and connects it to LM Studio or another stdio-compatible MCP client.
 
-It describes version 1.3.4. The Python package, the server, and the bundled Chrome
+It describes version 1.3.5. The Python package, the server, and the bundled Chrome
 companion carry that same version, and the bridge only accepts a companion able to complete
 the 1.3.0 handshake — see [Updating](#updating) if an older one is already installed.
 
@@ -150,6 +150,11 @@ standstill — and silently drops input into one that has never been shown — s
 turns on DevTools focus emulation for the tabs it drives, which restores normal speed and
 delivery for as long as it is attached to them.
 
+Ordinary `open`, `attach_tab`, navigation, keyboard input, and screenshots never request
+OS/browser foreground focus and never minimize, maximize, restore, or resize a window. The
+only foreground opt-in is `web_action` with `{"action":"show","session_id":"..."}`;
+use it only when the user explicitly asks to see the controlled tab.
+
 Start/restart the MCP first, then ask it for setup state:
 
 ```json
@@ -188,7 +193,7 @@ Earlier revisions tried to perform those clicks for you through Windows UI Autom
 code is gone. It depended on the interface language, on which window happened to have focus,
 and on a folder picker that the automation backend does not even enumerate.
 
-The bundled companion is version 1.3.4 and declares five permissions: `alarms`, `debugger`,
+The bundled companion is version 1.3.5 and declares five permissions: `alarms`, `debugger`,
 `storage`, `tabs`, and `tabGroups`. There are no content scripts and no `host_permissions`;
 page access comes from `debugger`, which attaches the Chrome DevTools Protocol to the tabs
 the agent drives. `alarms` exists because Chrome suspends an idle MV3 service worker after
@@ -308,13 +313,13 @@ work; it is documented because the file exists on your disk.
 
 ## 7. Choose an isolated or managed browser mode
 
-### Visible disposable browser
+### Disposable browser
 
-Use `profile_mode="temporary"`, which opens visibly by default. A Chrome window opens and you can watch the agent. Cookies are discarded when the session closes. Set `headless=true` only for background operation.
+Use `profile_mode="temporary"`, which is headless by default. Cookies are discarded when the session closes. Set `headless=false` only when you intentionally want a visible Chrome window.
 
-### Visible persistent browser
+### Persistent browser
 
-Use `profile_mode="persistent"` and a stable `profile_id`. It opens visibly by default. Log in once in that MCP-owned window; later sessions with the same profile ID reuse its cookies and local storage.
+Use `profile_mode="persistent"` and a stable `profile_id`. It is headless by default; set `headless=false` for the one-time visible login. Later sessions with the same profile ID reuse its cookies and local storage.
 
 ```json
 {
@@ -360,10 +365,10 @@ Visible mode is the attach launcher default. To run the same managed profile wit
 powershell -ExecutionPolicy Bypass -File scripts\start_managed_chrome.ps1 -ProfileId automation -Port 9223 -WindowMode headless
 ```
 
-All newly created MCP-owned `temporary` and `persistent` sessions are visible when `headless` is omitted. Set `headless=true` only for background operation. For `attach`, the launcher's `-WindowMode` controls the already-running Chrome; attach cannot change its visibility afterward.
+All newly created MCP-owned `temporary` and `persistent` sessions are headless when `headless` is omitted. Set `headless=false` only for an intentionally visible session. For `attach`, the launcher's `-WindowMode` controls the already-running Chrome; attach cannot change its visibility afterward.
 
 Use `profile_mode="auto"` to prefer the current Chrome but fall back to a separate
-visible temporary window. The default `current` mode does not fall back silently.
+headless temporary session. The default `current` mode does not fall back silently.
 
 Chrome 136+ requires remote debugging to use a non-default data directory. You cannot safely retrofit attach mode onto an arbitrary normal Chrome window that was started without a DevTools port. The launcher handles both requirements with a separate durable profile.
 
@@ -548,7 +553,7 @@ or when `setup_current_chrome` answered `self_update: "unsupported"` or `"timeou
    very directory **Load unpacked** points at, then reload the extension. Restarting the
    daemon does not help and never did after the daemon learned to re-read the token file:
    it already fetches the current secret from disk before calling anything a mismatch.
-3. Check the card's version. It must read 1.3.4; anything older than 1.3.0 cannot
+3. Check the card's version. It must read 1.3.5; anything older than 1.3.0 cannot
    authenticate at all, and Chrome only picks up the new manifest on reload.
 4. `%LOCALAPPDATA%\WebSearchNeo\bridge-daemon.log` records the bridge's side: `Rejected a
    bridge client that did not present the companion token` confirms that something did reach

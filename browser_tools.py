@@ -223,14 +223,18 @@ def resolve_profile_mode(profile_mode: str, headless: bool | None = None) -> str
 
 
 def _resolve_headless(profile_mode: str, headless: bool | None) -> bool:
-    """Default new browser sessions to a visible window unless explicitly hidden."""
+    """Keep owned browser sessions background-only unless visibility is explicit."""
     mode = profile_mode.strip().lower()
     if mode in {"extension", "current"}:
         return False
     if mode not in {"temporary", "persistent", "attach"}:
         raise ValueError("profile_mode must be 'temporary', 'persistent', 'attach', or 'current'")
     if headless is None:
-        return False
+        # An attached browser already has a window mode owned by its launcher;
+        # recording it as visible preserves that state without trying to change
+        # it. Browsers this server creates are headless by default so merely
+        # opening a page cannot take the user's OS focus.
+        return mode != "attach"
     return bool(headless)
 
 
@@ -1410,9 +1414,10 @@ def attach_current_tab(
 # disagreeing about what is on the page is the failure this avoids.
 _INSPECT_SCRIPT = page_perception.JS_LIBRARY + r"""
 const limit = arguments[0];
-const includeLinks = arguments[1];
-const includeForms = arguments[2];
-const includeButtons = arguments[3];
+const offset = arguments[1];
+const includeLinks = arguments[2];
+const includeForms = arguments[3];
+const includeButtons = arguments[4];
 
 // A web component keeps its controls in a shadow root and an embedded form keeps
 // them in another document, and `document.querySelectorAll` sees neither. That
@@ -1422,12 +1427,15 @@ const includeButtons = arguments[3];
 // that reached deeper than the outline reported controls the outline denied, and
 // one that stopped shallower hid controls the outline had already handed out.
 let framesTooDeep = 0;
+const WSN_ELEMENT_COLLECT_LIMIT = 20000;
+const collectorTruncated = {links: false, forms: false, fields: false, buttons: false, iframes: false};
 
 function collect(selectors) {
   const found = [];
   const seen = new Set();
+  let truncated = false;
   const walk = (root, depth) => {
-    if (found.length > 4000) return;
+    if (truncated) return;
     let matched;
     try {
       matched = root.querySelectorAll(selectors);
@@ -1436,9 +1444,14 @@ function collect(selectors) {
     }
     for (const el of matched) {
       if (seen.has(el)) continue;
+      if (found.length >= WSN_ELEMENT_COLLECT_LIMIT) {
+        truncated = true;
+        break;
+      }
       seen.add(el);
       found.push(el);
     }
+    if (truncated) return;
     let all;
     try {
       all = root.querySelectorAll('*');
@@ -1463,7 +1476,13 @@ function collect(selectors) {
     }
   };
   walk(document, 0);
-  return found;
+  return {items: found, truncated: truncated};
+}
+
+function category(name, selectors) {
+  const result = collect(selectors);
+  collectorTruncated[name] = result.truncated;
+  return order(result.items);
 }
 
 function visibility(el) {
@@ -1506,34 +1525,34 @@ const output = {links: [], forms: [], fields: [], buttons: [], iframes: []};
 const counts = {links: 0, forms: 0, fields: 0, buttons: 0, iframes: 0};
 const FIELD_SELECTOR = 'input, textarea, select, [contenteditable="true"]';
 if (includeLinks) {
-  const links = order(collect('a[href]'));
+  const links = category('links', 'a[href]');
   counts.links = links.length;
-  output.links = links.slice(0, limit).map(a => Object.assign({
+  output.links = links.slice(offset, offset + limit).map(a => Object.assign({
     selector: wsnSelector(a),
     text: (a.innerText || a.getAttribute('aria-label') || '').trim(),
     href: a.href
   }, visibility(a)));
 }
 if (includeForms) {
-  const forms = order(collect('form'));
+  const forms = category('forms', 'form');
   counts.forms = forms.length;
-  output.forms = forms.slice(0, limit).map((form, index) => Object.assign({
-    index, selector: wsnSelector(form), id: form.id || '',
+  output.forms = forms.slice(offset, offset + limit).map((form, index) => Object.assign({
+    index: offset + index, selector: wsnSelector(form), id: form.id || '',
     name: form.getAttribute('name') || '',
     action: form.action, method: (form.method || 'get').toLowerCase(), enctype: form.enctype,
     fields: Array.from(form.querySelectorAll(FIELD_SELECTOR)).slice(0, limit).map(fieldInfo)
   }, visibility(form)));
-  const fields = order(collect(FIELD_SELECTOR));
+  const fields = category('fields', FIELD_SELECTOR);
   counts.fields = fields.length;
-  output.fields = fields.slice(0, limit).map(fieldInfo);
+  output.fields = fields.slice(offset, offset + limit).map(fieldInfo);
 }
 if (includeButtons) {
-  const buttons = order(collect(
+  const buttons = category('buttons',
     'button, input[type="button"], input[type="submit"], input[type="reset"], ' +
     'input[type="image"], [role="button"]'
-  ));
+  );
   counts.buttons = buttons.length;
-  output.buttons = buttons.slice(0, limit).map(button => Object.assign({
+  output.buttons = buttons.slice(offset, offset + limit).map(button => Object.assign({
     selector: wsnSelector(button), tag: button.tagName.toLowerCase(),
     type: (button.getAttribute('type') || '').toLowerCase(), id: button.id || '',
     name: button.getAttribute('name') || '',
@@ -1541,9 +1560,9 @@ if (includeButtons) {
     disabled: !!button.disabled
   }, visibility(button)));
 }
-const frames = order(collect('iframe, frame'));
+const frames = category('iframes', 'iframe, frame');
 counts.iframes = frames.length;
-output.iframes = frames.slice(0, limit).map(frame => Object.assign({
+output.iframes = frames.slice(offset, offset + limit).map(frame => Object.assign({
   selector: wsnSelector(frame), id: frame.id || '', name: frame.name || '',
   src: frame.src || '', title: frame.title || '',
   same_origin: (() => {
@@ -1555,6 +1574,24 @@ output.iframes = frames.slice(0, limit).map(frame => Object.assign({
   })()
 }, visibility(frame)));
 output.found = counts;
+output.returned = {};
+output.range = {};
+for (const key of Object.keys(counts)) {
+  const returned = (output[key] || []).length;
+  const start = Math.min(offset, counts[key]);
+  const end = start + returned;
+  output.returned[key] = returned;
+  output.range[key] = {
+    start: start,
+    end: end,
+    next_offset: end < counts[key] ? end : null,
+    has_more: end < counts[key]
+  };
+}
+output.offset = offset;
+output.limit = limit;
+output.collector_limit = WSN_ELEMENT_COLLECT_LIMIT;
+output.collector_truncated = collectorTruncated;
 output.truncated = Object.keys(counts).some(key => counts[key] > (output[key] || []).length);
 output.frames_too_deep = framesTooDeep;
 return output;
@@ -1567,6 +1604,7 @@ def get_page_elements(
     include_forms: bool = True,
     include_buttons: bool = True,
     limit: int = 200,
+    offset: int = 0,
 ) -> dict[str, Any]:
     """Return stable selectors and metadata for rendered page controls.
 
@@ -1576,6 +1614,7 @@ def get_page_elements(
     no click can reach is never handed over looking like an ordinary one.
     """
     limit = max(1, min(int(limit), 1000))
+    offset = max(0, min(int(offset), 20_000))
     session = _get_session(session_id)
     with session.lock:
         # This topic has no frame_selector: it always answers for the whole page.
@@ -1587,6 +1626,7 @@ def get_page_elements(
         elements = session.driver.execute_script(
             _INSPECT_SCRIPT,
             limit,
+            offset,
             bool(include_links),
             bool(include_forms),
             bool(include_buttons),
@@ -2318,12 +2358,11 @@ def _normalize_game_key(key: str) -> str:
 
 _FOCUS_SCRIPT = """
 const element = arguments[0];
-if (!element) { window.focus(); return {focused: false}; }
+if (!element) { return {focused: false}; }
 element.scrollIntoView({block: 'center', inline: 'center'});
 if (!element.hasAttribute('tabindex') && element.tabIndex < 0) {
   element.setAttribute('tabindex', '-1');
 }
-window.focus();
 element.focus({preventScroll: true});
 return {focused: document.activeElement === element};
 """
@@ -2338,7 +2377,9 @@ def _focus_target(
     shot or a jump. Focusing directly avoids that phantom input.
     """
     if not target_selector:
-        driver.execute_script("window.focus();")
+        # CDP key dispatch does not need the browser window to be foreground.
+        # Leaving both the DOM focus and OS focus untouched is important for a
+        # user who is working in another tab or application.
         return
     target = WebDriverWait(driver, 10).until(
         conditions.visibility_of_element_located((By.CSS_SELECTOR, target_selector))
@@ -3486,6 +3527,84 @@ def pointer_action(
             **_action_summary(driver, session_id, include_summary),
             **result,
             "frame_selector": frame_selector,
+        }
+
+
+_SCROLL_METRICS_SCRIPT = """
+const root = document.scrollingElement || document.documentElement;
+const width = window.innerWidth;
+const height = window.innerHeight;
+const pageWidth = Math.max(root ? root.scrollWidth : 0, document.documentElement.scrollWidth);
+const pageHeight = Math.max(root ? root.scrollHeight : 0, document.documentElement.scrollHeight);
+return {
+  scroll_x: window.scrollX,
+  scroll_y: window.scrollY,
+  max_scroll_x: Math.max(0, pageWidth - width),
+  max_scroll_y: Math.max(0, pageHeight - height),
+  viewport_width: width,
+  viewport_height: height,
+  page_width: pageWidth,
+  page_height: pageHeight,
+  at_top: window.scrollY <= 0,
+  at_bottom: window.scrollY >= Math.max(0, pageHeight - height) - 1
+};
+"""
+
+
+def _scroll_metrics(driver: Any, frame_selector: str | None) -> dict[str, Any]:
+    """Read the selected document's page scroll position and always leave the top selected."""
+    try:
+        _select_frame(driver, frame_selector, css_only=True)
+        return dict(driver.execute_script(_SCROLL_METRICS_SCRIPT) or {})
+    finally:
+        driver.switch_to.default_content()
+
+
+def scroll_page(
+    delta_y: float,
+    session_id: str = "default",
+    delta_x: float = 0.0,
+    x: float | None = None,
+    y: float | None = None,
+    frame_selector: str | None = None,
+    wait_seconds: float = 0.1,
+    include_summary: bool = True,
+) -> dict[str, Any]:
+    """Scroll at a viewport point, defaulting to its centre.
+
+    Positive ``delta_y`` scrolls down and negative values scroll up. The point
+    matters on pages with nested scroll containers: Chrome sends the wheel to
+    whatever is painted under it. Page metrics still describe the selected
+    document's window, so an inner container may move while they stay unchanged.
+    """
+    if (x is None) != (y is None):
+        raise ValueError("x and y must be provided together, or both omitted for viewport centre")
+    _refuse_non_css_frame(frame_selector)
+    session = _get_session(session_id)
+    with session.lock:
+        driver = session.driver
+        frame_map, viewport = _pointer_context(driver, frame_selector)
+        actual_x = float(x) if x is not None else float(viewport["width"]) / 2
+        actual_y = float(y) if y is not None else float(viewport["height"]) / 2
+        before = _scroll_metrics(driver, frame_selector)
+        result = _pointer_dispatch(
+            session,
+            "wheel",
+            actual_x,
+            actual_y,
+            viewport,
+            frame_map=frame_map,
+            delta_x=float(delta_x),
+            delta_y=float(delta_y),
+        )
+        _wait_after_action(driver, wait_seconds)
+        after = _scroll_metrics(driver, frame_selector)
+        return {
+            **_action_summary(driver, session_id, include_summary),
+            **result,
+            "frame_selector": frame_selector,
+            "before": before,
+            "after": after,
         }
 
 
@@ -5446,36 +5565,160 @@ def submit_form(
         }
 
 
+_MAX_SCREENSHOT_WIDTH = 3840
+_MAX_SCREENSHOT_HEIGHT = 10_000
+
+
+def _screenshot_size_pair(width: int | None, height: int | None) -> bool:
+    if (width is None) != (height is None):
+        raise ValueError("width and height must be provided together")
+    return width is not None
+
+
+def _capture_png(driver: Any, clip: dict[str, float]) -> bytes:
+    capture = driver.execute_cdp_cmd(
+        "Page.captureScreenshot",
+        {
+            "format": "png",
+            "captureBeyondViewport": True,
+            "clip": {**clip, "scale": 1},
+        },
+    )
+    return base64.b64decode(capture["data"])
+
+
 def screenshot(
     session_id: str = "default",
-    width: int = 1440,
-    height: int = 900,
+    width: int | None = None,
+    height: int | None = None,
     full_page: bool = False,
+    mode: str | None = None,
+    x: float | None = None,
+    y: float | None = None,
 ) -> bytes:
-    """Capture the rendered page as PNG bytes."""
+    """Capture a viewport, full document, or exact page region as PNG bytes.
+
+    ``full_page`` remains the compatibility alias for ``mode='full_page'``.
+    Omitting width and height preserves the viewport exactly as it is. An
+    explicit viewport size is supported by server-owned/attached Selenium Chrome,
+    but never resizes or emulates the user's personal companion Chrome. Region
+    coordinates are page CSS pixels and capture without changing page layout.
+    """
+    selected_mode = str(mode or ("full_page" if full_page else "viewport")).strip().lower()
+    if selected_mode not in {"viewport", "full_page", "region"}:
+        raise ValueError("mode must be 'viewport', 'full_page', or 'region'")
+    if full_page and selected_mode != "full_page":
+        raise ValueError("full_page=true conflicts with mode; omit it or use mode='full_page'")
+    has_size = _screenshot_size_pair(width, height)
+    if selected_mode != "region" and (x is not None or y is not None):
+        raise ValueError("x and y are only accepted with mode='region'")
+    if selected_mode == "region" and (x is None or y is None or not has_size):
+        raise ValueError("mode='region' requires x, y, width, and height")
+
     session = _get_session(session_id)
-    width, height = _bounded_size(width, height)
     with session.lock:
-        _set_viewport(session.driver, width, height)
-        if full_page:
-            metrics = session.driver.execute_cdp_cmd("Page.getLayoutMetrics", {})
-            size = metrics["contentSize"]
-            capture = session.driver.execute_cdp_cmd(
-                "Page.captureScreenshot",
+        driver = session.driver
+        is_current = bool(getattr(driver, "is_extension_bridge", False))
+
+        if selected_mode == "viewport":
+            if has_size:
+                if is_current:
+                    raise ValueError(
+                        "An explicit viewport size cannot be applied in profile_mode='current': "
+                        "Web Search Neo preserves the user's Chrome window. Omit width/height "
+                        "for its actual viewport, or use mode='region' for an exact-size crop."
+                    )
+                bounded_width, bounded_height = _bounded_size(int(width), int(height))
+                _set_viewport(driver, bounded_width, bounded_height)
+            return driver.get_screenshot_as_png()
+
+        if selected_mode == "region":
+            region_width = int(width)
+            region_height = int(height)
+            if not 1 <= region_width <= _MAX_SCREENSHOT_WIDTH:
+                raise ValueError(
+                    f"region width must be 1-{_MAX_SCREENSHOT_WIDTH} CSS pixels"
+                )
+            if not 1 <= region_height <= _MAX_SCREENSHOT_HEIGHT:
+                raise ValueError(
+                    f"region height must be 1-{_MAX_SCREENSHOT_HEIGHT} CSS pixels"
+                )
+            region_x = float(x)
+            region_y = float(y)
+            if region_x < 0 or region_y < 0:
+                raise ValueError("region x and y must be non-negative page coordinates")
+            return _capture_png(
+                driver,
                 {
-                    "format": "png",
-                    "captureBeyondViewport": True,
-                    "clip": {
-                        "x": 0,
-                        "y": 0,
-                        "width": min(float(size["width"]), 3840),
-                        "height": min(float(size["height"]), 10000),
-                        "scale": 1,
-                    },
+                    "x": region_x,
+                    "y": region_y,
+                    "width": float(region_width),
+                    "height": float(region_height),
                 },
             )
-            return base64.b64decode(capture["data"])
-        return session.driver.get_screenshot_as_png()
+
+        # The old full_page call accepted width/height as the layout viewport used
+        # before measuring the document, so keep that behaviour for Selenium. It
+        # was silently ignored in current Chrome; saying so is safer than returning
+        # an image whose requested dimensions mean nothing.
+        if has_size:
+            if is_current:
+                raise ValueError(
+                    "width/height cannot change full-page layout in profile_mode='current'; "
+                    "omit them to capture the current layout"
+                )
+            bounded_width, bounded_height = _bounded_size(int(width), int(height))
+            _set_viewport(driver, bounded_width, bounded_height)
+        metrics = driver.execute_cdp_cmd("Page.getLayoutMetrics", {})
+        size = metrics.get("cssContentSize") or metrics.get("contentSize") or {}
+        page_width = float(size.get("width") or 0)
+        page_height = float(size.get("height") or 0)
+        if page_width <= 0 or page_height <= 0:
+            raise RuntimeError("Chrome returned no document size for the full-page screenshot")
+        if page_width > _MAX_SCREENSHOT_WIDTH or page_height > _MAX_SCREENSHOT_HEIGHT:
+            raise ValueError(
+                f"The full page is {page_width:g}x{page_height:g} CSS pixels, above the "
+                f"safe {_MAX_SCREENSHOT_WIDTH}x{_MAX_SCREENSHOT_HEIGHT} screenshot limit. "
+                "Use mode='region' to capture it in explicit pieces; no partial image was returned."
+            )
+        return _capture_png(
+            driver,
+            {"x": 0, "y": 0, "width": page_width, "height": page_height},
+        )
+
+
+def show_session(session_id: str = "default") -> dict[str, Any]:
+    """Explicitly put a session in front without changing its window state.
+
+    This is the sole browser-tools operation that may request foreground focus.
+    All ordinary automation remains background-safe; callers must opt into the
+    interruption by naming the ``show`` action.
+    """
+    session = _get_session(session_id)
+    with session.lock:
+        driver = session.driver
+        if session.profile_mode == "current":
+            # ChromeBridgeDriver.activate_tab is the audited bridge path that
+            # activates the tab and focuses its containing window. It does not
+            # request minimized/maximized/restored state.
+            driver.activate_tab()
+            focus_method = "tabs.activate"
+        else:
+            # CDP's page-level foreground request works for Selenium-owned and
+            # debugger-attached browsers without a window-state mutation API.
+            driver.execute_cdp_cmd("Page.bringToFront", {})
+            focus_method = "Page.bringToFront"
+        return {
+            **_page_summary(driver, session_id),
+            "success": True,
+            "focus_requested": True,
+            "focus_method": focus_method,
+            "warning": (
+                "Foreground focus was explicitly requested and may interrupt the user's "
+                "current browser or OS focus. No minimize, maximize, restore, resize, or "
+                "other window-state request was sent."
+            ),
+        }
 
 
 def get_status(session_id: str = "default") -> dict[str, Any]:

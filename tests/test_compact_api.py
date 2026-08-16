@@ -198,7 +198,7 @@ def test_capabilities_names_required_parameters_and_where_the_rest_live():
     # Optional names are deliberately absent, so the document must say so.
     assert "action_schema" in document["discovery"]["parameters"]
     assert not any("include_summary" in json.dumps(entry) for entry in actions.values())
-    assert len(json.dumps(document)) < 8_000
+    assert len(json.dumps(document)) < 10_000
 
     assert any(
         "ref:" in pitfall and "page_outline" in pitfall for pitfall in document["pitfalls"]
@@ -220,7 +220,7 @@ def test_capabilities_states_the_requirements_that_python_defaults_hide():
     # Unconditional actions keep the plain shape, so the key stays a signal.
     assert "also_required" not in actions["pointer"]
     assert "also_required" not in actions["open"]
-    assert len(json.dumps(document)) < 8_000
+    assert len(json.dumps(document)) < 10_000
 
 
 def test_input_and_touch_reject_exactly_what_the_document_calls_required():
@@ -322,3 +322,87 @@ def test_compact_web_info_discovers_one_action_at_a_time():
 
     with pytest.raises(ValueError, match="Unknown action schema"):
         asyncio.run(main.web_info("action_schema", {"action": "unknown"}))
+
+
+def test_scroll_screenshot_pagination_and_skill_are_published_for_small_models():
+    scroll = asyncio.run(main.web_info("action_schema", {"action": "scroll"}))
+    assert scroll["input_schema"]["required"] == ["action", "delta_y"]
+    scroll_properties = scroll["input_schema"]["properties"]
+    assert scroll_properties["delta_x"]["default"] == 0.0
+    assert scroll_properties["x"]["default"] is None
+    assert scroll_properties["wait_seconds"]["default"] == 0.1
+    assert "positive" in scroll["notes"]["direction"]
+
+    screenshot = asyncio.run(main.web_info("action_schema", {"action": "screenshot"}))
+    shot_properties = screenshot["params_schema"]["properties"]
+    assert shot_properties["mode"]["anyOf"][0]["enum"] == [
+        "viewport",
+        "full_page",
+        "region",
+    ]
+    assert shot_properties["width"]["default"] is None
+    assert screenshot["notes"]["region"].startswith("requires x/y/width/height")
+
+    elements = asyncio.run(main.web_info("action_schema", {"action": "page_elements"}))
+    assert elements["params_schema"]["properties"]["offset"]["default"] == 0
+    assert "next_offset" in elements["notes"]["pagination"]
+
+    skill = asyncio.run(main.web_info("skill"))
+    assert [step["step"] for step in skill["loop"]] == ["inspect", "act", "verify"]
+    assert "Positive" in skill["scroll"]["direction"]
+    assert "selector filter" in skill["elements"]["filtering"]
+    assert "not CSS" in skill["elements"]["refs"]
+    assert "timeout_seconds" in skill["schema"]["timeouts"]
+    assert "wait_seconds" in skill["schema"]["timeouts"]
+    assert "timeout_ms does not exist" in skill["schema"]["timeouts"]
+    assert "background" in skill["focus"]["default"]
+    assert "Only web_action show" in skill["focus"]["opt_in"]
+    assert "never minimizes, maximizes, restores, or resizes" in skill["focus"]["window_state"]
+    assert len(skill["forms"]["final_submit_guard"]) == 3
+    assert len(json.dumps(skill)) < 4_000
+    skill_schema = asyncio.run(main.web_info("action_schema", {"action": "skill"}))
+    assert skill_schema["params_schema"].get("properties", {}) == {}
+
+
+def test_show_schema_and_dispatch_make_foreground_an_explicit_opt_in(monkeypatch):
+    schema = asyncio.run(main.web_info("action_schema", {"action": "show"}))
+    assert schema["input_schema"]["required"] == ["action"]
+    assert set(schema["input_schema"]["properties"]) == {"action", "session_id"}
+    assert schema["input_schema"]["properties"]["session_id"]["default"] == "default"
+    assert "only action" in schema["notes"]["only_foreground"]
+    assert "No minimize, maximize, restore, resize" in schema["notes"]["window_state"]
+
+    monkeypatch.setattr(
+        main.browser_tools,
+        "show_session",
+        lambda session_id: {
+            "success": True,
+            "session_id": session_id,
+            "focus_requested": True,
+            "warning": "foreground may interrupt the user",
+        },
+    )
+    result = asyncio.run(
+        main.web_action([{"action": "show", "session_id": "explicit"}])
+    )
+    assert result["success"] is True
+    assert result["results"][0]["data"]["focus_requested"] is True
+    assert result["results"][0]["data"]["session_id"] == "explicit"
+
+
+def test_small_model_parameter_guesses_are_rejected_with_the_published_fix():
+    bad_scroll = asyncio.run(
+        main.web_action([{"action": "scroll", "delta_y": 600, "timeout_ms": 1000}])
+    )
+    assert bad_scroll["success"] is False
+    assert "timeout_ms" in bad_scroll["results"][0]["error"]
+    assert "timeout_seconds" not in bad_scroll["results"][0]["error"]  # scroll uses wait_seconds
+
+    with pytest.raises(ValueError) as failure:
+        asyncio.run(
+            main.web_info(
+                "page_elements", {"session_id": "unused", "selector": "button.apply"}
+            )
+        )
+    assert "selector" in str(failure.value)
+    assert "offset" in str(failure.value)

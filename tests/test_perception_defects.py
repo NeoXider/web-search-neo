@@ -674,6 +674,72 @@ def test_page_elements_marks_controls_no_click_can_reach(local_site):
         browser_tools.close_session("defect-elements-hidden")
 
 
+def test_page_elements_paginates_the_whole_dom_and_scroll_materialises_lazy_controls(
+    local_site,
+):
+    _open_or_skip(
+        _fixture(local_site, "scroll_and_many.html"), "defect-elements-pagination"
+    )
+    try:
+        first = browser_tools.get_page_elements(
+            session_id="defect-elements-pagination",
+            include_links=False,
+            include_forms=False,
+            limit=1000,
+            offset=0,
+        )
+        assert first["found"]["buttons"] == 1206
+        assert first["returned"]["buttons"] == 1000
+        assert first["range"]["buttons"] == {
+            "start": 0,
+            "end": 1000,
+            "next_offset": 1000,
+            "has_more": True,
+        }
+        assert first["collector_truncated"]["buttons"] is False
+        below = next(button for button in first["buttons"] if button["id"] == "below-fold")
+        assert below["visible"] is True  # rendered below the viewport is still in the DOM
+        assert not any(button["id"] == "lazy-button" for button in first["buttons"])
+
+        second = browser_tools.get_page_elements(
+            session_id="defect-elements-pagination",
+            include_links=False,
+            include_forms=False,
+            limit=1000,
+            offset=1000,
+        )
+        assert second["returned"]["buttons"] == 206
+        assert second["range"]["buttons"]["next_offset"] is None
+        ids = {button["id"] for button in first["buttons"] + second["buttons"]}
+        assert len(ids) == 1206
+
+        scrolled = browser_tools.scroll_page(
+            700,
+            session_id="defect-elements-pagination",
+            wait_seconds=0.2,
+            include_summary=False,
+        )
+        assert scrolled["after"]["scroll_y"] > scrolled["before"]["scroll_y"]
+        after = browser_tools.get_page_elements(
+            session_id="defect-elements-pagination",
+            include_links=False,
+            include_forms=False,
+            limit=1000,
+            offset=0,
+        )
+        assert after["found"]["buttons"] == 1207
+        last = browser_tools.get_page_elements(
+            session_id="defect-elements-pagination",
+            include_links=False,
+            include_forms=False,
+            limit=1000,
+            offset=1000,
+        )
+        assert any(button["id"] == "lazy-button" for button in last["buttons"])
+    finally:
+        browser_tools.close_session("defect-elements-pagination")
+
+
 # ---------------------------------------------------------------------------
 # The console topic's own note about itself
 # ---------------------------------------------------------------------------
