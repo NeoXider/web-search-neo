@@ -49,7 +49,9 @@ outcome happened. After navigation or rerender, discard old selectors, refs, and
   session takes its tab, so the first navigation is in the buffer; a tab claimed with
   `attach_tab` is recorded only from the claim onwards. `dropped` counts what the 500-entry
   buffer evicted, so an empty list plus a high `dropped` is not a quiet page.
-- `screenshot`, `game_probe`, `browser_status`, `browser_tabs`, `search_status`, `time`.
+- `screenshot`, `game_probe`, `browser_status`, `browser_tabs`, `search_status`.
+- Every `web_info` result (dict payloads) also carries the current local date/time and
+  UTC-offset region under the top-level `now` key — there is no separate time topic.
 
 The outline and `find` cross open shadow roots and same-origin iframes; a cross-origin frame
 is a stub, so pass its selector as `frame_selector` to read it.

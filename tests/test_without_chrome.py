@@ -58,7 +58,10 @@ def test_search_and_discovery_topics_do_not_need_a_browser(no_chrome):
     status = asyncio.run(main.web_info("search_status", {"check_live": False}))
     assert status["configured"]
 
-    assert asyncio.run(main.web_info("time"))["year"] >= 2024
+    contract = asyncio.run(main.web_info("capabilities"))
+    assert "time" not in contract["info_topics"]
+    assert contract["now"]["year"] >= 2024
+    assert contract["now"]["region"]
 
 
 def test_fetch_actions_do_not_need_a_browser(no_chrome, local_site):

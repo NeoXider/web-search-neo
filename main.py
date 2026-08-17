@@ -1324,7 +1324,6 @@ _INFO_TOPICS = {
     "browser_status": "Chrome availability and named session state.",
     "browser_tabs": "Tabs open in the user's Chrome, with ids and groups.",
     "search_status": "Search providers, live availability, latency, cooldowns.",
-    "time": "Current local date, time, and UTC offset.",
 }
 
 # Repeated verbatim on every hot-path action, because a model reads one schema.
@@ -1794,6 +1793,19 @@ _TOPIC_HANDLERS = {
 }
 
 
+def _stamp_now(payload: Any) -> Any:
+    """Attach the current local time to a web_info result (dicts only).
+
+    Every web_info answer carries the current local date/time and UTC-offset
+    region string under the top-level ``now`` key, so a model never needs a
+    separate time call. Non-dict payloads (e.g. screenshot images) pass through.
+    """
+    if isinstance(payload, dict):
+        payload = dict(payload)
+        payload["now"] = msp_date_time.get_current_time_and_region()
+    return payload
+
+
 @mcp.tool()
 async def web_info(
     topic: Literal[
@@ -1812,20 +1824,21 @@ async def web_info(
         "network_body",
         "game_probe",
         "screenshot",
-        "time",
     ] = "capabilities",
     params: dict[str, Any] | None = None,
 ) -> Any:
     """Read the contract, the page, the console, the network, or search/browser state.
 
     Called with no arguments it returns the whole contract, including recipes and
-    common mistakes, so no external skill file is needed.
+    common mistakes, so no external skill file is needed. Every result (dict
+    payloads) also carries the current local date/time and UTC-offset region
+    under the top-level ``now`` key.
     """
     arguments = dict(params or {})
     if topic == "capabilities":
         if arguments:
             raise ValueError("capabilities does not accept params")
-        return _capabilities()
+        return _stamp_now(_capabilities())
     if topic == "action_schema":
         # params.topic is accepted as an alias: what is being described may be an
         # info topic, and naming one under the key "action" reads as a mistake.
@@ -1838,18 +1851,14 @@ async def web_info(
                 "action_schema requires params.action: an action name for web_action, "
                 f"or an info topic name. Topics: {sorted(_TOPIC_HANDLERS)}"
             )
-        return _capabilities(named or alias)
-    if topic == "time":
-        if arguments:
-            raise ValueError("time does not accept params")
-        return get_current_time_and_region()
+        return _stamp_now(_capabilities(named or alias))
     handler = _TOPIC_HANDLERS.get(topic)
     if handler is None:
         raise ValueError(
             f"Unsupported info topic: {topic}. Available: {sorted(_INFO_TOPICS)}"
         )
     validated = _validate_arguments(handler.__name__, f"topic '{topic}'", arguments)
-    return await handler(**validated)
+    return _stamp_now(await handler(**validated))
 
 
 @mcp.tool()
