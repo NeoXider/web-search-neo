@@ -208,6 +208,82 @@ def test_selenium_network_rows_folds_three_events_into_one_row():
     assert row["text"] == "GET 200 http://host/index.html"
 
 
+def test_a_row_carries_the_post_body_and_the_headers_that_govern_the_page():
+    # What a form actually sent, and what the server allows, are the two things
+    # a defence audit reads; neither is visible anywhere else in a row.
+    sent = _perf(
+        "Network.requestWillBeSent",
+        {
+            "requestId": "REQ-P",
+            "wallTime": 1_700_000_000.5,
+            "timestamp": 100.0,
+            "type": "XHR",
+            "documentURL": "https://host/apply",
+            "initiator": {"type": "script"},
+            "request": {
+                "method": "POST",
+                "url": "https://host/api/apply",
+                "hasPostData": True,
+                "postData": "resume=1&token=abc",
+            },
+        },
+    )
+    driver = _FakeLogDriver(
+        [
+            [
+                sent,
+                _perf(
+                    "Network.responseReceived",
+                    {
+                        "requestId": "REQ-P",
+                        "type": "XHR",
+                        "response": {
+                            "status": 403,
+                            "mimeType": "application/json",
+                            "headers": {
+                                "Content-Security-Policy": "default-src 'self'",
+                                "X-Frame-Options": "DENY",
+                                "Set-Cookie": "sid=1; HttpOnly; Secure",
+                                "Content-Length": "27",
+                                "Date": "Tue, 19 Aug 2026 00:00:00 GMT",
+                            },
+                        },
+                    },
+                ),
+                _perf(
+                    "Network.loadingFinished",
+                    {"requestId": "REQ-P", "timestamp": 100.1, "encodedDataLength": 27},
+                ),
+            ]
+        ]
+    )
+    row = diagnostics.selenium_network_rows(driver, {})[0]
+
+    assert row["post_data"] == "resume=1&token=abc"
+    assert row["has_post_data"] is True
+    # Header names come back lowercased, so a caller never guesses the casing.
+    assert row["headers"]["content-security-policy"] == "default-src 'self'"
+    assert row["headers"]["x-frame-options"] == "DENY"
+    assert row["headers"]["set-cookie"] == "sid=1; HttpOnly; Secure"
+    # Noise is dropped: every header would double the size of a network read.
+    assert "content-length" not in row["headers"]
+    assert "date" not in row["headers"]
+    assert row["level"] == "error"
+
+
+def test_a_get_without_a_body_says_so_and_a_huge_body_is_clipped():
+    driver = _FakeLogDriver([[_will_be_sent("REQ-G", "https://host/page")]])
+    diagnostics.selenium_network_rows(driver, pending := {})
+    assert pending["REQ-G"]["post_data"] is None
+    assert pending["REQ-G"]["has_post_data"] is False
+
+    huge = "x" * (diagnostics.POST_DATA_LIMIT + 500)
+    clipped = diagnostics._clip_post_data(huge)
+    assert clipped.startswith("x" * 50)
+    assert str(len(huge)) in clipped
+    assert len(clipped) < len(huge)
+
+
 def test_selenium_network_rows_carries_partial_rows_between_calls():
     driver = _FakeLogDriver(
         [

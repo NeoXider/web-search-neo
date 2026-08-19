@@ -202,6 +202,56 @@ def _evict_pending(pending: dict[str, dict[str, Any]]) -> None:
         pending.pop(key, None)
 
 
+# The response headers worth carrying on every row. Keeping all of them would
+# double the size of a network read for the sake of Date and Content-Length;
+# these are the ones that answer "why was that refused" and "how is this
+# session protected", which is what a defence audit is looking for.
+SECURITY_HEADERS = (
+    "content-security-policy",
+    "content-security-policy-report-only",
+    "x-frame-options",
+    "strict-transport-security",
+    "access-control-allow-origin",
+    "x-content-type-options",
+    "referrer-policy",
+    "permissions-policy",
+    "cross-origin-opener-policy",
+    "cross-origin-resource-policy",
+    "set-cookie",
+    "www-authenticate",
+    "retry-after",
+    "location",
+)
+
+POST_DATA_LIMIT = 4_000
+
+
+def _clip_post_data(post_data: Any) -> str | None:
+    """Keep a request body readable without letting an upload flood the report."""
+    if not post_data:
+        return None
+    text = str(post_data)
+    if len(text) <= POST_DATA_LIMIT:
+        return text
+    return f"{text[:POST_DATA_LIMIT]}... [{len(text)} chars]"
+
+
+def _security_headers(headers: Any) -> dict[str, str]:
+    """Pick the response headers that govern what the page may do.
+
+    Chrome sends header names in whatever case the server used, so they are
+    matched case-insensitively and reported lowercased - otherwise a caller has
+    to guess whether this server wrote ``X-Frame-Options`` or ``x-frame-options``.
+    """
+    if not isinstance(headers, dict):
+        return {}
+    return {
+        name.lower(): str(value)
+        for name, value in headers.items()
+        if name.lower() in SECURITY_HEADERS
+    }
+
+
 def selenium_network_rows(driver: Any, pending: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     """Fold Chrome's performance log into finished request rows.
 
@@ -231,6 +281,11 @@ def selenium_network_rows(driver: Any, pending: dict[str, dict[str, Any]]) -> li
                 "doc": params.get("documentURL"),
                 "status": None,
                 "done": False,
+                # What was actually sent. A form that posts and a form that
+                # silently does not look identical without it, and it is the
+                # only way to see the token a page attached to the request.
+                "post_data": _clip_post_data(request.get("postData")),
+                "has_post_data": bool(request.get("hasPostData") or request.get("postData")),
             }
             _evict_pending(pending)
         elif method == "Network.responseReceived":
@@ -244,6 +299,10 @@ def selenium_network_rows(driver: Any, pending: dict[str, dict[str, Any]]) -> li
                 from_cache=bool(response.get("fromDiskCache") or response.get("fromServiceWorker")),
                 remote=response.get("remoteIPAddress"),
                 type=params.get("type", row.get("type")),
+                # The headers that decide what a page is allowed to do -
+                # Content-Security-Policy, X-Frame-Options, Set-Cookie flags -
+                # are only ever visible here, and only on the response itself.
+                headers=_security_headers(response.get("headers")),
             )
         elif method in {"Network.loadingFinished", "Network.loadingFailed"}:
             row = pending.pop(request_id, None)

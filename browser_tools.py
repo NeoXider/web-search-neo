@@ -44,6 +44,7 @@ from chrome_bootstrap import (
     expected_extension_version,
     setup_current_chrome,
 )
+import captcha
 import diagnostics
 import key_table
 import page_perception
@@ -126,6 +127,10 @@ class BrowserSession:
     # own buffer. Both backends bound what they keep; this counts what the
     # Selenium one threw away, as the extension counts evictions for the other.
     network_dropped: int = 0
+    # Identifiers of scripts registered with Page.addScriptToEvaluateOnNewDocument
+    # for this session, so inject_script can list and forget them by hand: CDP has
+    # no matching remove, and the ids are the only handle a caller ever gets back.
+    injected_scripts: list[str] = field(default_factory=list)
     lock: threading.RLock = field(default_factory=threading.RLock)
     last_used: float = field(default_factory=time.monotonic)
 
@@ -1753,6 +1758,7 @@ return {
   type: type,
   multiple: !!element.multiple,
   disabled: !!element.disabled,
+  editable: !!element.isContentEditable,
   readonly: !!element.readOnly && readonlyIgnored.indexOf(type) < 0
 };
 """
@@ -1846,6 +1852,37 @@ element.dispatchEvent(new Event('input', {bubbles: true}));
 element.dispatchEvent(new Event('change', {bubbles: true}));
 return {taken: true, value: String(element.value || ''), expected: outcome};
 """
+
+# A contenteditable editor (TipTap, ProseMirror, Slate, Quill) does not listen to
+# value sets or DOM patches: its document model only moves on real editing
+# events. Focus the host, select its whole contents, then insert the text
+# through the same CDP input channel a keyboard uses, so the editor sees a
+# genuine replacement edit.
+_CONTENTEDITABLE_SELECT_SCRIPT = """
+const element = arguments[0];
+element.focus();
+const range = document.createRange();
+range.selectNodeContents(element);
+const selection = window.getSelection();
+selection.removeAllRanges();
+selection.addRange(range);
+return true;
+"""
+
+
+def _write_contenteditable(
+    driver: webdriver.Chrome, element: Any, text: str
+) -> str:
+    """Replace a contenteditable's text the way an editor expects to be edited."""
+    driver.execute_script(_CONTENTEDITABLE_SELECT_SCRIPT, element, text)
+    cdp = getattr(driver, "execute_cdp_cmd", None)
+    if cdp is not None:
+        cdp("Input.insertText", {"text": text})
+    else:
+        element.send_keys(Keys.CONTROL, "a")
+        element.send_keys(text)
+    return text
+
 
 # select_by_value *adds* to the selection of a <select multiple>, so a second fill
 # left the first option set too and the form submitted both. The whole selection
@@ -2180,6 +2217,8 @@ def fill_fields(
                     expected = _write_selection(driver, element, selector, control, value)
                 elif input_type in _JS_VALUE_TYPES:
                     expected = _write_by_script(driver, element, input_type, value)
+                elif control.get("editable"):
+                    expected = _write_contenteditable(driver, element, str(value))
                 else:
                     element.clear()
                     element.send_keys(str(value))
@@ -2252,11 +2291,18 @@ def click(
     session_id: str = "default",
     wait_seconds: float = 0.5,
     frame_selector: str | None = None,
+    trusted: bool = False,
 ) -> dict[str, Any]:
     """Click a rendered element by CSS selector, ref handle, or piercing path.
 
     ``frame_selector`` names the frame a CSS selector is looked up in, exactly as
     it does for ``find`` and ``page_text``.
+
+    ``trusted=True`` dispatches a real trusted mouse sequence through the
+    browser's input pipeline instead of the element's synthetic click. It lands
+    on the element's centre as a human pointer would, so pages that demand
+    isTrusted events, or that read pointer position, behave as if a user
+    clicked. The element is scrolled into the middle of the viewport first.
     """
     session = _get_session(session_id)
     with session.lock:
@@ -2266,7 +2312,10 @@ def click(
             session.driver.execute_script(
                 "arguments[0].scrollIntoView({block: 'center'});", element
             )
-            element.click()
+            if trusted:
+                _click_trusted(session, element, frame_selector)
+            else:
+                element.click()
         finally:
             # The click may have happened inside a frame; everything after it -
             # the settle, the page summary - is about the page as a whole.
@@ -2277,6 +2326,107 @@ def click(
             "success": True,
             "clicked": selector,
             "frame_selector": frame_selector,
+            "trusted": trusted,
+        }
+
+
+_ELEMENT_CENTER_SCRIPT = """
+const rect = arguments[0].getBoundingClientRect();
+return {
+  x: rect.x + rect.width / 2,
+  y: rect.y + rect.height / 2,
+  width: rect.width,
+  height: rect.height
+};
+"""
+
+
+def _click_trusted(
+    session: BrowserSession, element: Any, frame_selector: str | None
+) -> None:
+    """Dispatch a trusted pointer click at the element's centre."""
+    driver = session.driver
+    center = driver.execute_script(_ELEMENT_CENTER_SCRIPT, element) or {}
+    if not center.get("width") or not center.get("height"):
+        raise ValueError(
+            "The element has no visible box, so a trusted click has nothing to "
+            "land on; use trusted=false to click it synthetically"
+        )
+    frame_map, viewport = _pointer_context(driver, frame_selector)
+    _pointer_dispatch(
+        session,
+        "click",
+        float(center["x"]),
+        float(center["y"]),
+        viewport,
+        frame_map=frame_map,
+    )
+
+
+_MAX_SCRIPT_RESULT_CHARS = 200_000
+
+
+def _clip_result(value: Any) -> Any:
+    """Cut undisplayable size out of a script result, marking what was lost."""
+    if isinstance(value, str) and len(value) > _MAX_SCRIPT_RESULT_CHARS:
+        return {
+            "clipped": True,
+            "length": len(value),
+            "head": value[:_MAX_SCRIPT_RESULT_CHARS],
+        }
+    return value
+
+
+def execute_js(
+    script: str,
+    args: list[Any] | None = None,
+    session_id: str = "default",
+    await_promise: bool = False,
+    user_gesture: bool = False,
+) -> dict[str, Any]:
+    """Run a JavaScript snippet in a session's page and report what it returns.
+
+    ``script`` runs in the top document of the session's current tab; ``args``
+    arrive as ``arguments[0..n]``. A JSON-serialisable value comes back as
+    itself, and a returned promise is awaited. Strings longer than 200k
+    characters are clipped in the report.
+
+    This is the escape hatch for page state the DOM reads do not expose -
+    localStorage, virtualised lists, framework state - and for mutations that
+    have no input-shaped equivalent. With the Chrome bridge driver the result
+    of ``await_promise`` is honoured because bridge evaluation awaits promises
+    anyway; a plain Selenium driver cannot await one, so that mode is refused
+    there rather than silently returning an unserialisable promise.
+
+    ``user_gesture`` runs the script as though a person had just clicked, which
+    is the only way to reach the APIs Chrome gates behind one - clipboard writes,
+    fullscreen, autoplay with sound. It goes through CDP directly, so ``args``
+    are inlined as ``arguments`` rather than passed by the WebDriver protocol.
+    """
+    session = _get_session(session_id)
+    with session.lock:
+        driver = session.driver
+        try:
+            if await_promise and not hasattr(driver, "execute_cdp_cmd"):
+                raise ValueError(
+                    "await_promise needs the Chrome bridge driver; with a plain "
+                    "Selenium driver, return the promise object and read it in a "
+                    "later call instead"
+                )
+            if user_gesture:
+                value = _evaluate_with_gesture(driver, script, args, await_promise)
+            else:
+                value = driver.execute_script(script, *(args or []))
+        except Exception as exc:
+            return {
+                **_page_summary(driver, session_id),
+                "success": False,
+                "error": _brief_error(exc),
+            }
+        return {
+            **_page_summary(driver, session_id),
+            "success": True,
+            "value": _clip_result(value),
         }
 
 
@@ -3189,6 +3339,286 @@ def get_network_body(
             "truncated": len(body) > limit,
             "body": body[:limit],
         }
+
+
+def _evaluate_with_gesture(
+    driver: Any,
+    script: str,
+    args: list[Any] | None,
+    await_promise: bool,
+) -> Any:
+    """Evaluate a script under a synthetic user gesture, returning its value.
+
+    ``Runtime.evaluate`` takes an expression, not a function body, so the script
+    is wrapped in a function that is *applied* to the arguments rather than one
+    that declares them: ``arguments`` is reserved inside a function body and
+    cannot be assigned, and applying keeps the ``arguments[0..n]`` contract the
+    WebDriver path already publishes. A page-side throw is raised here so the
+    caller's existing error handling reports it the same way either route fails.
+    """
+    expression = (
+        f"(function() {{\n{script}\n}}).apply(null, {json.dumps(args or [])})"
+    )
+    result = driver.execute_cdp_cmd(
+        "Runtime.evaluate",
+        {
+            "expression": expression,
+            "returnByValue": True,
+            "awaitPromise": bool(await_promise),
+            "userGesture": True,
+        },
+    )
+    details = result.get("exceptionDetails")
+    if details:
+        raise RuntimeError(_exception_text(details))
+    return (result.get("result") or {}).get("value")
+
+
+def _exception_text(details: dict[str, Any]) -> str:
+    """The most specific message a CDP exceptionDetails carries, line kept if present.
+
+    The nested ``exception.description`` holds the real stack-bearing message when
+    Chrome sends one; ``text`` is the flat fallback. Either way a line number, when
+    given, is worth keeping - it is the only pointer back into the injected source.
+    """
+    exception = details.get("exception") or {}
+    message = exception.get("description") or details.get("text") or "evaluation failed"
+    line = details.get("lineNumber")
+    if line is not None:
+        return f"{message} (line {line})"
+    return str(message)
+
+
+def inject_script(
+    op: str = "add",
+    source: str | None = None,
+    identifier: str | None = None,
+    session_id: str = "default",
+) -> dict[str, Any]:
+    """Register, list, or forget page code that runs before every document's own scripts.
+
+    ``add`` installs ``source`` with Page.addScriptToEvaluateOnNewDocument and keeps
+    the returned identifier; it takes effect on the next navigation of this session.
+    ``list`` returns the identifiers held. ``remove`` drops one from that list - CDP
+    offers no matching removal, so the drop is best-effort and only stops us
+    re-installing it, not what Chrome already queued for the next document.
+    """
+    session = _get_session(session_id)
+    with session.lock:
+        if op == "add":
+            if not source:
+                raise ValueError("inject_script op 'add' requires source")
+            result = session.driver.execute_cdp_cmd(
+                "Page.addScriptToEvaluateOnNewDocument", {"source": source}
+            )
+            script_id = str(result.get("identifier") or "")
+            session.injected_scripts.append(script_id)
+            return {"success": True, "session_id": session_id, "identifier": script_id}
+        if op == "list":
+            return {
+                "success": True,
+                "session_id": session_id,
+                "identifiers": list(session.injected_scripts),
+            }
+        if op == "remove":
+            removed = identifier in session.injected_scripts
+            if removed:
+                session.injected_scripts.remove(identifier)
+            return {
+                "success": True,
+                "session_id": session_id,
+                "identifier": identifier,
+                "removed": removed,
+            }
+    raise ValueError(f"inject_script op must be add, list, or remove, not '{op}'")
+
+
+def cookies(
+    op: str = "get",
+    session_id: str = "default",
+    domain: str | None = None,
+    name: str | None = None,
+    set_cookies: list[dict[str, Any]] | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Read, write, or clear cookies as full objects - flags included, so defenses read too.
+
+    ``get`` returns every field Chrome keeps (name, value, domain, path, secure,
+    httpOnly, sameSite, expires), filtered client-side by ``domain`` substring and
+    exact ``name``; a session or HttpOnly flag is as auditable as the value. ``set``
+    installs the list in ``set_cookies``; ``clear`` wipes everything, or just the
+    ``name``/``domain`` given.
+
+    A real profile holds thousands of cookies, so ``get`` reports ``count`` for
+    everything that matched and returns at most ``limit`` of them. Filter by
+    ``domain`` rather than raising the limit: the answer to "what is this site
+    setting" is never the other four thousand cookies.
+    """
+    session = _get_session(session_id)
+    with session.lock:
+        driver = session.driver
+        if op == "get":
+            payload = driver.execute_cdp_cmd("Storage.getCookies", {})
+            found = payload.get("cookies") or []
+            if domain:
+                found = [c for c in found if domain in (c.get("domain") or "")]
+            if name:
+                found = [c for c in found if c.get("name") == name]
+            kept = max(1, min(int(limit), 1000))
+            return {
+                "success": True,
+                "session_id": session_id,
+                "count": len(found),
+                "truncated": len(found) > kept,
+                "cookies": found[:kept],
+            }
+        if op == "set":
+            if not set_cookies:
+                raise ValueError("cookies op 'set' requires set_cookies")
+            driver.execute_cdp_cmd("Storage.setCookies", {"cookies": set_cookies})
+            return {"success": True, "session_id": session_id, "count": len(set_cookies)}
+        if op == "clear":
+            params: dict[str, Any] = {}
+            if name:
+                params["name"] = name
+            if domain:
+                params["domain"] = domain
+            driver.execute_cdp_cmd("Storage.clearCookies", params)
+            return {"success": True, "session_id": session_id}
+    raise ValueError(f"cookies op must be get, set, or clear, not '{op}'")
+
+
+def local_storage(
+    op: str = "read",
+    session_id: str = "default",
+    key: str | None = None,
+    value: str | None = None,
+    kind: str = "local",
+) -> dict[str, Any]:
+    """Read, write, or delete Web Storage for the open page (localStorage or sessionStorage).
+
+    ``read`` with no ``key`` returns the whole store as a name->value map; with a
+    ``key`` it returns that one value. ``write`` sets ``key`` to ``value``;
+    ``delete`` removes ``key``. ``kind='session'`` targets sessionStorage, which a
+    page clears on its own when the tab closes, rather than the persistent store.
+    """
+    # A typo must not quietly address the other store: "sesion" writing to
+    # localStorage looks like it worked and leaves the value where nobody reads it.
+    if kind not in {"local", "session"}:
+        raise ValueError(f"local_storage kind must be local or session, not '{kind}'")
+    store = "sessionStorage" if kind == "session" else "localStorage"
+    if op == "read":
+        if key is None:
+            expression = (
+                f"(() => {{ const out = {{}}; "
+                f"for (let i = 0; i < {store}.length; i++) {{ "
+                f"const k = {store}.key(i); out[k] = {store}.getItem(k); }} "
+                f"return out; }})()"
+            )
+        else:
+            expression = f"{store}.getItem({json.dumps(key)})"
+    elif op == "write":
+        if key is None or value is None:
+            raise ValueError("local_storage op 'write' requires key and value")
+        expression = f"{store}.setItem({json.dumps(key)}, {json.dumps(value)})"
+    elif op == "delete":
+        if key is None:
+            raise ValueError("local_storage op 'delete' requires key")
+        expression = f"{store}.removeItem({json.dumps(key)})"
+    else:
+        raise ValueError(f"local_storage op must be read, write, or delete, not '{op}'")
+
+    result = execute_js(f"return {expression};", session_id=session_id)
+    if not result.get("success"):
+        return {"success": False, "session_id": session_id, "key": key, "error": result.get("error")}
+    payload: dict[str, Any] = {"success": True, "session_id": session_id, "key": key}
+    if op == "read":
+        payload["value"] = result.get("value")
+    elif op == "write":
+        payload["value"] = value
+    return payload
+
+
+def solve_captcha(
+    mode: str = "auto",
+    session_id: str = "default",
+    timeout_seconds: float = 180.0,
+    poll_seconds: float = 3.0,
+) -> dict[str, Any]:
+    """Detect a captcha and get past it: wait for a human, or use a solving service.
+
+    ``mode='detect'`` only looks. ``mode='wait'`` blocks until the challenge is
+    gone from the page, which is what a human clicking the box actually produces.
+    ``mode='solve'`` needs a configured service and refuses without one.
+    ``mode='auto'`` - the default - solves when a service is configured and the
+    widget is one with a sitekey, and otherwise waits, so the same call works on a
+    machine with a key and on one without.
+
+    Waiting returns as soon as the page stops showing the challenge, so a captcha
+    the user clears in four seconds costs four seconds, not the whole timeout.
+    """
+    session = _get_session(session_id)
+    with session.lock:
+        status = _challenge_status(session.driver)
+    if not status.get("challenge_detected") and not status.get("captcha_widgets"):
+        return {"success": True, "session_id": session_id, "captcha_present": False, **status}
+    if mode == "detect":
+        return {"success": True, "session_id": session_id, "captcha_present": True, **status}
+
+    identity = execute_js(captcha.IDENTIFY_SCRIPT, session_id=session_id)
+    found = identity.get("value") or {}
+    vendor, sitekey = found.get("vendor"), found.get("sitekey")
+    configured = captcha.solver_config()["configured"]
+
+    if mode == "solve" or (mode == "auto" and configured and vendor and sitekey):
+        if not vendor or not sitekey:
+            raise ValueError(
+                "This captcha exposes no sitekey, so no service can be asked for a "
+                "token; it has to be cleared in the page with mode='wait'."
+            )
+        solved = captcha.solve_remotely(
+            found["task"], sitekey, found["url"], timeout_seconds, max(3.0, poll_seconds)
+        )
+        applied = execute_js(
+            captcha.APPLY_TOKEN_SCRIPT,
+            args=[vendor, solved["token"]],
+            session_id=session_id,
+        )
+        return {
+            "success": bool(applied.get("success")),
+            "session_id": session_id,
+            "captcha_present": True,
+            "mode": "solve",
+            "vendor": vendor,
+            "applied": applied.get("value"),
+            "cost": solved.get("cost"),
+            "note": (
+                "The token is in the page. Submitting the form is still the "
+                "caller's move: some sites submit from the widget callback and "
+                "some wait for the button."
+            ),
+        }
+
+    if mode not in {"auto", "wait"}:
+        raise ValueError(f"captcha mode must be detect, wait, solve, or auto, not '{mode}'")
+
+    # Waiting is what wait_challenge already does, down to holding the session
+    # open and reporting the page it ends on; repeating that loop here would only
+    # give it a second set of edge cases to drift from.
+    waited = wait_for_challenge_resolution(session_id, timeout_seconds, poll_seconds)
+    outcome = {
+        **waited,
+        "captcha_present": not waited["resolved"],
+        "mode": "wait",
+        "vendor": vendor,
+    }
+    if not waited["resolved"]:
+        outcome["error"] = (
+            f"The captcha was still on the page after {waited['waited_seconds']:.0f}s. "
+            "It needs a person to click it in the browser window, or a solving "
+            "service configured through WEB_SEARCH_NEO_CAPTCHA_KEY."
+        )
+    return outcome
 
 
 def _session_modifiers(session: BrowserSession) -> int:

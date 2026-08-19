@@ -18,6 +18,7 @@ from pydantic import ValidationError
 import bridge_daemon
 import browser_tools
 import chrome_bridge
+import macros
 import msp_date_time
 import msp_search
 from web_client import request
@@ -672,10 +673,66 @@ async def browser_click(
     session_id: str = "default",
     wait_seconds: float = 0.5,
     frame_selector: str | None = None,
+    trusted: bool = False,
 ) -> dict[str, Any]:
-    """Click one rendered page element using a CSS selector."""
+    """Click one rendered page element using a CSS selector.
+
+    trusted=true dispatches a real trusted mouse sequence at the element's
+    centre, for pages that reject synthetic clicks or read pointer position.
+    """
     return await asyncio.to_thread(
-        browser_tools.click, selector, session_id, wait_seconds, frame_selector
+        functools.partial(
+            browser_tools.click,
+            selector,
+            session_id=session_id,
+            wait_seconds=wait_seconds,
+            frame_selector=frame_selector,
+            trusted=trusted,
+        )
+    )
+
+
+@mcp.tool()
+async def browser_run_script(
+    script: str,
+    args: list[Any] | None = None,
+    session_id: str = "default",
+    await_promise: bool = False,
+    user_gesture: bool = False,
+) -> dict[str, Any]:
+    """Execute a JavaScript snippet in a session's page and return its value.
+
+    Use for state the DOM reads do not expose (localStorage, virtualised lists,
+    framework state) and for mutations without an input-shaped equivalent.
+    """
+    return await asyncio.to_thread(
+        functools.partial(
+            browser_tools.execute_js,
+            script,
+            args=args,
+            session_id=session_id,
+            await_promise=await_promise,
+            user_gesture=user_gesture,
+        )
+    )
+
+
+@mcp.tool()
+async def browser_execute_js(
+    script: str,
+    args: list[Any] | None = None,
+    session_id: str = "default",
+    await_promise: bool = False,
+) -> dict[str, Any]:
+    """Run a JavaScript snippet and report what it returns (info-topic form)."""
+    return await asyncio.to_thread(
+        functools.partial(
+            browser_tools.execute_js,
+            script,
+            args=args,
+            session_id=session_id,
+            await_promise=await_promise,
+        )
     )
 
 
@@ -1023,6 +1080,176 @@ async def browser_close_all() -> dict[str, Any]:
     return await asyncio.to_thread(browser_tools.close_all_sessions)
 
 
+# One recording at a time, because there is one hand driving the browser: a
+# second concurrent recording could only capture the same steps twice.
+_RECORDING: dict[str, Any] = {"active": False, "name": "", "steps": []}
+
+# A batch holds this for as long as it is dispatching, so two batches sent at
+# once are recorded one after the other instead of interleaving into a script
+# whose steps never ran in that order. It guards the recorder only: batches that
+# are not being recorded never touch it and stay fully concurrent.
+_RECORDING_LOCK = asyncio.Lock()
+
+
+@mcp.tool()
+async def browser_macro(
+    op: str = "list",
+    name: str | None = None,
+    steps: list[dict[str, Any]] | None = None,
+    variables: dict[str, Any] | None = None,
+    description: str = "",
+    continue_on_error: bool = False,
+) -> dict[str, Any]:
+    """Save, record, run, inspect, or delete a named action script with {{placeholders}}."""
+    op = str(op or "").strip().lower()
+
+    if op == "record":
+        if not name:
+            raise ValueError("macro op 'record' requires name")
+        # Starting over silently would throw away a task already driven by hand,
+        # which is the most expensive thing in the whole feature.
+        if _RECORDING["active"] and _RECORDING["steps"]:
+            raise ValueError(
+                f"A recording of '{_RECORDING['name']}' is already open with "
+                f"{len(_RECORDING['steps'])} step(s). Save it with op='save', or "
+                "throw it away with op='cancel', before recording another."
+            )
+        _RECORDING.update({"active": True, "name": macros.validate_name(name), "steps": []})
+        return {
+            "success": True,
+            "recording": True,
+            "name": name,
+            "note": (
+                "Every action that dispatches from now on is captured. Drive the "
+                "task once, then call macro op='save' to keep it under this name; "
+                "op='cancel' throws the recording away."
+            ),
+        }
+
+    if op == "cancel":
+        was = _RECORDING["name"]
+        _RECORDING.update({"active": False, "name": "", "steps": []})
+        return {"success": True, "recording": False, "discarded": was}
+
+    if op == "save":
+        captured = list(_RECORDING["steps"])
+        # An explicit step list is its own macro and must be named as one:
+        # borrowing the open recording's name would overwrite the macro that
+        # recording is going to be saved as, destroying work already done.
+        if steps is not None and not name:
+            raise ValueError(
+                "macro op 'save' with explicit steps requires name; it will not "
+                "borrow the name of the recording that is open."
+            )
+        target = name or _RECORDING["name"]
+        if steps is None and not captured:
+            raise ValueError(
+                "macro op 'save' needs either explicit steps or an open recording "
+                "that captured at least one action."
+            )
+        if not target:
+            raise ValueError("macro op 'save' requires name")
+        record = await asyncio.to_thread(
+            macros.save, target, steps if steps is not None else captured, description, variables
+        )
+        if steps is None:
+            _RECORDING.update({"active": False, "name": "", "steps": []})
+        return {
+            "success": True,
+            "name": record["name"],
+            "step_count": record["step_count"],
+            "variables": sorted(record["variables"]),
+            "recorded": steps is None,
+        }
+
+    if op == "run":
+        if not name:
+            raise ValueError("macro op 'run' requires name")
+        record = await asyncio.to_thread(macros.load, name)
+        resolved = macros.resolve(record["steps"], record.get("variables"), variables)
+        # A replay is one logical call, so it does not re-enter the recorder and
+        # does not inherit web_action's hand-written 32-action ceiling.
+        outcome = await _execute_actions(resolved, continue_on_error, record=False)
+        return {**outcome, "macro": record["name"], "step_count": len(resolved)}
+
+    if op == "list":
+        return {"success": True, "macros": await asyncio.to_thread(macros.list_macros)}
+
+    if op == "show":
+        if not name:
+            raise ValueError("macro op 'show' requires name")
+        record = await asyncio.to_thread(macros.load, name)
+        return {"success": True, **record}
+
+    if op == "delete":
+        if not name:
+            raise ValueError("macro op 'delete' requires name")
+        return {
+            "success": True,
+            "deleted": await asyncio.to_thread(macros.delete, name),
+            "name": name,
+        }
+
+    raise ValueError(
+        f"macro op must be record, save, run, list, show, delete, or cancel, not '{op}'"
+    )
+
+
+@mcp.tool()
+async def browser_captcha(
+    mode: str = "auto",
+    session_id: str = "default",
+    timeout_seconds: float = 180.0,
+    poll_seconds: float = 3.0,
+) -> dict[str, Any]:
+    """Detect a captcha and clear it: wait for a human, or use a configured solving service."""
+    return await asyncio.to_thread(
+        browser_tools.solve_captcha, mode, session_id, timeout_seconds, poll_seconds
+    )
+
+
+@mcp.tool()
+async def browser_inject_script(
+    op: str = "add",
+    source: str | None = None,
+    identifier: str | None = None,
+    session_id: str = "default",
+) -> dict[str, Any]:
+    """Register, list, or drop page code that runs before every document's own scripts."""
+    return await asyncio.to_thread(
+        browser_tools.inject_script, op, source, identifier, session_id
+    )
+
+
+@mcp.tool()
+async def browser_cookies(
+    op: str = "get",
+    session_id: str = "default",
+    domain: str | None = None,
+    name: str | None = None,
+    set_cookies: list[dict[str, Any]] | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Read, write, or clear cookies as full objects with flags (secure, httpOnly, sameSite)."""
+    return await asyncio.to_thread(
+        browser_tools.cookies, op, session_id, domain, name, set_cookies, limit
+    )
+
+
+@mcp.tool()
+async def browser_local_storage(
+    op: str = "read",
+    session_id: str = "default",
+    key: str | None = None,
+    value: str | None = None,
+    kind: str = "local",
+) -> dict[str, Any]:
+    """Read, write, or delete localStorage or sessionStorage entries for the open page."""
+    return await asyncio.to_thread(
+        browser_tools.local_storage, op, session_id, key, value, kind
+    )
+
+
 @mcp.tool()
 def get_current_time_and_region() -> dict:
     """Return the current local date, time, and UTC-offset region string."""
@@ -1101,6 +1328,12 @@ _ACTIONS: dict[str, ActionSpec] = {
         _action("upload", browser_upload_file, "page", "Attach local files to a file input."),
         _action("click", browser_click, "page", "Click one element by CSS selector."),
         _action(
+            "run_script",
+            browser_run_script,
+            "page",
+            "Execute a JavaScript snippet in a session's page and return its value.",
+        ),
+        _action(
             "input",
             browser_input_batch,
             "game",
@@ -1148,6 +1381,15 @@ _ACTIONS: dict[str, ActionSpec] = {
             "release_inputs", browser_release_inputs, "game", "Release every held key and pointer button."
         ),
         _action("submit", browser_submit_form, "page", "Submit a form."),
+        _action(
+            "inject_script", browser_inject_script, "page", "Run code before each document's scripts."
+        ),
+        _action("cookies", browser_cookies, "page", "Read, write, or clear cookies with their flags."),
+        _action(
+            "local_storage", browser_local_storage, "page", "Read or write local/session storage."
+        ),
+        _action("macro", browser_macro, "macro", "Record a task once; replay it by name."),
+        _action("captcha", browser_captcha, "page", "Detect a captcha and wait it out or solve it."),
         _action(
             "close", browser_close, "session", "Close one session; a claimed current-Chrome tab stays open."
         ),
@@ -1319,6 +1561,7 @@ _INFO_TOPICS = {
     "console": "console.log/warn/error and uncaught errors; params.levels, params.contains.",
     "network": "HTTP requests with status, type, ms, size; params.only_errors=true.",
     "network_body": "One response body; params.request_id is the id from a network read with output='json'.",
+    "execute_js": "Run a JavaScript snippet in a session's page and read its return value.",
     "screenshot": "PNG viewport, full-page, or exact page-region image.",
     "game_probe": "Canvas/WebGL/iframe surfaces, FPS, focus, console, held input.",
     "browser_status": "Chrome availability and named session state.",
@@ -1354,6 +1597,7 @@ _ACTION_NOTES = {
         "multi_select": "A <select multiple> reads back as a list and only it takes a list of values; a scalar replaces its whole selection rather than adding to it.",
         "sanitisation": "The browser's own tidying is accepted - trimmed whitespace on email/url, CRLF, a handler's case folding - while maxlength truncation and a rewritten value still fail.",
         "typed_controls": "date/time/datetime-local/month/week/range/color are set, not typed: an unparseable value is refused without touching the control and the error names the format.",
+        "contenteditable": "TipTap/ProseMirror/Slate/Quill editors are written like a real edit: the whole content is selected and the text inserted through the browser's input channel, so the editor's own model updates and its change handler fires. The read-back is the editor's textContent.",
         "files": "A file input is refused in fields; pass files={selector: path}, which replaces the input's selection rather than adding to it.",
         "blur": "Every control written is blurred, which is how the last field fires its change event - so focus ends on the body and a following press_keys needs target_selector to reach a field.",
         "frame_selector": _FRAME_ANY,
@@ -1372,7 +1616,15 @@ _ACTION_NOTES = {
     },
     "click": {
         "choice": "Prefer a fresh exact CSS/href-backed target over repeated visible text or document order. In current Chrome selector must be plain CSS, never ref: or >>>.",
+        "trusted": "trusted=true sends a real trusted mouse sequence at the element's centre (scrolled into view first), so pages that require isTrusted events or read pointer position behave as if a user clicked. Use it when a synthetic click is ignored. It lands on whatever is at that point, like a human pointer.",
+        "no_box": "trusted=true needs a visible box; an element with zero size refuses with a clear error instead of falling back silently.",
         "frame_selector": _FRAME_ANY,
+    },
+    "run_script": {
+        "scope": "Runs in the top document of the session's current tab; there is no frame_selector - address a frame from inside the script if needed.",
+        "args": "args arrive as arguments[0..n]; only JSON-serialisable values can cross into the page.",
+        "result": "value is the JSON-serialisable return value; a promise is awaited when await_promise=true (Chrome bridge driver). Long strings are clipped at 200k characters and reported as {clipped, length, head}.",
+        "safety": "This is raw page-side JavaScript: it can navigate, mutate, or delete state. Prefer fill/click/pointer for input-shaped work and reserve scripts for state only the page holds (localStorage, virtualised rows, framework stores).",
     },
     "wait": {
         "state": "present|visible|clickable; timeout_seconds is clamped to 30 and the result reports the effective value, so a requested 120 comes back as 30.",
@@ -1398,6 +1650,11 @@ _ACTION_NOTES = {
     },
     "network": {
         "id": "The default output='text' carries no ids. Pass output='json' and hand that row's id to network_body as request_id.",
+    },
+    "execute_js": {
+        "scope": "Top document of the session's current tab only; reach into a frame from inside the script when you must.",
+        "result": "value is the JSON-serialisable return value, promise-awaited on the Chrome bridge driver; strings over 200k characters come back as {clipped, length, head}.",
+        "prefer_actions": "Use fill/click/pointer for anything a user gesture should do; a script cannot simulate a trusted interaction.",
     },
     "game_probe": {
         "frame_selector": _FRAME_CSS,
@@ -1564,7 +1821,7 @@ _PITFALLS = [
     "Selectors and screenshots die when the page changes; reread or recapture after navigation, rerender, scroll, zoom, resize, or animation.",
     "In current Chrome every action locator is plain CSS: never send ref: from page_outline or >>> to click/fill/wait/upload/submit/input. Other modes accept them only where action_schema says so; refs expire after rerender/navigation.",
     "Repeated text is not identity: compare the exact href/value/stable attribute from a fresh page_elements read, never array index or nth-child alone.",
-    "challenge_detected means a CAPTCHA is in the way: use wait_challenge or let search fall back, never hammer clicks. captcha_widgets lists ones merely present; ignore those.",
+    "challenge_detected means a CAPTCHA is in the way: use captcha, never hammer clicks. captcha_widgets lists ones merely present; ignore those.",
     "find low_confidence=true means it is guessing: re-query with other words or a role, do not click matches[0].",
     "profile_mode=current drives the user's real Chrome; close closes a tab the agent opened and leaves an attach_tab tab open.",
     "Automation stays background-only by default and never changes window state. show is the sole foreground opt-in; call it only when the user explicitly asks to see the session.",
@@ -1624,6 +1881,15 @@ _EXAMPLES = {
                     {"action": "move", "x": 400, "y": 0, "coordinate_mode": "relative"}
                 ],
             },
+        ]
+    },
+    "script": {
+        "actions": [
+            {
+                "action": "run_script",
+                "session_id": "s",
+                "script": "return JSON.parse(localStorage.getItem('state'))",
+            }
         ]
     },
 }
@@ -1788,6 +2054,7 @@ _TOPIC_HANDLERS = {
     "console": browser_console,
     "network": browser_network,
     "network_body": browser_network_body,
+    "execute_js": browser_execute_js,
     "game_probe": browser_game_probe,
     "screenshot": browser_screenshot,
 }
@@ -1822,6 +2089,7 @@ async def web_info(
         "console",
         "network",
         "network_body",
+        "execute_js",
         "game_probe",
         "screenshot",
     ] = "capabilities",
@@ -1869,6 +2137,38 @@ async def web_action(
     """Execute 1-32 ordered search, fetch, browser, form, input, render, or close actions."""
     if not actions or len(actions) > 32:
         raise ValueError("Provide 1-32 actions")
+    return await _execute_actions(actions, continue_on_error)
+
+
+async def _execute_actions(
+    actions: list[dict[str, Any]],
+    continue_on_error: bool = False,
+    record: bool = True,
+) -> dict[str, Any]:
+    """Run an ordered action list, validating each against its published schema.
+
+    ``web_action`` and a macro replay share this loop rather than each having
+    their own: a macro that ran its steps down a second, laxer path would drift
+    from the calls it was recorded from, which is the one thing a saved click
+    path cannot afford. ``record=False`` keeps a replay out of the recorder, so
+    running a macro while recording does not inline its steps.
+
+    While a recording is open, the batches being recorded run one at a time: two
+    sent at once would otherwise interleave into a script whose steps never ran
+    in that order. Nothing is serialised when no recording is open.
+    """
+    if record and _RECORDING["active"]:
+        async with _RECORDING_LOCK:
+            return await _dispatch_actions(actions, continue_on_error, record)
+    return await _dispatch_actions(actions, continue_on_error, record)
+
+
+async def _dispatch_actions(
+    actions: list[dict[str, Any]],
+    continue_on_error: bool,
+    record: bool,
+) -> dict[str, Any]:
+    """Validate and run each action of one batch in order, reporting every one."""
     results: list[dict[str, Any]] = []
     for index, raw_action in enumerate(actions):
         if not isinstance(raw_action, dict):
@@ -1896,6 +2196,11 @@ async def web_action(
             reported_failure = (
                 isinstance(data, dict) and data.get("success") is False
             )
+            # Record what actually dispatched, not what was typed: the step kept
+            # is the validated one, so a macro replays the call the schema
+            # accepted rather than a shorthand that happened to work today.
+            if record and not reported_failure:
+                _record_step(action_name, validated)
             results.append(
                 {
                     "index": index,
@@ -1931,6 +2236,18 @@ async def web_action(
         "stopped_early": len(results) < len(actions),
         "results": results,
     }
+
+
+def _record_step(action_name: str, arguments: dict[str, Any]) -> None:
+    """Append one dispatched action to the open recording, if there is one.
+
+    A ``macro`` call is never captured. Recording one would build a script the
+    saver then refuses - a macro cannot run a macro - leaving the recording
+    unsaveable and the only way out the one that throws the work away. Managing
+    macros while recording a task is a normal thing to do, so it stays silent.
+    """
+    if _RECORDING["active"] and action_name != "macro":
+        _RECORDING["steps"].append({"action": action_name, **arguments})
 
 
 def stop_bridge_daemon() -> int:

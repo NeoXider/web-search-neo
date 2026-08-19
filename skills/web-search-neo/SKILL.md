@@ -50,6 +50,11 @@ outcome happened. After navigation or rerender, discard old selectors, refs, and
   `attach_tab` is recorded only from the claim onwards. `dropped` counts what the 500-entry
   buffer evicted, so an empty list plus a high `dropped` is not a quiet page.
 - `screenshot`, `game_probe`, `browser_status`, `browser_tabs`, `search_status`.
+- `execute_js`: run a JavaScript snippet in a session's page and read its JSON-serialisable
+  return value. The escape hatch for state the DOM reads do not expose — `localStorage`,
+  virtualised rows, framework stores — and for mutations without an input-shaped
+  equivalent. `args` arrive as `arguments[0..n]`; long strings are clipped at 200k chars and
+  reported as `{clipped, length, head}`.
 - Every `web_info` result (dict payloads) also carries the current local date/time and
   UTC-offset region under the top-level `now` key — there is no separate time topic.
 
@@ -135,7 +140,10 @@ value still fail. Checkboxes take `1/yes/y/on/check/checked` or
 and has its whole selection replaced by a scalar. Date, time, range and colour controls are
 set rather than typed, so an unparseable value is refused without touching the control and
 the error names the format. `upload`, and `fill`'s `files` key, *replace* an input's
-selection instead of adding to it.
+selection instead of adding to it. Rich-text editors (`contenteditable`, e.g. TipTap,
+ProseMirror, Slate, Quill) are written as a real edit — the whole content is selected and
+the text inserted through the browser's input channel — so the editor's own model updates
+and its change handler fires; the read-back is the editor's `textContent`.
 `fill`, `click`, `submit`, `upload` and `wait` accept `frame_selector`; `wait`'s
 `timeout_seconds` is clamped to 30 and the result reports the effective value.
 `challenge_detected` means a challenge is *blocking* — a widget, or a positioned ancestor of
@@ -171,6 +179,75 @@ For any consequential submit use this low-freedom guard:
 Inspect every batch result: `success=false`, validation error, or `challenge_detected` means
 the step is not complete. Use DOM/text to prove labels and selected values. If submission
 silently fails, check `console` and `network`.
+
+## Page scripts and trusted clicks
+
+When a page ignores a synthetic `click` (its handler checks `event.isTrusted`, or it reads
+pointer position), retry the same target with `click.trusted=true`: a real trusted mouse
+sequence is dispatched at the element's centre after scrolling it into view, exactly as a
+human pointer would land. The click hits whatever is at that point, so re-read the DOM to
+confirm the result; an element with no visible box is refused with a clear error instead of
+silently falling back.
+
+For state only the page holds — virtualised rows, framework stores — and for mutations with
+no input-shaped equivalent, use `run_script` (web_action) or the `execute_js` topic
+(web_info). Both run in the session's top document; `args` arrive as `arguments[0..n]` and a
+JSON-serialisable return value comes back as itself. Prefer `fill`/`click`/`pointer` for
+anything a user gesture should do, and never use a script where a form control read is
+enough.
+
+`run_script` takes `user_gesture=true` when the page gates what you need behind a real
+click — clipboard writes, fullscreen, audible autoplay. It runs the same snippet as though a
+person had just clicked; use it only for those APIs, because it bypasses the WebDriver route
+that reports errors most precisely.
+
+Web Storage has its own action: `local_storage` reads the whole store as a map, or one
+`key`, and writes or deletes one key, in `local` or `session` `kind`. Reach for it before
+writing a script for the same thing.
+
+`cookies` reads every cookie as a full object — `secure`, `httpOnly`, `sameSite` and
+`expires` included, which is what makes a site's session handling auditable rather than just
+readable — and also sets and clears them. Filter with `domain` (substring) and `name` (exact).
+
+`inject_script` registers code that runs *before* every document's own scripts, which is the
+only way to patch an API a page captures on load. It survives navigation for the life of the
+session; `op=list` shows what is registered and `op=remove` forgets one.
+
+## Repeating a task: macros
+
+A task you will do more than once — an application form, a login, a search-and-filter — is
+worth recording instead of re-deriving. `macro op=record name=hh-apply` starts capturing;
+drive the task once with ordinary actions; `macro op=save` keeps what dispatched. Only
+actions that *succeeded* are recorded, so a wrong selector you corrected does not enter the
+script.
+
+Replay with `macro op=run name=hh-apply`. The parts that change between runs are
+`{{placeholders}}` in the saved steps: edit them in with `op=save` and explicit `steps`, or
+write them from the start, then pass `variables` on each run. A placeholder that is a whole
+value keeps its type, so a recorded number stays a number. Every placeholder is declared in
+the saved file, so `op=show` tells you what a macro wants without reading its steps, and a
+run missing one names all of them at once rather than failing on the first.
+
+Macros are files and outlive the server; `op=list` summarises them and `op=delete` removes
+one. A macro cannot run another macro — run them in order instead. A replay reports like any
+batch, so check `failure_count` and each `results[i].success`: a saved click path is exactly
+as fragile as the page it was recorded from, and a site redesign invalidates it silently.
+
+## Captchas
+
+`captcha` handles the widget that stops everything else. `mode=detect` only reports.
+`mode=wait` hands the visible browser to the user and returns the moment the challenge
+clears — the default when no solving service is configured, and the honest answer, because a
+person clicking the box always works. `mode=solve` sends the sitekey to a configured service
+and writes the returned token into the page; it needs `WEB_SEARCH_NEO_CAPTCHA_KEY`
+(`WEB_SEARCH_NEO_CAPTCHA_HOST` picks the provider, 2captcha by default) and costs money per
+solve. `mode=auto` solves when a service is configured and the widget exposes a sitekey, and
+waits otherwise.
+
+A solved token is not a submitted form: some sites submit from the widget's own callback and
+some wait for the button, so re-read the page and submit if it did not. A captcha with no
+sitekey — an image or a behavioural check — cannot be sent to a service at all and has to be
+cleared in the page.
 
 ## Visual coordinate clicks
 
