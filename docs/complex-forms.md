@@ -605,7 +605,8 @@ the site. In a visible session, hand control to the user:
 This polls the page while a human solves the challenge and returns `resolved`,
 `timed_out`, `challenge_seen`, and `waited_seconds`, keeping the session open
 either way. It carries the page summary too, `captcha_scan_incomplete` included,
-so the same caution applies to its verdict. The timeout is clamped to 300 seconds.
+so the same caution applies to its verdict. The timeout honours `timeout_seconds`
+as passed (it defaults to 180).
 
 Automatic CAPTCHA bypass is intentionally not implemented, and there is no
 hidden flag for it. A provider-supported, legal integration is tracked in

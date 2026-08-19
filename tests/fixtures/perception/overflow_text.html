@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Overflow text fixture</title>
+    <style>
+      body { font-family: sans-serif; margin: 24px; }
+      #code {
+        width: 300px;
+        height: 90px;
+        overflow: hidden;
+        font-family: monospace;
+        font-size: 13px;
+        line-height: 15px;
+        white-space: pre;
+        border: 1px solid #ccc;
+        padding: 6px;
+      }
+      #invisible { display: none; }
+    </style>
+  </head>
+  <body>
+    <div id="code">line 01 visible
+line 02 visible
+line 03 visible
+line 04 visible
+line 05 visible
+line 06 visible
+line 07 hidden tail
+line 08 hidden tail
+line 09 hidden tail
+line 10 hidden tail
+line 11 hidden tail
+line 12 hidden tail
+line 13 hidden tail
+line 14 hidden tail
+line 15 hidden tail</div>
+    <div id="invisible">hidden by display none</div>
+    <p id="sibling">Sibling paragraph.</p>
+  </body>
+</html>

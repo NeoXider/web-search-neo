@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Semantic click fixture</title>
+    <style>
+      body { font-family: sans-serif; margin: 24px; }
+      [role="option"], button { display: block; margin: 12px; padding: 12px; }
+    </style>
+  </head>
+  <body>
+    <div
+      id="net-resume"
+      role="option"
+      onclick="document.body.dataset.clicked = 'net-resume'"
+    >Senior C#/.NET developer 320 000 ₽</div>
+    <button id="repeat-one" onclick="document.body.dataset.clicked = 'one'">Repeat</button>
+    <button id="repeat-two" onclick="document.body.dataset.clicked = 'two'">Repeat</button>
+  </body>
+</html>

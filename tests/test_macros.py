@@ -244,6 +244,74 @@ def test_record_then_save_captures_dispatched_actions(monkeypatch):
     assert macros.load("recorded")["steps"][0]["action"] == "open"
 
 
+def test_macro_records_and_replays_every_click_mode_and_new_actions(monkeypatch):
+    """Macros share the validated dispatcher, so every click target form and
+    the newer actions record and replay through it instead of a side channel."""
+    seen: list[dict] = []
+
+    async def fake_click(**kwargs):
+        seen.append({"action": "click", **kwargs})
+        return {"success": True, "target": "text" if kwargs.get("text") else kwargs.get("selector")}
+
+    async def fake_captcha(**kwargs):
+        seen.append({"action": "captcha", **kwargs})
+        return {"success": True}
+
+    async def fake_script(**kwargs):
+        seen.append({"action": "run_script", **kwargs})
+        return {"success": True}
+
+    click_spec = main._ACTIONS["click"]
+    monkeypatch.setitem(
+        main._ACTIONS, "click",
+        main.ActionSpec("click", fake_click, click_spec.tool_name, "page", "s"),
+    )
+    captcha_spec = main._ACTIONS["captcha"]
+    monkeypatch.setitem(
+        main._ACTIONS, "captcha",
+        main.ActionSpec("captcha", fake_captcha, captcha_spec.tool_name, "page", "s"),
+    )
+    script_spec = main._ACTIONS["run_script"]
+    monkeypatch.setitem(
+        main._ACTIONS, "run_script",
+        main.ActionSpec("run_script", fake_script, script_spec.tool_name, "page", "s"),
+    )
+
+    async def drive():
+        await main.browser_macro(op="record", name="click-all")
+        await main._execute_actions(
+            [
+                {"action": "click", "selector": "#go", "session_id": "s"},
+                {"action": "click", "text": "Submit", "role": "button", "session_id": "s"},
+                {"action": "click", "x": 120, "y": 40, "session_id": "s"},
+                {"action": "captcha", "session_id": "s"},
+                {"action": "run_script", "script": "return 1", "session_id": "s"},
+            ]
+        )
+
+    asyncio.run(drive())
+    saved = _call(op="save")
+    assert saved["step_count"] == 5
+
+    seen.clear()
+    outcome = _call(op="run", name="click-all")
+    assert outcome["macro"] == "click-all"
+    assert outcome["step_count"] == 5
+    assert outcome["failure_count"] == 0
+
+    clicks = [item for item in seen if item["action"] == "click"]
+    assert len(clicks) == 3
+    # Selector mode: the element target survives.
+    assert clicks[0]["selector"] == "#go" and clicks[0].get("text") is None
+    # Text mode: the strict text/role target survives.
+    assert clicks[1]["text"] == "Submit" and clicks[1]["role"] == "button"
+    # Coordinate mode: the viewport point survives.
+    assert clicks[2]["x"] == 120 and clicks[2]["y"] == 40
+    # The newer actions replay through the same validated dispatch.
+    assert any(item["action"] == "captcha" for item in seen)
+    assert any(item["action"] == "run_script" for item in seen)
+
+
 def test_recording_over_captured_steps_is_refused():
     _call(op="record", name="first")
     main._record_step("open", {"url": "https://example.com"})

@@ -61,6 +61,36 @@ def _wait_for_input(session, projection: str, timeout: float = 3.0):
         time.sleep(0.02)
 
 
+def test_scroll_with_selector_targets_the_container_holding_the_element(local_site):
+    _open_or_skip(
+        f"{local_site.base_url}/fixtures/games/scroll_container.html", "scroll-selector"
+    )
+    session = browser_tools._get_session("scroll-selector")
+    try:
+        before = session.driver.execute_script("return window.__panelScrollTop();")
+        result = browser_tools.scroll_page(
+            400, session_id="scroll-selector", selector="#marker", wait_seconds=0
+        )
+        assert result["success"] is True
+        assert result["selector"] == "#marker"
+        assert result["before"]["scroll_y"] == 0
+        after = session.driver.execute_script("return window.__panelScrollTop();")
+        assert after > before
+    finally:
+        browser_tools.close_session("scroll-selector")
+
+
+def test_scroll_selector_and_frame_selector_are_mutually_exclusive(local_site):
+    _open_or_skip(
+        f"{local_site.base_url}/fixtures/games/scroll_container.html", "scroll-selector-refusal"
+    )
+    try:
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            browser_tools.scroll_page(100, session_id="scroll-selector-refusal", selector="#marker", frame_selector="#panel")
+    finally:
+        browser_tools.close_session("scroll-selector-refusal")
+
+
 def test_wheel_carries_both_axes_and_drives_the_zoom_model(local_site):
     session = _open_pointer_fixture(local_site, "wheel-input")
     try:

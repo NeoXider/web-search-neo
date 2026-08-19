@@ -158,6 +158,37 @@ def test_scroll_defaults_to_viewport_centre_and_reports_page_metrics(monkeypatch
         browser_tools.scroll_page(100, session_id="fake-scroll", x=10, wait_seconds=0)
 
 
+def test_click_text_uses_exact_text_and_role_and_refuses_ambiguity(local_site):
+    _open_or_skip(
+        f"{local_site.base_url}/fixtures/perception/click_text.html",
+        "semantic-click",
+    )
+    driver = browser_tools._get_session("semantic-click").driver
+
+    clicked = browser_tools.click_text(
+        "Senior C#/.NET developer 320 000 ₽",
+        session_id="semantic-click",
+        role="option",
+        wait_seconds=0,
+    )
+
+    assert clicked["matched_role"] == "option"
+    assert clicked["matched_selector"] == "#net-resume"
+    assert driver.execute_script("return document.body.dataset.clicked") == "net-resume"
+
+    with pytest.raises(ValueError, match="found 2"):
+        browser_tools.click_text("Repeat", session_id="semantic-click", wait_seconds=0)
+
+    narrowed = browser_tools.click_text(
+        "Repeat",
+        session_id="semantic-click",
+        selector="#repeat-two",
+        wait_seconds=0,
+    )
+    assert narrowed["matched_selector"] == "#repeat-two"
+    assert driver.execute_script("return document.body.dataset.clicked") == "two"
+
+
 def test_screenshot_modes_preserve_current_chrome_and_send_exact_clips(monkeypatch):
     current = _FakeCaptureDriver(current=True)
     monkeypatch.setitem(

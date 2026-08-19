@@ -294,13 +294,15 @@ def test_the_action_tools_act_inside_the_frame_they_are_given(local_site, tmp_pa
 
 
 def test_wait_reports_the_wait_it_really_made_not_the_one_it_was_asked_for(local_site):
-    """The timeout is clamped to 30s. A caller who asked for 120 and was told
-    nothing read the failure as two minutes of waiting that never happened."""
+    """A requested timeout is honoured as passed, and the result says the number
+    that was actually waited, not the one that was guessed."""
     _open_or_skip(_form(local_site, "frame_host.html"), "defect-wait-clamp")
     waited = browser_tools.wait_for_element(
         "#host-state", session_id="defect-wait-clamp", state="visible", timeout_seconds=120.0
     )
-    assert waited["timeout_seconds"] == 30.0
+    # The wait succeeds immediately for a visible element, but the reported
+    # timeout must be the value the caller asked for, never a forced cap.
+    assert waited["timeout_seconds"] == 120.0
 
     with pytest.raises(WebDriverException) as failure:
         browser_tools.wait_for_element(

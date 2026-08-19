@@ -159,7 +159,7 @@ def setup_current_chrome(wait_seconds: float = 1.0) -> dict[str, Any]:
     Raise ``wait_seconds`` when calling right after the user pressed Load
     unpacked, so the companion has time to reach the bridge.
     """
-    wait = max(0.0, min(float(wait_seconds), 30.0))
+    wait = max(0.0, float(wait_seconds))
 
     # The companion refuses to talk to the bridge without the shared secret, so
     # the token has to be on disk before Chrome ever reads the folder.

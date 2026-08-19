@@ -175,9 +175,9 @@ def test_wait_seconds_is_passed_to_the_bridge_and_kept_sane(monkeypatch):
     chrome_bootstrap.setup_current_chrome(wait_seconds=5)
     assert bridge.waited == 5.0
 
-    # A caller must not be able to park the MCP thread for an hour.
+    # The caller decides how long to wait; the value is honoured as passed.
     chrome_bootstrap.setup_current_chrome(wait_seconds=3600)
-    assert bridge.waited == 30.0
+    assert bridge.waited == 3600.0
 
 
 def test_setup_reports_a_broken_clone_instead_of_promising_an_install(monkeypatch, tmp_path):

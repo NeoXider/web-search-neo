@@ -461,7 +461,7 @@ def get_search_engines_status(
         ):
             return {**copy.deepcopy(_status_cache[1]), "cached": True}
 
-    timeout = max(1.0, min(float(timeout_seconds), 15.0))
+    timeout = max(1.0, float(timeout_seconds))
     by_name: dict[str, dict] = {}
     with ThreadPoolExecutor(max_workers=min(3, len(ENGINE_ORDER))) as executor:
         futures = {
@@ -507,7 +507,7 @@ def search_web(
     if engine not in SEARCH_PROVIDERS:
         raise ValueError(f"Unknown engine '{engine}'. Choose from: {', '.join(ENGINE_ORDER)}")
     num = max(1, min(int(num), 20))
-    timeout = max(1.0, min(float(timeout_seconds), 20.0))
+    timeout = max(1.0, float(timeout_seconds))
     started = time.perf_counter()
     cache_key = (query.casefold(), num, engine, bool(fallback))
     with _runtime_lock:

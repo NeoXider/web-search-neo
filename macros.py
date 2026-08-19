@@ -30,7 +30,7 @@ _PLACEHOLDER = re.compile(r"\{\{\s*([A-Za-z0-9_]+)\s*\}\}")
 # A recorded application form runs long. web_action caps a hand-written batch at
 # 32 because a model writing JSON by hand rarely means more; a macro is machine
 # recorded, so the cap only has to stop a runaway file.
-MAX_STEPS = 256
+MAX_STEPS = 10000
 
 
 def macro_root() -> Path:

@@ -177,7 +177,7 @@ async def search_web(
         )
         return {**response, "challenge_mode": "fallback"}
 
-    manual_timeout = max(10.0, min(float(manual_timeout_seconds), 300.0))
+    manual_timeout = max(10.0, float(manual_timeout_seconds))
     initial = await asyncio.to_thread(
         msp_search.search_web,
         query,
@@ -518,6 +518,35 @@ async def browser_page_text(
 
 
 @mcp.tool()
+async def browser_element_text(
+    selector: str,
+    session_id: str = "default",
+    mode: Literal["text", "html", "outer", "both"] = "text",
+    full_text: bool = False,
+    max_chars: int = 20_000,
+    frame_selector: str | None = None,
+) -> dict[str, Any]:
+    """Extract one element's whole content - text, innerHTML, or outerHTML.
+
+    Unlike page_text, the answer is not clipped by overflow: the element's full
+    DOM subtree is read, so a scrolled code block or collapsed panel gives up
+    its tail. full_text=true switches to textContent (everything in the DOM,
+    including overflow-hidden parts); mode='html'/'outer'/'both' return markup.
+    """
+    return await asyncio.to_thread(
+        functools.partial(
+            browser_tools.get_element_text,
+            session_id=session_id,
+            selector=selector,
+            mode=mode,
+            full_text=full_text,
+            max_chars=max_chars,
+            frame_selector=frame_selector,
+        )
+    )
+
+
+@mcp.tool()
 async def browser_find(
     query: str,
     session_id: str = "default",
@@ -669,16 +698,25 @@ async def browser_upload_file(
 
 @mcp.tool()
 async def browser_click(
-    selector: str,
+    selector: str | None = None,
     session_id: str = "default",
     wait_seconds: float = 0.5,
     frame_selector: str | None = None,
     trusted: bool = False,
+    text: str | None = None,
+    role: str | None = None,
+    exact: bool = True,
+    x: float | None = None,
+    y: float | None = None,
 ) -> dict[str, Any]:
-    """Click one rendered page element using a CSS selector.
+    """Click one thing: a button/element, text, or a viewport point.
 
-    trusted=true dispatches a real trusted mouse sequence at the element's
-    centre, for pages that reject synthetic clicks or read pointer position.
+    Provide exactly one target: ``selector`` (CSS, ref handle, or a 'a >>> b'
+    piercing path) clicks that element; ``text`` (with optional ``role`` and
+    ``exact``) clicks the one visible interactive element matching that rendered
+    text and refuses ambiguity; ``x``/``y`` (both required) click the viewport
+    point in CSS pixels. ``trusted=true`` dispatches a real trusted mouse
+    sequence for the selector form.
     """
     return await asyncio.to_thread(
         functools.partial(
@@ -688,6 +726,11 @@ async def browser_click(
             wait_seconds=wait_seconds,
             frame_selector=frame_selector,
             trusted=trusted,
+            text=text,
+            role=role,
+            exact=exact,
+            x=x,
+            y=y,
         )
     )
 
@@ -733,6 +776,29 @@ async def browser_execute_js(
             session_id=session_id,
             await_promise=await_promise,
         )
+    )
+
+
+@mcp.tool()
+async def browser_click_text(
+    text: str,
+    session_id: str = "default",
+    exact: bool = True,
+    role: str | None = None,
+    selector: str | None = None,
+    wait_seconds: float = 0.5,
+    frame_selector: str | None = None,
+) -> dict[str, Any]:
+    """Click one visible interactive element by rendered text and optional role."""
+    return await asyncio.to_thread(
+        browser_tools.click_text,
+        text,
+        session_id,
+        exact,
+        role,
+        selector,
+        wait_seconds,
+        frame_selector,
     )
 
 
@@ -824,6 +890,7 @@ async def browser_scroll(
     delta_x: float = 0.0,
     x: float | None = None,
     y: float | None = None,
+    selector: str | None = None,
     frame_selector: str | None = None,
     wait_seconds: float = 0.1,
     include_summary: bool = True,
@@ -831,7 +898,10 @@ async def browser_scroll(
     """Scroll down with positive delta_y or up with negative delta_y.
 
     Omit x/y to use the viewport centre; provide both to choose the scrollable
-    container under that point.
+    container under that point. Pass selector (CSS, ref handle, or a 'a >>> b'
+    piercing path) to scroll the container that holds that element: it is
+    brought into view first, then the wheel lands on its centre. selector and
+    frame_selector are mutually exclusive.
     """
     return await asyncio.to_thread(
         functools.partial(
@@ -841,6 +911,7 @@ async def browser_scroll(
             delta_x=delta_x,
             x=x,
             y=y,
+            selector=selector,
             frame_selector=frame_selector,
             wait_seconds=wait_seconds,
             include_summary=include_summary,
@@ -1375,6 +1446,12 @@ _ACTIONS: dict[str, ActionSpec] = {
             "Execute a JavaScript snippet in a session's page and return its value.",
         ),
         _action(
+            "click_text",
+            browser_click_text,
+            "page",
+            "Click the one visible interactive element matching text and optional role.",
+        ),
+        _action(
             "input",
             browser_input_batch,
             "game",
@@ -1542,7 +1619,7 @@ _AUTOMATION_SKILL = {
         },
         {
             "step": "act",
-            "calls": ["fill/click/scroll/submit through web_action"],
+            "calls": ["fill/click_text/click/scroll/submit through web_action"],
             "rule": "Reuse session_id; after navigation or rerender discard old selectors and refs.",
         },
         {
@@ -1569,11 +1646,12 @@ _AUTOMATION_SKILL = {
         "pagination": "Use limit plus offset per category; follow range.<category>.next_offset until null.",
         "filtering": "page_elements has no selector filter: get its lists and filter the returned links/fields/buttons yourself.",
         "duplicates": "When text repeats, match the exact links.href, value, or stable attribute from a fresh read; never choose by list index or a brittle nth-child path alone.",
+        "semantic_click": "Use click_text for one visible interactive element when exact text plus role identifies it. Zero or multiple matches are refused; narrow with role or selector.",
         "refs": "Temporary/persistent/attach actions may use fresh refs and piercing paths where their schema says so. Current-Chrome actions may not. Every ref goes stale after its DOM epoch/rerender, so reread.",
         "dynamic": "Lazy/infinite/virtualized items do not exist yet: scroll, wait, then reread from offset=0 because the DOM may have changed.",
         "safety_cap": "collector_truncated.<category>=true means the 20000-item collector cap hid a tail; found is then not the true total.",
     },
-    "scroll": {
+"scroll": {
         "direction": "Positive delta_y moves down; negative delta_y moves up.",
         "point": "Omit x/y for viewport centre, or provide both to choose a nested scroll container.",
         "after": "Wait, then reread page_elements from offset=0 when scrolling may have changed the DOM.",
@@ -1610,6 +1688,7 @@ _INFO_TOPICS = {
     "action_schema": "Full JSON Schema for one action or topic; pass params.action.",
     "page_outline": "Roles, names, states, refs, and boxes - start looking here.",
     "page_text": "Readable text of the rendered page; params.mode=main|full.",
+    "element_text": "One element's whole content: params.selector (CSS/ref/piercing), params.mode=text|html|outer|both, params.full_text for overflow-unclipped text.",
     "find": "Find an element by meaning: params.query='submit application'.",
     "page_elements": "Links, forms, fields, buttons by selector: CSS, '#host >>> #leaf' in a shadow root or frame, or '' when none is unique.",
     "console": "console.log/warn/error and uncaught errors; params.levels, params.contains.",
@@ -1669,19 +1748,28 @@ _ACTION_NOTES = {
         "frame_selector": _FRAME_ANY,
     },
     "click": {
-        "choice": "Prefer a fresh exact CSS/href-backed target over repeated visible text or document order. In current Chrome selector must be plain CSS, never ref: or >>>.",
+        "choice": "Provide exactly one target: selector (CSS, ref handle, or 'a >>> b' piercing path) for the element, text with role for a strict rendered-text match that refuses ambiguity, or x+y for a viewport CSS-pixel point. In current Chrome a CSS selector must be plain CSS, never ref: or >>>.",
+        "text": "text clicks the one visible interactive element whose rendered text matches; role narrows by ARIA role and exact=false switches to substring matching. Zero or several matches are refused with samples, so narrow with role or selector rather than retrying.",
+        "coords": "x/y click the viewport point in CSS pixels, useful for image-guided clicks from a fresh screenshot. Scale image pixels to reported viewport width/height and recapture after any layout change.",
         "trusted": "trusted=true sends a real trusted mouse sequence at the element's centre (scrolled into view first), so pages that require isTrusted events or read pointer position behave as if a user clicked. Use it when a synthetic click is ignored. It lands on whatever is at that point, like a human pointer.",
         "no_box": "trusted=true needs a visible box; an element with zero size refuses with a clear error instead of falling back silently.",
         "frame_selector": _FRAME_ANY,
     },
-    "run_script": {
+"run_script": {
         "scope": "Runs in the top document of the session's current tab; there is no frame_selector - address a frame from inside the script if needed.",
         "args": "args arrive as arguments[0..n]; only JSON-serialisable values can cross into the page.",
         "result": "value is the JSON-serialisable return value; a promise is awaited when await_promise=true (Chrome bridge driver). Long strings are clipped at 200k characters and reported as {clipped, length, head}.",
         "safety": "This is raw page-side JavaScript: it can navigate, mutate, or delete state. Prefer fill/click/pointer for input-shaped work and reserve scripts for state only the page holds (localStorage, virtualised rows, framework stores).",
     },
+    "click_text": {
+        "strict": "Clicks only when exactly one visible interactive candidate matches. Zero or multiple matches are refused with samples; narrow using role or selector.",
+        "matching": "exact=true compares whitespace-normalized rendered text. exact=false is substring matching and should normally be paired with role.",
+        "selector": "Optional CSS candidate filter, not the click target. Omit it to search buttons, links, labels, options, checkboxes, radios, tabs, and menu items.",
+        "background": "hit_test_unavailable=true can occur in an unpainted background tab; the unique DOM target is still clicked and must be verified from fresh state.",
+        "frame_selector": _FRAME_CSS,
+    },
     "wait": {
-        "state": "present|visible|clickable; timeout_seconds is clamped to 30 and the result reports the effective value, so a requested 120 comes back as 30.",
+        "state": "present|visible|clickable; timeout_seconds defaults to 10 and is respected as passed.",
         "frame_selector": _FRAME_ANY,
     },
     "find": {
@@ -1786,9 +1874,10 @@ _ACTION_NOTES = {
         "frame_selector": _FRAME_CSS,
         "speed": _HOT_PATH_SPEED,
     },
-    "scroll": {
+"scroll": {
         "direction": "positive delta_y scrolls down; negative delta_y scrolls up",
         "point": "omit x/y for viewport centre; provide both to scroll the container painted under that point",
+        "selector": "pass selector (CSS, ref handle, or a 'a >>> b' piercing path) to scroll the container that holds that element: it is brought into view first, then the wheel lands on its centre; selector and frame_selector are mutually exclusive",
         "result": "before/after are selected document window metrics; a nested container can move while those page metrics stay unchanged",
         "lazy_pages": "page_elements already sees offscreen controls in the existing DOM. Scroll only to materialise lazy/infinite content, then read page_elements again.",
         "frame_selector": _FRAME_CSS,
@@ -1842,7 +1931,7 @@ _RECIPES = {
     "form": [
         "open {url}",
         "fresh page_elements: exact href/target plus live controls",
-        "fill/select, then reread every consequential value",
+        "fill/select; use click_text with exact text plus role for a custom option, then reread every consequential value",
         "set submit_attempted=true and terminal submit exactly once",
         "verify URL/text/elements; after timeout never submit again",
     ],
@@ -1874,7 +1963,7 @@ _PITFALLS = [
     "page_elements takes no selector filter: read its category lists and filter the returned objects yourself.",
     "Selectors and screenshots die when the page changes; reread or recapture after navigation, rerender, scroll, zoom, resize, or animation.",
     "In current Chrome every action locator is plain CSS: never send ref: from page_outline or >>> to click/fill/wait/upload/submit/input. Other modes accept them only where action_schema says so; refs expire after rerender/navigation.",
-    "Repeated text is not identity: compare the exact href/value/stable attribute from a fresh page_elements read, never array index or nth-child alone.",
+    "Repeated text is not identity: compare the exact href/value/stable attribute from a fresh page_elements read, or use click_text with exact text plus role (it refuses ambiguity); never array index or nth-child alone.",
     "challenge_detected means a CAPTCHA is in the way: use captcha, never hammer clicks. captcha_widgets lists ones merely present; ignore those.",
     "find low_confidence=true means it is guessing: re-query with other words or a role, do not click matches[0].",
     "profile_mode=current drives the user's real Chrome; close closes a tab the agent opened and leaves an attach_tab tab open.",
@@ -2103,6 +2192,7 @@ _TOPIC_HANDLERS = {
     "browser_tabs": browser_list_tabs,
     "page_outline": browser_page_outline,
     "page_text": browser_page_text,
+    "element_text": browser_element_text,
     "find": browser_find,
     "page_elements": browser_get_page_elements,
     "console": browser_console,
@@ -2138,6 +2228,7 @@ async def web_info(
         "browser_tabs",
         "page_outline",
         "page_text",
+        "element_text",
         "find",
         "page_elements",
         "console",

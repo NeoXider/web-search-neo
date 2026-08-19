@@ -135,6 +135,74 @@ def test_page_text_returns_rendered_text_without_scripts(local_site):
         browser_tools.close_session("perception-page-text")
 
 
+def test_element_text_reads_overflow_hidden_tails_with_full_text(local_site):
+    driver = _driver_or_skip(
+        f"{local_site.base_url}/fixtures/perception/overflow_text.html", "element-text-overflow"
+    )
+    try:
+        element = driver.find_element("css selector", "#code")
+        invisible = driver.find_element("css selector", "#invisible")
+
+        rendered = page_perception.element_text(driver, element)
+        assert rendered["found"] is True
+        assert rendered["tag"] == "div"
+        assert "line 01 visible" in rendered["text"]
+
+        whole = page_perception.element_text(driver, element, full_text=True)
+        assert "line 01 visible" in whole["text"]
+        assert "line 15 hidden tail" in whole["text"]
+        assert whole["truncated"] is False
+
+        # textContent is the promise of full_text: no rendering filter may drop
+        # a node, so even a display:none subtree gives up its text.
+        whole_invisible = page_perception.element_text(driver, invisible, full_text=True)
+        assert "hidden by display none" in whole_invisible["text"]
+
+        clipped = page_perception.element_text(driver, element, full_text=True, max_chars=200)
+        assert clipped["max_chars"] == 200
+        assert len(clipped["text"]) <= 200
+        assert clipped["truncated"] is True
+
+        markup = page_perception.element_text(driver, element, mode="html")
+        assert markup["html"].startswith("line 01 visible")
+        assert "line 15 hidden tail" in markup["html"]
+
+        outer = page_perception.element_text(driver, element, mode="outer")
+        assert outer["outer_html"].startswith("<div id=\"code\"")
+        assert "line 15 hidden tail" in outer["outer_html"]
+
+        both = page_perception.element_text(driver, element, mode="both", full_text=True)
+        assert "line 15 hidden tail" in both["text"]
+        assert "line 15 hidden tail" in both["html"]
+        assert both["outer_html"].startswith("<div id=\"code\"")
+    finally:
+        browser_tools.close_session("element-text-overflow")
+
+
+def test_element_text_by_selector_through_browser_tools(local_site):
+    session = browser_tools.open_page(
+        f"{local_site.base_url}/fixtures/perception/overflow_text.html",
+        session_id="element-text-tool",
+        width=1024,
+        height=768,
+        headless=True,
+        profile_mode="temporary",
+    )
+    try:
+        result = browser_tools.get_element_text(
+            session_id="element-text-tool", selector="#code", full_text=True
+        )
+        assert result["found"] is True
+        assert "line 15 hidden tail" in result["text"]
+
+        missing = browser_tools.get_element_text(
+            session_id="element-text-tool", selector="#does-not-exist"
+        )
+        assert missing["found"] is False
+    finally:
+        browser_tools.close_session("element-text-tool")
+
+
 def test_find_ranks_the_requested_field_first(local_site):
     driver = _driver_or_skip(f"{local_site.base_url}/form?session=find", "perception-find")
     try:

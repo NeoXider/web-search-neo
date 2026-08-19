@@ -239,7 +239,7 @@ def request(
 ) -> requests.Response:
     """Send a bounded HTTP request and raise a useful error for bad responses."""
     normalized = validate_http_url(url)
-    timeout = max(1.0, min(float(timeout_seconds), 60.0))
+    timeout = max(1.0, float(timeout_seconds))
     if max_response_bytes is not None:
         kwargs["stream"] = True
     session = _session()

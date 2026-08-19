@@ -193,6 +193,8 @@ def test_capabilities_names_required_parameters_and_where_the_rest_live():
     assert set(actions) == set(main._ACTIONS)
     assert actions["open"]["required"] == ["url"]
     assert actions["pointer"]["required"] == ["pointer_action", "x", "y"]
+    assert actions["click_text"]["required"] == ["text"]
+    assert main._ACTIONS["click_text"].group == "page"
     assert actions["press_keys"]["required"] == ["keys"]
     assert "required" not in actions["close_all"]  # nothing to send at all
     assert all(entry["summary"] for entry in actions.values())
@@ -375,7 +377,7 @@ def test_scroll_screenshot_pagination_and_skill_are_published_for_small_models()
     assert "submit_attempted=false" in submit_guard
     assert "exactly once" in submit_guard
     assert "never click it again" in submit_guard
-    assert len(json.dumps(skill)) < 5_800
+    assert len(json.dumps(skill)) < 6_500
     skill_schema = asyncio.run(main.web_info("action_schema", {"action": "skill"}))
     assert skill_schema["params_schema"].get("properties", {}) == {}
 

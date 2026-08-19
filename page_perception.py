@@ -1761,6 +1761,93 @@ def page_text(
 
 
 # ---------------------------------------------------------------------------
+# Single-element extraction
+# ---------------------------------------------------------------------------
+
+# ``innerText`` reports only the *rendered* text of an overflowing block: the
+# scrolled-out tail of a chat code panel simply does not exist there, and the
+# whole point of this topic is to hand over that tail. ``full_text`` switches
+# to ``textContent``, which is not clipped by overflow - at the price of also
+# including nodes hidden by ``display:none`` or ``visibility``, fine for code.
+_ELEMENT_TEXT_SCRIPT = _JS_LIB + r"""
+const el = arguments[0];
+const mode = arguments[1];
+const fullText = arguments[2];
+if (!el) return {found: false};
+const read = (element, forceFull) => {
+  if (forceFull) return element.textContent || '';
+  return element.innerText === undefined ? (element.textContent || '') : (element.innerText || '');
+};
+const rect = el.getBoundingClientRect();
+const box = {
+  x: rect.x, y: rect.y,
+  width: rect.width, height: rect.height,
+  scroll_height: el.scrollHeight || 0,
+  client_height: el.clientHeight || 0
+};
+const own = fullText ? (el.textContent || '') : read(el, false);
+const result = {
+  found: true,
+  url: location.href,
+  title: document.title,
+  tag: (el.tagName || '').toLowerCase(),
+  text: own,
+  box: box
+};
+if (mode === 'html' || mode === 'both') result.html = el.innerHTML || '';
+if (mode === 'outer' || mode === 'both') result.outer_html = el.outerHTML || '';
+return result;
+"""
+
+
+def element_text(
+    driver: Any,
+    element: Any,
+    *,
+    mode: str = "text",
+    full_text: bool = False,
+    max_chars: int = 20000,
+) -> dict[str, Any]:
+    """Extract one element's content instead of a clipped slice of the page.
+
+    ``mode`` is ``text`` (rendered text), ``html`` (innerHTML), ``outer``
+    (outerHTML) or ``both`` (text plus both markup forms). With ``full_text``
+    the text comes from ``textContent`` rather than ``innerText``: overflow
+    clipping (a scrolled code block, a collapsed accordion) stops hiding the
+    tail, at the price of also counting ``display:none`` subtrees.
+    """
+    selected = str(mode or "text").strip().lower()
+    if selected not in {"text", "html", "outer", "both"}:
+        raise ValueError("mode must be 'text', 'html', 'outer' or 'both'")
+    limit = max(200, min(int(max_chars), _MAX_TEXT_CHARS))
+    raw = driver.execute_script(_ELEMENT_TEXT_SCRIPT, element, selected, bool(full_text))
+    if not isinstance(raw, dict):
+        raise RuntimeError("Element text script returned an unexpected result")
+    if not raw.get("found"):
+        return {"found": False, "mode": selected, "full_text": bool(full_text)}
+    text, truncated = _clip_on_boundary(_normalize_text(str(raw.get("text") or "")), limit)
+    html = str(raw.get("html") or "")
+    outer = str(raw.get("outer_html") or "")
+    clipped_html = (html[:limit] + ("…" if len(html) > limit else "")) if html else ""
+    clipped_outer = (outer[:limit] + ("…" if len(outer) > limit else "")) if outer else ""
+    return {
+        "found": True,
+        "mode": selected,
+        "full_text": bool(full_text),
+        "url": raw.get("url", ""),
+        "title": raw.get("title", ""),
+        "tag": raw.get("tag", ""),
+        "text": text,
+        "chars": len(text),
+        "truncated": truncated,
+        "max_chars": limit,
+        "box": raw.get("box") or {},
+        **({"html": clipped_html} if selected in {"html", "both"} else {}),
+        **({"outer_html": clipped_outer} if selected in {"outer", "both"} else {}),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Semantic find
 # ---------------------------------------------------------------------------
 

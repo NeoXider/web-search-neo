@@ -29,6 +29,11 @@ outcome happened. After navigation or rerender, discard old selectors, refs, and
   navigation and chrome. On a page that is one big form, `main` would be empty, so the reader
   falls back to the full page and says so with `fallback_used` and `mode_used`. `excluded_chars`
   and `excluded` say what is missing from the answer and why.
+- `element_text`: the whole content of one element, not a clipped slice of the page. Pass
+  `params.selector` (CSS, a fresh `ref:`, or a `a >>> b` piercing path); `params.full_text=true`
+  reads `textContent`, which no rendering filter may drop, so a scrolled-out code block or a
+  collapsed panel gives up its tail. `params.mode="html"|"outer"|"both"` returns markup
+  (innerHTML / outerHTML / both plus text).
 - `find`: `params.query="submit application"` returns ranked refs instead of a whole page.
   `low_confidence: true` means nothing on the page answers the query - the matches are
   guesses, so read the page instead of clicking one. `ambiguous: true` means two matched
@@ -145,7 +150,8 @@ ProseMirror, Slate, Quill) are written as a real edit — the whole content is s
 the text inserted through the browser's input channel — so the editor's own model updates
 and its change handler fires; the read-back is the editor's `textContent`.
 `fill`, `click`, `submit`, `upload` and `wait` accept `frame_selector`; `wait`'s
-`timeout_seconds` is clamped to 30 and the result reports the effective value.
+`timeout_seconds` defaults to 10 and is respected as passed — ask for as long as
+the target needs.
 `challenge_detected` means a challenge is *blocking* — a widget, or a positioned ancestor of
 it, covering at least half the viewport over the centre, so a dismissible modal with a
 captcha in it does not count. `captcha_widgets` lists captchas that are merely present,
@@ -219,7 +225,10 @@ A task you will do more than once — an application form, a login, a search-and
 worth recording instead of re-deriving. `macro op=record name=hh-apply` starts capturing;
 drive the task once with ordinary actions; `macro op=save` keeps what dispatched. Only
 actions that *succeeded* are recorded, so a wrong selector you corrected does not enter the
-script.
+script. Every action is recordable, and a replay dispatches through the same validated loop:
+`click` keeps its target whichever form you used (selector, `text` plus `role`, or `x`/`y`
+coordinates), and the scripting, cookie, storage, captcha, stealth, and request-replay actions
+record and replay just like `open`, `fill`, and `submit` do.
 
 Replay with `macro op=run name=hh-apply`. The parts that change between runs are
 `{{placeholders}}` in the saved steps: edit them in with `op=save` and explicit `steps`, or
@@ -291,6 +300,16 @@ or rerender, discard the old image and recapture. Verify the click from fresh DO
 In background `current` Chrome, screenshots can be slow or unavailable while Chrome is not
 painting an obscured window. DOM inspection and pointer actions still work; do not treat a
 screenshot timeout as page failure or call `show` unless foreground was explicitly requested.
+
+## Scrolling
+
+`scroll` takes positive `delta_y` down and negative up. Omit `x`/`y` for the viewport
+centre, provide both to pick the container painted under that point, or pass `selector`
+(CSS, a fresh `ref:`, or an `a >>> b` piercing path): the element is brought into view,
+then the wheel lands on its centre, so the *container* holding the element scrolls — the
+way to reach the tail of a tall chat answer or code block. `selector` and `frame_selector`
+are mutually exclusive; pierce the frame instead. `before`/`after` are the selected
+document's window metrics, so an inner container can move while they stay unchanged.
 
 ## Input and games
 

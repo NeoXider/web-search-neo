@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 
 from selenium import webdriver
 from selenium.common.exceptions import (
+    NoSuchElementException,
     NoSuchFrameException,
     TimeoutException,
     WebDriverException,
@@ -827,7 +828,7 @@ def _get_session(session_id: str) -> BrowserSession:
 
 
 def _wait_until_ready(driver: webdriver.Chrome, timeout_seconds: float) -> None:
-    timeout = max(1.0, min(float(timeout_seconds), 30.0))
+    timeout = max(1.0, float(timeout_seconds))
     WebDriverWait(driver, timeout).until(
         lambda current: current.execute_script("return document.readyState") == "complete"
     )
@@ -1657,14 +1658,14 @@ def wait_for_element(
     handle, and a piercing path. ``frame_selector`` names the frame a CSS
     selector is looked up in, exactly as it does for ``find`` and ``page_text``.
 
-    The wait is capped at 30 seconds - a two-minute blocking wait inside a tool
-    call is worse than the surprise - and ``timeout_seconds`` in the result is the
-    wait that was really made, not the one asked for. A timeout says the same
-    number, so a wait that was cut short cannot read as one that ran its course.
+    The wait honours ``timeout_seconds`` as passed (it defaults to 10) and
+    ``timeout_seconds`` in the result is the wait that was really made. A timeout
+    says the same number, so a wait that was cut short cannot read as one that
+    ran its course.
     """
     if state not in _ELEMENT_STATES:
         raise ValueError("state must be 'present', 'visible', or 'clickable'")
-    timeout = max(0.1, min(float(timeout_seconds), 30.0))
+    timeout = max(0.1, float(timeout_seconds))
     session = _get_session(session_id)
     with session.lock:
         _enter_action_frame(session.driver, frame_selector, selector)
@@ -1690,7 +1691,7 @@ def wait_for_challenge_resolution(
     poll_interval_seconds: float = 0.5,
 ) -> dict[str, Any]:
     """Wait for a human to clear a visible challenge while keeping the session open."""
-    timeout = max(0.1, min(float(timeout_seconds), 300.0))
+    timeout = max(0.1, float(timeout_seconds))
     poll_interval = max(0.05, min(float(poll_interval_seconds), 2.0))
     session = _get_session(session_id)
     started = time.monotonic()
@@ -2292,23 +2293,60 @@ def _wait_after_action(driver: webdriver.Chrome, wait_seconds: float) -> None:
 
 
 def click(
-    selector: str,
+    selector: str | None = None,
     session_id: str = "default",
     wait_seconds: float = 0.5,
     frame_selector: str | None = None,
     trusted: bool = False,
+    text: str | None = None,
+    role: str | None = None,
+    exact: bool = True,
+    x: float | None = None,
+    y: float | None = None,
 ) -> dict[str, Any]:
-    """Click a rendered element by CSS selector, ref handle, or piercing path.
+    """Click one thing: a button/element, a piece of text, or a viewport point.
 
-    ``frame_selector`` names the frame a CSS selector is looked up in, exactly as
-    it does for ``find`` and ``page_text``.
+    Exactly one target form must be provided:
 
-    ``trusted=True`` dispatches a real trusted mouse sequence through the
-    browser's input pipeline instead of the element's synthetic click. It lands
-    on the element's centre as a human pointer would, so pages that demand
-    isTrusted events, or that read pointer position, behave as if a user
-    clicked. The element is scrolled into the middle of the viewport first.
+    - ``selector`` (CSS, ref handle, or an ``a >>> b`` piercing path) clicks the
+      element itself. ``trusted=True`` dispatches a real trusted mouse sequence
+      through the browser's input pipeline instead of the element's synthetic
+      click, landing on the element's centre as a human pointer would.
+    - ``text`` clicks the one visible interactive element whose rendered text
+      matches. ``role`` narrows by ARIA role and ``exact=False`` switches to
+      substring matching; zero or several matches are refused, never guessed.
+    - ``x``/``y`` (both required) click the viewport point in CSS pixels.
+
+    ``frame_selector`` names the frame a CSS selector or coordinate pair is
+    looked up in, exactly as it does for ``find`` and ``page_text``.
     """
+    if text is not None:
+        if x is not None or y is not None:
+            raise ValueError("text and x/y are mutually exclusive")
+        return click_text(
+            text,
+            session_id=session_id,
+            exact=exact,
+            role=role,
+            selector=selector,
+            wait_seconds=wait_seconds,
+            frame_selector=frame_selector,
+        )
+    if x is not None or y is not None:
+        if selector is not None:
+            raise ValueError("selector and x/y are mutually exclusive")
+        if x is None or y is None:
+            raise ValueError("x and y must be provided together")
+        return pointer_action(
+            "click",
+            x,
+            y,
+            session_id=session_id,
+            wait_seconds=wait_seconds,
+            frame_selector=frame_selector,
+        )
+    if selector is None:
+        raise ValueError("provide selector, text, or x/y to click")
     session = _get_session(session_id)
     with session.lock:
         _enter_action_frame(session.driver, frame_selector, selector)
@@ -2432,6 +2470,150 @@ def execute_js(
             **_page_summary(driver, session_id),
             "success": True,
             "value": _clip_result(value),
+        }
+
+
+_CLICK_TEXT_SCRIPT = page_perception.JS_LIBRARY + r"""
+const wanted = String(arguments[0] || '');
+const exact = !!arguments[1];
+const wantedRole = String(arguments[2] || '').trim().toLowerCase();
+const candidateSelector = String(arguments[3] || '').trim() ||
+  'button, a[href], label, [role="button"], [role="link"], [role="option"], ' +
+  '[role="checkbox"], [role="radio"], [role="tab"], [role="menuitem"]';
+const norm = value => String(value || '').replace(/\s+/g, ' ').trim();
+const needle = norm(wanted);
+if (!needle) throw new Error('text must not be empty');
+let nodes;
+try { nodes = Array.from(document.querySelectorAll(candidateSelector)); }
+catch (error) { throw new Error('Invalid selector: ' + candidateSelector); }
+const implicitRole = el => {
+  const tag = el.tagName.toLowerCase();
+  if (tag === 'button') return 'button';
+  if (tag === 'a' && el.hasAttribute('href')) return 'link';
+  if (tag === 'input') {
+    const type = (el.type || '').toLowerCase();
+    if (type === 'checkbox') return 'checkbox';
+    if (type === 'radio') return 'radio';
+    if (['button', 'submit', 'reset', 'image'].includes(type)) return 'button';
+  }
+  return '';
+};
+const visible = el => {
+  const style = getComputedStyle(el);
+  const rect = el.getBoundingClientRect();
+  return !!(rect.width && rect.height && style.display !== 'none' &&
+    style.visibility !== 'hidden' && style.opacity !== '0' &&
+    !el.closest('[aria-hidden="true"]'));
+};
+const name = el => norm(
+  el.getAttribute('aria-label') || el.innerText || el.value ||
+  el.getAttribute('title') || el.textContent || ''
+);
+const matches = nodes.filter(el => {
+  if (!visible(el)) return false;
+  const role = (el.getAttribute('role') || implicitRole(el)).toLowerCase();
+  if (wantedRole && role !== wantedRole) return false;
+  const label = name(el);
+  return exact ? label === needle : label.includes(needle);
+});
+if (matches.length !== 1) {
+  return {
+    ok: false,
+    count: matches.length,
+    samples: matches.slice(0, 8).map(el => ({
+      text: name(el), role: (el.getAttribute('role') || implicitRole(el)).toLowerCase(),
+      selector: wsnSelector(el)
+    }))
+  };
+}
+const el = matches[0];
+let rect = el.getBoundingClientRect();
+if (rect.left < 0 || rect.top < 0 || rect.right > window.innerWidth || rect.bottom > window.innerHeight) {
+  el.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
+  rect = el.getBoundingClientRect();
+}
+const x = rect.left + rect.width / 2;
+const y = rect.top + rect.height / 2;
+const top = document.elementFromPoint(x, y);
+if (top && !(top === el || el.contains(top))) {
+  return {
+    ok: false, count: 1, occluded: true,
+    blocker: name(top) || top.tagName.toLowerCase(),
+    samples: [{text: name(el), role: (el.getAttribute('role') || implicitRole(el)).toLowerCase(), selector: wsnSelector(el)}]
+  };
+}
+return {
+  ok: true, count: 1, x, y, text: name(el),
+  role: (el.getAttribute('role') || implicitRole(el)).toLowerCase(),
+  selector: wsnSelector(el), hit_test_unavailable: !top
+};
+"""
+
+
+def click_text(
+    text: str,
+    session_id: str = "default",
+    exact: bool = True,
+    role: str | None = None,
+    selector: str | None = None,
+    wait_seconds: float = 0.5,
+    frame_selector: str | None = None,
+) -> dict[str, Any]:
+    """Click the one visible interactive element whose rendered text matches.
+
+    This is deliberately strict: zero or several matches are returned as a
+    refusal instead of clicking whichever DOM node happened to come first.
+    ``role`` and ``selector`` narrow the candidate set without requiring the
+    caller to manufacture a fragile nth-of-type path.
+    """
+    if not str(text).strip():
+        raise ValueError("text must not be empty")
+    _refuse_non_css_frame(frame_selector)
+    session = _get_session(session_id)
+    with session.lock:
+        driver = session.driver
+        frame_map, viewport = _pointer_context(driver, frame_selector)
+        try:
+            _select_frame(driver, frame_selector, css_only=True)
+            match = driver.execute_script(
+                _CLICK_TEXT_SCRIPT,
+                text,
+                exact,
+                role or "",
+                selector or "",
+            ) or {}
+        finally:
+            driver.switch_to.default_content()
+        if not match.get("ok"):
+            if match.get("occluded"):
+                raise ValueError(
+                    f"The unique text match is covered by {match.get('blocker')!r}; "
+                    "inspect the page again before clicking."
+                )
+            raise ValueError(
+                f"Expected exactly one visible text match, found {int(match.get('count', 0))}. "
+                f"Matches: {match.get('samples') or []}. Narrow with role or selector."
+            )
+        result = _pointer_dispatch(
+            session,
+            "click",
+            float(match["x"]),
+            float(match["y"]),
+            viewport,
+            frame_map=frame_map,
+        )
+        _auto_advance_render_after_input(session)
+        _wait_after_action(driver, wait_seconds)
+        return {
+            **_page_summary(driver, session_id),
+            **result,
+            "success": True,
+            "matched_text": match.get("text", ""),
+            "matched_role": match.get("role", ""),
+            "matched_selector": match.get("selector", ""),
+            "hit_test_unavailable": bool(match.get("hit_test_unavailable")),
+            "exact": bool(exact),
+            "frame_selector": frame_selector,
         }
 
 
@@ -3011,9 +3193,8 @@ def _wait_for_locator(driver: Any, locator: str, state: str, timeout: float) -> 
     ``expected_conditions`` only speak ``(By, selector)`` tuples, so ref handles and
     piercing paths are polled through ``_resolve_element`` instead.
 
-    The wait it actually did is named in the failure, because the timeout asked
-    for is clamped: "never appeared in 120 seconds" about a wait that lasted 30
-    sends the caller looking for the wrong problem.
+    The wait it actually did is named in the failure, so a timeout does not read
+    as the exact number the caller asked for when the element never appeared.
     """
     waited = f"waited {timeout:g}s"
     if page_perception.resolve_locator_expression(locator) is None:
@@ -3091,6 +3272,49 @@ def get_page_text(
         finally:
             _leave_element_frame(driver)
         return {**result, "session_id": session_id, "frame_selector": frame_selector}
+
+
+def get_element_text(
+    session_id: str = "default",
+    selector: str = "body",
+    mode: str = "text",
+    full_text: bool = False,
+    max_chars: int = 20_000,
+    frame_selector: str | None = None,
+) -> dict[str, Any]:
+    """Extract one element's content: rendered text, innerHTML, or outerHTML.
+
+    Unlike the page text, the answer is not clipped by overflow: the element's
+    whole DOM subtree is read, so a scrolled code block or a collapsed panel
+    gives up its tail. ``selector`` accepts every locator form (CSS, a ref
+    handle, or an ``a >>> b`` piercing path). With ``full_text`` the text comes
+    from ``textContent`` instead of ``innerText``.
+    """
+    if not selector or not str(selector).strip():
+        raise ValueError("selector is required")
+    session = _get_session(session_id)
+    with session.lock:
+        driver = session.driver
+        try:
+            if frame_selector is not None:
+                _select_frame(driver, frame_selector)
+            try:
+                element = _resolve_element(driver, selector)
+            except NoSuchElementException:
+                return {
+                    "found": False,
+                    "mode": str(mode or "text").strip().lower(),
+                    "full_text": bool(full_text),
+                    "session_id": session_id,
+                    "selector": selector,
+                    "frame_selector": frame_selector,
+                }
+            result = page_perception.element_text(
+                driver, element, mode=mode, full_text=full_text, max_chars=max_chars
+            )
+        finally:
+            _leave_element_frame(driver)
+        return {**result, "session_id": session_id, "selector": selector, "frame_selector": frame_selector}
 
 
 def find_elements(
@@ -4200,33 +4424,93 @@ def _scroll_metrics(driver: Any, frame_selector: str | None) -> dict[str, Any]:
         driver.switch_to.default_content()
 
 
+# ``scrollIntoView`` brings the target into view first, so the wheel point below
+# is reachable even when the element lives inside a tall scroll container. The
+# call runs in the element's own document (``_resolve_element`` left the driver
+# there); ``wsnFrameMap`` then reports where the element's centre lands on the
+# top-level page, the same mapping outline and find boxes go through.
+_SCROLL_INTO_VIEW_SCRIPT = page_perception.JS_LIBRARY + """
+const element = arguments[0];
+if (!element || element.scrollIntoView !== undefined) {
+  element.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
+}
+const rect = element.getBoundingClientRect();
+const local_x = rect.x + rect.width / 2;
+const local_y = rect.y + rect.height / 2;
+const mapped = wsnFrameMap(element);
+return {
+  cx: local_x,
+  cy: local_y,
+  frame: {
+    x: mapped.x, y: mapped.y,
+    ax: mapped.ax, ay: mapped.ay,
+    bx: mapped.bx, by: mapped.by,
+    page_width: window.innerWidth, page_height: window.innerHeight
+  }
+};
+"""
+
+
 def scroll_page(
     delta_y: float,
     session_id: str = "default",
     delta_x: float = 0.0,
     x: float | None = None,
     y: float | None = None,
+    selector: str | None = None,
     frame_selector: str | None = None,
     wait_seconds: float = 0.1,
     include_summary: bool = True,
 ) -> dict[str, Any]:
-    """Scroll at a viewport point, defaulting to its centre.
+    """Scroll at a viewport point, defaulting to its centre, or at an element.
 
     Positive ``delta_y`` scrolls down and negative values scroll up. The point
     matters on pages with nested scroll containers: Chrome sends the wheel to
-    whatever is painted under it. Page metrics still describe the selected
-    document's window, so an inner container may move while they stay unchanged.
+    whatever is painted under it. With ``selector`` (CSS, a ref handle, or an
+    ``a >>> b`` piercing path) the element is brought into view first and the
+    wheel lands on its centre, which scrolls the *container* the element lives
+    in. ``selector`` and ``frame_selector`` are mutually exclusive - to reach
+    an element inside a frame, pierce it ('frame >>> #inner') instead. Page
+    metrics still describe the selected document's window, so an inner
+    container may move while they stay unchanged.
     """
     if (x is None) != (y is None):
         raise ValueError("x and y must be provided together, or both omitted for viewport centre")
+    if selector is not None and frame_selector is not None:
+        raise ValueError(
+            "selector and frame_selector are mutually exclusive; "
+            "pierce the frame instead, e.g. 'frame >>> #inner'"
+        )
     _refuse_non_css_frame(frame_selector)
     session = _get_session(session_id)
     with session.lock:
         driver = session.driver
-        frame_map, viewport = _pointer_context(driver, frame_selector)
-        actual_x = float(x) if x is not None else float(viewport["width"]) / 2
-        actual_y = float(y) if y is not None else float(viewport["height"]) / 2
         before = _scroll_metrics(driver, frame_selector)
+        element_centre = None
+        if selector is not None:
+            element = _resolve_element(driver, selector)
+            centre = driver.execute_script(_SCROLL_INTO_VIEW_SCRIPT, element)
+            if not isinstance(centre, dict) or "frame" not in centre:
+                raise RuntimeError("Element scroll script returned an unexpected result")
+            element_centre = centre
+        frame_map, viewport = _pointer_context(driver, frame_selector)
+        if element_centre is not None:
+            frame = element_centre["frame"]
+            frame_map = _FrameMap(
+                x=float(frame["x"]),
+                y=float(frame["y"]),
+                ax=float(frame["ax"]),
+                ay=float(frame["ay"]),
+                bx=float(frame["bx"]),
+                by=float(frame["by"]),
+                page_width=float(frame["page_width"]),
+                page_height=float(frame["page_height"]),
+            )
+            actual_x = float(element_centre["cx"])
+            actual_y = float(element_centre["cy"])
+        else:
+            actual_x = float(x) if x is not None else float(viewport["width"]) / 2
+            actual_y = float(y) if y is not None else float(viewport["height"]) / 2
         result = _pointer_dispatch(
             session,
             "wheel",
@@ -4242,6 +4526,7 @@ def scroll_page(
         return {
             **_action_summary(driver, session_id, include_summary),
             **result,
+            "selector": selector,
             "frame_selector": frame_selector,
             "before": before,
             "after": after,
@@ -4705,7 +4990,7 @@ def pointer_lock(
     selected_action = action.strip().lower()
     if selected_action not in {"acquire", "release", "status"}:
         raise ValueError("action must be 'acquire', 'release', or 'status'")
-    timeout = max(0.1, min(float(timeout_seconds), 10.0))
+    timeout = max(0.1, float(timeout_seconds))
     # Acquiring sends a real click, which is a coordinate: this call reads the
     # frame both ways and must not accept a locator only one of them can use.
     _refuse_non_css_frame(frame_selector)

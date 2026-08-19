@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Scroll container fixture</title>
+    <style>
+      body { margin: 0; font-family: sans-serif; }
+      #panel {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 420px;
+        height: 300px;
+        overflow-y: scroll;
+        background: #f5f5f5;
+        border: 1px solid #999;
+      }
+      #content { height: 4000px; padding: 10px; }
+      #marker {
+        height: 40px;
+        line-height: 40px;
+        text-align: center;
+        background: #cfe3ff;
+        border: 1px solid #7aa7e0;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="panel">
+      <div id="content">
+        <div id="marker">marker</div>
+        <div>padding body to make the panel scrollable</div>
+      </div>
+    </div>
+    <script>
+      window.__panelScrollTop = function () {
+        return document.getElementById('panel').scrollTop;
+      };
+    </script>
+  </body>
+</html>
