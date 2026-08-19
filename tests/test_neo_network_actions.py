@@ -141,6 +141,20 @@ CANNED_RESPONSE = {
 }
 
 
+def test_the_replay_script_is_valid_runnable_javascript():
+    # The canned driver never parses the script, so a syntax/scope error like a
+    # top-level await in a non-async wrapper would pass every mock. Assert the
+    # shape that keeps it valid: the awaits live inside an async IIFE that the
+    # wrapper returns, not at the top level.
+    script = browser_tools._REPLAY_SCRIPT
+    assert "return (async () =>" in script
+    # No await outside that IIFE - the only awaits are indented inside it.
+    for line in script.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("await ") or stripped.startswith("return await"):
+            raise AssertionError(f"top-level await would break the wrapper: {stripped!r}")
+
+
 def test_replay_by_explicit_url_runs_a_page_fetch():
     driver = _CannedDriver(script_result=CANNED_RESPONSE)
     _register(driver)
@@ -190,6 +204,35 @@ def test_replay_reports_a_page_side_fetch_failure():
     assert result["success"] is True
     assert result["response"]["ok"] is False
     assert result["response"]["error"] == "NetworkError"
+
+
+def test_teardown_clears_injected_state_on_a_tab_that_is_handed_back():
+    # A borrowed tab survives close, so headers and scripts we set on it must be
+    # undone or the next session to claim it inherits them.
+    driver = _CannedDriver({"Page.addScriptToEvaluateOnNewDocument": {"identifier": "s-1"}})
+    session = _register(driver)
+    session.owns_tab = False  # a borrowed tab, handed back rather than closed
+    browser_tools.set_extra_headers({"Authorization": "Bearer tok"})
+    browser_tools.stealth(op="on")
+
+    browser_tools._clear_injected_state(session)
+    assert session.extra_headers == {}
+    assert session.injected_scripts == []
+    assert session.stealth_identifier is None
+    commands = [cmd for cmd, _ in driver.cdp_calls]
+    assert "Page.removeScriptToEvaluateOnNewDocument" in commands
+    # The last header call cleared the set.
+    header_calls = [p for c, p in driver.cdp_calls if c == "Network.setExtraHTTPHeaders"]
+    assert header_calls[-1] == {"headers": {}}
+
+
+def test_remove_actually_calls_the_cdp_removal():
+    driver = _CannedDriver({"Page.addScriptToEvaluateOnNewDocument": {"identifier": "x-1"}})
+    _register(driver)
+    browser_tools.inject_script(op="add", source="void 0;")
+    browser_tools.inject_script(op="remove", identifier="x-1")
+    commands = [(cmd, params) for cmd, params in driver.cdp_calls]
+    assert ("Page.removeScriptToEvaluateOnNewDocument", {"identifier": "x-1"}) in commands
 
 
 def test_all_three_actions_are_registered():

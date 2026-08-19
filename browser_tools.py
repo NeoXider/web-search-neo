@@ -128,8 +128,8 @@ class BrowserSession:
     # Selenium one threw away, as the extension counts evictions for the other.
     network_dropped: int = 0
     # Identifiers of scripts registered with Page.addScriptToEvaluateOnNewDocument
-    # for this session, so inject_script can list and forget them by hand: CDP has
-    # no matching remove, and the ids are the only handle a caller ever gets back.
+    # for this session, so inject_script can list them and remove them by id -
+    # the id is the only handle CDP's removal takes, and the only one a caller gets.
     injected_scripts: list[str] = field(default_factory=list)
     # The extra HTTP headers Chrome adds to every request, echoed back so a caller
     # can see what is in force, and the injected-script id that enables stealth,
@@ -3404,9 +3404,10 @@ def inject_script(
 
     ``add`` installs ``source`` with Page.addScriptToEvaluateOnNewDocument and keeps
     the returned identifier; it takes effect on the next navigation of this session.
-    ``list`` returns the identifiers held. ``remove`` drops one from that list - CDP
-    offers no matching removal, so the drop is best-effort and only stops us
-    re-installing it, not what Chrome already queued for the next document.
+    ``list`` returns the identifiers held. ``remove`` calls the matching CDP removal
+    so the script stops running on future documents, and forgets the id; on a
+    backend without that call it still forgets the id and the script lapses on the
+    next navigation.
     """
     session = _get_session(session_id)
     with session.lock:
@@ -3429,6 +3430,18 @@ def inject_script(
             removed = identifier in session.injected_scripts
             if removed:
                 session.injected_scripts.remove(identifier)
+                # Actually stop it in Chrome, not just forget the id: the CDP
+                # removal exists, so a "removed" that left the script running on
+                # every future document would be a lie the caller acts on.
+                try:
+                    session.driver.execute_cdp_cmd(
+                        "Page.removeScriptToEvaluateOnNewDocument",
+                        {"identifier": identifier},
+                    )
+                except Exception:
+                    # A backend without the removal still forgets the id; the
+                    # script lapses on the next navigation rather than at once.
+                    pass
             return {
                 "success": True,
                 "session_id": session_id,
@@ -3727,32 +3740,40 @@ def stealth(
 # probe - resend the login POST, see whether the token still works - rather than
 # a blind fire-and-forget.
 _REPLAY_SCRIPT = """
+// Returns a Promise, which execute_js(await_promise=True) resolves at the CDP
+// layer. The script runs in a plain (non-async) function wrapper, so a top-level
+// `await` here would be a sloppy-mode identifier, not a keyword - the await lives
+// inside this async IIFE instead, and its result is what the caller receives.
 const spec = arguments[0];
 const started = performance.now();
-try {
-  const response = await fetch(spec.url, {
-    method: spec.method || 'GET',
-    headers: spec.headers || {},
-    body: (spec.body != null && spec.method !== 'GET' && spec.method !== 'HEAD') ? spec.body : undefined,
-    credentials: spec.credentials || 'include',
-    redirect: 'follow',
-  });
-  const text = await response.text();
-  const headers = {};
-  response.headers.forEach((value, key) => { headers[key] = value; });
-  return {
-    ok: response.ok,
-    status: response.status,
-    url: response.url,
-    redirected: response.redirected,
-    headers: headers,
-    body: text.length > 20000 ? text.slice(0, 20000) : text,
-    truncated: text.length > 20000,
-    ms: Math.round(performance.now() - started),
-  };
-} catch (error) {
-  return {ok: false, status: 0, error: String(error && error.message || error)};
-}
+return (async () => {
+  try {
+    const noBody = spec.method === 'GET' || spec.method === 'HEAD';
+    const response = await fetch(spec.url, {
+      method: spec.method || 'GET',
+      headers: spec.headers || {},
+      body: (spec.body != null && !noBody) ? spec.body : undefined,
+      credentials: spec.credentials || 'include',
+      redirect: 'follow',
+    });
+    const text = await response.text();
+    const headers = {};
+    response.headers.forEach((value, key) => { headers[key] = value; });
+    return {
+      ok: response.ok,
+      status: response.status,
+      url: response.url,
+      redirected: response.redirected,
+      headers: headers,
+      body: text.length > 20000 ? text.slice(0, 20000) : text,
+      truncated: text.length > 20000,
+      ms: Math.round(performance.now() - started),
+      body_ignored: spec.body != null && noBody,
+    };
+  } catch (error) {
+    return {ok: false, status: 0, error: String(error && error.message || error)};
+  }
+})();
 """
 
 
@@ -3801,8 +3822,10 @@ def replay_request(
         "body": body,
         "credentials": credentials,
     }
-    result = execute_js("return await (async () => {" + _REPLAY_SCRIPT + "})();",
-                        args=[spec], session_id=session_id, await_promise=True)
+    # The script returns a Promise; await_promise resolves it at the CDP layer.
+    # A plain Selenium driver cannot await one, so replay needs the bridge - the
+    # same rule execute_js already enforces, surfaced here with the reason.
+    result = execute_js(_REPLAY_SCRIPT, args=[spec], session_id=session_id, await_promise=True)
     if not result.get("success"):
         return {"success": False, "session_id": session_id, "error": result.get("error")}
     return {"success": True, "session_id": session_id, "request": spec, "response": result.get("value")}
@@ -6553,6 +6576,35 @@ def _reset_session_runtime_state(session: BrowserSession) -> None:
             pass
 
 
+def _clear_injected_state(session: BrowserSession) -> None:
+    """Undo the per-target state we set, for a tab that outlives this session.
+
+    Extra HTTP headers and evaluate-on-new-document scripts live on the Chrome
+    target, not the session object, so forgetting the session does not stop them:
+    a later session claiming the same tab would send an old Authorization header
+    and run a webdriver-override it never asked for. Each removal is best-effort -
+    teardown may not raise - and only a borrowed, surviving tab ever gets here.
+    """
+    driver = session.driver
+    if not hasattr(driver, "execute_cdp_cmd"):
+        return
+    if session.extra_headers:
+        try:
+            driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {"headers": {}})
+        except Exception:
+            pass
+        session.extra_headers = {}
+    for identifier in list(session.injected_scripts):
+        try:
+            driver.execute_cdp_cmd(
+                "Page.removeScriptToEvaluateOnNewDocument", {"identifier": identifier}
+            )
+        except Exception:
+            pass
+    session.injected_scripts.clear()
+    session.stealth_identifier = None
+
+
 def _shutdown_session(
     session: BrowserSession, close_tab: bool | None = None
 ) -> dict[str, Any]:
@@ -6605,6 +6657,12 @@ def _shutdown_session(
     tab_closed = False
     should_close_tab = session.owns_tab if close_tab is None else bool(close_tab)
     attempt("releasing held input", lambda: _reset_session_runtime_state(session))
+    # A tab that is handed back rather than closed keeps whatever we set on it -
+    # extra request headers, scripts that run before every document - and the next
+    # session to claim it would inherit them unaware. A tab about to close needs
+    # none of this. So the cleanup runs exactly when the tab survives us.
+    if not should_close_tab:
+        attempt("clearing injected page state", lambda: _clear_injected_state(session))
     if should_close_tab and hasattr(session.driver, "close_tab"):
         removed = attempt("closing the tab", session.driver.close_tab)
         tab_closed = bool((removed or {}).get("removed"))
