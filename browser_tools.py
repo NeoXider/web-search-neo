@@ -131,6 +131,11 @@ class BrowserSession:
     # for this session, so inject_script can list and forget them by hand: CDP has
     # no matching remove, and the ids are the only handle a caller ever gets back.
     injected_scripts: list[str] = field(default_factory=list)
+    # The extra HTTP headers Chrome adds to every request, echoed back so a caller
+    # can see what is in force, and the injected-script id that enables stealth,
+    # kept so it can be turned off without the caller tracking it.
+    extra_headers: dict[str, str] = field(default_factory=dict)
+    stealth_identifier: str | None = None
     lock: threading.RLock = field(default_factory=threading.RLock)
     last_used: float = field(default_factory=time.monotonic)
 
@@ -3619,6 +3624,188 @@ def solve_captcha(
             "service configured through WEB_SEARCH_NEO_CAPTCHA_KEY."
         )
     return outcome
+
+
+def set_extra_headers(
+    headers: dict[str, str] | None = None,
+    session_id: str = "default",
+) -> dict[str, Any]:
+    """Send extra HTTP headers with every request this session makes, until cleared.
+
+    Chrome adds these to every outgoing request - navigations, fetches, images -
+    so it is how a whole session is given an Authorization token, a custom
+    User-Agent, or an A/B cookie without touching each call. Passing no headers
+    (or an empty map) clears the override, which is the only way to stop it:
+    Network.setExtraHTTPHeaders replaces the set every time, it does not add to it.
+    """
+    session = _get_session(session_id)
+    payload = {str(key): str(value) for key, value in (headers or {}).items()}
+    with session.lock:
+        session.driver.execute_cdp_cmd("Network.enable", {})
+        session.driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {"headers": payload})
+        session.extra_headers = payload
+    return {
+        "success": True,
+        "session_id": session_id,
+        "headers": payload,
+        "cleared": not payload,
+    }
+
+
+# The token every automation-detection script looks at first. Setting it before
+# the page's own scripts run is the difference between hiding the flag and being
+# caught reading it late; inject_script is what makes that ordering possible.
+STEALTH_SOURCE = """
+Object.defineProperty(navigator, 'webdriver', {get: () => false, configurable: true});
+if (!window.chrome) { window.chrome = {runtime: {}}; }
+try {
+  const original = navigator.permissions && navigator.permissions.query;
+  if (original) {
+    navigator.permissions.query = (parameters) =>
+      parameters && parameters.name === 'notifications'
+        ? Promise.resolve({state: Notification.permission})
+        : original(parameters);
+  }
+} catch (error) { /* a locked-down permissions API is not worth failing over */ }
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5], configurable: true});
+Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en'], configurable: true});
+"""
+
+
+def stealth(
+    op: str = "on",
+    session_id: str = "default",
+) -> dict[str, Any]:
+    """Hide the usual automation tells from a page before its scripts can read them.
+
+    ``on`` registers the overrides with inject_script, so they run before every
+    document's own code and survive navigation - the only ordering that actually
+    works, because a page reads ``navigator.webdriver`` on load. ``off`` forgets
+    the registration for future documents.
+
+    This lowers the chance a site *shows* a challenge; it does not solve one. A
+    determined anti-bot service fingerprints far more than these flags, and the
+    override cannot touch the ``--enable-automation`` switch Chrome was launched
+    with. Pair it with a real profile and human-paced input, and use ``captcha``
+    for what still gets through.
+    """
+    if op == "on":
+        # Idempotent: a second on would otherwise register a duplicate script and
+        # forget the first, leaving it running after off with no handle to remove it.
+        session = _get_session(session_id)
+        with session.lock:
+            previous = session.stealth_identifier
+        if previous:
+            inject_script(op="remove", identifier=previous, session_id=session_id)
+        result = inject_script(op="add", source=STEALTH_SOURCE, session_id=session_id)
+        with session.lock:
+            session.stealth_identifier = result["identifier"]
+        return {
+            "success": True,
+            "session_id": session_id,
+            "enabled": True,
+            "identifier": result["identifier"],
+            "note": (
+                "Overrides take effect on the next navigation. They reduce captcha "
+                "frequency, not certainty; a real profile and paced input matter more."
+            ),
+        }
+    if op == "off":
+        session = _get_session(session_id)
+        with session.lock:
+            identifier = session.stealth_identifier
+            session.stealth_identifier = None
+        removed = False
+        if identifier:
+            removed = inject_script(op="remove", identifier=identifier, session_id=session_id)["removed"]
+        return {"success": True, "session_id": session_id, "enabled": False, "removed": removed}
+    raise ValueError(f"stealth op must be on or off, not '{op}'")
+
+
+# Re-issue a captured request from inside the page, so its cookies and origin are
+# the page's own. Returning status, headers and a clipped body is what makes it a
+# probe - resend the login POST, see whether the token still works - rather than
+# a blind fire-and-forget.
+_REPLAY_SCRIPT = """
+const spec = arguments[0];
+const started = performance.now();
+try {
+  const response = await fetch(spec.url, {
+    method: spec.method || 'GET',
+    headers: spec.headers || {},
+    body: (spec.body != null && spec.method !== 'GET' && spec.method !== 'HEAD') ? spec.body : undefined,
+    credentials: spec.credentials || 'include',
+    redirect: 'follow',
+  });
+  const text = await response.text();
+  const headers = {};
+  response.headers.forEach((value, key) => { headers[key] = value; });
+  return {
+    ok: response.ok,
+    status: response.status,
+    url: response.url,
+    redirected: response.redirected,
+    headers: headers,
+    body: text.length > 20000 ? text.slice(0, 20000) : text,
+    truncated: text.length > 20000,
+    ms: Math.round(performance.now() - started),
+  };
+} catch (error) {
+  return {ok: false, status: 0, error: String(error && error.message || error)};
+}
+"""
+
+
+def replay_request(
+    request_id: str | None = None,
+    session_id: str = "default",
+    url: str | None = None,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    body: str | None = None,
+    credentials: str = "include",
+) -> dict[str, Any]:
+    """Re-send a request from the page's own context and return the full response.
+
+    Give it a ``request_id`` from the network topic to repeat that captured
+    request - the url and method are taken from the row - or spell out ``url`` /
+    ``method`` / ``headers`` / ``body`` directly. The fetch runs inside the page,
+    so it carries the page's cookies and origin: this is how you check whether a
+    session token is still valid, whether an endpoint is rate-limited, or what a
+    form's POST actually returns, without driving the whole form again.
+
+    Captured bodies are not retained by the network buffer, so a replay by
+    ``request_id`` alone repeats a GET faithfully but cannot resend the original
+    POST body - pass ``body`` explicitly for that.
+    """
+    session = _get_session(session_id)
+    target_url, target_method = url, method
+    if request_id is not None:
+        with session.lock:
+            rows = list(session.network_rows)
+        match = next((row for row in rows if str(row.get("id")) == str(request_id)), None)
+        if match is None:
+            raise ValueError(
+                f"No captured request has id '{request_id}'. Read the network topic "
+                "with output='json' for current ids, or pass url and method directly."
+            )
+        target_url = url or match.get("url")
+        target_method = method if method != "GET" else match.get("method", "GET")
+    if not target_url:
+        raise ValueError("replay_request needs a request_id or an explicit url")
+
+    spec = {
+        "url": target_url,
+        "method": str(target_method or "GET").upper(),
+        "headers": {str(key): str(value) for key, value in (headers or {}).items()},
+        "body": body,
+        "credentials": credentials,
+    }
+    result = execute_js("return await (async () => {" + _REPLAY_SCRIPT + "})();",
+                        args=[spec], session_id=session_id, await_promise=True)
+    if not result.get("success"):
+        return {"success": False, "session_id": session_id, "error": result.get("error")}
+    return {"success": True, "session_id": session_id, "request": spec, "response": result.get("value")}
 
 
 def _session_modifiers(session: BrowserSession) -> int:

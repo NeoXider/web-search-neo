@@ -249,6 +249,27 @@ some wait for the button, so re-read the page and submit if it did not. A captch
 sitekey — an image or a behavioural check — cannot be sent to a service at all and has to be
 cleared in the page.
 
+## Requests, headers, and staying unremarkable
+
+`set_extra_headers` adds headers to *every* request the session makes until cleared — an
+`Authorization` token, a custom `User-Agent`, an A/B cookie — without touching each call.
+The set is replaced whole each time, so `set_extra_headers` with no `headers` clears it;
+there is no per-header removal.
+
+`replay_request` re-sends a request from inside the page, so it carries the page's cookies
+and origin. Pass a `request_id` from `network` (read it with `output=json` for ids) to repeat
+a captured request, or spell out `url`/`method`/`headers`/`body`. The response comes back with
+status, headers and a clipped body — enough to check whether a session token still works, an
+endpoint is rate-limited, or what a form's POST returns, without driving the form again.
+Captured POST bodies are not retained, so pass `body` explicitly to resend one.
+
+`stealth op=on` hides the usual automation tells (`navigator.webdriver`, plugin/language
+shape) before the page's own scripts read them, which lowers how often a site *shows* a
+challenge. It is not a solve: a serious anti-bot service fingerprints far more, and the
+override cannot undo the `--enable-automation` switch Chrome launched with. Pair it with a
+real profile (`profile_mode=current`), human-paced input, and `captcha` for what gets
+through. `op=off` forgets it for future documents.
+
 ## Visual coordinate clicks
 
 Screenshot modes are `viewport` (default), `full_page`, and `region`. Omit viewport

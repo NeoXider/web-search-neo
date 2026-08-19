@@ -199,7 +199,7 @@ def test_capabilities_names_required_parameters_and_where_the_rest_live():
     # Optional names are deliberately absent, so the document must say so.
     assert "action_schema" in document["discovery"]["parameters"]
     assert not any("include_summary" in json.dumps(entry) for entry in actions.values())
-    assert len(json.dumps(document)) < 11_000
+    assert len(json.dumps(document)) < 11_500
 
     assert any(
         "ref:" in pitfall and "page_outline" in pitfall for pitfall in document["pitfalls"]
@@ -221,7 +221,7 @@ def test_capabilities_states_the_requirements_that_python_defaults_hide():
     # Unconditional actions keep the plain shape, so the key stays a signal.
     assert "also_required" not in actions["pointer"]
     assert "also_required" not in actions["open"]
-    assert len(json.dumps(document)) < 11_000
+    assert len(json.dumps(document)) < 11_500
 
 
 def test_input_and_touch_reject_exactly_what_the_document_calls_required():

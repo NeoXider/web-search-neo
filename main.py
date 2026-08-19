@@ -1209,6 +1209,47 @@ async def browser_captcha(
 
 
 @mcp.tool()
+async def browser_set_extra_headers(
+    headers: dict[str, str] | None = None,
+    session_id: str = "default",
+) -> dict[str, Any]:
+    """Send extra HTTP headers with every request this session makes; empty map clears them."""
+    return await asyncio.to_thread(browser_tools.set_extra_headers, headers, session_id)
+
+
+@mcp.tool()
+async def browser_stealth(
+    op: str = "on",
+    session_id: str = "default",
+) -> dict[str, Any]:
+    """Hide common automation tells (navigator.webdriver, plugins) before page scripts run."""
+    return await asyncio.to_thread(browser_tools.stealth, op, session_id)
+
+
+@mcp.tool()
+async def browser_replay_request(
+    request_id: str | None = None,
+    session_id: str = "default",
+    url: str | None = None,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    body: str | None = None,
+    credentials: str = "include",
+) -> dict[str, Any]:
+    """Re-send a captured or explicit request from the page's context; return the full response."""
+    return await asyncio.to_thread(
+        browser_tools.replay_request,
+        request_id,
+        session_id,
+        url,
+        method,
+        headers,
+        body,
+        credentials,
+    )
+
+
+@mcp.tool()
 async def browser_inject_script(
     op: str = "add",
     source: str | None = None,
@@ -1390,6 +1431,19 @@ _ACTIONS: dict[str, ActionSpec] = {
         ),
         _action("macro", browser_macro, "macro", "Record a task once; replay it by name."),
         _action("captcha", browser_captcha, "page", "Detect a captcha and wait it out or solve it."),
+        _action(
+            "set_extra_headers",
+            browser_set_extra_headers,
+            "page",
+            "Send extra HTTP headers with every request; empty clears.",
+        ),
+        _action("stealth", browser_stealth, "page", "Hide automation tells before page scripts run."),
+        _action(
+            "replay_request",
+            browser_replay_request,
+            "page",
+            "Re-send a captured or explicit request from the page context.",
+        ),
         _action(
             "close", browser_close, "session", "Close one session; a claimed current-Chrome tab stays open."
         ),
