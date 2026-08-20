@@ -24,7 +24,7 @@ import msp_search
 from web_client import request
 
 
-__version__ = "1.3.7"
+__version__ = "1.3.8"
 
 PROJECT_DIR = Path(__file__).resolve().parent
 log = logging.getLogger("web_search_neo")
@@ -1153,7 +1153,7 @@ async def browser_close_all() -> dict[str, Any]:
 
 # One recording at a time, because there is one hand driving the browser: a
 # second concurrent recording could only capture the same steps twice.
-_RECORDING: dict[str, Any] = {"active": False, "name": "", "steps": []}
+_RECORDING: dict[str, Any] = {"active": False, "name": "", "steps": [], "project_root": None}
 
 # A batch holds this for as long as it is dispatching, so two batches sent at
 # once are recorded one after the other instead of interleaving into a script
@@ -1170,8 +1170,11 @@ async def browser_macro(
     variables: dict[str, Any] | None = None,
     description: str = "",
     continue_on_error: bool = False,
+    guard: dict[str, Any] | None = None,
+    checkpoint: str | None = None,
+    project_root: str | None = None,
 ) -> dict[str, Any]:
-    """Save, record, preview, run, inspect, or delete an action script with {{placeholders}}."""
+    """Manage generic macros, including guarded two-phase submit, in user or project storage."""
     op = str(op or "").strip().lower()
 
     if op == "record":
@@ -1185,7 +1188,15 @@ async def browser_macro(
                 f"{len(_RECORDING['steps'])} step(s). Save it with op='save', or "
                 "throw it away with op='cancel', before recording another."
             )
-        _RECORDING.update({"active": True, "name": macros.validate_name(name), "steps": []})
+        selected_root = str(macros.macro_root(project_root)) if project_root else None
+        _RECORDING.update(
+            {
+                "active": True,
+                "name": macros.validate_name(name),
+                "steps": [],
+                "project_root": selected_root,
+            }
+        )
         return {
             "success": True,
             "recording": True,
@@ -1199,7 +1210,7 @@ async def browser_macro(
 
     if op == "cancel":
         was = _RECORDING["name"]
-        _RECORDING.update({"active": False, "name": "", "steps": []})
+        _RECORDING.update({"active": False, "name": "", "steps": [], "project_root": None})
         return {"success": True, "recording": False, "discarded": was}
 
     if op == "save":
@@ -1220,11 +1231,21 @@ async def browser_macro(
             )
         if not target:
             raise ValueError("macro op 'save' requires name")
+        selected_project = project_root
+        if steps is None and selected_project is None:
+            recorded_store = _RECORDING.get("project_root")
+            if recorded_store:
+                selected_project = str(Path(recorded_store).parents[1])
         record = await asyncio.to_thread(
-            macros.save, target, steps if steps is not None else captured, description, variables
+            macros.save,
+            target,
+            steps if steps is not None else captured,
+            description,
+            variables,
+            selected_project,
         )
         if steps is None:
-            _RECORDING.update({"active": False, "name": "", "steps": []})
+            _RECORDING.update({"active": False, "name": "", "steps": [], "project_root": None})
         return {
             "success": True,
             "name": record["name"],
@@ -1236,17 +1257,65 @@ async def browser_macro(
     if op == "run":
         if not name:
             raise ValueError("macro op 'run' requires name")
-        record = await asyncio.to_thread(macros.load, name)
+        record = await asyncio.to_thread(macros.load, name, project_root)
         resolved = macros.resolve(record["steps"], record.get("variables"), variables)
         # A replay is one logical call, so it does not re-enter the recorder and
         # does not inherit web_action's hand-written 32-action ceiling.
         outcome = await _execute_actions(resolved, continue_on_error, record=False)
         return {**outcome, "macro": record["name"], "step_count": len(resolved)}
 
+    if op == "guarded_stage":
+        if not name:
+            raise ValueError("macro op 'guarded_stage' requires name")
+        record = await asyncio.to_thread(macros.load, name, project_root)
+        resolved = macros.resolve(record["steps"], record.get("variables"), variables)
+        checked_guard = await asyncio.to_thread(macros.validate_guard, guard, resolved)
+        staged_steps, submit_step = macros.split_terminal_submit(resolved)
+        outcome = await _execute_actions(staged_steps, continue_on_error=False, record=False)
+        if not outcome.get("success"):
+            return {
+                **outcome,
+                "macro": record["name"],
+                "executed_submit": False,
+                "checkpoint": None,
+                "note": "Staging failed; terminal submit was not dispatched.",
+            }
+        assertions = macros.evaluate_assertions(outcome, checked_guard["assertions"])
+        reserved = await asyncio.to_thread(
+            macros.reserve_checkpoint, checked_guard, submit_step, project_root
+        )
+        return {
+            **outcome,
+            "macro": record["name"],
+            "executed_submit": False,
+            "checkpoint": reserved,
+            "identity": checked_guard["identity"],
+            "assertions": assertions,
+            "note": (
+                "Live semantic assertions passed. Review this result, then call "
+                "op='guarded_commit' once with the checkpoint to attempt terminal submit."
+            ),
+        }
+
+    if op == "guarded_commit":
+        if not checkpoint:
+            raise ValueError("macro op 'guarded_commit' requires checkpoint")
+        # Consume before dispatch: a timeout or lost response is ambiguous, so the
+        # same terminal submit must never be replayed automatically.
+        reserved = await asyncio.to_thread(macros.consume_checkpoint, checkpoint, project_root)
+        outcome = await _execute_actions([reserved["submit_step"]], False, record=False)
+        return {
+            **outcome,
+            "executed_submit": True,
+            "checkpoint": checkpoint,
+            "identity": reserved["identity"],
+            "note": "Checkpoint consumed before dispatch; this submit cannot be replayed.",
+        }
+
     if op == "preview":
         if not name:
             raise ValueError("macro op 'preview' requires name")
-        record = await asyncio.to_thread(macros.load, name)
+        record = await asyncio.to_thread(macros.load, name, project_root)
         resolved = macros.resolve(record["steps"], record.get("variables"), variables)
         return {
             "success": True,
@@ -1259,12 +1328,16 @@ async def browser_macro(
         }
 
     if op == "list":
-        return {"success": True, "macros": await asyncio.to_thread(macros.list_macros)}
+        return {
+            "success": True,
+            "macros": await asyncio.to_thread(macros.list_macros, project_root),
+            "storage": str(macros.macro_root(project_root)),
+        }
 
     if op == "show":
         if not name:
             raise ValueError("macro op 'show' requires name")
-        record = await asyncio.to_thread(macros.load, name)
+        record = await asyncio.to_thread(macros.load, name, project_root)
         return {"success": True, **record}
 
     if op == "delete":
@@ -1272,12 +1345,12 @@ async def browser_macro(
             raise ValueError("macro op 'delete' requires name")
         return {
             "success": True,
-            "deleted": await asyncio.to_thread(macros.delete, name),
+            "deleted": await asyncio.to_thread(macros.delete, name, project_root),
             "name": name,
         }
 
     raise ValueError(
-        f"macro op must be record, save, preview, run, list, show, delete, or cancel, not '{op}'"
+        f"macro op must be record, save, preview, run, guarded_stage, guarded_commit, list, show, delete, or cancel, not '{op}'"
     )
 
 
@@ -1685,7 +1758,7 @@ _AUTOMATION_SKILL = {
     },
     "forms": {
         "prepare": "Inspect fields/options, fill, then reread the form and its selected/current values.",
-        "resume_rule": "Never infer a selected resume/account/option from a URL parameter, remembered default, or prior page; verify the visible selected value in the live form.",
+        "resource_rule": "Never infer a selected file/account/option from a URL parameter, remembered default, or prior page; verify the visible selected value in the live form.",
         "choice_widget": "Open it, reread its options, match exact visible text/value, click the visible option row rather than a hidden radio/input, then reread the collapsed control after rerender.",
         "question_rule": "A heading such as 'answer questions' is boilerplate, not proof that questions exist. Treat only live enabled form controls as questions; after a success message, stop.",
         "final_submit_guard": [
@@ -1704,7 +1777,7 @@ _INFO_TOPICS = {
     "page_outline": "Roles, names, states, refs, and boxes - start looking here.",
     "page_text": "Readable text of the rendered page; params.mode=main|full.",
     "element_text": "One element's whole content: params.selector (CSS/ref/piercing), params.mode=text|html|outer|both, params.full_text for overflow-unclipped text.",
-    "find": "Find an element by meaning: params.query='submit application'.",
+    "find": "Find an element by meaning: params.query='submit request'.",
     "page_elements": "Links, forms, fields, buttons by selector: CSS, '#host >>> #leaf' in a shadow root or frame, or '' when none is unique.",
     "console": "console.log/warn/error and uncaught errors; params.levels, params.contains.",
     "network": "HTTP requests with status, type, ms, size; params.only_errors=true.",

@@ -40,6 +40,7 @@ Startpage are available as fallbacks.
 - [Reading a page](#reading-a-page) · [Locators](#locators)
 - [Console and network diagnostics](#console-and-network-diagnostics)
 - [Forms and multi-step flows](#forms-and-multi-step-flows) · [Reviewable macros](#reviewable-macros)
+- [Architecture invariants](ARCHITECTURE.md) · [Project-local and guarded macros](#project-local-and-guarded-macros)
 - [Canvas and WebGL games](#canvas-and-webgl-games) · [Render modes](#render-modes) · [Input latency](#input-latency)
 - [Two-tool MCP contract](#two-tool-mcp-contract) · [Optional agent skill](#optional-agent-skill)
 - [Optional configuration](#optional-configuration) · [Transport policy](#transport-policy)
@@ -277,7 +278,7 @@ is no automatic substitute. If you would rather not install an extension at all,
 `profile_mode="temporary"` and `profile_mode="persistent"` drive a Selenium
 browser that needs no companion.
 
-The bundled companion is version 1.3.7. Chrome does not refresh an unpacked
+The bundled companion is version 1.3.8. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. Upgrading *onto*
@@ -604,8 +605,8 @@ Sign in to the sites you need in that window, keep it open, then let the agent a
 {
   "actions": [{
     "action": "open",
-    "url": "https://hh.ru/",
-    "session_id": "hh-authorized",
+    "url": "https://example.com/",
+    "session_id": "authorized",
     "headless": false,
     "profile_mode": "attach",
     "debugger_address": "127.0.0.1:9222"
@@ -833,7 +834,7 @@ consequential replay, preview the exact resolved steps with the same variables
 that will be passed to `run`:
 
 ```json
-{"actions":[{"action":"macro","op":"preview","name":"job-apply","variables":{"vacancy_url":"https://example.com/jobs/42","resume_path":"C:/CV/role.pdf"}}]}
+{"actions":[{"action":"macro","op":"preview","name":"document-submit","variables":{"target_url":"https://forms.example/requests/42","resource_path":"C:/docs/request-42.pdf"},"project_root":"C:/work/my-project"}]}
 ```
 
 `preview` loads the saved macro, validates that every placeholder was supplied,
@@ -846,6 +847,72 @@ Preview is a review boundary, not proof that replay will succeed. After `run`,
 check the batch result and freshly inspect the page. For applications, payments,
 messages, or other consequential actions, keep terminal Submit in a separate
 macro or direct action so it is attempted only once after live-state validation.
+
+### Project-local and guarded macros
+
+The engine is universal and domain-neutral. Domain rules belong in a saved macro or its
+calling project, never in Web Search Neo core. Pass an existing absolute `project_root` to
+`save`, `list`, `show`, `preview`, `run`, `guarded_stage`, `guarded_commit`, or `delete` to
+use that project's independent macro set under `.web-search-neo/macros/`. Without it, the
+existing per-user macro store remains the default. Macro names are already traversal-safe;
+the resolved project store is additionally required to remain beneath `project_root`.
+
+Consequential flows use a generic two-phase path. A guarded macro must end in exactly one
+explicit `submit` action. `guarded_stage` resolves the macro, then fails closed unless
+`guard` provides:
+
+- equal `target_url` and `canonical_url`, plus an optional domain-defined `identity_key`;
+- an explicit `allowed_hosts` policy and optional `denied_hosts` policy;
+- an existing absolute `resource_path` that the resolved macro uploads exactly;
+- a stable 16-128 character `idempotency_token` unique to this target;
+- one or more live `assertions` over staged action results.
+
+Host policy is data. Core contains no built-in site categories or denylist. A project can
+deny platforms, production hosts, vendors, or any other domain-specific routes in its own
+macro/configuration. The resolved macro must open the exact canonical target URL.
+
+This neutral document-request example assumes result 2 is a fresh `page_text` checkpoint:
+
+```json
+{
+  "actions": [{
+    "action": "macro",
+    "op": "guarded_stage",
+    "name": "document-request",
+    "project_root": "C:/work/my-project",
+    "variables": {
+      "target_url": "https://forms.example.com/requests/42",
+      "resource_path": "C:/work/my-project/artifacts/request-42.pdf"
+    },
+    "guard": {
+      "target_url": "https://forms.example.com/requests/42",
+      "canonical_url": "https://forms.example.com/requests/42",
+      "identity_key": "request-42",
+      "allowed_hosts": ["example.com"],
+      "denied_hosts": ["staging.example.com"],
+      "resource_path": "C:/work/my-project/artifacts/request-42.pdf",
+      "idempotency_token": "request-42-20260820",
+      "assertions": [
+        {"result_index": 2, "path": "data.text", "contains": "Request 42"}
+      ]
+    }
+  }]
+}
+```
+
+`guarded_stage` dispatches every step except terminal Submit. Only after all staged actions
+succeed and every semantic assertion passes does it reserve a `checkpoint`. Review the
+result and commit once from the same project store:
+
+```json
+{"actions":[{"action":"macro","op":"guarded_commit","checkpoint":"guard-request-42-20260820","project_root":"C:/work/my-project"}]}
+```
+
+The project-local ledger is marked `submit_attempted` *before* Submit dispatch. A timeout,
+lost response, second call, new token for the same target identity, or resource reused for
+another target refuses replay. The guard proves one guarded attempt, not server acceptance;
+inspect durable confirmation separately. Concrete domain macros should live with their
+projects and are not bundled in this repository.
 
 ## Canvas and WebGL games
 

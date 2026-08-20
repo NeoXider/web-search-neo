@@ -174,3 +174,4 @@ chrome-extension/bridge-token.js
 _audit_*.py
 _tmp_*.py
 _tmp_*.json
+msp_server.log*

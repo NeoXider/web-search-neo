@@ -15,15 +15,15 @@ import main
 def macro_root(tmp_path, monkeypatch):
     """Keep every test's macros in its own directory, never the real one."""
     monkeypatch.setenv("WEB_SEARCH_NEO_MACRO_ROOT", str(tmp_path / "macros"))
-    main._RECORDING.update({"active": False, "name": "", "steps": []})
+    main._RECORDING.update({"active": False, "name": "", "steps": [], "project_root": None})
     yield tmp_path
-    main._RECORDING.update({"active": False, "name": "", "steps": []})
+    main._RECORDING.update({"active": False, "name": "", "steps": [], "project_root": None})
 
 
-APPLY_STEPS = [
-    {"action": "open", "url": "{{vacancy_url}}", "session_id": "hh"},
-    {"action": "click", "selector": "[data-qa=vacancy-response-link-top]", "session_id": "hh"},
-    {"action": "fill", "fields": {"textarea[name=text]": "{{cover_letter}}"}, "session_id": "hh"},
+FORM_STEPS = [
+    {"action": "open", "url": "{{target_url}}", "session_id": "form"},
+    {"action": "click", "selector": "#continue", "session_id": "form"},
+    {"action": "fill", "fields": {"textarea[name=notes]": "{{notes}}"}, "session_id": "form"},
 ]
 
 
@@ -31,27 +31,27 @@ APPLY_STEPS = [
 
 
 def test_save_declares_placeholders_and_round_trips():
-    record = macros.save("hh-apply", APPLY_STEPS, description="Apply to one vacancy")
+    record = macros.save("form-flow", FORM_STEPS, description="Complete one request form")
     assert record["step_count"] == 3
-    assert sorted(record["variables"]) == ["cover_letter", "vacancy_url"]
+    assert sorted(record["variables"]) == ["notes", "target_url"]
 
-    loaded = macros.load("hh-apply")
-    assert loaded["steps"] == APPLY_STEPS
-    assert loaded["description"] == "Apply to one vacancy"
+    loaded = macros.load("form-flow")
+    assert loaded["steps"] == FORM_STEPS
+    assert loaded["description"] == "Complete one request form"
 
 
 def test_declared_default_survives_and_beats_auto_declaration():
-    macros.save("greet", [{"action": "open", "url": "{{site}}"}], variables={"site": "https://hh.ru"})
-    assert macros.load("greet")["variables"]["site"] == "https://hh.ru"
+    macros.save("greet", [{"action": "open", "url": "{{site}}"}], variables={"site": "https://example.com"})
+    assert macros.load("greet")["variables"]["site"] == "https://example.com"
 
 
 def test_list_summarises_and_delete_removes():
     macros.save("one", [{"action": "close_all"}])
-    macros.save("two", APPLY_STEPS)
+    macros.save("two", FORM_STEPS)
     listed = {item["name"]: item for item in macros.list_macros()}
     assert set(listed) == {"one", "two"}
     assert listed["two"]["step_count"] == 3
-    assert listed["two"]["variables"] == ["cover_letter", "vacancy_url"]
+    assert listed["two"]["variables"] == ["notes", "target_url"]
 
     assert macros.delete("one") is True
     assert macros.delete("one") is False
@@ -164,11 +164,11 @@ def test_step_count_is_capped():
 
 def test_resolve_fills_nested_strings_and_keeps_whole_value_types():
     steps = [
-        {"action": "open", "url": "https://hh.ru/vacancy/{{id}}"},
+        {"action": "open", "url": "https://example.com/items/{{id}}"},
         {"action": "step", "frames": "{{frames}}", "session_id": "s"},
     ]
     filled = macros.resolve(steps, None, {"id": 42, "frames": 3})
-    assert filled[0]["url"] == "https://hh.ru/vacancy/42"
+    assert filled[0]["url"] == "https://example.com/items/42"
     # A placeholder that is the whole string keeps its native type, so a
     # recorded int parameter still validates on replay.
     assert filled[1]["frames"] == 3
@@ -183,20 +183,20 @@ def test_resolve_reaches_into_dicts_and_lists():
 
 def test_resolve_reports_every_missing_name_at_once():
     with pytest.raises(ValueError) as excinfo:
-        macros.resolve(APPLY_STEPS, {"cover_letter": None, "vacancy_url": None}, {})
+        macros.resolve(FORM_STEPS, {"notes": None, "target_url": None}, {})
     message = str(excinfo.value)
-    assert "cover_letter" in message and "vacancy_url" in message
+    assert "notes" in message and "target_url" in message
 
 
 def test_declared_default_fills_an_unsupplied_variable():
     steps = [{"action": "open", "url": "{{site}}"}]
-    assert macros.resolve(steps, {"site": "https://hh.ru"}, {})[0]["url"] == "https://hh.ru"
+    assert macros.resolve(steps, {"site": "https://example.com"}, {})[0]["url"] == "https://example.com"
 
 
 def test_supplied_value_overrides_the_default():
     steps = [{"action": "open", "url": "{{site}}"}]
-    filled = macros.resolve(steps, {"site": "https://hh.ru"}, {"site": "https://linkedin.com"})
-    assert filled[0]["url"] == "https://linkedin.com"
+    filled = macros.resolve(steps, {"site": "https://example.com"}, {"site": "https://example.org"})
+    assert filled[0]["url"] == "https://example.org"
 
 
 def test_a_placeholder_in_a_dict_key_is_declared_and_filled():
@@ -380,13 +380,13 @@ def test_run_replays_every_step_through_the_dispatcher(monkeypatch):
         return {"success": True, "results": [], "failure_count": 0}
 
     monkeypatch.setattr(main, "_execute_actions", fake_execute)
-    macros.save("apply", APPLY_STEPS)
-    outcome = _call(op="run", name="apply", variables={"vacancy_url": "https://hh.ru/v/1", "cover_letter": "Hi"})
+    macros.save("request", FORM_STEPS)
+    outcome = _call(op="run", name="request", variables={"target_url": "https://example.com/r/1", "notes": "Hi"})
 
-    assert outcome["macro"] == "apply"
+    assert outcome["macro"] == "request"
     assert outcome["step_count"] == 3
-    assert seen[0]["actions"][0]["url"] == "https://hh.ru/v/1"
-    assert seen[0]["actions"][2]["fields"]["textarea[name=text]"] == "Hi"
+    assert seen[0]["actions"][0]["url"] == "https://example.com/r/1"
+    assert seen[0]["actions"][2]["fields"]["textarea[name=notes]"] == "Hi"
     # A replay must not be captured into an open recording as its own steps.
     assert seen[0]["record"] is False
 
@@ -396,28 +396,28 @@ def test_preview_resolves_every_step_without_dispatching(monkeypatch):
         raise AssertionError("preview must not dispatch browser actions")
 
     monkeypatch.setattr(main, "_execute_actions", forbidden_execute)
-    macros.save("apply", APPLY_STEPS, description="Review before applying")
+    macros.save("request", FORM_STEPS, description="Review before sending")
 
     outcome = _call(
         op="preview",
-        name="apply",
-        variables={"vacancy_url": "https://hh.ru/v/42", "cover_letter": "Hello"},
+        name="request",
+        variables={"target_url": "https://example.com/r/42", "notes": "Hello"},
     )
 
     assert outcome["success"] is True
     assert outcome["executed"] is False
-    assert outcome["description"] == "Review before applying"
+    assert outcome["description"] == "Review before sending"
     assert outcome["step_count"] == 3
-    assert outcome["steps"][0]["url"] == "https://hh.ru/v/42"
-    assert outcome["steps"][2]["fields"]["textarea[name=text]"] == "Hello"
+    assert outcome["steps"][0]["url"] == "https://example.com/r/42"
+    assert outcome["steps"][2]["fields"]["textarea[name=notes]"] == "Hello"
     assert "no browser state changed" in outcome["note"]
 
 
 def test_preview_requires_every_variable_before_returning_steps():
-    macros.save("apply", APPLY_STEPS)
+    macros.save("request", FORM_STEPS)
     with pytest.raises(ValueError) as excinfo:
-        _call(op="preview", name="apply", variables={"vacancy_url": "https://hh.ru/v/42"})
-    assert "cover_letter" in str(excinfo.value)
+        _call(op="preview", name="request", variables={"target_url": "https://example.com/r/42"})
+    assert "notes" in str(excinfo.value)
 
 
 def test_concurrent_batches_do_not_interleave_into_one_recording(monkeypatch):
@@ -450,23 +450,23 @@ def test_concurrent_batches_do_not_interleave_into_one_recording(monkeypatch):
 
 
 def test_run_without_required_variables_says_what_is_missing():
-    macros.save("apply", APPLY_STEPS)
-    with pytest.raises(ValueError, match="cover_letter"):
-        _call(op="run", name="apply", variables={"vacancy_url": "https://hh.ru/v/1"})
+    macros.save("request", FORM_STEPS)
+    with pytest.raises(ValueError, match="notes"):
+        _call(op="run", name="request", variables={"target_url": "https://example.com/r/1"})
 
 
 def test_show_returns_the_stored_record_and_list_is_empty_at_first():
     assert _call(op="list")["macros"] == []
-    macros.save("apply", APPLY_STEPS, description="d")
-    shown = _call(op="show", name="apply")
+    macros.save("request", FORM_STEPS, description="d")
+    shown = _call(op="show", name="request")
     assert shown["description"] == "d"
     assert len(shown["steps"]) == 3
 
 
 def test_delete_reports_whether_anything_was_removed():
-    macros.save("apply", APPLY_STEPS)
-    assert _call(op="delete", name="apply")["deleted"] is True
-    assert _call(op="delete", name="apply")["deleted"] is False
+    macros.save("request", FORM_STEPS)
+    assert _call(op="delete", name="request")["deleted"] is True
+    assert _call(op="delete", name="request")["deleted"] is False
 
 
 @pytest.mark.parametrize("op", ["run", "preview", "show", "delete", "record"])
@@ -483,3 +483,221 @@ def test_unknown_op_lists_the_real_ones():
 def test_macro_is_registered_as_an_action():
     assert "macro" in main._ACTIONS
     assert main._ACTIONS["macro"].group == "macro"
+
+
+# --- generic guarded consequential macros ----------------------------------
+
+
+def _guarded_steps():
+    return [
+        {"action": "open", "url": "{{target_url}}", "session_id": "guarded"},
+        {
+            "action": "upload",
+            "selector": "input[type=file]",
+            "file_paths": ["{{resource_path}}"],
+            "session_id": "guarded",
+        },
+        {"action": "page_text", "session_id": "guarded"},
+        {"action": "submit", "form_selector": "form", "session_id": "guarded"},
+    ]
+
+
+def _guard(resource_path, **overrides):
+    guard = {
+        "target_url": "https://forms.example.com/requests/42",
+        "canonical_url": "https://forms.example.com/requests/42/",
+        "identity_key": "request-42",
+        "allowed_hosts": ["example.com"],
+        "denied_hosts": ["blocked.example"],
+        "resource_path": str(resource_path),
+        "idempotency_token": "request-42-20260820",
+        "assertions": [{"result_index": 2, "path": "data.text", "contains": "Request 42"}],
+    }
+    guard.update(overrides)
+    return guard
+
+
+def test_guarded_macro_stages_asserts_then_commits_submit_once(tmp_path, monkeypatch):
+    resource = tmp_path / "request-42.pdf"
+    resource.write_bytes(b"pdf")
+    macros.save("request", _guarded_steps())
+    calls = []
+
+    async def fake_execute(actions, continue_on_error=False, record=True):
+        calls.append(actions)
+        result_data = {} if actions[0]["action"] == "submit" else {"text": "Request 42 ready"}
+        results = [
+            {"index": index, "action": step["action"], "success": True, "data": {}}
+            for index, step in enumerate(actions)
+        ]
+        results[-1]["data"] = result_data
+        return {"success": True, "results": results, "failure_count": 0}
+
+    monkeypatch.setattr(main, "_execute_actions", fake_execute)
+    variables = {
+        "target_url": "https://forms.example.com/requests/42",
+        "resource_path": str(resource.resolve()),
+    }
+    staged = _call(
+        op="guarded_stage",
+        name="request",
+        variables=variables,
+        guard=_guard(resource.resolve()),
+    )
+    assert staged["checkpoint"] == "guard-request-42-20260820"
+    assert staged["executed_submit"] is False
+    assert all(step["action"] != "submit" for step in calls[0])
+    assert _call(op="guarded_commit", checkpoint=staged["checkpoint"])["executed_submit"] is True
+    with pytest.raises(ValueError, match="already submit_attempted"):
+        _call(op="guarded_commit", checkpoint=staged["checkpoint"])
+
+
+def test_host_policy_is_caller_configuration_not_built_in(tmp_path):
+    resource = tmp_path / "resource.bin"
+    resource.write_bytes(b"x")
+    target = "https://blocked.example/requests/42"
+    steps = macros.resolve(
+        _guarded_steps(), None, {"target_url": target, "resource_path": str(resource.resolve())}
+    )
+    with pytest.raises(ValueError, match="policy denies"):
+        macros.validate_guard(
+            _guard(resource, target_url=target, canonical_url=target, allowed_hosts=["blocked.example"]),
+            steps,
+        )
+    allowed = macros.validate_guard(
+        _guard(
+            resource,
+            target_url=target,
+            canonical_url=target,
+            allowed_hosts=["blocked.example"],
+            denied_hosts=[],
+        ),
+        steps,
+    )
+    assert allowed["canonical_url"] == target
+
+
+def test_guard_requires_exact_target_host_and_uploaded_resource(tmp_path):
+    resource = tmp_path / "resource.bin"
+    other = tmp_path / "other.bin"
+    resource.write_bytes(b"x")
+    other.write_bytes(b"y")
+    steps = macros.resolve(
+        _guarded_steps(),
+        None,
+        {
+            "target_url": "https://forms.example.com/requests/42",
+            "resource_path": str(other.resolve()),
+        },
+    )
+    with pytest.raises(ValueError, match="exact guard.resource_path"):
+        macros.validate_guard(_guard(resource.resolve()), steps)
+    with pytest.raises(ValueError, match="explicitly allow"):
+        macros.validate_guard(_guard(other, allowed_hosts=["other.example"]), steps)
+    with pytest.raises(ValueError, match="must equal"):
+        macros.validate_guard(
+            _guard(other, canonical_url="https://forms.example.com/requests/99"), steps
+        )
+
+
+def test_failed_assertion_does_not_create_checkpoint(tmp_path, monkeypatch):
+    resource = tmp_path / "resource.bin"
+    resource.write_bytes(b"x")
+    macros.save("request", _guarded_steps())
+
+    async def fake_execute(actions, continue_on_error=False, record=True):
+        return {"success": True, "results": [{"data": {}}, {"data": {}}, {"data": {"text": "No"}}]}
+
+    monkeypatch.setattr(main, "_execute_actions", fake_execute)
+    with pytest.raises(ValueError, match="assertion 0 failed"):
+        _call(
+            op="guarded_stage",
+            name="request",
+            variables={
+                "target_url": "https://forms.example.com/requests/42",
+                "resource_path": str(resource.resolve()),
+            },
+            guard=_guard(resource.resolve()),
+        )
+    assert not macros._guarded_ledger_path().exists()
+
+
+def test_resource_and_identity_reservations_prevent_reuse(tmp_path):
+    first = tmp_path / "first.bin"
+    second = tmp_path / "second.bin"
+    first.write_bytes(b"1")
+    second.write_bytes(b"2")
+
+    def checked(resource, token, target="https://forms.example.com/requests/42"):
+        steps = macros.resolve(
+            _guarded_steps(), None, {"target_url": target, "resource_path": str(resource.resolve())}
+        )
+        return macros.validate_guard(
+            _guard(
+                resource.resolve(),
+                target_url=target,
+                canonical_url=target,
+                identity_key=target.rsplit("/", 1)[-1],
+                idempotency_token=token,
+            ),
+            steps,
+        )
+
+    macros.reserve_checkpoint(checked(first, "first-token-20260820"), {"action": "submit"})
+    with pytest.raises(ValueError, match="identity was already staged"):
+        macros.reserve_checkpoint(checked(second, "second-token-20260820"), {"action": "submit"})
+    with pytest.raises(ValueError, match="another target"):
+        macros.reserve_checkpoint(
+            checked(first, "third-token-20260820", "https://forms.example.com/requests/43"),
+            {"action": "submit"},
+        )
+
+
+def test_guarded_macro_requires_one_terminal_explicit_submit():
+    with pytest.raises(ValueError, match="exactly one"):
+        macros.split_terminal_submit([{"action": "click", "text": "Confirm"}])
+    with pytest.raises(ValueError, match="exactly one"):
+        macros.split_terminal_submit([{"action": "submit"}, {"action": "page_text"}])
+
+
+def test_project_roots_keep_macro_sets_and_ledgers_separate(tmp_path):
+    project_a = tmp_path / "a"
+    project_b = tmp_path / "b"
+    project_a.mkdir()
+    project_b.mkdir()
+    macros.save("same-name", [{"action": "open", "url": "https://a.example"}], project_root=project_a)
+    macros.save("same-name", [{"action": "open", "url": "https://b.example"}], project_root=project_b)
+    assert macros.load("same-name", project_a)["steps"][0]["url"] == "https://a.example"
+    assert macros.load("same-name", project_b)["steps"][0]["url"] == "https://b.example"
+    assert macros.macro_root(project_a) == project_a / ".web-search-neo" / "macros"
+    assert _call(op="list", project_root=str(project_a))["storage"] == str(macros.macro_root(project_a))
+    with pytest.raises(ValueError, match="existing absolute"):
+        macros.macro_root("relative/project")
+
+
+def test_recording_remembers_its_project_store_until_save(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    _call(op="record", name="recorded-local", project_root=str(project))
+    main._record_step("open", {"url": "https://example.com"})
+    saved = _call(op="save")
+    assert saved["name"] == "recorded-local"
+    assert macros.load("recorded-local", project)["steps"][0]["url"] == "https://example.com"
+    with pytest.raises(ValueError, match="does not exist"):
+        macros.load("recorded-local")
+
+
+def test_guard_checkpoint_is_available_only_in_its_project(tmp_path):
+    project_a = tmp_path / "a"
+    project_b = tmp_path / "b"
+    project_a.mkdir()
+    project_b.mkdir()
+    guard = {
+        "identity": "https://example.com/request/1",
+        "resource_path": str((tmp_path / "resource.bin").resolve()),
+        "idempotency_token": "project-local-token-1",
+    }
+    checkpoint = macros.reserve_checkpoint(guard, {"action": "submit"}, project_a)
+    with pytest.raises(ValueError, match="unknown guarded checkpoint"):
+        macros.consume_checkpoint(checkpoint, project_b)
+    assert macros.consume_checkpoint(checkpoint, project_a)["state"] == "submit_attempted"

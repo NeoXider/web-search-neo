@@ -230,7 +230,7 @@ script. Every action is recordable, and a replay dispatches through the same val
 coordinates), and the scripting, cookie, storage, captcha, stealth, and request-replay actions
 record and replay just like `open`, `fill`, and `submit` do.
 
-Before replaying a consequential task, call `macro op=preview name=hh-apply` with the
+Before replaying a consequential task, call `macro op=preview name=review-form` with the
 same `variables` planned for `run`. It resolves every placeholder and returns the exact
 steps with `executed=false`, without dispatching an action or changing browser state. This
 is the review point for a final URL, form values, an upload path, or a submit step.
@@ -246,6 +246,31 @@ Macros are files and outlive the server; `op=list` summarises them and `op=delet
 one. A macro cannot run another macro — run them in order instead. A replay reports like any
 batch, so check `failure_count` and each `results[i].success`: a saved click path is exactly
 as fragile as the page it was recorded from, and a site redesign invalidates it silently.
+
+The macro engine is universal and domain-neutral. Never add recruitment, commerce, finance,
+or other domain policy to core. Put domain rules in project-owned saved macros/configuration;
+only neutral broadly useful examples belong in the engine repository.
+
+Pass an existing absolute `project_root` to any macro operation to use that project's
+`.web-search-neo/macros/` set. Without it, the existing user store remains active. Always pass
+the same project root to `guarded_stage` and `guarded_commit`, because its idempotency ledger
+is project-local too.
+
+For a consequential flow, keep one explicit terminal `submit` as the last step and use:
+
+1. `op=guarded_stage` with `guard.target_url`, equal `canonical_url`, optional domain-defined
+   `identity_key`, explicit `allowed_hosts`, optional `denied_hosts`, a unique idempotency
+   token, and an existing absolute `resource_path` uploaded by that run.
+2. Live semantic assertions such as
+   `{"result_index":2,"path":"data.text","contains":"Request 42"}`. Stage executes
+   everything except Submit and returns no checkpoint if an action or assertion fails.
+3. Review the staged result. Only then call `op=guarded_commit` once with its checkpoint.
+
+Core has no built-in host categories: allow/deny policy is supplied by the macro or caller.
+The project ledger reserves canonical target/identity, resource path, and token, and consumes
+the checkpoint before Submit dispatch, so an ambiguous timeout cannot cause an automatic
+retry. Inspect the destination response separately; the guard proves one attempt, not remote
+acceptance.
 
 ## Captchas
 
