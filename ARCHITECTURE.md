@@ -5,9 +5,9 @@ storage, validation, guards, and documentation primitives must not encode recrui
 sites, commerce vendors, or any other domain-specific workflow or host policy.
 
 Domain behavior belongs in saved macros, templates, and configuration owned by the calling
-project. Only neutral, broadly useful examples may be bundled in this repository. In
-particular, the Unity application macro belongs outside this repository at
-`D:\AI\outputs\unity-job-agent\.web-search-neo\macros\`.
+project. Only neutral, broadly useful examples may be bundled in this repository. Concrete
+project macros belong under that project's `.web-search-neo/macros/` directory and must not
+be copied into the MCP repository.
 
 ## Macro storage
 
@@ -23,9 +23,13 @@ particular, the Unity application macro belongs outside this repository at
 
 The generic `guarded_stage` / `guarded_commit` protocol provides canonical target identity,
 optional domain identity, caller-supplied host allow/deny policy, exact uploaded-resource
-binding, assertions against live staged results, and a persistent one-time token. The
-terminal Submit is held back during staging and its checkpoint is consumed before dispatch,
-so retry after an ambiguous result fails closed.
+binding, assertions against live staged results, and a persistent one-time token. Exactly one
+terminal consequential action is held back during staging: either an explicit Submit or a safe
+Click. Guarded Click accepts only a plain CSS selector with a live unique-match check at
+dispatch, or exact rendered text plus an explicit role through the ambiguity-refusing semantic
+dispatcher. Coordinates, trusted centre clicks, substring text, ref handles, piercing paths,
+and embedded Submit steps are refused. The checkpoint is consumed before dispatch, so retry
+after an ambiguous result fails closed.
 
 Canonical target identity preserves the complete query string because a query parameter can
 be the only distinction between two resources or requisitions on one shared path. URL

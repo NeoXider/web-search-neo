@@ -174,4 +174,12 @@ chrome-extension/bridge-token.js
 _audit_*.py
 _tmp_*.py
 _tmp_*.json
+_tmp_*.txt
 msp_server.log*
+
+# Рабочие заметки о ходе работ и аудитов: живут у автора, в клоны не едут.
+# Их коммит означает, что чужой чекаут получает чужой недописанный черновик,
+# а `git status` перестаёт быть сигналом «есть что коммитить».
+PROGRESS.*.md
+PROGRESS_*.md
+*.audit.md

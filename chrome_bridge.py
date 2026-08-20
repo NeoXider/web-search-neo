@@ -286,6 +286,12 @@ class ChromeBridge:
         self._daemon: Any = None
         self._daemon_version = ""
         self._daemon_pid: int | None = None
+        # The other tenants of this bridge, as the daemon last described them.
+        # Kept because nothing else in this process can know them: a second MCP
+        # server is invisible from here, and the first sign of one used to be a
+        # tab claim coming back refused.
+        self._daemon_clients: int | None = None
+        self._daemon_claims: list[dict[str, Any]] = []
         # tab id -> the browser run it was granted under. Kept so that a link
         # rebuilt after a drop can ask for the same tabs again: the daemon ties a
         # claim to the connection that made it, and connections do not last.
@@ -679,20 +685,33 @@ class ChromeBridge:
             self._daemon_pid = None
 
     def _retire(self, connection: Any, expected: str) -> None:
+        request_id = uuid.uuid4().hex
         try:
             connection.send(
                 json.dumps(
                     {
                         "type": "control",
-                        "id": uuid.uuid4().hex,
+                        "id": request_id,
                         "method": "shutdown",
                         "reason": f"replaced by version {expected}",
                     }
                 )
             )
-            # The daemon acks before it stops; reading it also lets the close
-            # frame arrive before we dial the port again.
-            connection.recv(timeout=5.0)
+            # The daemon acks before it stops, and waiting for that ack is what
+            # keeps the next dial from landing on a daemon that is already
+            # refusing connections - a 503 that surfaces as an unexplained
+            # transport error instead of the version conflict being handled here.
+            # It has to be *that* ack, though: the daemon pushes state to every
+            # client whenever the crowd or the claims change, so the next frame
+            # on the wire is not reliably the answer to this question.
+            deadline = time.monotonic() + 5.0
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("the outdated daemon did not acknowledge the stop")
+                frame = json.loads(connection.recv(timeout=remaining))
+                if isinstance(frame, dict) and str(frame.get("id", "")) == request_id:
+                    break
         except Exception as exc:
             LOGGER.warning(
                 "The outdated bridge daemon did not answer the stop request: %s: %s",
@@ -816,6 +835,11 @@ class ChromeBridge:
                     self._connected.clear()
                     self._daemon_version = ""
                     self._daemon_pid = None
+                    # Who else was on the bridge is a fact about a daemon we no
+                    # longer talk to; reporting it after the link ended would
+                    # describe a room this process has left.
+                    self._daemon_clients = None
+                    self._daemon_claims = []
             # A caller blocked on an answer that can no longer come must be told
             # so, rather than sit out its whole timeout.
             self._fail_pending(
@@ -849,6 +873,12 @@ class ChromeBridge:
                 self._daemon_version = str(state.get("version") or "")
             if state.get("pid") is not None:
                 self._daemon_pid = state.get("pid")
+            if isinstance(state.get("clients"), int):
+                self._daemon_clients = int(state["clients"])
+            if isinstance(state.get("claims"), list):
+                self._daemon_claims = [
+                    dict(item) for item in state["claims"] if isinstance(item, dict)
+                ]
             if state.get("connected"):
                 self._connected.set()
             else:
@@ -1018,15 +1048,40 @@ class ChromeBridge:
         ``daemon.server_version`` is this server's own. Both are there because a
         skew between them is the thing being diagnosed, and one number cannot
         show a difference.
+
+        ``daemon.clients`` counts every MCP server on this bridge, this one
+        included, and ``daemon.claims`` lists every tab any of them is driving,
+        with ``mine`` telling ours from theirs. Neither can be worked out inside
+        this process, and without them "is another agent using this browser?" had
+        no answer short of trying something and being refused.
+
+        ``held_seconds`` on a claim is worked out here, from the wall-clock
+        instant the daemon sent, rather than taken ready-made: the claim list
+        arrives when a claim changes and is then read whenever somebody asks, so
+        a duration measured at send time would age silently in between and report
+        a tab held for an hour as one held for a second.
         """
         connected = self.wait_connected(wait_seconds)
         server_version = self._expected_version()
+        now = time.time()
         with self._state_lock:
+            mine = set(self._claimed)
             daemon = {
                 "linked": self._daemon is not None,
                 "version": self._daemon_version or None,
                 "pid": self._daemon_pid,
                 "server_version": server_version or None,
+                "clients": self._daemon_clients,
+                "claims": [
+                    {
+                        **claim,
+                        "mine": claim.get("tab_id") in mine,
+                        "held_seconds": round(
+                            max(0.0, now - float(claim.get("since") or now)), 1
+                        ),
+                    }
+                    for claim in self._daemon_claims
+                ],
             }
         return {
             "connected": connected,
@@ -1791,12 +1846,46 @@ class ChromeBridgeDriver:
 
 
 def list_current_chrome_tabs(wait_seconds: float = 1.0) -> dict[str, Any]:
+    """Every normal tab in the user's Chrome, with the ones already driven marked.
+
+    The mark is the point. This list is what an agent reads before it picks a tab
+    to attach to, and until the claim register was visible from here the only way
+    to learn that another agent held tab 42 was to ask for it and be refused -
+    after which the sensible move (pick a different one) needed this same list
+    again, still unmarked. ``driven_by`` names the holder; ``driven_by_me`` tells
+    a tab this server already owns from a stranger's.
+    """
     bridge = get_chrome_bridge()
     status = bridge.status(wait_seconds)
     if not status["connected"]:
         return {**status, "tabs": []}
     tabs = bridge.request("tabs.list", timeout=10.0)
-    return {**status, "tabs": tabs}
+    if not isinstance(tabs, list):
+        # Whatever the companion answered is the caller's to see; marking it up
+        # is an improvement, not a filter, and must not turn an odd answer into
+        # an exception from a listing call.
+        return {**status, "tabs": tabs}
+    claims = {
+        claim.get("tab_id"): claim
+        for claim in (status.get("daemon") or {}).get("claims") or []
+    }
+    marked = []
+    for tab in tabs:
+        if not isinstance(tab, dict):
+            marked.append(tab)
+            continue
+        claim = claims.get(tab.get("id"))
+        marked.append(
+            tab
+            if claim is None
+            else {
+                **tab,
+                "driven_by": claim.get("holder"),
+                "driven_by_me": bool(claim.get("mine")),
+                "driven_for_seconds": claim.get("held_seconds"),
+            }
+        )
+    return {**status, "tabs": marked}
 
 
 atexit.register(_bridge.shutdown)

@@ -231,7 +231,7 @@ limits, and worked examples. `web_info(topic="action_schema", params={"action":
 | Semantic page reading | `page_outline`, `page_text`, `element_text`, and `find` return roles, accessible names, states, boxes, and `ref:<epoch>:N` handles across open Shadow DOM and same-origin iframes — and `element_text` hands over the whole content of one element, overflow-clipped tails included. |
 | Visible failures | The `console` and `network` topics surface console output, uncaught exceptions with stack frames, and every HTTP request with status, type, duration, and size — recorded from the session's first navigation, not from the first time someone asks. |
 | Deterministic frames | Gated render modes freeze `performance.now()`/`Date.now()` and queue page timers, so a released frame is a fixed delta instead of the agent's thinking time. |
-| Concurrent work | Search, HTTP fetches, and independent browser sessions run outside the MCP event loop; up to four browser sessions can work in parallel. |
+| Concurrent work | Search, HTTP fetches, and independent browser sessions run outside the MCP event loop; four browser sessions work in parallel by default (`WEB_SEARCH_NEO_MAX_SESSIONS` raises it). Agents running side by side must each take their own `session_id`, because that is the only thing separating them inside one server. |
 
 ## Connect your already-open Chrome
 
@@ -278,7 +278,7 @@ is no automatic substitute. If you would rather not install an extension at all,
 `profile_mode="temporary"` and `profile_mode="persistent"` drive a Selenium
 browser that needs no companion.
 
-The bundled companion is version 1.3.9. Chrome does not refresh an unpacked
+The bundled companion is version 1.3.10. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. Upgrading *onto*
@@ -359,21 +359,43 @@ that is the case where the badge stays on all day. Set
 a daemon inherits the environment of the server that spawned it, so setting it in
 the MCP client configuration is enough.
 
-The daemon reports its version during the client handshake. A client whose
-`__version__` differs asks it to exit and starts one of its own, so a daemon
-started before a `git pull` cannot keep serving the old code. It will do that
-twice; if a third daemon still reports the wrong version, it stops instead of
-replacing daemons forever and reports an error naming both versions. That error
-is latched — later calls repeat it rather than restarting the tug-of-war — and it
-means another checkout of Web Search Neo is running against the same port. Stop
-that one, then restart this server.
+The daemon reports its version during the client handshake, and versions are
+ranked by component rather than compared as text — `1.3.10` is newer than
+`1.3.9`, which the string order gets backwards. Only a **strictly older** daemon
+is asked to exit and replaced with one of this server's own, so a daemon started
+before a `git pull` cannot keep serving the old code.
+
+A daemon that is **newer** than the server talking to it is used, not replaced.
+That is the ordinary state of an updated machine, not a fault: an MCP server
+keeps running the revision it imported at startup, so after a `git pull` every
+daemon started from `main.py` is ahead of the server that started it. Refusing
+that was unfixable from the user's side — the server evicted the newer daemon,
+started a replacement from the same updated file, was handed the same newer
+version again, and after two rounds gave up with an error blaming a second
+checkout that did not exist. What matters for sharing a companion is the bridge
+protocol, not the release number, and that is now the only skew that stops the
+server: the message names the protocol each side speaks instead of guessing at a
+cause.
+
+Replacing an older daemon still gives up after two attempts, and the error names
+both versions — and, when this process is running code the checkout no longer
+has, says so and tells you to restart the MCP server rather than hunt for another
+clone. The error is latched so that later calls do not restart the tug-of-war,
+but the latch expires after ten seconds
+(`WEB_SEARCH_NEO_BRIDGE_RECHECK_SECONDS`) and the look that follows is passive —
+it starts no daemon and evicts none — so the state clears itself once the other
+side is stopped, instead of surviving until someone restarts the server by hand.
 
 `web_info(topic="browser_status")` reports the link under `current_chrome.daemon`:
-`linked` says whether this server currently holds one, and `version` and `pid`
-come from the daemon's own handshake, so they identify the process that would be
-replaced. `current_chrome.connected` still means what it always did — the
-companion itself is attached — and a `daemon.linked: true` with
-`connected: false` is exactly the case of a running bridge with Chrome closed.
+`linked` says whether this server currently holds one, `version` and `pid` come
+from the last handshake this server completed on that port — whether or not it
+went on to link — and `server_version` is this server's own, so a skew is visible
+as two numbers side by side. `version` and `pid` are cleared when the link ends;
+they used to survive it, so a `startup_error` about the daemon now on the port
+could sit next to the version of a daemon that had already exited.
+`current_chrome.connected` still means what it always did — the companion itself
+is attached — and a `daemon.linked: true` with `connected: false` is exactly the
+case of a running bridge with Chrome closed.
 
 ### Bridge authentication
 
@@ -571,6 +593,26 @@ client's socket does — including an abrupt one, so a crashed agent cannot stra
 a tab. A client that reconnects re-asserts its claims, and gives up any it lost.
 When there is no daemon to ask, nothing is guarding the browser and the claim is
 skipped rather than failing closed.
+
+That register is also readable, which it had to become: a refusal arrives after an
+agent has already chosen a tab, and the list it chose from said nothing. Every
+client is told who else is on the bridge — `browser_status` reports
+`current_chrome.daemon.clients` and a `claims` list naming each held tab, its
+holder and whether it is ours — and `browser_tabs` marks a tab another agent is
+driving with `driven_by`, so the choice is informed rather than corrected.
+
+Agents inside **one** MCP server are not separated by any of that. Subagents of a
+single run share one server process, so `session_id` is the only thing between
+them, and two that both leave it at its default `"default"` are handed the same
+session and the same tab: each one's navigation and typing lands in the other's
+page. Nothing here can arbitrate — an MCP call carries no caller identity — so
+the server does the one useful thing instead of pretending otherwise and says so:
+`sessions_in_use` lists the sessions another caller is inside right now, and
+`shared_session` with a warning appears on `browser_status` and on `open` when
+this session is one of them. Give each agent its own `session_id` and they get a
+tab each. The four-session cap is per process, so parallel agents share it too;
+`WEB_SEARCH_NEO_MAX_SESSIONS` raises it, and the refusal at the cap says so.
+`close_all` is likewise per process and ends every agent's work, not only yours.
 
 Sessions are pinned to the browser run they were opened in. Tab ids restart with
 Chrome, so a session that outlived a restart would address whatever tab inherited
@@ -840,13 +882,13 @@ that will be passed to `run`:
 `preview` loads the saved macro, validates that every placeholder was supplied,
 and returns the resolved `steps` with `executed: false`. It never dispatches an
 action or changes browser state. Review the canonical URL, form values, upload
-path, and whether a terminal submit is present before sending the corresponding
+path, and whether a terminal consequential action is present before sending the corresponding
 `op: "run"` call.
 
 Preview is a review boundary, not proof that replay will succeed. After `run`,
 check the batch result and freshly inspect the page. For applications, payments,
-messages, or other consequential actions, keep terminal Submit in a separate
-macro or direct action so it is attempted only once after live-state validation.
+messages, or other consequential actions, use the guarded two-phase path below so the exact
+terminal Submit or safe Click is attempted only once after live-state validation.
 
 ### Project-local and guarded macros
 
@@ -858,7 +900,11 @@ existing per-user macro store remains the default. Macro names are already trave
 the resolved project store is additionally required to remain beneath `project_root`.
 
 Consequential flows use a generic two-phase path. A guarded macro must end in exactly one
-explicit `submit` action. `guarded_stage` resolves the macro, then fails closed unless
+consequential action: explicit `submit`, or a safe `click`. A terminal click must be either
+a plain CSS selector (required to match exactly one live element immediately before commit)
+or exact rendered `text` plus an explicit `role` (the semantic dispatcher refuses zero or
+multiple matches). Coordinates, `trusted=true`, substring text, ref handles, piercing paths,
+and non-terminal submits fail closed. `guarded_stage` resolves the macro, then fails closed unless
 `guard` provides:
 
 - equal `target_url` and `canonical_url`, plus an optional domain-defined `identity_key`; query parameters are preserved because they may carry the target/requisition identity, while fragments are ignored;
@@ -900,7 +946,7 @@ This neutral document-request example assumes result 2 is a fresh `page_text` ch
 }
 ```
 
-`guarded_stage` dispatches every step except terminal Submit. Only after all staged actions
+`guarded_stage` dispatches every step except the terminal consequential action. Only after all staged actions
 succeed and every semantic assertion passes does it reserve a `checkpoint`. Review the
 result and commit once from the same project store:
 
@@ -908,9 +954,11 @@ result and commit once from the same project store:
 {"actions":[{"action":"macro","op":"guarded_commit","checkpoint":"guard-request-42-20260820","project_root":"C:/work/my-project"}]}
 ```
 
-The project-local ledger is marked `submit_attempted` *before* Submit dispatch. A timeout,
+The project-local ledger is marked `<action>_attempted` *before* terminal dispatch. A timeout,
 lost response, second call, new token for the same target identity, or resource reused for
-another target refuses replay. The guard proves one guarded attempt, not server acceptance;
+another target refuses replay. Every one of those refusals is final by design, so each names
+the ledger file it is refusing from — otherwise a stage whose commit never ran leaves a target
+that can never be staged again and nothing to look at. The guard proves one guarded attempt, not server acceptance;
 inspect durable confirmation separately. Concrete domain macros should live with their
 projects and are not bundled in this repository.
 
@@ -1065,7 +1113,7 @@ web_info(topic='action_schema', params={'action': '<name>'}) for the full schema
 
 Existing direct Python imports remain available. For temporary MCP-client migration only, set `WEB_SEARCH_NEO_LEGACY_TOOLS=1` before starting the server to advertise the former narrow tool list instead of the compact default.
 
-Browser state is keyed by `session_id`. The `open_many` action can create up to four independent sessions concurrently. A viewport screenshot with no dimensions preserves the current viewport in every mode. An explicit viewport `width`/`height` pair is exact in isolated Selenium modes and is refused in `current` mode, where the MCP never resizes the user's Chrome; use `mode="region"` there for an exact-size image. Full-page captures above `3840x10000` fail explicitly instead of returning an unlabelled partial image.
+Browser state is keyed by `session_id`, and that key is also the boundary between agents working at the same time: one `session_id` is one tab, so parallel agents must not share one. The `open_many` action can create up to four independent sessions concurrently, and `WEB_SEARCH_NEO_MAX_SESSIONS` moves that ceiling. A viewport screenshot with no dimensions preserves the current viewport in every mode. An explicit viewport `width`/`height` pair is exact in isolated Selenium modes and is refused in `current` mode, where the MCP never resizes the user's Chrome; use `mode="region"` there for an exact-size image. Full-page captures above `3840x10000` fail explicitly instead of returning an unlabelled partial image.
 
 Image-guided clicking is available through `pointer` with
 `pointer_action="click"` and viewport CSS `x`/`y`. Take a fresh viewport screenshot;
@@ -1118,6 +1166,12 @@ server process: a daemon inherits the environment of whichever server spawns it.
 | `WEB_SEARCH_NEO_BRIDGE_CONNECT_TIMEOUT` | How long a server keeps trying to reach a daemon, including one it started itself, default `12` seconds. |
 | `WEB_SEARCH_NEO_BRIDGE_START_TIMEOUT` | How long server startup waits for that first attempt before continuing in the background, default `2` seconds. |
 
+One more is about the server rather than the bridge:
+
+| Variable | Effect |
+| --- | --- |
+| `WEB_SEARCH_NEO_MAX_SESSIONS` | Browser sessions one server holds at once, default `4`, capped at `64`. Per process, so agents running in parallel share the allowance; the refusal at the cap names this variable. |
+
 Only use a proxy you are authorized to use. HTTP sessions use desktop browser headers, connection pooling, bounded response sizes, and conservative retry/backoff. Rendered pages use the installed Chrome's native matching User-Agent unless explicitly overridden.
 
 ### Transport policy
@@ -1147,11 +1201,11 @@ The deterministic suite is 576 tests, grouped by what they protect:
 | Locators | The three forms and their escaping, refs that refuse to resolve in another document or after their element was removed, valid CSS that merely contains ` >>> `. |
 | Diagnostics | The companion's console and network buffers with their ring-buffer eviction, capture armed at open so the very first navigation is reported, a claimed tab recorded only from the claim, and a subscription that failed at open repaired on the next read. |
 | Companion bridge | The handshake — a client without the token, a hello without a nonce, a newer companion evicting an older one, and WebCrypto HMAC agreeing with the Python signature — origin checks, tab grouping, and confirmation-gated Chrome setup that publishes the token before touching Chrome. |
-| Bridge daemon | Two MCP servers with commands in flight at once, two servers starting together converging on one daemon, a client never mistaken for the browser, an in-flight command failing instead of hanging when the daemon dies, a daemon of the same version left alone while an outdated one is replaced, a second outdated replacement reported instead of looped over, the idle exit once neither browser nor client is left, and `--bridge --stop` against a running daemon and against none. |
-| Forms | Multipart upload, form filling, native validation, values read back off the control so a refused write is not a success, exact PNG viewport size. |
+| Bridge daemon | Two MCP servers with commands in flight at once, two servers starting together converging on one daemon, a client never mistaken for the browser, an in-flight command failing instead of hanging when the daemon dies, a daemon of the same version left alone while an outdated one is replaced, a *newer* daemon used rather than evicted by the server it outranks, versions ranked component by component so `1.3.10` outranks `1.3.9`, two checkouts on one port settling on the newer daemon, a second outdated replacement reported instead of looped over — with the reported `daemon.version` being the one the error names — a conflict that clears itself once the other side stops, a daemon of another bridge protocol refused by name, the idle exit once neither browser nor client is left, `--bridge --stop` against a running daemon and against none, each client seeing how many agents share the bridge and which tabs they hold, a departure taken off that list, a tab list that marks what another agent is already driving, a handshake that still gets its acknowledgement while the bridge is broadcasting, and a stop request that waits for its own answer rather than the next frame. |
+| Forms | Multipart upload, form filling, native validation, values read back off the control so a refused write is not a success, exact PNG viewport size, a guarded terminal click that counts its matches in the page and so works in the user's own Chrome as well as a Selenium one, and guarded refusals that name the ledger they refuse from. |
 | Challenges | A captcha that blocks told apart from one merely present on the page, and the providers a top-level query walked past — DataDome, AWS WAF, a challenge one frame down, and one in a shadow root. |
 | Games and input | Canvas probing, normal/throttled/step rendering, atomic mixed input, held modifiers across a batch, gate and held-input reset on navigation, coordinates that follow a frame's CSS transforms, key spellings that release each other, and a virtual clock whose intervals keep their period. |
-| Sessions | Sessions that close the tabs they own, concurrent sessions, persistent storage, a session dropped when the browser it was opened in is gone, a borrowed tab handed back instead of navigated, and a real managed-Chrome attach/detach that leaves Chrome running. |
+| Sessions | Sessions that close the tabs they own, concurrent sessions, persistent storage, a session dropped when the browser it was opened in is gone, a borrowed tab handed back instead of navigated, a real managed-Chrome attach/detach that leaves Chrome running, a second caller inside one session reported rather than swallowed (and a reentrant one not mistaken for it), and a full session cap that names the setting which lifts it. |
 
 Public search engines may rate-limit an IP or region, so live internet smoke checks are kept separate from deterministic tests. `scripts/live_smoke.py` runs a search, opens two pages concurrently, fills and submits a public Selenium test form, uploads a file, and verifies exact screenshot dimensions; it does not cover games. `scripts/companion_live_smoke.py` reaches the network too, though its subject is the extension: it starts a disposable Chromium with the companion loaded and drives whatever `--url` names, which defaults to `https://example.com`. Public game sites change without notice, so the frame gate, input atomicity, and held-input recovery are verified by the deterministic local suite instead.
 

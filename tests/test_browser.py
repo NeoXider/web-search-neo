@@ -189,6 +189,129 @@ def test_click_text_uses_exact_text_and_role_and_refuses_ambiguity(local_site):
     assert driver.execute_script("return document.body.dataset.clicked") == "two"
 
 
+def test_guarded_selector_click_requires_exactly_one_live_css_match(local_site):
+    _open_or_skip(f"{local_site.base_url}/form", "guarded-selector-click")
+    clicked = browser_tools.click(
+        "#action-button",
+        session_id="guarded-selector-click",
+        wait_seconds=0,
+        selector_must_be_unique=True,
+    )
+    assert clicked["success"] is True
+    assert clicked["selector_must_be_unique"] is True
+    with pytest.raises(ValueError, match="exactly one match"):
+        browser_tools.click(
+            "button",
+            session_id="guarded-selector-click",
+            wait_seconds=0,
+            selector_must_be_unique=True,
+        )
+    with pytest.raises(ValueError, match="plain CSS only"):
+        browser_tools.click(
+            "ref:1:2",
+            session_id="guarded-selector-click",
+            wait_seconds=0,
+            selector_must_be_unique=True,
+        )
+
+
+class _FakeUniqueClickDriver:
+    """The extension-backed driver, in the respects a guarded click depends on.
+
+    Deliberately exactly that and no more: the real `ChromeBridgeDriver` has
+    `find_element` and no `find_elements`, so a fake that grew the plural one to
+    be convenient would hide the very difference this test exists to pin.
+    """
+
+    is_extension_bridge = True
+
+    def __init__(self, matches: int) -> None:
+        self.matches = matches
+        self.switch_to = _FakeSwitchTo()
+        self.clicked: list[str] = []
+
+    def execute_script(self, script, *args):
+        if script == browser_tools._MATCH_COUNT_SCRIPT:
+            return self.matches
+        if script == browser_tools._PAGE_SUMMARY_SCRIPT:
+            return {"url": "https://example.test/", "title": "Page"}
+        return None
+
+    def find_element(self, by, value):
+        assert by == "css selector"
+        return _FakeUniqueElement(self, value)
+
+    # Teardown only: the autouse fixture closes every session after each test.
+    def execute_cdp_cmd(self, *_args, **_kwargs):
+        return {}
+
+    def close_tab(self, **_kwargs):
+        return {"removed": True}
+
+    def quit(self):
+        return {"detached": True}
+
+
+class _FakeUniqueElement:
+    def __init__(self, driver: _FakeUniqueClickDriver, selector: str) -> None:
+        self.driver = driver
+        self.selector = selector
+
+    def is_displayed(self) -> bool:
+        return True
+
+    def is_enabled(self) -> bool:
+        return True
+
+    def click(self) -> None:
+        self.driver.clicked.append(self.selector)
+
+
+def test_a_guarded_click_works_in_the_users_own_chrome_too():
+    """`profile_mode="current"` is the default, and its driver is not Selenium's.
+
+    The uniqueness check counted matches with `find_elements`, which only the
+    Selenium driver has. In the user's real Chrome the same call raised
+    `AttributeError` - and it raised it inside `guarded_commit`, after the
+    checkpoint had already been consumed, so the one-time guard was spent on an
+    action that never happened. That is precisely the outcome the two-phase
+    protocol exists to prevent, so the count has to be taken from the page,
+    which both driver kinds can do.
+    """
+    driver = _FakeUniqueClickDriver(matches=1)
+    browser_tools._sessions["bridge-guarded"] = browser_tools.BrowserSession(
+        driver=driver, headless=False, profile_mode="current", owns_tab=True
+    )
+    assert not hasattr(driver, "find_elements"), "the fake is kinder than the real driver"
+
+    clicked = browser_tools.click(
+        "#confirm",
+        session_id="bridge-guarded",
+        wait_seconds=0,
+        selector_must_be_unique=True,
+    )
+    assert clicked["success"] is True and driver.clicked == ["#confirm"]
+
+    # And the refusal still refuses, by counting rather than by failing to count.
+    driver.matches = 3
+    with pytest.raises(ValueError, match="found 3"):
+        browser_tools.click(
+            "#confirm",
+            session_id="bridge-guarded",
+            wait_seconds=0,
+            selector_must_be_unique=True,
+        )
+    driver.matches = 0
+    with pytest.raises(ValueError, match="found 0"):
+        browser_tools.click(
+            "#confirm",
+            session_id="bridge-guarded",
+            wait_seconds=0,
+            selector_must_be_unique=True,
+        )
+    assert driver.clicked == ["#confirm"], "a refused guarded click still clicked"
+
+
 def test_screenshot_modes_preserve_current_chrome_and_send_exact_clips(monkeypatch):
     current = _FakeCaptureDriver(current=True)
     monkeypatch.setitem(

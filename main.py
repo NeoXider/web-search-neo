@@ -24,7 +24,7 @@ import msp_search
 from web_client import request
 
 
-__version__ = "1.3.9"
+__version__ = "1.3.10"
 
 PROJECT_DIR = Path(__file__).resolve().parent
 log = logging.getLogger("web_search_neo")
@@ -708,6 +708,7 @@ async def browser_click(
     exact: bool = True,
     x: float | None = None,
     y: float | None = None,
+    selector_must_be_unique: bool = False,
 ) -> dict[str, Any]:
     """Click one thing: a button/element, text, or a viewport point.
 
@@ -716,7 +717,8 @@ async def browser_click(
     ``exact``) clicks the one visible interactive element matching that rendered
     text and refuses ambiguity; ``x``/``y`` (both required) click the viewport
     point in CSS pixels. ``trusted=true`` dispatches a real trusted mouse
-    sequence for the selector form.
+    sequence for the selector form. ``selector_must_be_unique=true`` accepts
+    plain CSS only and refuses zero or multiple matches immediately before click.
     """
     return await asyncio.to_thread(
         functools.partial(
@@ -731,6 +733,7 @@ async def browser_click(
             exact=exact,
             x=x,
             y=y,
+            selector_must_be_unique=selector_must_be_unique,
         )
     )
 
@@ -1174,7 +1177,7 @@ async def browser_macro(
     checkpoint: str | None = None,
     project_root: str | None = None,
 ) -> dict[str, Any]:
-    """Manage generic macros, including guarded two-phase submit, in user or project storage."""
+    """Manage generic macros, including guarded two-phase actions, in user or project storage."""
     op = str(op or "").strip().lower()
 
     if op == "record":
@@ -1270,30 +1273,35 @@ async def browser_macro(
         record = await asyncio.to_thread(macros.load, name, project_root)
         resolved = macros.resolve(record["steps"], record.get("variables"), variables)
         checked_guard = await asyncio.to_thread(macros.validate_guard, guard, resolved)
-        staged_steps, submit_step = macros.split_terminal_submit(resolved)
+        staged_steps, terminal_step = macros.split_terminal_action(resolved)
         outcome = await _execute_actions(staged_steps, continue_on_error=False, record=False)
         if not outcome.get("success"):
             return {
                 **outcome,
                 "macro": record["name"],
+                "executed_terminal_action": False,
                 "executed_submit": False,
+                "executed_click": False,
                 "checkpoint": None,
-                "note": "Staging failed; terminal submit was not dispatched.",
+                "note": "Staging failed; terminal consequential action was not dispatched.",
             }
         assertions = macros.evaluate_assertions(outcome, checked_guard["assertions"])
         reserved = await asyncio.to_thread(
-            macros.reserve_checkpoint, checked_guard, submit_step, project_root
+            macros.reserve_checkpoint, checked_guard, terminal_step, project_root
         )
         return {
             **outcome,
             "macro": record["name"],
+            "executed_terminal_action": False,
             "executed_submit": False,
+            "executed_click": False,
+            "terminal_action": terminal_step["action"],
             "checkpoint": reserved,
             "identity": checked_guard["identity"],
             "assertions": assertions,
             "note": (
                 "Live semantic assertions passed. Review this result, then call "
-                "op='guarded_commit' once with the checkpoint to attempt terminal submit."
+                "op='guarded_commit' once with the checkpoint to attempt the terminal action."
             ),
         }
 
@@ -1301,15 +1309,22 @@ async def browser_macro(
         if not checkpoint:
             raise ValueError("macro op 'guarded_commit' requires checkpoint")
         # Consume before dispatch: a timeout or lost response is ambiguous, so the
-        # same terminal submit must never be replayed automatically.
+        # same terminal consequential action must never be replayed automatically.
         reserved = await asyncio.to_thread(macros.consume_checkpoint, checkpoint, project_root)
-        outcome = await _execute_actions([reserved["submit_step"]], False, record=False)
+        terminal_step = reserved.get("terminal_step") or reserved.get("submit_step")
+        if not isinstance(terminal_step, dict):
+            raise ValueError("guarded checkpoint has no terminal action; refusing dispatch")
+        terminal_action = str(reserved.get("terminal_action") or terminal_step.get("action"))
+        outcome = await _execute_actions([terminal_step], False, record=False)
         return {
             **outcome,
-            "executed_submit": True,
+            "executed_terminal_action": True,
+            "executed_submit": terminal_action == "submit",
+            "executed_click": terminal_action == "click",
+            "terminal_action": terminal_action,
             "checkpoint": checkpoint,
             "identity": reserved["identity"],
-            "note": "Checkpoint consumed before dispatch; this submit cannot be replayed.",
+            "note": "Checkpoint consumed before dispatch; this terminal action cannot be replayed.",
         }
 
     if op == "preview":
@@ -1721,6 +1736,7 @@ _AUTOMATION_SKILL = {
         "existing_tab": "browser_tabs -> attach_tab(tab_id, session_id) claims without navigating.",
         "new_tab": "open defaults to profile_mode=current and creates a background AI-group tab.",
         "session_rule": "Reusing session_id navigates that controlled page; use a different session_id when a second reference page must stay open.",
+        "parallel_agents": "One session_id is one tab, and it is the only thing separating agents inside this MCP server: parallel agents must each choose their own, or they drive the same tab. Across servers the bridge refuses a tab another agent holds; inside one server nothing does.",
         "action_locators": "In current Chrome every action locator is plain CSS. Never send ref: or >>> to click, fill, wait, upload, submit.form_selector, or input; they are observation-only there.",
         "ownership": "close removes an agent-created tab but only detaches a claimed user tab.",
     },
@@ -1916,9 +1932,14 @@ _ACTION_NOTES = {
     },
     "close_all": {
         "browser_gone": "A list of session ids left alone because their Chrome is gone; closed_all stays true, since nothing of ours was left to leak.",
+        "scope": "Every session in this MCP server, including ones other agents opened - subagents share the server. Close your own session_id unless you mean to end everybody's work.",
     },
     "browser_status": {
         "browser_gone": "session_open=false with browser_gone=true means the session was dropped because its Chrome restarted; follow the 'next' field and open the page again.",
+        "co_tenants": "sessions_in_use names the sessions another caller of this server is inside right now; shared_session=true means this very session is one of them. current_chrome.daemon.clients counts the MCP servers sharing the browser and .claims lists every tab any of them drives, with mine telling ours apart.",
+    },
+    "browser_tabs": {
+        "ownership": "A tab another agent is already driving carries driven_by (and driven_by_me when it is this server's). Attaching to one of those is refused, so pick an unmarked tab or open your own.",
     },
     "input": {
         "key_action": {"key": "W|SPACE|ARROW_LEFT|F5|NUMPAD1|...", "action": "tap|hold|release"},
@@ -2055,6 +2076,7 @@ _PITFALLS = [
     "challenge_detected means a CAPTCHA is in the way: use captcha, never hammer clicks. captcha_widgets lists ones merely present; ignore those.",
     "find low_confidence=true means it is guessing: re-query with other words or a role, do not click matches[0].",
     "profile_mode=current drives the user's real Chrome; close closes a tab the agent opened and leaves an attach_tab tab open.",
+    "Parallel agents must each choose their own session_id: subagents share one MCP server, so two on the default drive one tab and navigate each other's page - browser_status reports shared_session. close_all ends every agent's sessions, not only yours.",
     "Automation stays background-only by default and never changes window state. show is the sole foreground opt-in; call it only when the user explicitly asks to see the session.",
     "In render=step nothing moves until input or step runs, so a screenshot taken first shows the old frame.",
     "Always release_inputs after hold, and return render to normal before you finish.",

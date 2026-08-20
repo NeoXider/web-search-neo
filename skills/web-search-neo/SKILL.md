@@ -15,7 +15,10 @@ refuses any parameter it does not list.
 
 Two tools only. `web_info` reads state; `web_action` performs 1-32 ordered operations.
 One `session_id` controls one page. Reuse it to continue on that page; use a different id
-when a second reference page must remain open.
+when a second reference page must remain open. It is also the only boundary between agents
+working at once: subagents share one MCP server, so two that both leave `session_id` at its
+default drive the same tab and navigate each other's page. Pick your own id. `close_all` ends
+every agent's sessions in that server, so close your own `session_id` instead.
 
 For reliable small-model automation, repeat one rigid loop: inspect fresh DOM, act once,
 then verify fresh DOM/text. Tool success proves an event was dispatched, not that the user
@@ -256,7 +259,13 @@ Pass an existing absolute `project_root` to any macro operation to use that proj
 the same project root to `guarded_stage` and `guarded_commit`, because its idempotency ledger
 is project-local too.
 
-For a consequential flow, keep one explicit terminal `submit` as the last step and use:
+For a consequential flow, keep exactly one consequential last step: explicit `submit`, or a
+safe `click`. A guarded selector click uses plain CSS and is required to match exactly one live
+element at commit. A semantic click requires exact text plus an explicit role and refuses zero
+or multiple matches. Never guard coordinates, `trusted=true`, substring text, ref handles, or
+piercing paths; those target forms fail closed.
+
+Then use:
 
 1. `op=guarded_stage` with `guard.target_url`, equal `canonical_url`, optional domain-defined
    `identity_key`, explicit `allowed_hosts`, optional `denied_hosts`, a unique idempotency
@@ -264,12 +273,13 @@ For a consequential flow, keep one explicit terminal `submit` as the last step a
    Query parameters remain part of canonical target identity; only URL fragments are ignored.
 2. Live semantic assertions such as
    `{"result_index":2,"path":"data.text","contains":"Request 42"}`. Stage executes
-   everything except Submit and returns no checkpoint if an action or assertion fails.
+   everything except the terminal consequential action and returns no checkpoint if an action
+   or assertion fails.
 3. Review the staged result. Only then call `op=guarded_commit` once with its checkpoint.
 
 Core has no built-in host categories: allow/deny policy is supplied by the macro or caller.
 The project ledger reserves canonical target/identity, resource path, and token, and consumes
-the checkpoint before Submit dispatch, so an ambiguous timeout cannot cause an automatic
+the checkpoint before terminal dispatch, so an ambiguous timeout cannot cause an automatic
 retry. Inspect the destination response separately; the guard proves one attempt, not remote
 acceptance.
 

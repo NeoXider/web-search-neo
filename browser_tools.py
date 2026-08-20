@@ -54,7 +54,35 @@ from web_client import validate_http_url
 
 logger = logging.getLogger(__name__)
 
-MAX_SESSIONS = 4
+
+def _max_sessions() -> int:
+    """How many browser sessions this process will hold at once.
+
+    Four is the default because four visible Chrome tabs under a debugger is
+    already a lot of memory on an ordinary desktop, and because a model that
+    opens sessions it never closes should hit a wall early rather than late.
+
+    It is a setting rather than a constant because the cap is per process and
+    agents are not: a run with five subagents, each wanting its own session
+    through one MCP server, hits it through no fault of its own, and the only
+    remedies used to be editing this file or making the agents queue. Read once
+    at import, since raising it under a running server would not free the memory
+    the old number was protecting.
+    """
+    try:
+        wanted = int(os.getenv("WEB_SEARCH_NEO_MAX_SESSIONS", "") or 4)
+    except ValueError:
+        return 4
+    # One session is the floor: zero would refuse every open with a message about
+    # closing something first, and there would be nothing to close.
+    return max(1, min(wanted, 64))
+
+
+MAX_SESSIONS = _max_sessions()
+# How many elements a CSS selector matches, asked of the page. Both driver kinds
+# run scripts; only Selenium's has ``find_elements``, so anything that has to
+# work in ``profile_mode="current"`` counts this way.
+_MATCH_COUNT_SCRIPT = "return document.querySelectorAll(arguments[0]).length;"
 _SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 # Chrome hands out its browser log exactly once, so the session keeps a bounded copy.
 _BROWSER_LOG_LIMIT = 500
@@ -74,6 +102,108 @@ class ConsoleCursor:
     seq: int = 0
     doc: str = ""
     log_index: int = 0
+
+
+class SessionLock:
+    """An ``RLock`` that can also say whether a second caller is inside.
+
+    Sessions are the unit of isolation between agents, and across processes the
+    bridge daemon's tab register keeps two of them off one tab. Inside one MCP
+    server there is no such register: several agents - subagents of one run, most
+    of the time - share this process, and two that both leave ``session_id`` at
+    its default land on the same :class:`BrowserSession`. The lock below then did
+    its job perfectly and made that invisible: the second caller waited, took the
+    lock, and acted on a page the first one had navigated out from under it. No
+    error, no warning, a click on whatever happened to be there.
+
+    Nothing here can tell the two agents apart - an MCP call carries no caller
+    identity - so this does not try to arbitrate. It counts, so that the overlap
+    can be reported instead of swallowed: :attr:`busy` is true while another
+    thread holds the session, and :attr:`waiting` counts the callers queued
+    behind it.
+
+    The API is the subset of ``threading.RLock`` this module actually uses -
+    the context manager plus ``acquire``/``release`` - so every ``with
+    session.lock:`` in this file keeps working untouched.
+    """
+
+    __slots__ = ("_lock", "_state", "_owner", "_depth", "_waiting")
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._state = threading.Lock()
+        self._owner: int | None = None
+        self._depth = 0
+        self._waiting = 0
+
+    @property
+    def waiting(self) -> int:
+        """How many callers are queued for a session somebody else is using."""
+        with self._state:
+            return self._waiting
+
+    @property
+    def busy(self) -> bool:
+        """Whether a *different* thread is inside this session right now.
+
+        Reentrancy is why the owner is compared rather than the depth: a tool
+        that takes its own session's lock twice is one caller, not two.
+        """
+        with self._state:
+            return self._owner is not None and self._owner != threading.get_ident()
+
+    @property
+    def concurrent_callers(self) -> int:
+        """Callers inside or queued, counting from the point of view of others.
+
+        Zero when this thread is the only one that has anything to do with the
+        session, which is the ordinary case and the one that must stay silent.
+        """
+        with self._state:
+            mine = threading.get_ident()
+            inside = 1 if self._owner is not None and self._owner != mine else 0
+            return inside + self._waiting
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        mine = threading.get_ident()
+        counted = False
+        with self._state:
+            # Only a wait that is actually about to happen counts: a free lock,
+            # or one this very thread already holds, is not contention.
+            if blocking and self._owner is not None and self._owner != mine:
+                self._waiting += 1
+                counted = True
+        try:
+            acquired = self._lock.acquire(blocking, timeout)
+        finally:
+            if counted:
+                with self._state:
+                    self._waiting -= 1
+        if acquired:
+            with self._state:
+                self._owner = mine
+                self._depth += 1
+        return acquired
+
+    def release(self) -> None:
+        with self._state:
+            # Released inside the bookkeeping section, and before it, on purpose.
+            # Before, because a release by a thread that does not hold the lock
+            # raises and must leave the counters alone rather than corrupt them.
+            # Inside, because otherwise the thread this hands off to could record
+            # itself as owner and then be overwritten by our own tidying.
+            self._lock.release()
+            self._depth -= 1
+            if self._depth <= 0:
+                self._depth = 0
+                self._owner = None
+
+    def __enter__(self) -> "SessionLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, *_exception: Any) -> None:
+        self.release()
 
 
 @dataclass
@@ -137,7 +267,7 @@ class BrowserSession:
     # kept so it can be turned off without the caller tracking it.
     extra_headers: dict[str, str] = field(default_factory=dict)
     stealth_identifier: str | None = None
-    lock: threading.RLock = field(default_factory=threading.RLock)
+    lock: SessionLock = field(default_factory=SessionLock)
     last_used: float = field(default_factory=time.monotonic)
 
 
@@ -616,6 +746,9 @@ def _create_session(
                         f"Maximum of {MAX_SESSIONS} browser sessions reached; close one first. "
                         f"Open: {sorted(_sessions)}."
                         + (f" Least recently used: '{stalest}'." if stalest else "")
+                        + " The cap counts every session in this MCP server, so parallel "
+                        "agents share it; raise it with WEB_SEARCH_NEO_MAX_SESSIONS in the "
+                        "server's environment if they all genuinely need a page at once."
                     )
                 selected_current_tab_id = (
                     int(current_tab_id)
@@ -798,6 +931,38 @@ def _discard_stale_session(session_id: str, session: BrowserSession) -> None:
     with _sessions_lock:
         if _sessions.get(session_id) is session:
             del _sessions[session_id]
+
+
+def _shared_session_note(session_id: str, session: BrowserSession) -> dict[str, Any]:
+    """Report a session two callers of this process are driving at once.
+
+    Across processes the bridge daemon refuses the second agent a tab the first
+    one holds. Inside one process there is nothing to refuse with: several agents
+    - subagents of one run, typically - share these module globals, and two that
+    both left ``session_id`` at ``"default"`` are handed the same session object
+    and the same Chrome tab. That is not an error, and it is not this function's
+    business to make it one: a caller may well have several threads working one
+    page on purpose. What was wrong was that it happened in silence, so an agent
+    whose page had been navigated by somebody else read the result as its own.
+
+    Empty - and therefore invisible - whenever this caller is alone, which is
+    every ordinary call. Must be read before the session's lock is taken, or the
+    overlap it is looking for will have been waited out.
+    """
+    concurrent = session.lock.concurrent_callers
+    if not concurrent:
+        return {}
+    return {
+        "shared_session": True,
+        "concurrent_callers": concurrent,
+        "shared_session_warning": (
+            f"{concurrent} other caller(s) inside this MCP server are driving session "
+            f"'{session_id}' at the same time. They share one Chrome tab, so each one's "
+            "navigation, scrolling and typing lands in the other's page and results here "
+            "may describe a page this caller did not open. Give each agent its own "
+            "session_id (any name works) and they will get a tab each instead."
+        ),
+    }
 
 
 def _get_session(session_id: str) -> BrowserSession:
@@ -1280,6 +1445,10 @@ def open_page(
         current_tab_id,
         tab_group,
     )
+    # Read before the lock: taking it first would wait the other caller out and
+    # then report an empty room. This is the moment two agents that both took the
+    # default session id collide, so it is the moment worth naming.
+    shared = _shared_session_note(session_id, session)
     try:
         with session.lock:
             previous_mode = session.render_mode
@@ -1322,6 +1491,7 @@ def open_page(
             "current_tab_id": session.current_tab_id,
             "tab_group": session.tab_group,
             **({"left_claimed_tab": released_tab} if released_tab is not None else {}),
+            **shared,
         }
     # RuntimeError rather than ChromeBridgeError (which it covers, being its
     # base): a tab claim refused mid-open raises a plain one, and it used to
@@ -2303,6 +2473,7 @@ def click(
     exact: bool = True,
     x: float | None = None,
     y: float | None = None,
+    selector_must_be_unique: bool = False,
 ) -> dict[str, Any]:
     """Click one thing: a button/element, a piece of text, or a viewport point.
 
@@ -2312,6 +2483,8 @@ def click(
       element itself. ``trusted=True`` dispatches a real trusted mouse sequence
       through the browser's input pipeline instead of the element's synthetic
       click, landing on the element's centre as a human pointer would.
+      ``selector_must_be_unique=True`` accepts plain CSS only and refuses unless
+      exactly one element matches immediately before the click.
     - ``text`` clicks the one visible interactive element whose rendered text
       matches. ``role`` narrows by ARIA role and ``exact=False`` switches to
       substring matching; zero or several matches are refused, never guessed.
@@ -2321,6 +2494,8 @@ def click(
     looked up in, exactly as it does for ``find`` and ``page_text``.
     """
     if text is not None:
+        if selector_must_be_unique:
+            raise ValueError("selector_must_be_unique applies only to selector clicks")
         if x is not None or y is not None:
             raise ValueError("text and x/y are mutually exclusive")
         return click_text(
@@ -2333,6 +2508,8 @@ def click(
             frame_selector=frame_selector,
         )
     if x is not None or y is not None:
+        if selector_must_be_unique:
+            raise ValueError("selector_must_be_unique applies only to selector clicks")
         if selector is not None:
             raise ValueError("selector and x/y are mutually exclusive")
         if x is None or y is None:
@@ -2347,11 +2524,46 @@ def click(
         )
     if selector is None:
         raise ValueError("provide selector, text, or x/y to click")
+    if selector_must_be_unique and (
+        str(selector).strip().startswith("ref:") or ">>>" in str(selector)
+    ):
+        raise ValueError(
+            "selector_must_be_unique accepts plain CSS only, not ref handles "
+            "or piercing paths"
+        )
     session = _get_session(session_id)
     with session.lock:
         _enter_action_frame(session.driver, frame_selector, selector)
         try:
-            element = _wait_for_locator(session.driver, selector, "clickable", 10.0)
+            if selector_must_be_unique:
+                if page_perception.resolve_locator_expression(selector) is not None:
+                    raise ValueError(
+                        "selector_must_be_unique accepts plain CSS only, not ref handles "
+                        "or piercing paths"
+                    )
+                # Counted in the page rather than through ``find_elements``,
+                # which only Selenium's driver has: the extension-backed driver
+                # of ``profile_mode="current"`` - the default mode, and the one
+                # a guarded commit is most likely to run in - has no such method,
+                # so asking it for one raised AttributeError from inside a
+                # checkpoint that had already been consumed. The guard was then
+                # spent on an action that never happened, which is the one
+                # outcome the two-phase protocol exists to prevent.
+                found = int(
+                    session.driver.execute_script(_MATCH_COUNT_SCRIPT, selector) or 0
+                )
+                if found != 1:
+                    raise ValueError(
+                        f"Guarded selector expected exactly one match, found {found}; "
+                        "narrow the selector before committing."
+                    )
+                element = session.driver.find_element(By.CSS_SELECTOR, selector)
+                if not element.is_displayed() or not element.is_enabled():
+                    raise ValueError(
+                        "The unique guarded selector match is not visible and clickable"
+                    )
+            else:
+                element = _wait_for_locator(session.driver, selector, "clickable", 10.0)
             session.driver.execute_script(
                 "arguments[0].scrollIntoView({block: 'center'});", element
             )
@@ -2370,6 +2582,7 @@ def click(
             "clicked": selector,
             "frame_selector": frame_selector,
             "trusted": trusted,
+            "selector_must_be_unique": selector_must_be_unique,
         }
 
 
@@ -6702,6 +6915,14 @@ def get_status(session_id: str = "default") -> dict[str, Any]:
             ),
             "current_chrome": bridge_status,
         }
+    # Both read before the lock, and both about co-tenants rather than about
+    # Chrome: which sessions of this process another thread is inside right now,
+    # and whether this one is being shared. Neither survives the wait that taking
+    # the lock would impose, and this topic is where somebody looks to find out
+    # why a page keeps changing under them.
+    shared = _shared_session_note(session_id, session)
+    with _sessions_lock:
+        in_use = sorted(name for name, item in _sessions.items() if item.lock.busy)
     with session.lock:
         bridge_status = _companion_status()
         if session.profile_mode == "current" and not bridge_status["connected"]:
@@ -6719,7 +6940,13 @@ def get_status(session_id: str = "default") -> dict[str, Any]:
                 "debugger_address": None,
                 "current_tab_id": session.current_tab_id,
                 "tab_group": session.tab_group,
+                # Reported on every branch, healthy or not: who else is working
+                # in this server is a fact about the server, and a reader who
+                # only gets it when Chrome happens to be well is a reader who
+                # cannot use it to explain why Chrome is not.
+                "sessions_in_use": in_use,
                 "current_chrome": bridge_status,
+                **shared,
             }
         try:
             summary = _page_summary(session.driver, session_id)
@@ -6742,7 +6969,9 @@ def get_status(session_id: str = "default") -> dict[str, Any]:
                 "debugger_address": session.debugger_address,
                 "current_tab_id": session.current_tab_id,
                 "tab_group": session.tab_group,
+                "sessions_in_use": in_use,
                 "current_chrome": bridge_status,
+                **shared,
             }
         return {
             "available": True,
@@ -6761,8 +6990,10 @@ def get_status(session_id: str = "default") -> dict[str, Any]:
             "debugger_address": session.debugger_address,
             "current_tab_id": session.current_tab_id,
             "tab_group": session.tab_group,
+            "sessions_in_use": in_use,
             "current_chrome": bridge_status,
             **summary,
+            **shared,
         }
 
 

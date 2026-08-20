@@ -212,6 +212,13 @@ class _Claim:
     tab_id: int
     browser_run: str | None
     claimed_at: float
+    # The same instant on the wall clock. ``claimed_at`` is monotonic, which is
+    # right for measuring here and useless anywhere else: it counts from an
+    # origin only this process knows. A duration derived from it can therefore
+    # only be computed here - and a duration computed here and then pushed to the
+    # other clients is stale the moment it lands. They are given the instant and
+    # do their own subtraction, which cannot go out of date between pushes.
+    since: float = field(default_factory=time.time)
 
     def held_seconds(self) -> float:
         return max(0.0, time.monotonic() - self.claimed_at)
@@ -424,6 +431,14 @@ class BridgeDaemon:
         companion is connected ``browser`` is empty, so the key is absent
         entirely - "no browser" rather than "an unnamed browser".
 
+        ``clients`` and ``claims`` describe the other tenants. They are here
+        because this process is the only one that can see them: an MCP server
+        asked how many agents share the browser, or which tabs are already
+        spoken for, has nowhere else to look, and until it could ask, the first
+        news of a co-tenant was a refusal after the attach had been attempted.
+        ``claims`` names the holder rather than "somebody", for the same reason
+        the refusal does - "the tab is busy" invites retrying forever.
+
         This is the answer to the ``status`` control call and, with a ``type`` of
         ``extension``, the state pushed to every client whenever the companion
         connects or drops.
@@ -436,6 +451,17 @@ class BridgeDaemon:
                 "pid": os.getpid(),
                 "instance": self.instance,
                 "clients": len(self._clients),
+                # A list rather than a dict: JSON turns integer keys into
+                # strings, and a tab id that arrives back as "42" is one more
+                # thing every reader has to remember to convert.
+                "claims": [
+                    {
+                        "tab_id": tab_id,
+                        "holder": claim.client.label,
+                        "since": claim.since,
+                    }
+                    for tab_id, claim in sorted(self._claims.items())
+                ],
                 "host": self.host,
                 "port": self.port,
             }
@@ -600,6 +626,11 @@ class BridgeDaemon:
                 client=client, tab_id=tab_id, browser_run=recorded, claimed_at=time.monotonic()
             )
         LOGGER.info("Bridge client %s claimed tab %s", client.label, tab_id)
+        # Every other client's picture of who holds what has just gone stale, and
+        # a picture that is only refreshed when the companion happens to
+        # reconnect is worse than none: it reads as current. Sent outside the
+        # lock, because a slow peer must not hold the register shut.
+        self._broadcast_state()
         return {"granted": True, "tab_id": tab_id, "browser_run": recorded}
 
     def _release_tab(self, client: _Client, raw_tab_id: Any) -> dict[str, Any]:
@@ -623,6 +654,7 @@ class BridgeDaemon:
                 }
             self._claims.pop(tab_id, None)
         LOGGER.info("Bridge client %s released tab %s", client.label, tab_id)
+        self._broadcast_state()
         return {"released": True, "tab_id": tab_id}
 
     def _drop_claims_of(self, client: _Client) -> list[int]:
@@ -786,10 +818,14 @@ class BridgeDaemon:
         client = _Client(
             connection=websocket, version=str(hello.get("version") or ""), label=label
         )
-        with self._lock:
-            self._clients.add(client)
-            self._idle_since = None
         try:
+            # The acknowledgement goes out before this client joins the register,
+            # and the order matters: a client is not listening for pushed state
+            # until it has read the ack, so a broadcast that reached it first -
+            # from any thread, for any reason - would be read as the ack and the
+            # handshake would fail with "not a bridge daemon". Registering only
+            # after the ack is on the wire makes that impossible rather than
+            # unlikely.
             client.send(
                 {
                     "type": "hello_ack",
@@ -801,9 +837,16 @@ class BridgeDaemon:
                     "instance": self.instance,
                 }
             )
+            with self._lock:
+                self._clients.add(client)
+                self._idle_since = None
             LOGGER.info(
                 "Bridge client %s attached (version %s)", label, client.version or "unknown"
             )
+            # A second agent arriving is news for the first one, and this is the
+            # only moment it can be told: nothing else on this bridge changes
+            # when a client merely connects.
+            self._broadcast_state()
             for raw_message in websocket:
                 try:
                     message = json.loads(raw_message)
@@ -846,6 +889,10 @@ class BridgeDaemon:
                     label,
                 )
             LOGGER.info("Bridge client %s is gone", label)
+            # The client count changed, and so did the claims if it held any.
+            # Whoever is left has to hear it, or a tab that came back to the pool
+            # goes on reading as taken until something else makes the daemon speak.
+            self._broadcast_state()
 
     def _relay_command(self, client: _Client, message: dict[str, Any]) -> None:
         client_id = message.get("id")

@@ -201,10 +201,20 @@ def test_capabilities_names_required_parameters_and_where_the_rest_live():
     # Optional names are deliberately absent, so the document must say so.
     assert "action_schema" in document["discovery"]["parameters"]
     assert not any("include_summary" in json.dumps(entry) for entry in actions.values())
-    assert len(json.dumps(document)) < 11_500
+    # A ceiling, not a target: every model reads this document on every session,
+    # so a rule earns its place here or it lives in a topic. Raised deliberately
+    # twice - once for request replay, once for the parallel-agent pitfall, whose
+    # collision is otherwise silent and costs an agent the page it was working on.
+    assert len(json.dumps(document)) < 12_000
 
     assert any(
         "ref:" in pitfall and "page_outline" in pitfall for pitfall in document["pitfalls"]
+    )
+    # The one rule a subagent cannot work out from its own results, because from
+    # inside, another agent's navigation looks exactly like its own page changing.
+    assert any(
+        "session_id" in pitfall and "Parallel" in pitfall
+        for pitfall in document["pitfalls"]
     )
 
 
@@ -223,7 +233,7 @@ def test_capabilities_states_the_requirements_that_python_defaults_hide():
     # Unconditional actions keep the plain shape, so the key stays a signal.
     assert "also_required" not in actions["pointer"]
     assert "also_required" not in actions["open"]
-    assert len(json.dumps(document)) < 11_500
+    assert len(json.dumps(document)) < 12_000
 
 
 def test_input_and_touch_reject_exactly_what_the_document_calls_required():

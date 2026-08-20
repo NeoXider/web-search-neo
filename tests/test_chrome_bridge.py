@@ -1204,6 +1204,227 @@ def test_two_agents_cannot_drive_the_same_tab() -> None:
             companion.close()
 
 
+def _next_frame(websocket, wanted: str, timeout: float = 5.0) -> dict:
+    """The next frame of one type, skipping state the daemon pushes unasked.
+
+    A raw socket is not the real client: it has no dispatcher, so an ``extension``
+    state frame arriving between a question and its answer looks like the answer.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(f"no {wanted} frame arrived")
+        frame = json.loads(websocket.recv(timeout=remaining))
+        if frame.get("type") == wanted:
+            return frame
+
+
+def _settle(check, label: str, seconds: float = 5.0) -> None:
+    """Wait for state the daemon *pushes* rather than answers, and name the wait."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if check():
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"timed out waiting for {label}")
+
+
+def test_each_client_can_see_the_other_agents_and_the_tabs_they_hold() -> None:
+    """A co-tenant used to be invisible until a claim of ours came back refused.
+
+    Which is too late to be useful: by then the agent has already picked a tab,
+    and the list it picked from - the only list there is - said nothing about
+    that tab being driven. The register lives in the daemon and nowhere else, so
+    unless the daemon says who holds what, no client can know.
+    """
+    with _running_daemon() as daemon:
+        companion = _FakeCompanion(daemon.port, run="one-browser")
+        try:
+            with _attached_client(daemon) as first, _attached_client(daemon) as second:
+                assert first.wait_connected(2.0) and second.wait_connected(2.0)
+                _settle(
+                    lambda: first.status(0.0)["daemon"]["clients"] == 2,
+                    "the second agent to be counted",
+                )
+
+                assert first.claim_tab(41)["granted"] is True
+                _settle(
+                    lambda: second.status(0.0)["daemon"]["claims"],
+                    "the claim to reach the other agent",
+                )
+
+                theirs = second.status(0.0)["daemon"]
+                assert [claim["tab_id"] for claim in theirs["claims"]] == [41]
+                assert theirs["claims"][0]["mine"] is False
+                # Named, not anonymous: "somebody has it" invites retrying forever.
+                assert theirs["claims"][0]["holder"] == daemon.claimed_tabs[41]
+                # An instant travels, a duration does not: the claim list is
+                # pushed once and read many times, so the age is computed on
+                # every read rather than measured when it was sent.
+                assert theirs["claims"][0]["since"] > 0
+                first_age = theirs["claims"][0]["held_seconds"]
+                assert first_age >= 0
+                time.sleep(1.1)
+                assert second.status(0.0)["daemon"]["claims"][0]["held_seconds"] > first_age
+
+                assert first.status(0.0)["daemon"]["claims"][0]["mine"] is True
+
+                # And letting go has to reach them too, or the tab reads as taken
+                # for as long as nothing else makes the daemon speak.
+                assert first.release_tab(41)["released"] is True
+                _settle(
+                    lambda: not second.status(0.0)["daemon"]["claims"],
+                    "the release to reach the other agent",
+                )
+        finally:
+            companion.close()
+
+
+def test_a_departing_agent_stops_being_counted_by_the_one_that_stays() -> None:
+    """Otherwise the browser reads as crowded long after everyone else has left."""
+    with _running_daemon() as daemon:
+        companion = _FakeCompanion(daemon.port, run="one-browser")
+        try:
+            with _attached_client(daemon) as survivor:
+                assert survivor.wait_connected(2.0)
+                with _attached_client(daemon) as leaving:
+                    assert leaving.wait_connected(2.0)
+                    assert leaving.claim_tab(41)["granted"] is True
+                    _settle(
+                        lambda: survivor.status(0.0)["daemon"]["clients"] == 2,
+                        "the second agent to be counted",
+                    )
+                    _settle(
+                        lambda: survivor.status(0.0)["daemon"]["claims"],
+                        "the other agent's claim to arrive",
+                    )
+                _settle(
+                    lambda: survivor.status(0.0)["daemon"]["clients"] == 1,
+                    "the departure to be noticed",
+                )
+                assert survivor.status(0.0)["daemon"]["claims"] == []
+        finally:
+            companion.close()
+
+
+def test_retiring_a_daemon_waits_for_its_own_answer_not_the_next_frame() -> None:
+    """The daemon pushes state whenever the crowd or the claims change.
+
+    So the frame arriving after a control question is not reliably the answer to
+    it. Taking it for one returned from the stop request before the daemon had
+    begun to stop, and the dial that immediately follows then landed on a
+    listener already refusing connections - surfacing as an unexplained
+    ``HTTP 503`` in place of the version conflict this path exists to resolve.
+    """
+
+    class _Connection:
+        def __init__(self) -> None:
+            self.sent: list[dict] = []
+            self.frames: list[str] = []
+            self.closed: tuple | None = None
+
+        def send(self, payload: str) -> None:
+            message = json.loads(payload)
+            self.sent.append(message)
+            self.frames = [
+                # Pushed state first, exactly as a real daemon may do.
+                json.dumps({"type": "extension", "connected": True, "clients": 2}),
+                json.dumps(
+                    {
+                        "type": "control_result",
+                        "id": message["id"],
+                        "result": {"stopping": True},
+                    }
+                ),
+            ]
+
+        def recv(self, timeout: float | None = None) -> str:
+            assert self.frames, "read past the answer it was waiting for"
+            return self.frames.pop(0)
+
+        def close(self, code: int | None = None, reason: str | None = None) -> None:
+            self.closed = (code, reason)
+
+    connection = _Connection()
+    client = ChromeBridge(port=_free_port(), token=TEST_TOKEN, spawn=False)
+    try:
+        client._retire(connection, "9.9.9")
+    finally:
+        client.shutdown()
+
+    assert connection.sent[0]["method"] == "shutdown"
+    assert connection.frames == [], "the pushed state was mistaken for the answer"
+    assert connection.closed is not None and connection.closed[0] == 1000
+
+
+def test_a_client_still_completes_its_handshake_while_the_bridge_is_busy() -> None:
+    """Its acknowledgement must reach it before any state push can.
+
+    A client is not listening for pushed state until it has read the ack, so a
+    broadcast that got there first would be read as the ack and the handshake
+    would fail with "not a bridge daemon". Every attach and detach now makes the
+    daemon broadcast, so this is a race that runs on every connection rather than
+    a theoretical one.
+    """
+    with _running_daemon() as daemon:
+        companion = _FakeCompanion(daemon.port, run="one-browser")
+        try:
+            with _attached_client(daemon) as resident:
+                assert resident.wait_connected(2.0)
+                assert resident.claim_tab(41)["granted"] is True
+                for _ in range(5):
+                    with _attached_client(daemon) as visitor:
+                        # Connected at all means the hello_ack was read as one.
+                        assert visitor.wait_connected(3.0), "a handshake lost its ack"
+                        assert visitor.status(0.0)["daemon"]["linked"] is True
+                # The resident kept its tab through all that coming and going.
+                assert resident.claimed_tabs == (41,)
+        finally:
+            companion.close()
+
+
+def test_the_tab_list_marks_a_tab_another_agent_is_already_driving(monkeypatch) -> None:
+    """Choosing a tab is done from this list, so this list is where the mark belongs."""
+
+    class _Stub:
+        def status(self, _wait_seconds):
+            return {
+                "connected": True,
+                "daemon": {
+                    "clients": 2,
+                    "claims": [
+                        {
+                            "tab_id": 7,
+                            "holder": "python#900",
+                            "since": time.time() - 12.0,
+                            "held_seconds": 12.0,
+                            "mine": False,
+                        },
+                        {
+                            "tab_id": 9,
+                            "holder": "python#100",
+                            "since": time.time() - 1.0,
+                            "held_seconds": 1.0,
+                            "mine": True,
+                        },
+                    ],
+                },
+            }
+
+        def request(self, method, params=None, timeout=0.0):
+            assert method == "tabs.list"
+            return [{"id": 7, "url": "a"}, {"id": 8, "url": "b"}, {"id": 9, "url": "c"}]
+
+    monkeypatch.setattr(chrome_bridge, "get_chrome_bridge", lambda: _Stub())
+    tabs = {tab["id"]: tab for tab in chrome_bridge.list_current_chrome_tabs(0.0)["tabs"]}
+    assert tabs[7]["driven_by"] == "python#900" and tabs[7]["driven_by_me"] is False
+    assert tabs[7]["driven_for_seconds"] == 12.0
+    assert tabs[9]["driven_by_me"] is True
+    # A free tab that looked taken would be as unhelpful as a taken one that did not.
+    assert "driven_by" not in tabs[8]
+
+
 def test_a_tab_claim_dies_with_the_client_that_made_it() -> None:
     """A claim nobody can release would take the tab out of use until a restart."""
     with _running_daemon() as daemon:
@@ -1213,11 +1434,14 @@ def test_a_tab_claim_dies_with_the_client_that_made_it() -> None:
             # what an MCP server that is killed mid-session leaves behind.
             doomed = connect(f"ws://127.0.0.1:{daemon.port}")
             doomed.send(_hello(TEST_TOKEN, nonce="2b" * 16, role="client"))
-            assert json.loads(doomed.recv(timeout=5.0))["type"] == "hello_ack"
+            assert _next_frame(doomed, "hello_ack")["type"] == "hello_ack"
             doomed.send(
                 json.dumps({"type": "control", "id": "c1", "method": "claim_tab", "tab_id": 41})
             )
-            assert json.loads(doomed.recv(timeout=5.0))["result"]["granted"] is True
+            # Read past the pushed state: the daemon tells every client when the
+            # crowd or the claims change, so an answer is not always the next
+            # frame on the wire. The real client's dispatcher does the same.
+            assert _next_frame(doomed, "control_result")["result"]["granted"] is True
             assert 41 in daemon.claimed_tabs
 
             doomed.close()

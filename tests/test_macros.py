@@ -552,6 +552,60 @@ def test_guarded_macro_stages_asserts_then_commits_submit_once(tmp_path, monkeyp
         _call(op="guarded_commit", checkpoint=staged["checkpoint"])
 
 
+@pytest.mark.parametrize(
+    "terminal",
+    [
+        {"action": "click", "selector": "button[data-action='confirm']", "session_id": "guarded"},
+        {
+            "action": "click",
+            "text": "Confirm request",
+            "role": "button",
+            "exact": True,
+            "session_id": "guarded",
+        },
+    ],
+)
+def test_guarded_macro_stages_then_commits_safe_terminal_click_once(
+    tmp_path, monkeypatch, terminal
+):
+    resource = tmp_path / "request-42.pdf"
+    resource.write_bytes(b"pdf")
+    macros.save("request-click", [*_guarded_steps()[:-1], terminal])
+    calls = []
+
+    async def fake_execute(actions, continue_on_error=False, record=True):
+        calls.append(actions)
+        results = [
+            {"index": index, "action": step["action"], "success": True, "data": {}}
+            for index, step in enumerate(actions)
+        ]
+        if len(actions) > 1:
+            results[-1]["data"] = {"text": "Request 42 ready"}
+        return {"success": True, "results": results, "failure_count": 0}
+
+    monkeypatch.setattr(main, "_execute_actions", fake_execute)
+    staged = _call(
+        op="guarded_stage",
+        name="request-click",
+        variables={
+            "target_url": "https://forms.example.com/requests/42",
+            "resource_path": str(resource.resolve()),
+        },
+        guard=_guard(resource.resolve()),
+    )
+    assert staged["terminal_action"] == "click"
+    assert staged["executed_terminal_action"] is False
+    assert all(step != terminal for step in calls[0])
+    committed = _call(op="guarded_commit", checkpoint=staged["checkpoint"])
+    assert committed["executed_terminal_action"] is True
+    assert committed["executed_click"] is True
+    assert committed["executed_submit"] is False
+    if "selector" in terminal and "text" not in terminal:
+        assert calls[1][0]["selector_must_be_unique"] is True
+    with pytest.raises(ValueError, match="already click_attempted"):
+        _call(op="guarded_commit", checkpoint=staged["checkpoint"])
+
+
 def test_host_policy_is_caller_configuration_not_built_in(tmp_path):
     resource = tmp_path / "resource.bin"
     resource.write_bytes(b"x")
@@ -665,11 +719,83 @@ def test_resource_and_identity_reservations_prevent_reuse(tmp_path):
         )
 
 
-def test_guarded_macro_requires_one_terminal_explicit_submit():
+def test_every_guarded_refusal_says_which_file_is_refusing(tmp_path):
+    """A one-time guard is permanent by design, so it has to be explainable.
+
+    Each of these refusals is final: the token, the identity and the resource are
+    burned for good, and a stage whose commit never ran - the browser died in
+    between, the agent was killed - leaves a target that can never be staged
+    again. The refusals used to end at "refusing replay", which named nothing a
+    person could look at and nothing they could decide about. The ledger is one
+    JSON file; saying which one turns a dead end into a deliberate choice.
+    """
+    resource = tmp_path / "resource.bin"
+    resource.write_bytes(b"1")
+    target = "https://forms.example.com/requests/42"
+    steps = macros.resolve(
+        _guarded_steps(), None, {"target_url": target, "resource_path": str(resource.resolve())}
+    )
+    guard = macros.validate_guard(
+        _guard(
+            resource.resolve(),
+            target_url=target,
+            canonical_url=target,
+            idempotency_token="only-token-20260820",
+        ),
+        steps,
+    )
+    ledger = str(macros._guarded_ledger_path())
+    checkpoint = macros.reserve_checkpoint(guard, {"action": "submit"})
+
+    with pytest.raises(ValueError) as replay:
+        macros.reserve_checkpoint(guard, {"action": "submit"})
+    assert ledger in str(replay.value)
+
+    assert macros.consume_checkpoint(checkpoint)["state"] == "submit_attempted"
+    with pytest.raises(ValueError) as second_commit:
+        macros.consume_checkpoint(checkpoint)
+    assert ledger in str(second_commit.value)
+
+    with pytest.raises(ValueError) as unknown:
+        macros.consume_checkpoint("guard-never-staged")
+    assert ledger in str(unknown.value)
+
+
+def test_guarded_macro_accepts_one_terminal_submit_or_safe_click():
+    _, submit = macros.split_terminal_action([{"action": "submit", "form_selector": "form"}])
+    assert submit["action"] == "submit"
+    _, click = macros.split_terminal_action([{"action": "click", "selector": "#confirm"}])
+    assert click["selector_must_be_unique"] is True
+    _, semantic = macros.split_terminal_action(
+        [{"action": "click", "text": "Confirm", "role": "button", "exact": True}]
+    )
+    assert semantic["text"] == "Confirm"
+
+
+@pytest.mark.parametrize(
+    ("steps", "message"),
+    [
+        ([{"action": "click", "text": "Confirm"}], "explicit role"),
+        (
+            [{"action": "click", "text": "Confirm", "role": "button", "exact": False}],
+            "exact=true",
+        ),
+        ([{"action": "click", "x": 10, "y": 20}], "coordinate"),
+        ([{"action": "click", "selector": "#confirm", "trusted": True}], "trusted=true"),
+        ([{"action": "click", "selector": "ref:1:2"}], "plain CSS"),
+        ([{"action": "click", "selector": "x-host >>> button"}], "plain CSS"),
+        ([{"action": "submit"}, {"action": "click", "selector": "#confirm"}], "cannot contain"),
+        ([{"action": "submit"}, {"action": "page_text"}], "terminal consequential"),
+    ],
+)
+def test_guarded_macro_refuses_unsafe_or_nonterminal_consequential_actions(steps, message):
+    with pytest.raises(ValueError, match=message):
+        macros.split_terminal_action(steps)
+
+
+def test_guarded_macro_requires_a_terminal_consequential_action():
     with pytest.raises(ValueError, match="exactly one"):
-        macros.split_terminal_submit([{"action": "click", "text": "Confirm"}])
-    with pytest.raises(ValueError, match="exactly one"):
-        macros.split_terminal_submit([{"action": "submit"}, {"action": "page_text"}])
+        macros.split_terminal_action([{"action": "page_text"}])
 
 
 def test_project_roots_keep_macro_sets_and_ledgers_separate(tmp_path):
@@ -713,3 +839,29 @@ def test_guard_checkpoint_is_available_only_in_its_project(tmp_path):
     with pytest.raises(ValueError, match="unknown guarded checkpoint"):
         macros.consume_checkpoint(checkpoint, project_b)
     assert macros.consume_checkpoint(checkpoint, project_a)["state"] == "submit_attempted"
+
+
+def test_guarded_commit_accepts_a_legacy_staged_submit_checkpoint(monkeypatch):
+    ledger = {
+        "tokens": {
+            "legacy-token-20260820": {
+                "state": "staged",
+                "checkpoint": "guard-legacy-token-20260820",
+                "identity": "https://example.com/request/legacy",
+                "resource_path": "C:/artifact.bin",
+                "submit_step": {"action": "submit", "form_selector": "form"},
+            }
+        },
+        "resources": {},
+        "identities": {},
+    }
+    macros._write_guarded_ledger(ledger)
+
+    async def fake_execute(actions, continue_on_error=False, record=True):
+        assert actions == [{"action": "submit", "form_selector": "form"}]
+        return {"success": True, "results": [], "failure_count": 0}
+
+    monkeypatch.setattr(main, "_execute_actions", fake_execute)
+    committed = _call(op="guarded_commit", checkpoint="guard-legacy-token-20260820")
+    assert committed["terminal_action"] == "submit"
+    assert committed["executed_submit"] is True

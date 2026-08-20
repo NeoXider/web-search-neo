@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import socket
 import threading
+import time
 
 import pytest
 
@@ -402,6 +403,132 @@ def test_the_sweep_leaves_alone_a_session_another_thread_is_using():
     # The one nobody was using is still swept.
     assert "idle" not in browser_tools._sessions
     assert "quit" in idle.calls
+
+
+def test_the_session_lock_can_tell_a_second_caller_from_a_reentrant_one():
+    """Counting depth would report one careful tool as two competing agents."""
+    lock = browser_tools.SessionLock()
+    assert lock.busy is False and lock.concurrent_callers == 0
+
+    holding = threading.Event()
+    inside = threading.Event()
+    may_finish = threading.Event()
+
+    def other_agent() -> None:
+        holding.set()
+        with lock:
+            inside.set()
+            may_finish.wait(5)
+
+    caller = threading.Thread(target=other_agent)
+    try:
+        with lock:
+            # The same thread taking its own session's lock twice is one caller.
+            with lock:
+                assert lock.busy is False and lock.concurrent_callers == 0
+
+            caller.start()
+            assert holding.wait(5)
+            # It is queued behind us, which is exactly the overlap worth naming.
+            deadline = time.monotonic() + 5
+            while lock.waiting != 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert lock.waiting == 1
+            assert lock.concurrent_callers == 1
+
+        # Now that it holds the lock, the same overlap reads from the other side.
+        assert inside.wait(5)
+        assert lock.busy is True
+        assert lock.concurrent_callers == 1
+    finally:
+        may_finish.set()
+        caller.join(timeout=10)
+    assert caller.is_alive() is False
+
+    assert lock.waiting == 0 and lock.busy is False
+    # And the non-blocking form the cap sweep uses still works, and still counts
+    # nothing: a caller that refuses to wait is not waiting.
+    assert lock.acquire(blocking=False) is True
+    try:
+        assert lock.waiting == 0
+    finally:
+        lock.release()
+
+
+def test_browser_status_says_when_another_caller_is_inside_the_same_session():
+    """Two subagents of one run share this process, so they share 'default'.
+
+    Nothing here can tell them apart - an MCP call carries no caller identity -
+    so the tab is genuinely shared and each one's navigation lands in the
+    other's page. What was wrong was that it happened in silence: the second
+    caller waited for the lock, took it, and read a page somebody else had
+    opened as its own.
+    """
+    _register("default", _Tab(1))
+    _register("other", _Tab(2))
+    session = browser_tools._sessions["default"]
+    released = threading.Event()
+    holding = threading.Event()
+
+    def other_agent() -> None:
+        with session.lock:
+            holding.set()
+            # Long enough for the status call below to be started while we are
+            # inside, and short enough that the test never hangs on us.
+            released.wait(3)
+
+    caller = threading.Thread(target=other_agent)
+    caller.start()
+    try:
+        assert holding.wait(5)
+        status = browser_tools.get_status("default")
+    finally:
+        released.set()
+        caller.join(timeout=10)
+
+    assert status["shared_session"] is True
+    assert status["concurrent_callers"] >= 1
+    assert "session_id" in status["shared_session_warning"]
+    # Named so an agent can act on it, rather than left as a number to interpret.
+    assert "default" in status["shared_session_warning"]
+    assert status["sessions_in_use"] == ["default"], "the idle session read as busy"
+
+
+def test_a_session_nobody_else_is_touching_is_reported_without_a_warning():
+    """The warning has to stay invisible in the ordinary case or it is noise."""
+    _register("solo", _Tab(3))
+    status = browser_tools.get_status("solo")
+    assert "shared_session" not in status
+    assert "shared_session_warning" not in status
+    assert status["sessions_in_use"] == []
+
+
+def test_the_session_cap_is_a_setting_because_agents_outnumber_it(monkeypatch):
+    """The cap counts every session in the process and parallel agents share it,
+    so five subagents hit a wall that has nothing to do with any of them."""
+    monkeypatch.setenv("WEB_SEARCH_NEO_MAX_SESSIONS", "9")
+    assert browser_tools._max_sessions() == 9
+    # A floor, because zero would refuse every open and tell the caller to close
+    # something that cannot exist.
+    monkeypatch.setenv("WEB_SEARCH_NEO_MAX_SESSIONS", "0")
+    assert browser_tools._max_sessions() == 1
+    monkeypatch.setenv("WEB_SEARCH_NEO_MAX_SESSIONS", "not a number")
+    assert browser_tools._max_sessions() == 4
+    monkeypatch.delenv("WEB_SEARCH_NEO_MAX_SESSIONS")
+    assert browser_tools._max_sessions() == 4
+
+
+def test_the_full_session_cap_names_the_setting_that_lifts_it(monkeypatch):
+    """A wall with no door written on it sends the reader to the source."""
+    for index in range(browser_tools.MAX_SESSIONS):
+        _register(f"agent{index}", _Tab(index + 1))
+    with pytest.raises(RuntimeError) as refusal:
+        browser_tools._create_session(
+            "one-too-many", 1440, 900, False, "current", None, None, None,
+            browser_tools.DEFAULT_TAB_GROUP,
+        )
+    assert "WEB_SEARCH_NEO_MAX_SESSIONS" in str(refusal.value)
+    assert "parallel agents" in str(refusal.value)
 
 
 # What the real client and the real driver do, which is the only thing that

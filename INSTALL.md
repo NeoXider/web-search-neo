@@ -2,7 +2,7 @@
 
 This guide installs the MCP server from source and connects it to LM Studio or another stdio-compatible MCP client.
 
-It describes version 1.3.9. The Python package, the server, and the bundled Chrome
+It describes version 1.3.10. The Python package, the server, and the bundled Chrome
 companion carry that same version, and the bridge only accepts a companion able to complete
 the 1.3.0 handshake — see [Updating](#updating) if an older one is already installed.
 
@@ -201,7 +201,7 @@ Earlier revisions tried to perform those clicks for you through Windows UI Autom
 code is gone. It depended on the interface language, on which window happened to have focus,
 and on a folder picker that the automation backend does not even enumerate.
 
-The bundled companion is version 1.3.9 and declares five permissions: `alarms`, `debugger`,
+The bundled companion is version 1.3.10 and declares five permissions: `alarms`, `debugger`,
 `storage`, `tabs`, and `tabGroups`. There are no content scripts and no `host_permissions`;
 page access comes from `debugger`, which attaches the Chrome DevTools Protocol to the tabs
 the agent drives. `alarms` exists because Chrome suspends an idle MV3 service worker after
@@ -301,6 +301,25 @@ the last completed handshake on that port, and `server_version` is this server's
 two numbers a skew is about are both in the answer. `current_chrome.connected` is about the
 companion itself, so `linked: true` with `connected: false` means the bridge is up and Chrome
 is not.
+
+The same answer says who else is here. `current_chrome.daemon.clients` counts the MCP servers
+sharing this browser, this one included, and `current_chrome.daemon.claims` lists every tab any
+of them is driving — `tab_id`, the `holder` that has it, how long for, and `mine` telling this
+server's tabs from a stranger's. `web_info(topic="browser_tabs")` carries the same fact where
+it is acted on: a tab already being driven comes back marked `driven_by`, so an agent picks a
+free one instead of learning about the collision from a refusal after the fact.
+
+Agents inside **one** MCP server are a different matter, and the fields for them are
+`sessions_in_use` and `shared_session`. Subagents of one run share one server process, so the
+only thing separating them is `session_id` — and two that both leave it at its default
+`"default"` get the same session and the same Chrome tab, where each one's navigation and
+typing lands in the other's page. Nothing can arbitrate that: an MCP call carries no caller
+identity, so the server cannot tell two agents apart. It can say it is happening, and does:
+`sessions_in_use` names the sessions another caller is inside right now, and `shared_session`
+with `shared_session_warning` appears on `browser_status` and on `open` when this very session
+is one of them. Give each agent its own `session_id` and they get a tab each. The session cap
+is per process too, so parallel agents share it — raise it with `WEB_SEARCH_NEO_MAX_SESSIONS`
+if four is not enough for the number of agents you run.
 
 ### The shared bridge secret
 
@@ -472,6 +491,7 @@ Set these for the MCP server process before it starts.
 | `WEB_SEARCH_NEO_PROXY` | Proxy for HTTP fetches, search, and browser sessions. |
 | `WEB_SEARCH_NEO_BROWSER_USER_AGENT` | Override the User-Agent of rendered sessions. |
 | `WEB_SEARCH_NEO_PROFILE_ROOT` | Root directory for `persistent` Chrome profiles. |
+| `WEB_SEARCH_NEO_MAX_SESSIONS` | How many browser sessions one server holds at once, default `4`, capped at `64`. The cap is per process and parallel agents share it, so raise it when several agents each need a page of their own. |
 | `WEB_SEARCH_NEO_DEBUGGER_ADDRESS` | Default DevTools address for `attach` mode. |
 | `WEB_SEARCH_NEO_BRIDGE_PORT` | Loopback port of the companion bridge, default `8765`. Shared by the daemon, every MCP server, and the extension. |
 | `WEB_SEARCH_NEO_BRIDGE_IDLE_SECONDS` | How long the bridge daemon stays up with neither a companion nor a client attached, default `900`. `0` disables the timer. |
@@ -577,7 +597,7 @@ or when `setup_current_chrome` answered `self_update: "unsupported"` or `"timeou
    very directory **Load unpacked** points at, then reload the extension. Restarting the
    daemon does not help and never did after the daemon learned to re-read the token file:
    it already fetches the current secret from disk before calling anything a mismatch.
-3. Check the card's version. It must read 1.3.9; anything older than 1.3.0 cannot
+3. Check the card's version. It must read 1.3.10; anything older than 1.3.0 cannot
    authenticate at all, and Chrome only picks up the new manifest on reload.
 4. `%LOCALAPPDATA%\WebSearchNeo\bridge-daemon.log` records the bridge's side: `Rejected a
    bridge client that did not present the companion token` confirms that something did reach

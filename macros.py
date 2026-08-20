@@ -108,7 +108,7 @@ def canonical_target_url(value: str) -> str:
     if path != "/":
         path = path.rstrip("/")
     # Query parameters can be the requisition identity (for example one shared
-    # application path with a role-specific ``?src=...``). Core cannot know
+    # resource path with identity carried by ``?src=...``). Core cannot know
     # which parameters are "tracking noise", so discarding any of them would
     # merge distinct targets. Callers must supply their already-canonical URL;
     # only the client-side fragment is excluded from the server target identity.
@@ -192,15 +192,76 @@ def validate_guard(guard: Any, resolved_steps: list[dict[str, Any]]) -> dict[str
     }
 
 
-def split_terminal_submit(steps: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Require one explicit terminal submit, never a heuristic click-to-submit."""
-    submit_indexes = [index for index, step in enumerate(steps) if step.get("action") == "submit"]
-    if submit_indexes != [len(steps) - 1]:
+def _validate_terminal_click(step: dict[str, Any]) -> dict[str, Any]:
+    """Return a fail-closed terminal click accepted by guarded dispatch."""
+    checked = dict(step)
+    if checked.get("trusted") is True:
+        raise ValueError("guarded terminal click refuses trusted=true")
+    if checked.get("x") is not None or checked.get("y") is not None:
+        raise ValueError("guarded terminal click refuses coordinate targets")
+
+    text = checked.get("text")
+    selector = checked.get("selector")
+    if text is not None:
+        if not str(text).strip():
+            raise ValueError("guarded terminal click text must not be empty")
+        if checked.get("exact", True) is not True:
+            raise ValueError("guarded terminal text click requires exact=true")
+        if not str(checked.get("role") or "").strip():
+            raise ValueError("guarded terminal text click requires an explicit role")
+        # A selector is allowed here only as the semantic dispatcher's candidate
+        # filter. Its exact text+role match still has to be unique at commit.
+        checked.pop("selector_must_be_unique", None)
+        return checked
+
+    if not isinstance(selector, str) or not selector.strip():
         raise ValueError(
-            "guarded macro requires exactly one explicit terminal action='submit'; "
-            "submit-like click actions are not accepted"
+            "guarded terminal click requires one plain CSS selector or exact text plus role"
         )
-    return steps[:-1], dict(steps[-1])
+    normalized_selector = selector.strip()
+    if normalized_selector.startswith("ref:") or ">>>" in normalized_selector:
+        raise ValueError(
+            "guarded terminal selector click requires plain CSS; ref handles and "
+            "piercing paths are not stable one-time targets"
+        )
+    checked["selector_must_be_unique"] = True
+    return checked
+
+
+def split_terminal_action(
+    steps: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Hold back exactly one terminal consequential ``submit`` or safe ``click``."""
+    if not steps:
+        raise ValueError("guarded macro requires a terminal submit or click action")
+    terminal = dict(steps[-1])
+    terminal_name = str(terminal.get("action") or "").strip().lower()
+    submit_indexes = [index for index, step in enumerate(steps) if step.get("action") == "submit"]
+    if terminal_name == "submit":
+        if submit_indexes != [len(steps) - 1]:
+            raise ValueError(
+                "guarded macro requires exactly one terminal consequential action; "
+                "submit must be the last step"
+            )
+    elif terminal_name == "click":
+        if submit_indexes:
+            raise ValueError(
+                "guarded macro with terminal click cannot contain a submit action"
+            )
+        terminal = _validate_terminal_click(terminal)
+    else:
+        raise ValueError(
+            "guarded macro requires exactly one terminal consequential action='submit' "
+            "or action='click'"
+        )
+    return steps[:-1], terminal
+
+
+def split_terminal_submit(
+    steps: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Backward-compatible name for :func:`split_terminal_action`."""
+    return split_terminal_action(steps)
 
 
 def _result_value(result: Any, path: str) -> Any:
@@ -269,25 +330,41 @@ def _write_guarded_ledger(
 
 def reserve_checkpoint(
     guard: dict[str, Any],
-    submit_step: dict[str, Any],
+    terminal_step: dict[str, Any],
     project_root: str | os.PathLike[str] | None = None,
 ) -> str:
     """Reserve a unique target/resource/token tuple after all assertions pass."""
     with _GUARDED_LEDGER_LOCK:
         ledger = _load_guarded_ledger(project_root)
+        # Every refusal below is permanent by design - that is what a one-time
+        # guard is - and each one used to end the sentence there. It left a
+        # caller whose commit never ran (the browser died between stage and
+        # commit, say) with a target that could not be staged again, no way to
+        # see why, and no way out that was written down anywhere. The ledger is
+        # a file; saying which file turns a dead end into a decision somebody can
+        # make deliberately.
+        ledger_path = _guarded_ledger_path(project_root)
         token = guard["idempotency_token"]
         existing = ledger["tokens"].get(token)
         if existing:
             raise ValueError(
-                f"idempotency token was already {existing.get('state', 'used')}; refusing replay"
+                f"idempotency token was already {existing.get('state', 'used')}; refusing "
+                f"replay. This is recorded in {ledger_path}; a genuinely new attempt needs "
+                "a new idempotency_token."
             )
         prior_token = ledger["identities"].get(guard["identity"])
         if prior_token:
-            raise ValueError("canonical target identity was already staged; refusing duplicate submit")
+            raise ValueError(
+                "canonical target identity was already staged; refusing duplicate submit. "
+                f"The earlier staging is recorded in {ledger_path}."
+            )
         resource_key = os.path.normcase(guard["resource_path"])
         prior_identity = ledger["resources"].get(resource_key)
         if prior_identity and prior_identity != guard["identity"]:
-            raise ValueError("resource path was already reserved for another target identity")
+            raise ValueError(
+                "resource path was already reserved for another target identity "
+                f"({prior_identity}); the reservation is recorded in {ledger_path}."
+            )
         checkpoint = f"guard-{token}"
         ledger["resources"][resource_key] = guard["identity"]
         ledger["identities"][guard["identity"]] = token
@@ -296,7 +373,8 @@ def reserve_checkpoint(
             "checkpoint": checkpoint,
             "identity": guard["identity"],
             "resource_path": guard["resource_path"],
-            "submit_step": submit_step,
+            "terminal_action": terminal_step["action"],
+            "terminal_step": terminal_step,
             "staged_at": time.time(),
         }
         _write_guarded_ledger(ledger, project_root)
@@ -314,10 +392,23 @@ def consume_checkpoint(
             None,
         )
         if not match:
-            raise ValueError("unknown guarded checkpoint; run guarded_stage first")
+            raise ValueError(
+                "unknown guarded checkpoint; run guarded_stage first. Staged "
+                f"checkpoints are recorded in {_guarded_ledger_path(project_root)}."
+            )
         if match.get("state") != "staged":
-            raise ValueError(f"guarded checkpoint is already {match.get('state')}; refusing replay submit")
-        match["state"] = "submit_attempted"
+            raise ValueError(
+                f"guarded checkpoint is already {match.get('state')}; "
+                "refusing replay of the terminal action. Whether it took effect is a "
+                "question for the site, not for this server; the record is in "
+                f"{_guarded_ledger_path(project_root)}."
+            )
+        terminal_action = str(
+            match.get("terminal_action")
+            or (match.get("terminal_step") or match.get("submit_step") or {}).get("action")
+            or "submit"
+        )
+        match["state"] = f"{terminal_action}_attempted"
         match["attempted_at"] = time.time()
         _write_guarded_ledger(ledger, project_root)
         return dict(match)
