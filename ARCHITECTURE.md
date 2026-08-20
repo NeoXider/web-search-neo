@@ -27,5 +27,10 @@ binding, assertions against live staged results, and a persistent one-time token
 terminal Submit is held back during staging and its checkpoint is consumed before dispatch,
 so retry after an ambiguous result fails closed.
 
+Canonical target identity preserves the complete query string because a query parameter can
+be the only distinction between two resources or requisitions on one shared path. URL
+fragments are excluded because they are client-side navigation state. Core never guesses
+which query parameters are tracking noise; the calling project supplies an already-canonical URL.
+
 These are mechanisms, not policies. A concrete project decides which hosts, identities,
 resources, assertions, and tokens are appropriate and stores those decisions with the project.

@@ -261,6 +261,7 @@ For a consequential flow, keep one explicit terminal `submit` as the last step a
 1. `op=guarded_stage` with `guard.target_url`, equal `canonical_url`, optional domain-defined
    `identity_key`, explicit `allowed_hosts`, optional `denied_hosts`, a unique idempotency
    token, and an existing absolute `resource_path` uploaded by that run.
+   Query parameters remain part of canonical target identity; only URL fragments are ignored.
 2. Live semantic assertions such as
    `{"result_index":2,"path":"data.text","contains":"Request 42"}`. Stage executes
    everything except Submit and returns no checkpoint if an action or assertion fails.

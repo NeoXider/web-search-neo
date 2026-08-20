@@ -577,6 +577,18 @@ def test_host_policy_is_caller_configuration_not_built_in(tmp_path):
     assert allowed["canonical_url"] == target
 
 
+def test_canonical_target_preserves_query_identity_and_drops_fragment():
+    senior = macros.canonical_target_url(
+        "HTTPS://Example.COM/listing/?src=/roles/senior.md#application"
+    )
+    lead = macros.canonical_target_url(
+        "https://example.com/listing?src=/roles/lead.md"
+    )
+    assert senior == "https://example.com/listing?src=/roles/senior.md"
+    assert lead == "https://example.com/listing?src=/roles/lead.md"
+    assert senior != lead
+
+
 def test_guard_requires_exact_target_host_and_uploaded_resource(tmp_path):
     resource = tmp_path / "resource.bin"
     other = tmp_path / "other.bin"

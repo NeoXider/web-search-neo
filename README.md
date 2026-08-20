@@ -278,7 +278,7 @@ is no automatic substitute. If you would rather not install an extension at all,
 `profile_mode="temporary"` and `profile_mode="persistent"` drive a Selenium
 browser that needs no companion.
 
-The bundled companion is version 1.3.8. Chrome does not refresh an unpacked
+The bundled companion is version 1.3.9. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. Upgrading *onto*
@@ -861,7 +861,7 @@ Consequential flows use a generic two-phase path. A guarded macro must end in ex
 explicit `submit` action. `guarded_stage` resolves the macro, then fails closed unless
 `guard` provides:
 
-- equal `target_url` and `canonical_url`, plus an optional domain-defined `identity_key`;
+- equal `target_url` and `canonical_url`, plus an optional domain-defined `identity_key`; query parameters are preserved because they may carry the target/requisition identity, while fragments are ignored;
 - an explicit `allowed_hosts` policy and optional `denied_hosts` policy;
 - an existing absolute `resource_path` that the resolved macro uploads exactly;
 - a stable 16-128 character `idempotency_token` unique to this target;

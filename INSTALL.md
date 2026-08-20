@@ -2,7 +2,7 @@
 
 This guide installs the MCP server from source and connects it to LM Studio or another stdio-compatible MCP client.
 
-It describes version 1.3.8. The Python package, the server, and the bundled Chrome
+It describes version 1.3.9. The Python package, the server, and the bundled Chrome
 companion carry that same version, and the bridge only accepts a companion able to complete
 the 1.3.0 handshake — see [Updating](#updating) if an older one is already installed.
 
@@ -201,7 +201,7 @@ Earlier revisions tried to perform those clicks for you through Windows UI Autom
 code is gone. It depended on the interface language, on which window happened to have focus,
 and on a folder picker that the automation backend does not even enumerate.
 
-The bundled companion is version 1.3.8 and declares five permissions: `alarms`, `debugger`,
+The bundled companion is version 1.3.9 and declares five permissions: `alarms`, `debugger`,
 `storage`, `tabs`, and `tabGroups`. There are no content scripts and no `host_permissions`;
 page access comes from `debugger`, which attaches the Chrome DevTools Protocol to the tabs
 the agent drives. `alarms` exists because Chrome suspends an idle MV3 service worker after
@@ -561,7 +561,7 @@ or when `setup_current_chrome` answered `self_update: "unsupported"` or `"timeou
    very directory **Load unpacked** points at, then reload the extension. Restarting the
    daemon does not help and never did after the daemon learned to re-read the token file:
    it already fetches the current secret from disk before calling anything a mismatch.
-3. Check the card's version. It must read 1.3.8; anything older than 1.3.0 cannot
+3. Check the card's version. It must read 1.3.9; anything older than 1.3.0 cannot
    authenticate at all, and Chrome only picks up the new manifest on reload.
 4. `%LOCALAPPDATA%\WebSearchNeo\bridge-daemon.log` records the bridge's side: `Rejected a
    bridge client that did not present the companion token` confirms that something did reach

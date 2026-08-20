@@ -98,7 +98,7 @@ def _guarded_ledger_path(project_root: str | os.PathLike[str] | None = None) -> 
 
 
 def canonical_target_url(value: str) -> str:
-    """Return a stable HTTP(S) target identity, without query noise or fragments."""
+    """Return a stable HTTP(S) target identity while preserving meaningful query data."""
     parsed = urlsplit(str(value or "").strip())
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
         raise ValueError("guard requires an absolute http(s) canonical target URL")
@@ -107,7 +107,12 @@ def canonical_target_url(value: str) -> str:
     path = re.sub(r"/{2,}", "/", parsed.path or "/")
     if path != "/":
         path = path.rstrip("/")
-    return urlunsplit((parsed.scheme.lower(), host + port, path, "", ""))
+    # Query parameters can be the requisition identity (for example one shared
+    # application path with a role-specific ``?src=...``). Core cannot know
+    # which parameters are "tracking noise", so discarding any of them would
+    # merge distinct targets. Callers must supply their already-canonical URL;
+    # only the client-side fragment is excluded from the server target identity.
+    return urlunsplit((parsed.scheme.lower(), host + port, path, parsed.query, ""))
 
 
 def _host_is(host: str, suffix: str) -> bool:
