@@ -391,6 +391,35 @@ def test_run_replays_every_step_through_the_dispatcher(monkeypatch):
     assert seen[0]["record"] is False
 
 
+def test_preview_resolves_every_step_without_dispatching(monkeypatch):
+    async def forbidden_execute(*args, **kwargs):
+        raise AssertionError("preview must not dispatch browser actions")
+
+    monkeypatch.setattr(main, "_execute_actions", forbidden_execute)
+    macros.save("apply", APPLY_STEPS, description="Review before applying")
+
+    outcome = _call(
+        op="preview",
+        name="apply",
+        variables={"vacancy_url": "https://hh.ru/v/42", "cover_letter": "Hello"},
+    )
+
+    assert outcome["success"] is True
+    assert outcome["executed"] is False
+    assert outcome["description"] == "Review before applying"
+    assert outcome["step_count"] == 3
+    assert outcome["steps"][0]["url"] == "https://hh.ru/v/42"
+    assert outcome["steps"][2]["fields"]["textarea[name=text]"] == "Hello"
+    assert "no browser state changed" in outcome["note"]
+
+
+def test_preview_requires_every_variable_before_returning_steps():
+    macros.save("apply", APPLY_STEPS)
+    with pytest.raises(ValueError) as excinfo:
+        _call(op="preview", name="apply", variables={"vacancy_url": "https://hh.ru/v/42"})
+    assert "cover_letter" in str(excinfo.value)
+
+
 def test_concurrent_batches_do_not_interleave_into_one_recording(monkeypatch):
     """Two batches sent at once must record as two runs, not as one shuffled script."""
     started: list[str] = []
@@ -440,7 +469,7 @@ def test_delete_reports_whether_anything_was_removed():
     assert _call(op="delete", name="apply")["deleted"] is False
 
 
-@pytest.mark.parametrize("op", ["run", "show", "delete", "record"])
+@pytest.mark.parametrize("op", ["run", "preview", "show", "delete", "record"])
 def test_ops_that_need_a_name_say_so(op):
     with pytest.raises(ValueError, match="requires name"):
         _call(op=op)

@@ -230,6 +230,11 @@ script. Every action is recordable, and a replay dispatches through the same val
 coordinates), and the scripting, cookie, storage, captcha, stealth, and request-replay actions
 record and replay just like `open`, `fill`, and `submit` do.
 
+Before replaying a consequential task, call `macro op=preview name=hh-apply` with the
+same `variables` planned for `run`. It resolves every placeholder and returns the exact
+steps with `executed=false`, without dispatching an action or changing browser state. This
+is the review point for a final URL, form values, an upload path, or a submit step.
+
 Replay with `macro op=run name=hh-apply`. The parts that change between runs are
 `{{placeholders}}` in the saved steps: edit them in with `op=save` and explicit `steps`, or
 write them from the start, then pass `variables` on each run. A placeholder that is a whole

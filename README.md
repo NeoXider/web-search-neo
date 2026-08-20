@@ -39,7 +39,7 @@ Startpage are available as fallbacks.
 - [Current Chrome automation](#current-chrome-automation) · [Chrome profile modes](#chrome-profile-modes)
 - [Reading a page](#reading-a-page) · [Locators](#locators)
 - [Console and network diagnostics](#console-and-network-diagnostics)
-- [Forms and multi-step flows](#forms-and-multi-step-flows)
+- [Forms and multi-step flows](#forms-and-multi-step-flows) · [Reviewable macros](#reviewable-macros)
 - [Canvas and WebGL games](#canvas-and-webgl-games) · [Render modes](#render-modes) · [Input latency](#input-latency)
 - [Two-tool MCP contract](#two-tool-mcp-contract) · [Optional agent skill](#optional-agent-skill)
 - [Optional configuration](#optional-configuration) · [Transport policy](#transport-policy)
@@ -277,7 +277,7 @@ is no automatic substitute. If you would rather not install an extension at all,
 `profile_mode="temporary"` and `profile_mode="persistent"` drive a Selenium
 browser that needs no companion.
 
-The bundled companion is version 1.3.5. Chrome does not refresh an unpacked
+The bundled companion is version 1.3.6. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. Upgrading *onto*
@@ -825,6 +825,27 @@ selectors are generated, partial-failure recovery, multi-step wizards and SPAs,
 fields inside Shadow DOM and same-origin iframes, what to do when
 `challenge_detected` turns true, and how to trace a submit that silently failed
 through `network` and `network_body`.
+
+## Reviewable macros
+
+Use the `macro` action to record and replay a repeated browser flow. Before a
+consequential replay, preview the exact resolved steps with the same variables
+that will be passed to `run`:
+
+```json
+{"actions":[{"action":"macro","op":"preview","name":"job-apply","variables":{"vacancy_url":"https://example.com/jobs/42","resume_path":"C:/CV/role.pdf"}}]}
+```
+
+`preview` loads the saved macro, validates that every placeholder was supplied,
+and returns the resolved `steps` with `executed: false`. It never dispatches an
+action or changes browser state. Review the canonical URL, form values, upload
+path, and whether a terminal submit is present before sending the corresponding
+`op: "run"` call.
+
+Preview is a review boundary, not proof that replay will succeed. After `run`,
+check the batch result and freshly inspect the page. For applications, payments,
+messages, or other consequential actions, keep terminal Submit in a separate
+macro or direct action so it is attempted only once after live-state validation.
 
 ## Canvas and WebGL games
 

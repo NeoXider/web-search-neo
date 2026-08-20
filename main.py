@@ -24,7 +24,7 @@ import msp_search
 from web_client import request
 
 
-__version__ = "1.3.5"
+__version__ = "1.3.6"
 
 PROJECT_DIR = Path(__file__).resolve().parent
 log = logging.getLogger("web_search_neo")
@@ -1171,7 +1171,7 @@ async def browser_macro(
     description: str = "",
     continue_on_error: bool = False,
 ) -> dict[str, Any]:
-    """Save, record, run, inspect, or delete a named action script with {{placeholders}}."""
+    """Save, record, preview, run, inspect, or delete an action script with {{placeholders}}."""
     op = str(op or "").strip().lower()
 
     if op == "record":
@@ -1243,6 +1243,21 @@ async def browser_macro(
         outcome = await _execute_actions(resolved, continue_on_error, record=False)
         return {**outcome, "macro": record["name"], "step_count": len(resolved)}
 
+    if op == "preview":
+        if not name:
+            raise ValueError("macro op 'preview' requires name")
+        record = await asyncio.to_thread(macros.load, name)
+        resolved = macros.resolve(record["steps"], record.get("variables"), variables)
+        return {
+            "success": True,
+            "macro": record["name"],
+            "description": record.get("description") or "",
+            "step_count": len(resolved),
+            "steps": resolved,
+            "executed": False,
+            "note": "Preview only: no action was dispatched and no browser state changed.",
+        }
+
     if op == "list":
         return {"success": True, "macros": await asyncio.to_thread(macros.list_macros)}
 
@@ -1262,7 +1277,7 @@ async def browser_macro(
         }
 
     raise ValueError(
-        f"macro op must be record, save, run, list, show, delete, or cancel, not '{op}'"
+        f"macro op must be record, save, preview, run, list, show, delete, or cancel, not '{op}'"
     )
 
 
