@@ -17,6 +17,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import secrets
 import subprocess
 import sys
@@ -74,6 +75,19 @@ _IS_WINDOWS = os.name == "nt"
 # Two daemons of the wrong version in a row means another checkout is fighting us
 # over the port, and replacing each other forever would be worse than saying so.
 MAX_DAEMON_REPLACEMENTS = 2
+
+# How long a version conflict is believed before the port is looked at again. The
+# conflict is a statement about two processes, and the other one can be stopped
+# at any time, so latching it forever turns a passing collision into a server
+# that has to be restarted by hand. The re-check only looks: it never spawns a
+# daemon and never asks one to leave, so it cannot restart the tug-of-war it
+# reports.
+DAEMON_RECHECK_SECONDS = 10.0
+
+# A daemon of another revision refuses the hello and names the protocol it wants
+# in the close reason. That reason is the only thing it ever tells us, so it is
+# read rather than reported as an unexplained hello failure.
+_PROTOCOL_REFUSAL = re.compile(r"bridge protocol (\d+)")
 
 # Long enough for a capture of a window nothing is looking at, which measured
 # between 70 ms and half a minute depending on whether Chrome was painting it,
@@ -200,6 +214,32 @@ def _package_version() -> str:
         return ""
 
 
+def _daemon_entry_version() -> str:
+    """The version of ``main.py`` as it is on disk, without importing it.
+
+    This is deliberately not :func:`_package_version`. That one answers "what
+    code is this process running", read from the module imported when the server
+    started; this one answers "what code would a daemon started now run", read
+    from the file :data:`DAEMON_ENTRY` points at. The two differ for as long as a
+    long-lived MCP server keeps running after the checkout was updated under it,
+    and that gap is the only thing that can explain a replacement daemon
+    reporting a version this server never asked for.
+    """
+    try:
+        source = DAEMON_ENTRY.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    for line in source.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("__version__"):
+            _, _, value = stripped.partition("=")
+            return value.strip().strip("\"'")
+        if stripped.startswith("def ") or stripped.startswith("class "):
+            # Past the module header; a later assignment would not be the banner.
+            break
+    return ""
+
+
 class ChromeBridge:
     """Client of the bridge daemon that owns the port the Chrome companion dials.
 
@@ -258,6 +298,10 @@ class ChromeBridge:
         self._thread: threading.Thread | None = None
         self._startup_error: str | None = None
         self._fatal_error: str | None = None
+        # When the latched conflict above may be looked at again, and the flag
+        # that keeps that second look passive.
+        self._recheck_at = 0.0
+        self._probe_only = False
 
     @staticmethod
     def _resolve_spawn(
@@ -301,7 +345,17 @@ class ChromeBridge:
         """Make sure a daemon is reachable, without blocking longer than it takes."""
         with self._state_lock:
             if self._fatal_error:
-                return
+                if time.monotonic() < self._recheck_at:
+                    return
+                # The conflict describes another process, and that one can be
+                # stopped or updated at any moment. Look again - but only look:
+                # a probe neither starts a daemon nor asks one to leave, so it
+                # cannot restart the fight the latch exists to end.
+                self._recheck_at = time.monotonic() + _env_seconds(
+                    "WEB_SEARCH_NEO_BRIDGE_RECHECK_SECONDS", DAEMON_RECHECK_SECONDS
+                )
+                self._probe_only = True
+                self._fatal_error = None
             if self._thread is None or not self._thread.is_alive():
                 self._closing = False
                 self._wake.clear()
@@ -324,11 +378,18 @@ class ChromeBridge:
             try:
                 connection = self._establish()
             except _VersionConflict as exc:
-                # Latched on purpose: retrying would restart the very tug-of-war
-                # over the port that this reports.
+                # Latched on purpose: retrying in a tight loop would restart the
+                # very tug-of-war over the port that this reports. The latch runs
+                # out after DAEMON_RECHECK_SECONDS, and the look that follows is
+                # passive, so the state clears itself once the other side is gone
+                # instead of outliving it until someone restarts this server.
                 with self._state_lock:
                     self._fatal_error = str(exc)
                     self._startup_error = str(exc)
+                    self._recheck_at = time.monotonic() + _env_seconds(
+                        "WEB_SEARCH_NEO_BRIDGE_RECHECK_SECONDS", DAEMON_RECHECK_SECONDS
+                    )
+                    self._probe_only = False
                 LOGGER.error("%s", exc)
                 self._attempted.set()
                 return
@@ -344,13 +405,106 @@ class ChromeBridge:
             self._read_until_closed(connection)
         self._attempted.set()
 
+    def _protocol_conflict(self, theirs: Any) -> str:
+        """The refusal, naming what actually differs.
+
+        Versions differing is not a reason two processes cannot work together -
+        that was the mistake the old message made, and it sent people hunting for
+        a second checkout that was not there. The frames differing is a reason,
+        and it is the only one, so the numbers that differ are in the sentence.
+        """
+        return (
+            f"The bridge daemon on {self.host}:{self.port} speaks bridge protocol {theirs} "
+            f"and this server speaks {PROTOCOL}, so this server cannot use it. The two are "
+            "different revisions of Web Search Neo: bring them to the same one, or stop "
+            "that daemon's process so this server can start one it understands."
+        )
+
+    def _verdict(self, acknowledgement: dict[str, Any], expected: str) -> tuple[str, str]:
+        """Decide what to do with the daemon that just introduced itself.
+
+        Three answers, and only one of them refuses to work:
+
+        ``link``
+            Its code can serve ours. That includes a daemon *newer* than this
+            server: a long-lived MCP client keeps running the revision it was
+            started with, so after a ``git pull`` the daemon on the port is
+            routinely ahead of the server talking to it, and treating that as a
+            fault took the browser away from a machine where everything was up to
+            date. Same protocol means the frames mean the same thing, which is
+            what sharing a companion actually requires. A daemon that reports no
+            version, or one whose version cannot be ranked against ours, is
+            linked to as well rather than evicted on a guess.
+        ``replace``
+            Strictly older, so it predates this server and would serve code we
+            have already moved past. This is the case the replacement exists for.
+        ``incompatible``
+            The frames themselves differ - a bridge protocol this server does not
+            speak - and the daemon is not ours to replace. Naming the protocol is
+            the point: "version 1.3.9 vs 1.3.8" says nothing about whether the
+            two can work together, and it was the reason the old message had to
+            guess at a cause.
+        """
+        daemon_version = str(acknowledgement.get("version") or "")
+        raw_protocol = acknowledgement.get("protocol")
+        protocol = raw_protocol if isinstance(raw_protocol, int) else None
+        order = bridge_daemon.compare_versions(daemon_version, expected)
+        if protocol is not None and protocol != PROTOCOL:
+            # A daemon that accepted our hello and then acknowledged with another
+            # protocol number is not something either side should paper over.
+            return "incompatible", self._protocol_conflict(protocol)
+        if not expected or not daemon_version or order is None or order >= 0:
+            return "link", ""
+        return "replace", ""
+
+    def _outdated_daemon(
+        self, daemon_version: str, expected: str, *, replaced: bool
+    ) -> str:
+        """Say why the daemon on the port is older than this server, and stays so.
+
+        The old wording named the only cause anyone had thought of - a second
+        checkout on the same port - and stated it as fact. There is a commoner
+        one: this server is running the revision it was started with, so a
+        checkout that changed underneath it hands every daemon it spawns a
+        version the server does not recognise. That is visible from here, so it
+        is said rather than guessed at.
+        """
+        disk = _daemon_entry_version()
+        cause = (
+            "Another checkout of Web Search Neo is running against the same port; "
+            "stop it, then restart this server."
+        )
+        if disk and disk != expected:
+            cause = (
+                f"{DAEMON_ENTRY} is version {disk}, so this server is running code that is "
+                "no longer on disk - restart this MCP server to pick the checkout up. If "
+                "the versions still disagree afterwards, another checkout of Web Search "
+                "Neo is holding the same port."
+            )
+        # A re-check of a latched conflict starts nothing, and claiming a
+        # replacement that never happened would send the reader looking for it.
+        attempt = (
+            f", and the daemons started in its place reported {daemon_version} as well"
+            if replaced
+            else " still"
+        )
+        return (
+            f"The bridge daemon on {self.host}:{self.port} reports version "
+            f"{daemon_version}{attempt}, older than this server's {expected}. {cause}"
+        )
+
     def _establish(self) -> Any:
         """Connect to the daemon, starting or replacing one when that is needed."""
         # The generous budget is there to cover a daemon we start ourselves; with
         # nobody allowed to start one, waiting that long only delays the answer.
-        budget = self._connect_timeout if self._spawn is not None else min(
-            self._connect_timeout, 1.0
-        )
+        with self._state_lock:
+            # Consumed here, not left standing: the passive look is one attempt.
+            # A flag that outlived it would silently disable autospawn for the
+            # rest of the process the first time a probe found nothing listening.
+            probe_only = self._probe_only
+            self._probe_only = False
+        may_spawn = self._spawn is not None and not probe_only
+        budget = self._connect_timeout if may_spawn else min(self._connect_timeout, 1.0)
         deadline = time.monotonic() + budget
         spawned = False
         replacements = 0
@@ -361,7 +515,11 @@ class ChromeBridge:
             try:
                 connection = self._dial()
             except OSError:
-                if not spawned and self._spawn is not None:
+                # Nothing answers the port, so there is no daemon left to describe;
+                # keeping the last one's version would make `status()` report a
+                # process that is gone.
+                self._forget_daemon()
+                if not spawned and may_spawn:
                     LOGGER.info(
                         "Nothing is listening on %s:%s; starting the bridge daemon",
                         self.host,
@@ -374,10 +532,21 @@ class ChromeBridge:
                 time.sleep(0.15)
                 continue
             acknowledgement = self._handshake(connection)
+            # Whatever is decided below, this is the daemon that is on the port.
+            # Recording it here is what keeps an error and `status()` from naming
+            # two different daemons in the same answer.
+            self._remember_daemon(acknowledgement)
             daemon_version = str(acknowledgement.get("version") or "")
             expected = self._expected_version()
-            if not expected or not daemon_version or daemon_version == expected:
-                self._remember_daemon(acknowledgement)
+            verdict, detail = self._verdict(acknowledgement, expected)
+            if verdict == "link":
+                if daemon_version and daemon_version != expected:
+                    LOGGER.info(
+                        "Bridge daemon %s serves this server (%s); versions differ but the "
+                        "protocol does not",
+                        daemon_version,
+                        expected,
+                    )
                 try:
                     self._refresh_state(connection)
                 except Exception:
@@ -387,6 +556,9 @@ class ChromeBridge:
                     close_quietly(connection, 1000, "The daemon handshake did not finish")
                     raise
                 return connection
+            if verdict == "incompatible":
+                close_quietly(connection, 1000, "Incompatible bridge daemon")
+                raise _VersionConflict(detail)
             pid = acknowledgement.get("pid")
             identity = acknowledgement.get("instance") or pid
             if identity in retired:
@@ -398,14 +570,18 @@ class ChromeBridge:
                     )
                 time.sleep(0.2)
                 continue
+            if probe_only:
+                # Re-checking a latched conflict must not evict anything: the
+                # point of looking again is to notice that it has cleared.
+                close_quietly(connection, 1000, "Version mismatch")
+                raise _VersionConflict(
+                    self._outdated_daemon(daemon_version, expected, replaced=False)
+                )
             replacements += 1
             if replacements > MAX_DAEMON_REPLACEMENTS:
                 close_quietly(connection, 1000, "Version mismatch")
                 raise _VersionConflict(
-                    f"The bridge daemon on {self.host}:{self.port} reports version "
-                    f"{daemon_version}, but this server is {expected}, and replacing it "
-                    "did not help. Another checkout of Web Search Neo is running against "
-                    "the same port; stop it, then restart this server."
+                    self._outdated_daemon(daemon_version, expected, replaced=True)
                 )
             LOGGER.info(
                 "Bridge daemon %s (pid %s) predates this server (%s); replacing it",
@@ -461,6 +637,13 @@ class ChromeBridge:
             # otherwise leave one abandoned socket and its reader thread behind
             # on every retry, for as long as the server runs.
             close_quietly(connection, 1002, "The bridge daemon did not finish the hello")
+            refusal = _PROTOCOL_REFUSAL.search(str(exc))
+            if refusal:
+                # Not a wedged peer: a daemon of another revision, which rejects
+                # the hello before it would ever answer with a version. This is
+                # the one skew that is a real incompatibility, so it is the one
+                # that stops instead of retrying every half second.
+                raise _VersionConflict(self._protocol_conflict(refusal.group(1))) from exc
             raise ChromeBridgeError(
                 f"The peer on the bridge port did not answer the hello: "
                 f"{type(exc).__name__}: {exc}"
@@ -479,6 +662,21 @@ class ChromeBridge:
         with self._state_lock:
             self._daemon_version = str(acknowledgement.get("version") or "")
             self._daemon_pid = acknowledgement.get("pid")
+
+    def _forget_daemon(self) -> None:
+        """Stop describing a daemon this client is no longer talking to.
+
+        ``version`` and ``pid`` used to survive every drop, so a server that had
+        once linked to a matching daemon kept reporting that daemon's numbers
+        while the port was held by a different process - the answer said
+        ``linked: false`` and named the version of the one that was gone, next to
+        a ``startup_error`` naming the one that is there. Two versions in one
+        answer is not a detail: the version is exactly what the reader is trying
+        to establish.
+        """
+        with self._state_lock:
+            self._daemon_version = ""
+            self._daemon_pid = None
 
     def _retire(self, connection: Any, expected: str) -> None:
         try:
@@ -616,6 +814,8 @@ class ChromeBridge:
                     self._daemon = None
                     self._browser_info = {}
                     self._connected.clear()
+                    self._daemon_version = ""
+                    self._daemon_pid = None
             # A caller blocked on an answer that can no longer come must be told
             # so, rather than sit out its whole timeout.
             self._fail_pending(
@@ -811,13 +1011,22 @@ class ChromeBridge:
                 self._pending.pop(request_id, None)
 
     def status(self, wait_seconds: float = 0.0) -> dict[str, Any]:
-        """The bridge as a caller sees it; ``browser`` is :attr:`browser_info`."""
+        """The bridge as a caller sees it; ``browser`` is :attr:`browser_info`.
+
+        ``daemon.version`` is what the daemon on the port said in the handshake
+        this client last completed, whether or not it went on to link to it, and
+        ``daemon.server_version`` is this server's own. Both are there because a
+        skew between them is the thing being diagnosed, and one number cannot
+        show a difference.
+        """
         connected = self.wait_connected(wait_seconds)
+        server_version = self._expected_version()
         with self._state_lock:
             daemon = {
                 "linked": self._daemon is not None,
                 "version": self._daemon_version or None,
                 "pid": self._daemon_pid,
+                "server_version": server_version or None,
             }
         return {
             "connected": connected,

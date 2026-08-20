@@ -81,6 +81,55 @@ def idle_shutdown_seconds() -> float:
         return IDLE_SHUTDOWN_SECONDS
 
 
+def parse_version(text: str) -> tuple[int, ...]:
+    """The numeric release components of a version string, for ordering.
+
+    Ordering versions is not string comparison: ``"1.3.10" < "1.3.9"`` is true
+    for text and false for releases, and the bridge decides whether to replace a
+    daemon on exactly that question. Leading numeric components are read and a
+    trailing label is ignored, so ``"1.3.10-rc1"`` orders as ``(1, 3, 10)``; a
+    string with no leading number at all yields ``()``, which compares equal only
+    to another such string and is therefore never mistaken for "older".
+    """
+    components: list[int] = []
+    for chunk in str(text or "").strip().split("."):
+        match = re.match(r"\d+", chunk)
+        if not match:
+            break
+        components.append(int(match.group()))
+        if match.end() != len(chunk):
+            # A label starts here ("10-rc1"): the number counted, the rest cannot.
+            break
+    return tuple(components)
+
+
+def compare_versions(left: str, right: str) -> int | None:
+    """``-1``/``0``/``1`` for older/same/newer, or ``None`` when unorderable.
+
+    ``None`` is a real answer and not a failure: two builds whose versions carry
+    no numbers - a development checkout, a fork's naming scheme - can be told
+    apart but not ranked, and a caller that must not guess needs to hear so
+    rather than be handed an arbitrary side of zero.
+    """
+    left_text = str(left or "").strip()
+    right_text = str(right or "").strip()
+    if left_text == right_text:
+        return 0
+    first = parse_version(left_text)
+    second = parse_version(right_text)
+    if not first or not second:
+        return None
+    # Trailing zeros must not make 1.3 look older than 1.3.0.
+    width = max(len(first), len(second))
+    first = first + (0,) * (width - len(first))
+    second = second + (0,) * (width - len(second))
+    if first == second:
+        # Same release, different labels ("1.3.10" vs "1.3.10-rc1"): same code as
+        # far as anything here can tell, so neither side may evict the other.
+        return 0
+    return -1 if first < second else 1
+
+
 def browser_state(hello: dict[str, Any]) -> dict[str, Any]:
     """Describe the browser a companion hello came from, run identity included.
 
@@ -618,7 +667,12 @@ class BridgeDaemon:
             close_quietly(websocket, 1008, "Companion hello must be a JSON object")
             return None
         if first.get("type") != "hello" or first.get("protocol") != PROTOCOL:
-            close_quietly(websocket, 1008, "Expected Web Search Neo protocol hello")
+            # The number is in the reason on purpose: this close is the only thing
+            # a peer of another revision ever receives, so a bare "wrong hello"
+            # left it unable to report what it could not agree with.
+            close_quietly(
+                websocket, 1008, f"Expected Web Search Neo bridge protocol {PROTOCOL}"
+            )
             return None
         token = self._ensure_token()
         nonce = first.get("nonce")

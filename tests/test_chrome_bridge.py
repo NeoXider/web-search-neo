@@ -2110,6 +2110,286 @@ def test_a_daemon_of_the_same_version_is_left_alone() -> None:
             assert daemon.stopped is False
 
 
+def test_versions_are_ranked_component_wise_rather_than_as_text() -> None:
+    """The one comparison where text and releases disagree decides an eviction."""
+    assert "1.3.10" < "1.3.9", "the string order this must not use"
+    assert bridge_daemon.compare_versions("1.3.10", "1.3.9") == 1
+    assert bridge_daemon.compare_versions("1.3.9", "1.3.10") == -1
+    assert bridge_daemon.compare_versions("1.3.9", "1.3.9") == 0
+    # A missing trailing component is a zero, not a smaller release.
+    assert bridge_daemon.compare_versions("1.3", "1.3.0") == 0
+    assert bridge_daemon.compare_versions("1.4", "1.3.9") == 1
+    # A label is not a release: 1.3.10-rc1 and 1.3.10 are the same code here, and
+    # neither may evict the other over the suffix alone.
+    assert bridge_daemon.compare_versions("1.3.10-rc1", "1.3.10") == 0
+    assert bridge_daemon.compare_versions("0.0.1-stale", "9.9.9") == -1
+    # Unrankable is an answer of its own, not an arbitrary side of zero.
+    assert bridge_daemon.compare_versions("dev", "1.3.9") is None
+    assert bridge_daemon.compare_versions("dev", "dev") == 0
+
+
+def test_a_daemon_newer_than_this_server_is_used_rather_than_replaced() -> None:
+    """A long-lived MCP server outlives the checkout it was started from.
+
+    ``git pull`` does not touch the running process, so its ``__version__`` stays
+    at the revision it imported while every daemon started from ``main.py`` on
+    disk reports the new one. Treating that as a fault was unfixable by
+    construction: the server evicted the newer daemon, started a replacement from
+    the same updated file, and was handed the same newer version again - twice,
+    and then it gave up and blamed a second checkout that did not exist.
+    """
+    port = _free_port()
+    spawned: list[BridgeDaemon] = []
+
+    def spawn_from_disk(_port: int) -> None:
+        # Whatever this server starts comes from the checkout, which is ahead.
+        replacement = BridgeDaemon(port=port, token=TEST_TOKEN, version="1.3.9")
+        replacement.start()
+        spawned.append(replacement)
+
+    daemon = BridgeDaemon(port=port, token=TEST_TOKEN, version="1.3.9")
+    daemon.start()
+    client = ChromeBridge(
+        port=port,
+        token=TEST_TOKEN,
+        version="1.3.8",
+        spawn=spawn_from_disk,
+        connect_timeout=20.0,
+    )
+    try:
+        client.start()
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline:
+            status = client.status(0.0)
+            if status["daemon"]["linked"] or status["startup_error"]:
+                break
+            time.sleep(0.05)
+        status = client.status(0.0)
+        assert status["startup_error"] is None, status["startup_error"]
+        assert status["daemon"]["linked"], status
+        assert status["daemon"]["version"] == "1.3.9"
+        assert status["daemon"]["server_version"] == "1.3.8"
+        assert not daemon.stopped, "the newer daemon was evicted by an older server"
+        assert spawned == [], "an older server started a daemon over a newer one"
+    finally:
+        client.shutdown()
+        daemon.shutdown()
+        for replacement in spawned:
+            replacement.shutdown()
+
+
+def test_the_reported_daemon_version_is_the_one_the_error_names() -> None:
+    """One answer must not name two daemons.
+
+    ``version`` and ``pid`` used to be written only on a link that succeeded and
+    cleared by nothing, so a server that had once linked to a matching daemon
+    reported that dead daemon's numbers next to a ``startup_error`` about the
+    process actually holding the port - the field a reader consults to check the
+    claim contradicted the claim.
+    """
+    port = _free_port()
+    spawned: list[BridgeDaemon] = []
+
+    def spawn_stale(_port: int) -> None:
+        replacement = BridgeDaemon(port=port, token=TEST_TOKEN, version="0.0.1-stale")
+        replacement.start()
+        spawned.append(replacement)
+
+    matching = BridgeDaemon(port=port, token=TEST_TOKEN, version="9.9.9")
+    matching.start()
+    client = ChromeBridge(
+        port=port,
+        token=TEST_TOKEN,
+        version="9.9.9",
+        spawn=spawn_stale,
+        connect_timeout=20.0,
+    )
+    try:
+        client.start()
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline and not client.status(0.0)["daemon"]["linked"]:
+            time.sleep(0.05)
+        assert client.status(0.0)["daemon"]["version"] == "9.9.9"
+
+        # The port changes hands under the running server, exactly as it does
+        # when a daemon exits on its idle timer and something else starts one.
+        matching.shutdown()
+        stale = BridgeDaemon(port=port, token=TEST_TOKEN, version="0.0.1-stale")
+        stale.start()
+        spawned.append(stale)
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline and not client.status(0.0)["startup_error"]:
+            time.sleep(0.1)
+
+        status = client.status(0.0)
+        error = status["startup_error"] or ""
+        assert "0.0.1-stale" in error, error
+        assert status["daemon"]["version"] == "0.0.1-stale", status
+        assert status["daemon"]["server_version"] == "9.9.9", status
+        assert "9.9.9" in error, error
+    finally:
+        client.shutdown()
+        matching.shutdown()
+        for daemon in spawned:
+            daemon.shutdown()
+
+
+def test_two_checkouts_on_one_port_settle_on_the_newer_daemon() -> None:
+    """Two clones sharing the port must converge, not take turns evicting."""
+    port = _free_port()
+    started: list[BridgeDaemon] = []
+
+    def spawn_new(_port: int) -> None:
+        replacement = BridgeDaemon(port=port, token=TEST_TOKEN, version="1.3.10")
+        replacement.start()
+        started.append(replacement)
+
+    old_daemon = BridgeDaemon(port=port, token=TEST_TOKEN, version="1.3.9")
+    old_daemon.start()
+    started.append(old_daemon)
+    # The old checkout's server is already using the daemon its own clone started.
+    old_client = ChromeBridge(port=port, token=TEST_TOKEN, version="1.3.9", spawn=False)
+    new_client = ChromeBridge(
+        port=port,
+        token=TEST_TOKEN,
+        version="1.3.10",
+        spawn=spawn_new,
+        connect_timeout=20.0,
+    )
+    try:
+        old_client.start()
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline and not old_client.status(0.0)["daemon"]["linked"]:
+            time.sleep(0.05)
+        assert old_client.status(0.0)["daemon"]["version"] == "1.3.9"
+
+        # The newer clone comes up and does replace the older daemon: it is the
+        # one case where an eviction is right.
+        new_client.start()
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline and not new_client.status(0.0)["daemon"]["linked"]:
+            time.sleep(0.05)
+        assert new_client.status(0.0)["daemon"]["version"] == "1.3.10"
+        assert old_daemon.stopped
+
+        # And the older clone follows it there instead of starting the fight over.
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline and (
+            old_client.status(0.0)["daemon"]["version"] != "1.3.10"
+        ):
+            time.sleep(0.1)
+        status = old_client.status(0.0)
+        assert status["daemon"]["linked"], status
+        assert status["daemon"]["version"] == "1.3.10", status
+        assert status["startup_error"] is None, status
+        assert len(started) == 2, started
+        assert not started[-1].stopped, "the newer daemon was evicted by the older clone"
+    finally:
+        old_client.shutdown()
+        new_client.shutdown()
+        for daemon in started:
+            daemon.shutdown()
+
+
+def test_a_daemon_speaking_another_protocol_is_refused_by_name(monkeypatch) -> None:
+    """A refusal has to name what is incompatible, not what merely differs.
+
+    Versions differing is not a reason two processes cannot work together; the
+    frames differing is. So this is the only skew that ends in a refusal, and the
+    message says which protocol each side speaks.
+    """
+    monkeypatch.setattr(bridge_daemon, "PROTOCOL", chrome_bridge.PROTOCOL + 1)
+    port = _free_port()
+    spawns: list[int] = []
+    daemon = BridgeDaemon(port=port, token=TEST_TOKEN, version="2.0.0")
+    daemon.start()
+    client = ChromeBridge(
+        port=port,
+        token=TEST_TOKEN,
+        version="1.3.10",
+        spawn=spawns.append,
+        connect_timeout=10.0,
+    )
+    try:
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline and not client.status(0.0)["startup_error"]:
+            time.sleep(0.05)
+        status = client.status(0.0)
+        error = status["startup_error"] or ""
+        # The daemon of another revision never answers the hello, so its close
+        # reason is the only thing there is to report - and it carries the number.
+        assert "bridge protocol" in error, error
+        assert str(chrome_bridge.PROTOCOL) in error and str(bridge_daemon.PROTOCOL) in error
+        assert not status["daemon"]["linked"]
+        assert not daemon.stopped, "a daemon we cannot speak to is not ours to stop"
+        assert spawns == [], "the port was not free, so nothing may be started on it"
+    finally:
+        client.shutdown()
+        daemon.shutdown()
+
+
+def test_a_version_conflict_clears_itself_once_the_other_side_is_gone(monkeypatch) -> None:
+    """The latch describes another process, so it cannot outlive that process.
+
+    Latching the conflict is right - retrying in a loop is the tug-of-war it
+    reports - but a latch that never lifts turns a passing collision into a
+    server that has to be restarted by hand, which is what a user was left doing.
+    """
+    monkeypatch.setattr(chrome_bridge, "DAEMON_RECHECK_SECONDS", 0.5)
+    port = _free_port()
+    spawned: list[BridgeDaemon] = []
+
+    def spawn_stale(_port: int) -> None:
+        replacement = BridgeDaemon(port=port, token=TEST_TOKEN, version="0.0.1-stale")
+        replacement.start()
+        spawned.append(replacement)
+
+    first = BridgeDaemon(port=port, token=TEST_TOKEN, version="0.0.1-stale")
+    first.start()
+    spawned.append(first)
+    client = ChromeBridge(
+        port=port,
+        token=TEST_TOKEN,
+        version="9.9.9",
+        spawn=spawn_stale,
+        connect_timeout=20.0,
+    )
+    current: BridgeDaemon | None = None
+    try:
+        client.start()
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline and not client.status(0.0)["startup_error"]:
+            time.sleep(0.1)
+        assert "0.0.1-stale" in (client.status(0.0)["startup_error"] or "")
+        replacements_made = len(spawned)
+
+        # The other checkout is stopped and a current daemon takes the port - the
+        # fix a user would apply by hand. Nothing restarts this server.
+        for daemon in spawned:
+            daemon.shutdown()
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and not all(d.stopped for d in spawned):
+            time.sleep(0.05)
+        current = BridgeDaemon(port=port, token=TEST_TOKEN, version="9.9.9")
+        current.start()
+
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline and not client.status(0.0)["daemon"]["linked"]:
+            time.sleep(0.1)
+        status = client.status(0.0)
+        assert status["daemon"]["linked"], status
+        assert status["daemon"]["version"] == "9.9.9", status
+        assert status["startup_error"] is None, status
+        # Looking again is passive: the re-check started no daemon of its own.
+        assert len(spawned) == replacements_made, spawned
+    finally:
+        client.shutdown()
+        for daemon in spawned:
+            daemon.shutdown()
+        if current is not None:
+            current.shutdown()
+
+
 def test_a_daemon_running_other_code_is_replaced_before_any_command() -> None:
     """A daemon spawned before a git pull would keep serving the code it started with."""
     port = _free_port()

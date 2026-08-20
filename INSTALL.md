@@ -275,16 +275,32 @@ that window, or to `0` to keep the port held; the daemon inherits the environmen
 server that spawned it, so setting it in your MCP client configuration is enough.
 
 After `git pull`, a daemon started by the previous revision does not keep serving the old
-code: it reports its version during the client handshake, and a server of a different
-version stops it and starts a current one. It does that at most twice; if a third daemon
-still reports the wrong version, the server gives up and repeats an error naming both
-versions instead of restarting the fight. That means another checkout is running against the
-same port — stop it, then restart this server.
+code: it reports its version during the client handshake, and a server that is newer stops it
+and starts a current one. Versions are ranked component by component, so `1.3.10` is newer
+than `1.3.9` — as text it is not, and that comparison decides an eviction.
+
+A daemon that is *newer* than the server is used as it is. That is the normal state after a
+pull, not a fault: your MCP client keeps running the revision it loaded at startup, while any
+daemon started from `main.py` on disk reports the new one. It used to be reported as
+`Another checkout of Web Search Neo is running against the same port`, which could not be
+acted on because there was no second checkout — restarting the MCP client was the actual fix,
+and nothing said so. Only a daemon speaking a different **bridge protocol** stops this server
+now, and that message names both protocol numbers.
+
+Replacing an older daemon is still attempted at most twice; if a third daemon still reports
+an older version, the server gives up with an error naming both versions — and, when the
+`main.py` on disk carries a different version than the running process, saying to restart the
+MCP client. That error is latched so the fight is not restarted on every call, but the latch
+expires after ten seconds (`WEB_SEARCH_NEO_BRIDGE_RECHECK_SECONDS`) and the next look is
+passive, so stopping the other daemon is enough — the server recovers on its own, with no
+restart and no process killing.
 
 `web_info(topic="browser_status")` shows the link under `current_chrome.daemon`: `linked`
-says whether this server currently holds one, while `version` and `pid` identify the daemon
-process from its handshake. `current_chrome.connected` is about the companion itself, so
-`linked: true` with `connected: false` means the bridge is up and Chrome is not.
+says whether this server currently holds one, `version` and `pid` identify the daemon seen in
+the last completed handshake on that port, and `server_version` is this server's own, so the
+two numbers a skew is about are both in the answer. `current_chrome.connected` is about the
+companion itself, so `linked: true` with `connected: false` means the bridge is up and Chrome
+is not.
 
 ### The shared bridge secret
 
