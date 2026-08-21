@@ -278,7 +278,7 @@ is no automatic substitute. If you would rather not install an extension at all,
 `profile_mode="temporary"` and `profile_mode="persistent"` drive a Selenium
 browser that needs no companion.
 
-The bundled companion is version 1.3.10. Chrome does not refresh an unpacked
+The bundled companion is version 1.3.11. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. Upgrading *onto*
@@ -910,6 +910,8 @@ and non-terminal submits fail closed. `guarded_stage` resolves the macro, then f
 - equal `target_url` and `canonical_url`, plus an optional domain-defined `identity_key`; query parameters are preserved because they may carry the target/requisition identity, while fragments are ignored;
 - an explicit `allowed_hosts` policy and optional `denied_hosts` policy;
 - an existing absolute `resource_path` that the resolved macro uploads exactly;
+- the exact 64-hex `resource_sha256` for the current file bytes (case-insensitive input,
+  normalized to lowercase after verification);
 - a stable 16-128 character `idempotency_token` unique to this target;
 - one or more live `assertions` over staged action results.
 
@@ -937,6 +939,7 @@ This neutral document-request example assumes result 2 is a fresh `page_text` ch
       "allowed_hosts": ["example.com"],
       "denied_hosts": ["staging.example.com"],
       "resource_path": "C:/work/my-project/artifacts/request-42.pdf",
+      "resource_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
       "idempotency_token": "request-42-20260820",
       "assertions": [
         {"result_index": 2, "path": "data.text", "contains": "Request 42"}
@@ -947,7 +950,9 @@ This neutral document-request example assumes result 2 is a fresh `page_text` ch
 ```
 
 `guarded_stage` dispatches every step except the terminal consequential action. Only after all staged actions
-succeed and every semantic assertion passes does it reserve a `checkpoint`. Review the
+succeed, the supplied SHA-256 matches the current resource bytes, and every semantic assertion
+passes does it reserve a `checkpoint`. The normalized digest is returned by staging and stored
+with the checkpoint. Review the
 result and commit once from the same project store:
 
 ```json
@@ -961,6 +966,10 @@ the ledger file it is refusing from — otherwise a stage whose commit never ran
 that can never be staged again and nothing to look at. The guard proves one guarded attempt, not server acceptance;
 inspect durable confirmation separately. Concrete domain macros should live with their
 projects and are not bundled in this repository.
+
+`guarded_commit` never retries the terminal action and does not infer remote acceptance. After
+the single attempt, use ordinary read-only inspection actions (for example fresh page text or a
+screenshot) to collect destination-specific proof.
 
 ## Canvas and WebGL games
 

@@ -13,6 +13,7 @@ steps belongs to the caller that already owns the action table.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -35,6 +36,15 @@ MAX_STEPS = 10000
 
 _GUARDED_LEDGER_NAME = ".guarded-macro-ledger.json"
 _GUARDED_LEDGER_LOCK = threading.Lock()
+
+
+def _sha256_file(path: Path) -> str:
+    """Return a lowercase SHA-256 for *path* without loading it all into memory."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def macro_root(project_root: str | os.PathLike[str] | None = None) -> Path:
@@ -162,6 +172,14 @@ def validate_guard(guard: Any, resolved_steps: list[dict[str, Any]]) -> dict[str
     if not resource_path.is_absolute() or not resource_path.is_file():
         raise ValueError("guard.resource_path must be an existing absolute file")
     resource_resolved = str(resource_path.resolve())
+    expected_sha256 = str(guard.get("resource_sha256") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        raise ValueError("guard.resource_sha256 must be exactly 64 hexadecimal characters")
+    actual_sha256 = _sha256_file(Path(resource_resolved))
+    if actual_sha256 != expected_sha256:
+        raise ValueError(
+            "guard.resource_sha256 does not match the current guard.resource_path bytes"
+        )
     uploaded_paths: list[str] = []
     for step in resolved_steps:
         if step.get("action") == "upload":
@@ -185,6 +203,7 @@ def validate_guard(guard: Any, resolved_steps: list[dict[str, Any]]) -> dict[str
         "identity_key": identity_key,
         "identity": identity,
         "resource_path": resource_resolved,
+        "resource_sha256": actual_sha256,
         "idempotency_token": idempotency_token,
         "assertions": assertions,
         "allowed_hosts": sorted(allowed_hosts),
@@ -373,6 +392,7 @@ def reserve_checkpoint(
             "checkpoint": checkpoint,
             "identity": guard["identity"],
             "resource_path": guard["resource_path"],
+            "resource_sha256": guard["resource_sha256"],
             "terminal_action": terminal_step["action"],
             "terminal_step": terminal_step,
             "staged_at": time.time(),

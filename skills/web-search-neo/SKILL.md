@@ -269,7 +269,9 @@ Then use:
 
 1. `op=guarded_stage` with `guard.target_url`, equal `canonical_url`, optional domain-defined
    `identity_key`, explicit `allowed_hosts`, optional `denied_hosts`, a unique idempotency
-   token, and an existing absolute `resource_path` uploaded by that run.
+   token, an existing absolute `resource_path` uploaded by that run, and the exact 64-hex
+   `resource_sha256` of its current bytes. The server recomputes the digest, refuses missing or
+   mismatched values, normalizes it to lowercase, and persists it with the checkpoint.
    Query parameters remain part of canonical target identity; only URL fragments are ignored.
 2. Live semantic assertions such as
    `{"result_index":2,"path":"data.text","contains":"Request 42"}`. Stage executes

@@ -23,7 +23,10 @@ be copied into the MCP repository.
 
 The generic `guarded_stage` / `guarded_commit` protocol provides canonical target identity,
 optional domain identity, caller-supplied host allow/deny policy, exact uploaded-resource
-binding, assertions against live staged results, and a persistent one-time token. Exactly one
+binding by absolute path and required SHA-256, assertions against live staged results, and a
+persistent one-time token. The guard computes the current file hash during staging, refuses a
+missing, malformed, or mismatched digest, normalizes it to lowercase, and records it in the
+one-time checkpoint ledger. Exactly one
 terminal consequential action is held back during staging: either an explicit Submit or a safe
 Click. Guarded Click accepts only a plain CSS selector with a live unique-match check at
 dispatch, or exact rendered text plus an explicit role through the ambiguity-refusing semantic

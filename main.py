@@ -24,7 +24,7 @@ import msp_search
 from web_client import request
 
 
-__version__ = "1.3.10"
+__version__ = "1.3.11"
 
 PROJECT_DIR = Path(__file__).resolve().parent
 log = logging.getLogger("web_search_neo")
@@ -1298,6 +1298,7 @@ async def browser_macro(
             "terminal_action": terminal_step["action"],
             "checkpoint": reserved,
             "identity": checked_guard["identity"],
+            "resource_sha256": checked_guard["resource_sha256"],
             "assertions": assertions,
             "note": (
                 "Live semantic assertions passed. Review this result, then call "
@@ -1324,6 +1325,7 @@ async def browser_macro(
             "terminal_action": terminal_action,
             "checkpoint": checkpoint,
             "identity": reserved["identity"],
+            "resource_sha256": reserved.get("resource_sha256"),
             "note": "Checkpoint consumed before dispatch; this terminal action cannot be replayed.",
         }
 

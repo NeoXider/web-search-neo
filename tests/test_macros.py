@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+from pathlib import Path
 
 import pytest
 
@@ -503,6 +505,7 @@ def _guarded_steps():
 
 
 def _guard(resource_path, **overrides):
+    resource_path = Path(resource_path)
     guard = {
         "target_url": "https://forms.example.com/requests/42",
         "canonical_url": "https://forms.example.com/requests/42/",
@@ -510,6 +513,7 @@ def _guard(resource_path, **overrides):
         "allowed_hosts": ["example.com"],
         "denied_hosts": ["blocked.example"],
         "resource_path": str(resource_path),
+        "resource_sha256": hashlib.sha256(resource_path.read_bytes()).hexdigest(),
         "idempotency_token": "request-42-20260820",
         "assertions": [{"result_index": 2, "path": "data.text", "contains": "Request 42"}],
     }
@@ -545,9 +549,13 @@ def test_guarded_macro_stages_asserts_then_commits_submit_once(tmp_path, monkeyp
         guard=_guard(resource.resolve()),
     )
     assert staged["checkpoint"] == "guard-request-42-20260820"
+    expected_sha256 = hashlib.sha256(resource.read_bytes()).hexdigest()
+    assert staged["resource_sha256"] == expected_sha256
     assert staged["executed_submit"] is False
     assert all(step["action"] != "submit" for step in calls[0])
-    assert _call(op="guarded_commit", checkpoint=staged["checkpoint"])["executed_submit"] is True
+    committed = _call(op="guarded_commit", checkpoint=staged["checkpoint"])
+    assert committed["executed_submit"] is True
+    assert committed["resource_sha256"] == expected_sha256
     with pytest.raises(ValueError, match="already submit_attempted"):
         _call(op="guarded_commit", checkpoint=staged["checkpoint"])
 
@@ -664,6 +672,52 @@ def test_guard_requires_exact_target_host_and_uploaded_resource(tmp_path):
         macros.validate_guard(
             _guard(other, canonical_url="https://forms.example.com/requests/99"), steps
         )
+
+
+def test_guard_requires_matching_resource_sha256(tmp_path):
+    resource = tmp_path / "resource.bin"
+    resource.write_bytes(b"verified bytes")
+    steps = macros.resolve(
+        _guarded_steps(),
+        None,
+        {
+            "target_url": "https://forms.example.com/requests/42",
+            "resource_path": str(resource.resolve()),
+        },
+    )
+
+    missing = _guard(resource)
+    missing.pop("resource_sha256")
+    with pytest.raises(ValueError, match="exactly 64 hexadecimal"):
+        macros.validate_guard(missing, steps)
+
+    with pytest.raises(ValueError, match="exactly 64 hexadecimal"):
+        macros.validate_guard(_guard(resource, resource_sha256="not-a-sha256"), steps)
+
+    with pytest.raises(ValueError, match="does not match"):
+        macros.validate_guard(_guard(resource, resource_sha256="0" * 64), steps)
+
+    expected = hashlib.sha256(resource.read_bytes()).hexdigest()
+    checked = macros.validate_guard(_guard(resource, resource_sha256=expected.upper()), steps)
+    assert checked["resource_sha256"] == expected
+
+
+def test_guarded_checkpoint_persists_verified_resource_sha256(tmp_path):
+    resource = tmp_path / "resource.bin"
+    resource.write_bytes(b"immutable bytes")
+    steps = macros.resolve(
+        _guarded_steps(),
+        None,
+        {
+            "target_url": "https://forms.example.com/requests/42",
+            "resource_path": str(resource.resolve()),
+        },
+    )
+    checked = macros.validate_guard(_guard(resource), steps)
+    checkpoint = macros.reserve_checkpoint(checked, {"action": "submit"})
+    reserved = macros.consume_checkpoint(checkpoint)
+
+    assert reserved["resource_sha256"] == hashlib.sha256(resource.read_bytes()).hexdigest()
 
 
 def test_failed_assertion_does_not_create_checkpoint(tmp_path, monkeypatch):
@@ -833,6 +887,7 @@ def test_guard_checkpoint_is_available_only_in_its_project(tmp_path):
     guard = {
         "identity": "https://example.com/request/1",
         "resource_path": str((tmp_path / "resource.bin").resolve()),
+        "resource_sha256": "0" * 64,
         "idempotency_token": "project-local-token-1",
     }
     checkpoint = macros.reserve_checkpoint(guard, {"action": "submit"}, project_a)
