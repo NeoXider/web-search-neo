@@ -19,7 +19,26 @@ import {
   trackPending,
 } from "./events.js";
 
-const BRIDGE_URL = "ws://127.0.0.1:8765";
+const DEFAULT_BRIDGE_PORT = 8765;
+const PORT_KEY = "companion_bridge_port";
+// The port used to live only in this line, so a server moved off 8765 meant
+// editing an installed extension and reloading it by hand - a source edit as
+// configuration, in the one file a user has no reason to open. It is a setting
+// now, read before each connect, and the constant is only the default.
+let bridgePort = DEFAULT_BRIDGE_PORT;
+
+function bridgeUrl() {
+  return `ws://127.0.0.1:${bridgePort}`;
+}
+
+function normalizePort(value) {
+  const port = Number.parseInt(value, 10);
+  // Ports below 1024 need privileges the daemon does not take, and a loopback
+  // bridge has no business asking for one, so the range refuses them outright
+  // rather than failing later inside a connect nobody is watching.
+  if (!Number.isFinite(port) || port < 1024 || port > 65535) return null;
+  return port;
+}
 const PROTOCOL_VERSION = 1;
 // The bridge only listens while the MCP server runs, which on a desktop is a
 // small slice of the day. Chrome logs every refused attempt as a runtime error
@@ -356,6 +375,36 @@ async function ensureDebugger(tabId) {
   persistState();
 }
 
+// Every DevTools method the server sends through "cdp.send", and nothing else.
+// The companion previously forwarded whatever arrived, so an authenticated peer
+// held the entire protocol - including domains this MCP never exposes. The list
+// is asserted against the Python call sites by tests/test_chrome_bridge.py, so
+// adding a method to the server without adding it here fails the suite instead
+// of failing a user.
+export const ALLOWED_CDP_METHODS = new Set([
+  "DOM.setFileInputFiles",
+  "Emulation.setDeviceMetricsOverride",
+  "Emulation.setEmitTouchEventsForMouse",
+  "Emulation.setTouchEmulationEnabled",
+  "Input.dispatchKeyEvent",
+  "Input.dispatchMouseEvent",
+  "Input.dispatchTouchEvent",
+  "Input.insertText",
+  "Network.enable",
+  "Network.getResponseBody",
+  "Network.setExtraHTTPHeaders",
+  "Network.setUserAgentOverride",
+  "Page.addScriptToEvaluateOnNewDocument",
+  "Page.bringToFront",
+  "Page.captureScreenshot",
+  "Page.getLayoutMetrics",
+  "Page.removeScriptToEvaluateOnNewDocument",
+  "Runtime.evaluate",
+  "Storage.clearCookies",
+  "Storage.getCookies",
+  "Storage.setCookies",
+]);
+
 async function cdpSend({tabId, sessionId, method, params = {}}) {
   await ensureDebugger(tabId);
   const target = sessionId ? {tabId, sessionId} : {tabId};
@@ -489,6 +538,17 @@ const commands = {
   },
 
   async "cdp.send"(params) {
+    const method = String(params?.method || "");
+    if (!ALLOWED_CDP_METHODS.has(method)) {
+      // The peer is authenticated, not trusted with the whole protocol. Every
+      // method the MCP contract actually exposes is listed above; anything else
+      // reaching this tab would be a capability the contract never granted, so
+      // it stops here rather than at the debugger.
+      throw new Error(
+        `Refused DevTools method '${method}': the companion forwards only the ` +
+        `${ALLOWED_CDP_METHODS.size} methods Web Search Neo uses.`
+      );
+    }
     return cdpSend({...params, tabId: Number(params.tabId)});
   },
 
@@ -813,6 +873,31 @@ function setBadge(online) {
   });
 }
 
+async function loadBridgePort() {
+  try {
+    const stored = (await chrome.storage.local.get(PORT_KEY))?.[PORT_KEY];
+    bridgePort = normalizePort(stored) ?? DEFAULT_BRIDGE_PORT;
+  } catch (error) {
+    console.warn("bridge: could not read the port setting", error);
+    bridgePort = DEFAULT_BRIDGE_PORT;
+  }
+  return bridgePort;
+}
+
+async function setBridgePort(value) {
+  const port = normalizePort(value);
+  if (port === null) {
+    throw new Error("Bridge port must be a whole number between 1024 and 65535.");
+  }
+  if (port === bridgePort) return connectionStatus();
+  bridgePort = port;
+  await chrome.storage.local.set({[PORT_KEY]: port});
+  // A port change is only real once the socket follows it, and the old socket
+  // is pointed at a server this companion no longer belongs to.
+  await resetBackoff();
+  return reconnectNow();
+}
+
 async function loadEnabled() {
   if (!enabledPromise) {
     enabledPromise = Promise.resolve(chrome.storage.local.get(ENABLED_KEY))
@@ -834,7 +919,9 @@ function connectionStatus() {
     enabled,
     connected: Boolean(socket && socket.readyState === WebSocket.OPEN && verified),
     connecting,
-    bridge_url: BRIDGE_URL,
+    bridge_url: bridgeUrl(),
+    bridge_port: bridgePort,
+    default_bridge_port: DEFAULT_BRIDGE_PORT,
     controlled_tabs: attachedTabs.size,
     next_attempt_at: enabled ? backoff.nextAttemptAt || 0 : 0,
     version: chrome.runtime.getManifest().version,
@@ -1155,7 +1242,7 @@ export async function connect() {
 
   verified = false;
   let handshakeStarted = false;
-  socket = new WebSocket(BRIDGE_URL);
+  socket = new WebSocket(bridgeUrl());
   connecting = false;
   const active = socket;
   socket.onopen = () => {
@@ -1280,6 +1367,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     operation = loadEnabled().then(() => reconnectNow());
   } else if (type === "companion.releaseTabs") {
     operation = detachAllTabs().then(detached_tabs => ({...connectionStatus(), detached_tabs}));
+  } else if (type === "companion.setBridgePort") {
+    operation = loadEnabled().then(() => setBridgePort(message.port));
   } else {
     return false;
   }
@@ -1296,7 +1385,9 @@ if (alarmsAvailable) {
   });
 }
 restoreState();
-loadEnabled().then(active => {
-  setBadge(false);
-  if (active) resumeConnect();
-});
+loadBridgePort()
+  .then(loadEnabled)
+  .then(active => {
+    setBadge(false);
+    if (active) resumeConnect();
+  });

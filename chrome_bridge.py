@@ -155,6 +155,14 @@ def _daemon_interpreter(environment: dict[str, str]) -> str:
     return executable
 
 
+# subprocess exposes this only on Windows, and the Windows branch below is
+# deliberately exercised on other platforms by tests that force _IS_WINDOWS.
+# Reading the constant through the module would make that branch raise
+# AttributeError off Windows, which is a test-only failure standing in for a
+# code path that is correct - so the value is named once, here.
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+
 def spawn_bridge_daemon(port: int) -> None:
     """Start the bridge daemon detached, so it outlives the process that needs it.
 
@@ -171,7 +179,7 @@ def spawn_bridge_daemon(port: int) -> None:
         # CREATE_NO_WINDOW is ignored when combined with DETACHED_PROCESS. A
         # Windows child already outlives its parent, and the three DEVNULL
         # handles below keep it independent of the MCP stdio transport.
-        detach["creationflags"] = subprocess.CREATE_NO_WINDOW
+        detach["creationflags"] = CREATE_NO_WINDOW
     else:
         detach["start_new_session"] = True
     try:

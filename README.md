@@ -279,7 +279,7 @@ is no automatic substitute. If you would rather not install an extension at all,
 `profile_mode="temporary"` and `profile_mode="persistent"` drive a Selenium
 browser that needs no companion.
 
-The bundled companion is version 1.4.0. Chrome does not refresh an unpacked
+The bundled companion is version 1.5.0. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. Upgrading *onto*
@@ -301,6 +301,27 @@ The bridge accepts only the fixed bundled extension ID, binds only to loopback, 
 A badge reading `OFF` means this companion is not connected and authenticated, which is usually — but not only — because nothing is listening on the bridge port: no daemon has been started since the machine booted, the last one exited after its idle window, or it was stopped with `--bridge --stop`. That is the normal state of a machine on which no MCP server has run yet, not a fault — but it is no longer the state between two agent calls, which is what it was when the port lived inside the MCP server. The badge also reads `OFF` in two cases where the port is very much held: when the daemon refused this companion's token, and when a companion in a second Chrome profile authenticated later and displaced it. So `OFF` is not by itself a reason to start a daemon — read `web_info(topic="browser_status")` and `bridge-daemon.log` before concluding the port is free. While nothing listens, the worker retries with an exponential backoff — about 1.5 seconds after the first failure, doubling to a ceiling of one minute, and dropping back to the floor the moment a handshake verifies. Chrome suspends an idle service worker after roughly thirty seconds, which is why the longer waits are `chrome.alarms` rather than timers: a timer that long would die with the worker. Chrome also logs every refused attempt as an extension error of ours and an extension cannot suppress that, so a red **Errors** button on the card of an idle machine is expected; before 1.3.1 the worker retried every two seconds and could fill that page with hundreds of identical `ERR_CONNECTION_REFUSED` lines. Starting the browser or reloading the extension resets the schedule, and the popup's **Reconnect** button retries immediately.
 
 Keep the companion enabled in one Chrome profile at a time. The bridge holds exactly one companion connection and the most recent authenticated one wins, so a second profile with the companion enabled quietly takes the agent's tabs with it.
+
+### The companion popup
+
+The toolbar popup is where the companion is switched on, watched, and configured.
+Beyond the enable switch, the controlled-tab count, and the release check, it shows
+**Next attempt** — a connection that is merely waiting says when it will try again,
+which is what tells a stalled bridge apart from a deliberate backoff.
+
+Under **Settings**:
+
+| Setting | What it does |
+| --- | --- |
+| **Bridge port** | The loopback port the companion dials, 1024–65535. It must match `WEB_SEARCH_NEO_BRIDGE_PORT` on the server. Applying it stores the value, drops the old socket, and reconnects at once; the port survives a browser restart. A privileged port is refused with the range rather than failing inside a connect nobody is watching. |
+| **Protocol access** | States what the companion will forward. It is a list, not a passthrough: only the DevTools methods this MCP issues reach the tab. |
+
+That allowlist is the answer to the obvious question about a companion holding
+`debugger` on your signed-in tabs. Authentication proves a peer knows a
+machine-local secret; it does not make that peer trusted with all of Chrome's
+protocol. Any method outside the list is refused inside the extension, and a test
+compares the list against the server's own call sites, so the two cannot drift
+apart without the suite failing.
 
 ### The bridge daemon
 
@@ -886,10 +907,34 @@ action or changes browser state. Review the canonical URL, form values, upload
 path, and whether a terminal consequential action is present before sending the corresponding
 `op: "run"` call.
 
+It also checks every resolved step against the schema its action publishes, and reports
+`steps_valid` with a `problems` list naming the offending step index and error. Because macro
+files are written and edited by hand, the defect in one is usually a mistyped parameter rather
+than a wrong click path — and without this check it surfaces mid-replay, after the steps
+before it have already dispatched.
+
 Preview is a review boundary, not proof that replay will succeed. After `run`,
 check the batch result and freshly inspect the page. For applications, payments,
 messages, or other consequential actions, use the guarded two-phase path below so the exact
 terminal Submit or safe Click is attempted only once after live-state validation.
+
+### Recording, and agents working at once
+
+A recording belongs to one `session_id`: `macro op=record name=… session_id=work` captures
+what happens on that tab and nothing else. Agents running side by side therefore record
+independently, which is the only way the feature is safe in a server they share — a single
+shared recording collected every dispatched action, so an agent recording a login silently
+got another agent's clicks in the middle of it and replayed them.
+
+`save` and `cancel` infer the recording when one is open and refuse to guess when two are,
+naming both sessions. An action with no session of its own — a `search`, a `fetch_text` —
+joins the only open recording; with several open it is left out of all of them and reported
+as `unattributed_steps` on the saved macro, rather than attributed by luck.
+
+A replay can be pointed somewhere else: `session_id` on `run` or `preview` rewrites the
+session of every step, so a macro recorded in one tab runs in another without editing the
+file. A macro that already drives two sessions is refused rather than collapsed into one,
+because two tabs were the point; give those steps a `{{placeholder}}` session instead.
 
 ### Where macros live
 
@@ -932,7 +977,9 @@ The full form is what `op=save` writes, and adds the description and placeholder
 
 Every step is exactly one `web_action` action object, so
 `web_info(topic="action_schema", params={"action": "<name>"})` is the reference for what a
-step may contain. Each store gets a `README.md` stating this next to the files, because the
+step may contain. The `variables` map is optional: placeholders are declared from the steps
+themselves, so a hand-written file reports what it wants through `op=list` and `op=show`
+without one. Name a variable only to give it a default. Each store gets a `README.md` stating this next to the files, because the
 next reader of a committed macro directory is often a model that has never seen the schema.
 A file that cannot be read as a macro is reported by `op=list` as `broken` rather than
 skipped, so one bad hand edit never hides the macros beside it. The guarded-operation
@@ -1268,7 +1315,7 @@ server process: a daemon inherits the environment of whichever server spawns it.
 
 | Variable | Effect |
 | --- | --- |
-| `WEB_SEARCH_NEO_BRIDGE_PORT` | Loopback port shared by the daemon, the servers, and the extension, default `8765`. Changing it also means editing `BRIDGE_URL` in `chrome-extension/service-worker.js` and reloading the unpacked extension. |
+| `WEB_SEARCH_NEO_BRIDGE_PORT` | Loopback port shared by the daemon and the servers, default `8765`. Set the companion to the same number under Settings → Bridge port in its popup; it is stored and survives a browser restart. |
 | `WEB_SEARCH_NEO_BRIDGE_IDLE_SECONDS` | How long a daemon with neither a companion nor a client stays up, default `900`. `0` disables the timer and keeps the port held. |
 | `WEB_SEARCH_NEO_BRIDGE_AUTOSPAWN` | `0`, `false`, or `no` stops a server from starting a daemon; it then uses one only if something else already runs it. |
 | `WEB_SEARCH_NEO_BRIDGE_CONNECT_TIMEOUT` | How long a server keeps trying to reach a daemon, including one it started itself, default `12` seconds. |

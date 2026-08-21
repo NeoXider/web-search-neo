@@ -24,7 +24,7 @@ import msp_search
 from web_client import request
 
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 PROJECT_DIR = Path(__file__).resolve().parent
 log = logging.getLogger("web_search_neo")
@@ -1197,15 +1197,113 @@ async def browser_close_all() -> dict[str, Any]:
     return await asyncio.to_thread(browser_tools.close_all_sessions)
 
 
-# One recording at a time, because there is one hand driving the browser: a
-# second concurrent recording could only capture the same steps twice.
-_RECORDING: dict[str, Any] = {"active": False, "name": "", "steps": [], "project_root": None}
+# One recording per session_id, because one session_id is one tab and one agent.
+# A single shared recording was silently wrong the moment two agents worked at
+# once: every dispatched action went into whichever recording happened to be
+# open, so an agent recording a login ended up with another agent's clicks in
+# the middle of it, and the macro replayed them. Keying by session is the same
+# boundary the rest of the server already uses.
+_RECORDINGS: dict[str, dict[str, Any]] = {}
 
-# A batch holds this for as long as it is dispatching, so two batches sent at
-# once are recorded one after the other instead of interleaving into a script
-# whose steps never ran in that order. It guards the recorder only: batches that
-# are not being recorded never touch it and stay fully concurrent.
+# A batch holds this while it dispatches, so two batches recorded into the same
+# script cannot interleave into an order their steps never ran in. Only batches
+# that touch a recorded session take it; everything else stays fully concurrent,
+# which is the point of recording per session in the first place.
 _RECORDING_LOCK = asyncio.Lock()
+
+# The session a recording is opened against when the caller does not say. It is
+# also the default of every session_id parameter, so an agent that never picked
+# an id records exactly the tab it has been driving.
+_DEFAULT_SESSION = "default"
+
+
+def _recording_session(session_id: str | None) -> str:
+    return str(session_id).strip() if str(session_id or "").strip() else _DEFAULT_SESSION
+
+
+def _open_recording(session_id: str | None, op: str) -> tuple[str, dict[str, Any]]:
+    """Find the recording an op means, refusing an ambiguous guess.
+
+    With one recording open the caller does not have to name it. With two, a
+    guess would save one agent's work under another's name, so it is refused
+    with both session ids rather than resolved by order.
+    """
+    if session_id is not None and str(session_id).strip():
+        session = _recording_session(session_id)
+        recording = _RECORDINGS.get(session)
+        if recording is None:
+            raise ValueError(
+                f"macro op '{op}': no recording is open for session_id '{session}'. "
+                f"Open recordings: {sorted(_RECORDINGS)}."
+            )
+        return session, recording
+    if not _RECORDINGS:
+        raise ValueError(f"macro op '{op}': no recording is open.")
+    if len(_RECORDINGS) > 1:
+        raise ValueError(
+            f"macro op '{op}': {len(_RECORDINGS)} recordings are open "
+            f"({sorted(_RECORDINGS)}). Name the one you mean with session_id."
+        )
+    return next(iter(_RECORDINGS.items()))
+
+
+def _step_problems(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Check each resolved step against the schema its action publishes.
+
+    Macro files are written by hand, so the mistake in one is usually a wrong
+    parameter name rather than a wrong click path - and without this it surfaces
+    mid-replay, after the steps before it have already dispatched. The same
+    validator the dispatcher uses runs here, against nothing.
+    """
+    problems: list[dict[str, Any]] = []
+    for index, step in enumerate(steps):
+        arguments = dict(step)
+        action_name = str(arguments.pop("action", "")).strip().lower()
+        spec = _ACTIONS.get(action_name)
+        if spec is None:
+            problems.append(
+                {"index": index, "error": _unsupported_action_error(action_name, arguments)}
+            )
+            continue
+        try:
+            _validate_arguments(spec.tool_name, f"action '{action_name}'", arguments)
+        except ValueError as exc:
+            problems.append({"index": index, "action": action_name, "error": str(exc)})
+    return problems
+
+
+def _retarget_session(steps: list[dict[str, Any]], session_id: str) -> list[dict[str, Any]]:
+    """Point every step of a replay at one session, or refuse to guess.
+
+    A macro recorded against one tab carries that tab's id in every step, so
+    running it beside the original - a second agent, a second account - otherwise
+    means editing the file. A macro that already drives two sessions means two
+    tabs on purpose, and collapsing them into one would quietly change what it
+    does, so that is refused and the caller is pointed at a placeholder instead.
+    """
+    target = str(session_id).strip()
+    if not target:
+        return steps
+    sessions = {
+        found
+        for step in steps
+        if (spec := _ACTIONS.get(str(step.get("action") or "").strip().lower())) is not None
+        and (found := _step_session(spec.tool_name, step)) is not None
+    }
+    if len(sessions) > 1:
+        raise ValueError(
+            f"session_id cannot retarget this macro: its steps already use {sorted(sessions)}, "
+            "and running them all in one tab would change what the macro does. Put a "
+            "{{placeholder}} in the session_id of the steps that should vary instead."
+        )
+    retargeted: list[dict[str, Any]] = []
+    for step in steps:
+        spec = _ACTIONS.get(str(step.get("action") or "").strip().lower())
+        if spec is None or _step_session(spec.tool_name, step) is None:
+            retargeted.append(step)
+            continue
+        retargeted.append({**step, "session_id": target})
+    return retargeted
 
 
 async def _macro_store(project_root: str | None) -> dict[str, Any]:
@@ -1233,6 +1331,7 @@ async def browser_macro(
     path: str | None = None,
     pack: dict[str, Any] | list[dict[str, Any]] | None = None,
     overwrite: bool = False,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """Record, replay, guard, and move named macros in this project's or the user's store."""
     op = str(op or "").strip().lower()
@@ -1240,46 +1339,53 @@ async def browser_macro(
     if op == "record":
         if not name:
             raise ValueError("macro op 'record' requires name")
+        session = _recording_session(session_id)
         # Starting over silently would throw away a task already driven by hand,
-        # which is the most expensive thing in the whole feature.
-        if _RECORDING["active"] and _RECORDING["steps"]:
+        # which is the most expensive thing in the whole feature. Another agent's
+        # recording on another session is not in the way and is left alone.
+        open_here = _RECORDINGS.get(session)
+        if open_here and open_here["steps"]:
             raise ValueError(
-                f"A recording of '{_RECORDING['name']}' is already open with "
-                f"{len(_RECORDING['steps'])} step(s). Save it with op='save', or "
-                "throw it away with op='cancel', before recording another."
+                f"A recording of '{open_here['name']}' is already open on session_id "
+                f"'{session}' with {len(open_here['steps'])} step(s). Save it with "
+                "op='save', or throw it away with op='cancel', before recording another."
             )
         # The resolved project, not the macro directory: "auto" may resolve to
         # no project at all, and deriving a project back out of the user store's
         # path would name a directory the caller never chose.
         discovered = macros.resolve_project_root(project_root)
         selected_root = str(discovered) if discovered is not None else None
-        _RECORDING.update(
-            {
-                "active": True,
-                "name": macros.validate_name(name),
-                "steps": [],
-                "project_root": selected_root,
-            }
-        )
+        _RECORDINGS[session] = {
+            "name": macros.validate_name(name),
+            "steps": [],
+            "project_root": selected_root,
+            "unattributed": 0,
+        }
         return {
             "success": True,
             "recording": True,
             "name": name,
+            "session_id": session,
             "note": (
-                "Every action that dispatches from now on is captured. Drive the "
-                "task once, then call macro op='save' to keep it under this name; "
-                "op='cancel' throws the recording away."
+                f"Actions on session_id '{session}' are captured from now on; work "
+                "another agent does on another session is not. Drive the task once, "
+                "then call macro op='save' to keep it under this name; op='cancel' "
+                "throws the recording away."
             ),
             **await _macro_store(project_root),
         }
 
     if op == "cancel":
-        was = _RECORDING["name"]
-        _RECORDING.update({"active": False, "name": "", "steps": [], "project_root": None})
-        return {"success": True, "recording": False, "discarded": was}
+        session, recording = _open_recording(session_id, "cancel")
+        _RECORDINGS.pop(session, None)
+        return {
+            "success": True,
+            "recording": False,
+            "discarded": recording["name"],
+            "session_id": session,
+        }
 
     if op == "save":
-        captured = list(_RECORDING["steps"])
         # An explicit step list is its own macro and must be named as one:
         # borrowing the open recording's name would overwrite the macro that
         # recording is going to be saved as, destroying work already done.
@@ -1288,17 +1394,29 @@ async def browser_macro(
                 "macro op 'save' with explicit steps requires name; it will not "
                 "borrow the name of the recording that is open."
             )
-        target = name or _RECORDING["name"]
-        if steps is None and not captured:
-            raise ValueError(
-                "macro op 'save' needs either explicit steps or an open recording "
-                "that captured at least one action."
-            )
+        session = ""
+        recording: dict[str, Any] = {}
+        captured: list[dict[str, Any]] = []
+        if steps is None:
+            if not _RECORDINGS:
+                raise ValueError(
+                    "macro op 'save' needs either explicit steps or an open recording "
+                    "that captured at least one action."
+                )
+            session, recording = _open_recording(session_id, "save")
+            captured = list(recording["steps"])
+            if not captured:
+                raise ValueError(
+                    f"The recording of '{recording['name']}' on session_id '{session}' "
+                    "captured no actions. Drive the task first, or throw the recording "
+                    "away with op='cancel'."
+                )
+        target = name or recording.get("name") or ""
         if not target:
             raise ValueError("macro op 'save' requires name")
         selected_project = project_root
         if steps is None and selected_project is None:
-            selected_project = _RECORDING.get("project_root")
+            selected_project = recording.get("project_root")
         record = await asyncio.to_thread(
             macros.save,
             target,
@@ -1307,22 +1425,37 @@ async def browser_macro(
             variables,
             selected_project,
         )
-        if steps is None:
-            _RECORDING.update({"active": False, "name": "", "steps": [], "project_root": None})
-        return {
+        answer: dict[str, Any] = {
             "success": True,
             "name": record["name"],
             "step_count": record["step_count"],
             "variables": sorted(record["variables"]),
             "recorded": steps is None,
-            **await _macro_store(selected_project),
         }
+        if steps is None:
+            answer["session_id"] = session
+            dropped = int(recording.get("unattributed") or 0)
+            if dropped:
+                # Said out loud rather than swallowed: these are actions that ran
+                # while more than one recording was open and carried no session of
+                # their own, so no recording could claim them honestly.
+                answer["unattributed_steps"] = dropped
+                answer["note"] = (
+                    f"{dropped} action(s) without a session_id ran while several "
+                    "recordings were open and were left out of every one of them. "
+                    "Check the saved steps, and record alone if they belong here."
+                )
+            _RECORDINGS.pop(session, None)
+        answer.update(await _macro_store(selected_project))
+        return answer
 
     if op == "run":
         if not name:
             raise ValueError("macro op 'run' requires name")
         record = await asyncio.to_thread(macros.load, name, project_root)
         resolved = macros.resolve(record["steps"], record.get("variables"), variables)
+        if session_id:
+            resolved = _retarget_session(resolved, session_id)
         # A replay is one logical call, so it does not re-enter the recorder and
         # does not inherit web_action's hand-written 32-action ceiling.
         outcome = await _execute_actions(resolved, continue_on_error, record=False)
@@ -1330,6 +1463,7 @@ async def browser_macro(
             **outcome,
             "macro": record["name"],
             "step_count": len(resolved),
+            **({"session_override": _recording_session(session_id)} if session_id else {}),
             **await _macro_store(project_root),
         }
 
@@ -1402,6 +1536,9 @@ async def browser_macro(
             raise ValueError("macro op 'preview' requires name")
         record = await asyncio.to_thread(macros.load, name, project_root)
         resolved = macros.resolve(record["steps"], record.get("variables"), variables)
+        if session_id:
+            resolved = _retarget_session(resolved, session_id)
+        problems = _step_problems(resolved)
         return {
             "success": True,
             "macro": record["name"],
@@ -1409,7 +1546,15 @@ async def browser_macro(
             "step_count": len(resolved),
             "steps": resolved,
             "executed": False,
-            "note": "Preview only: no action was dispatched and no browser state changed.",
+            **({"session_override": _recording_session(session_id)} if session_id else {}),
+            "steps_valid": not problems,
+            **({"problems": problems} if problems else {}),
+            "note": (
+                "Preview only: no action was dispatched and no browser state changed."
+                if not problems
+                else "Preview only: nothing was dispatched, and these steps would fail "
+                "as written. Fix the macro file before running it."
+            ),
             **await _macro_store(project_root),
         }
 
@@ -2945,7 +3090,7 @@ async def _execute_actions(
     sent at once would otherwise interleave into a script whose steps never ran
     in that order. Nothing is serialised when no recording is open.
     """
-    if record and _RECORDING["active"]:
+    if record and _RECORDINGS and _touches_a_recording(actions):
         async with _RECORDING_LOCK:
             return await _dispatch_actions(actions, continue_on_error, record)
     return await _dispatch_actions(actions, continue_on_error, record)
@@ -2988,7 +3133,7 @@ async def _dispatch_actions(
             # is the validated one, so a macro replays the call the schema
             # accepted rather than a shorthand that happened to work today.
             if record and not reported_failure:
-                _record_step(action_name, validated)
+                _record_step(action_name, validated, _step_session(spec.tool_name, validated))
             results.append(
                 {
                     "index": index,
@@ -3026,16 +3171,68 @@ async def _dispatch_actions(
     }
 
 
-def _record_step(action_name: str, arguments: dict[str, Any]) -> None:
-    """Append one dispatched action to the open recording, if there is one.
+def _step_session(tool_name: str, arguments: dict[str, Any]) -> str | None:
+    """The session an action actually acted on, its schema default included.
+
+    ``exclude_unset`` keeps a default out of the recorded step, which is right -
+    but the action still ran against that default tab, and attributing it to
+    "no session" would hand it to whichever recording happened to be open.
+    """
+    fields = _argument_model(tool_name).model_fields
+    if "session_id" not in fields:
+        return None
+    value = arguments.get("session_id")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    default = fields["session_id"].default
+    return default if isinstance(default, str) and default else None
+
+
+def _touches_a_recording(actions: list[dict[str, Any]]) -> bool:
+    """Whether a batch could write into any open recording.
+
+    Read from the raw actions on purpose: this only decides whether to serialise
+    the batch, so a best-effort answer before validation is enough, and being
+    wrong costs concurrency rather than correctness.
+    """
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        spec = _ACTIONS.get(str(action.get("action") or "").strip().lower())
+        if spec is None:
+            continue
+        session = _step_session(spec.tool_name, action)
+        if session is None or session in _RECORDINGS:
+            return True
+    return False
+
+
+def _record_step(action_name: str, arguments: dict[str, Any], session: str | None) -> None:
+    """Append one dispatched action to the recording that owns its session.
 
     A ``macro`` call is never captured. Recording one would build a script the
     saver then refuses - a macro cannot run a macro - leaving the recording
     unsaveable and the only way out the one that throws the work away. Managing
     macros while recording a task is a normal thing to do, so it stays silent.
+
+    An action with no session of its own - a search, a fetch - belongs to the
+    only recording open, and to none when there are several: guessing there
+    would put one agent's search into another agent's macro, which is the whole
+    defect this routing exists to remove.
     """
-    if _RECORDING["active"] and action_name != "macro":
-        _RECORDING["steps"].append({"action": action_name, **arguments})
+    if action_name == "macro" or not _RECORDINGS:
+        return
+    step = {"action": action_name, **arguments}
+    if session is not None:
+        recording = _RECORDINGS.get(session)
+        if recording is not None:
+            recording["steps"].append(step)
+        return
+    if len(_RECORDINGS) == 1:
+        next(iter(_RECORDINGS.values()))["steps"].append(step)
+        return
+    for recording in _RECORDINGS.values():
+        recording["unattributed"] += 1
 
 
 def stop_bridge_daemon() -> int:

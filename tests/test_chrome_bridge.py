@@ -280,7 +280,7 @@ def test_windows_daemon_bypasses_a_venv_redirector_without_a_console(
     options = captured["kwargs"]
     assert options["env"]["__PYVENV_LAUNCHER__"] == venv_pythonw
     assert options["env"]["WEB_SEARCH_NEO_BRIDGE_PORT"] == "18765"
-    assert options["creationflags"] == subprocess.CREATE_NO_WINDOW
+    assert options["creationflags"] == chrome_bridge.CREATE_NO_WINDOW
     assert "start_new_session" not in options
     assert options["stdin"] is subprocess.DEVNULL
     assert options["stdout"] is subprocess.DEVNULL
@@ -305,7 +305,7 @@ def test_windows_daemon_uses_the_base_console_interpreter_as_a_safe_fallback(
     chrome_bridge.spawn_bridge_daemon(18766)
 
     assert captured["command"][0] == str(base)
-    assert captured["kwargs"]["creationflags"] == subprocess.CREATE_NO_WINDOW
+    assert captured["kwargs"]["creationflags"] == chrome_bridge.CREATE_NO_WINDOW
     assert captured["kwargs"]["env"]["__PYVENV_LAUNCHER__"] == venv_python
 
 
@@ -718,6 +718,7 @@ def test_popup_controls_have_unique_ids() -> None:
     ids = re.findall(r'\bid="([^"]+)"', popup)
     assert len(ids) == len(set(ids))
     assert {"release-status", "release-tabs", "check-release", "open-github"} <= set(ids)
+    assert {"port", "save-port", "reset-port", "next-attempt"} <= set(ids)
 
 
 @requires_node
@@ -728,18 +729,29 @@ const callbacks = {{}};
 const ids = [
   "enabled", "reconnect", "release-tabs", "status", "tabs", "bridge", "version",
   "release-status", "message", "check-release", "open-github",
+  "port", "save-port", "reset-port", "port-default", "next-attempt",
 ];
 const nodes = new Map(ids.map(id => [id, {{
-  textContent: "", title: "", dataset: {{}}, checked: false, disabled: false,
+  textContent: "", title: "", value: "", dataset: {{}}, checked: false, disabled: false,
   addEventListener(type, callback) {{ callbacks[`${{id}}:${{type}}`] = callback; }},
 }}]));
-globalThis.document = {{querySelector: selector => nodes.get(selector.slice(1))}};
+globalThis.document = {{
+  querySelector: selector => nodes.get(selector.slice(1)),
+  activeElement: null,
+}};
 let opened = null;
+const sent = [];
 globalThis.chrome = {{
-  runtime: {{sendMessage: async () => ({{
-    enabled: true, connected: true, connecting: false, controlled_tabs: 2,
-    bridge_url: "ws://127.0.0.1:8765", version: "1.3.4",
-  }})}},
+  runtime: {{sendMessage: async message => {{
+    sent.push(message);
+    return {{
+      enabled: true, connected: true, connecting: false, controlled_tabs: 2,
+      bridge_url: `ws://127.0.0.1:${{message.port || 8765}}`,
+      bridge_port: Number(message.port) || 8765,
+      default_bridge_port: 8765,
+      version: "1.3.4",
+    }};
+  }}}},
   tabs: {{create: options => {{ opened = options.url; }}}},
 }};
 globalThis.fetch = async () => ({{
@@ -752,10 +764,17 @@ await new Promise(resolve => setTimeout(resolve, 20));
 await callbacks["open-github:click"]();
 await callbacks["check-release:click"]();
 await new Promise(resolve => setTimeout(resolve, 20));
+nodes.get("port").value = "9001";
+await callbacks["save-port:click"]();
+await new Promise(resolve => setTimeout(resolve, 20));
 process.stdout.write(JSON.stringify({{
   release: nodes.get("release-status").textContent,
   releaseState: nodes.get("release-status").dataset.state,
   opened,
+  port: nodes.get("port").value,
+  bridge: nodes.get("bridge").textContent,
+  nextAttempt: nodes.get("next-attempt").textContent,
+  portMessages: sent.filter(item => item.type === "companion.setBridgePort"),
 }}));
 """
     completed = subprocess.run(
@@ -767,11 +786,17 @@ process.stdout.write(JSON.stringify({{
     )
     assert completed.returncode == 0, completed.stderr
     outcome = json.loads(completed.stdout)
-    assert outcome == {
-        "release": "Up to date (v1.3.4)",
-        "releaseState": "current",
-        "opened": "https://github.com/NeoXider/web-search-neo",
-    }
+    assert outcome["release"] == "Up to date (v1.3.4)"
+    assert outcome["releaseState"] == "current"
+    assert outcome["opened"] == "https://github.com/NeoXider/web-search-neo"
+    # A connected companion has nothing to count down to, and saying "in 60s"
+    # there would read as a connection that is about to drop.
+    assert outcome["nextAttempt"] == "connected"
+    # Applying a port asks the worker for it and re-renders from the answer,
+    # rather than assuming the write succeeded.
+    assert outcome["portMessages"] == [{"type": "companion.setBridgePort", "port": "9001"}]
+    assert outcome["bridge"] == "127.0.0.1:9001"
+    assert outcome["port"] == "9001"
 
 
 @requires_node
@@ -3291,3 +3316,203 @@ def test_auto_prefers_current_chrome_and_headless_forces_temporary(monkeypatch) 
     monkeypatch.setattr(browser_tools, "get_chrome_bridge", lambda: ConnectedBridge())
     assert browser_tools._resolve_profile_mode("auto", None) == "current"
     assert browser_tools._resolve_profile_mode("auto", True) == "temporary"
+
+
+# --- the companion forwards only what the server actually uses ---------------
+
+EXTENSION_DIR = Path(__file__).resolve().parents[1] / "chrome-extension"
+
+# Methods the server never sends: these names appear in the Python sources
+# because a captured DevTools *event* is parsed under them. Classifying each new
+# name deliberately is the point - a method that turns up here uncategorised
+# fails the test below rather than silently gaining access to the tab.
+RECEIVED_CDP_EVENTS = frozenset(
+    {
+        "Network.loadingFailed",
+        "Network.loadingFinished",
+        "Network.requestWillBeSent",
+        "Network.responseReceived",
+    }
+)
+
+CDP_DOMAINS = "DOM|Emulation|Input|Network|Page|Runtime|Storage|Target"
+_CDP_NAME = re.compile(rf'"(({CDP_DOMAINS})\.[a-z][A-Za-z]*)"')
+
+
+def _allowed_cdp_methods() -> set[str]:
+    """The allowlist the companion enforces, read from the extension itself."""
+    source = (EXTENSION_DIR / "service-worker.js").read_text(encoding="utf-8")
+    block = re.search(
+        r"export const ALLOWED_CDP_METHODS = new Set\(\[(.*?)\]\)", source, re.S
+    )
+    assert block, "service-worker.js no longer declares ALLOWED_CDP_METHODS"
+    return set(re.findall(r'"([^"]+)"', block.group(1)))
+
+
+def _cdp_names_in_python() -> set[str]:
+    """Every DevTools method name written in the modules that drive the bridge."""
+    root = Path(__file__).resolve().parents[1]
+    found: set[str] = set()
+    for name in ("chrome_bridge.py", "browser_tools.py", "page_perception.py", "diagnostics.py"):
+        found |= {
+            match[0] for match in _CDP_NAME.findall((root / name).read_text(encoding="utf-8"))
+        }
+    return found
+
+
+def test_the_companion_allows_exactly_the_methods_the_server_sends() -> None:
+    """The allowlist and the call sites cannot drift apart unnoticed.
+
+    Every DevTools name in the bridge-driving modules must be either a method the
+    companion forwards or a captured event the server only reads. A new name is
+    therefore a decision somebody has to write down, instead of a capability that
+    appears in a released extension because nobody looked.
+    """
+    allowed = _allowed_cdp_methods()
+    unclassified = _cdp_names_in_python() - allowed - RECEIVED_CDP_EVENTS
+    assert not unclassified, (
+        f"DevTools method(s) {sorted(unclassified)} are used by the server but the "
+        "companion would refuse them. Add each to ALLOWED_CDP_METHODS in "
+        "chrome-extension/service-worker.js, or to RECEIVED_CDP_EVENTS here if it "
+        "is an event the server only reads."
+    )
+    # An allowlist that outgrows its call sites is the same failure in reverse:
+    # a capability kept open for nothing.
+    assert not allowed & RECEIVED_CDP_EVENTS
+
+
+@requires_node
+def test_an_authenticated_peer_cannot_reach_the_whole_devtools_protocol() -> None:
+    """The peer knows a machine-local secret; that is not the same as trust.
+
+    The companion used to forward whatever method arrived, so anything running as
+    this user held the entire DevTools protocol over any tab the agent had -
+    including domains the MCP contract never exposes.
+    """
+    outcome = _node_worker_eval(
+        _WORKER_READY
+        + _VERIFIED_SOCKET
+        + """
+        const socket = await openSocket();
+        const allowed = await ask(socket, "cdp.send",
+          {tabId: 7, method: "Runtime.evaluate", params: {expression: "1"}});
+        const refused = await ask(socket, "cdp.send",
+          {tabId: 7, method: "Browser.setDownloadBehavior", params: {}});
+        const internal = await ask(socket, "cdp.send",
+          {tabId: 7, method: "Target.attachToTarget", params: {}});
+        return {allowed, refused, internal, size: worker.ALLOWED_CDP_METHODS.size};
+        """
+    )
+    assert answer_error(outcome["allowed"]) is None
+    assert "Refused DevTools method 'Browser.setDownloadBehavior'" in answer_error(
+        outcome["refused"]
+    )
+    # Target.* is how the extension reaches a cross-origin frame on its own. It
+    # stays internal: a peer may benefit from it and can never ask for it.
+    assert "Refused DevTools method 'Target.attachToTarget'" in answer_error(
+        outcome["internal"]
+    )
+    assert outcome["size"] == len(_allowed_cdp_methods())
+
+
+def test_the_refusal_guards_the_command_and_not_the_extensions_own_calls() -> None:
+    source = (EXTENSION_DIR / "service-worker.js").read_text(encoding="utf-8")
+    command = source.index('async "cdp.send"(params)')
+    body = source[command : command + 900]
+    assert "ALLOWED_CDP_METHODS.has(method)" in body
+    # cdpSend is the extension's own path to a frame or a target; guarding it
+    # there would break resolveFrame instead of the peer.
+    helper = source.index("async function cdpSend(")
+    assert "ALLOWED_CDP_METHODS" not in source[helper : helper + 400]
+    assert "Target.attachToTarget" not in _allowed_cdp_methods()
+
+
+@requires_node
+def test_a_stored_bridge_port_is_what_the_companion_dials() -> None:
+    # The port used to live in one source line, so moving the server off 8765
+    # meant editing an installed extension by hand.
+    outcome = _node_worker_eval(
+        """
+        await globalThis.__waitFor(() => globalThis.__sockets.length, "the first socket");
+        return {
+          url: globalThis.__sockets[0].url,
+          status: await globalThis.__message({type: "companion.status"}),
+        };
+        """,
+        prelude=(
+            "globalThis.__seedLocal({companion_bridge_port: 9310});\n"
+            f"globalThis.__setToken('export const BRIDGE_TOKEN = \"{TEST_TOKEN}\";');"
+        ),
+    )
+    assert outcome["url"] == "ws://127.0.0.1:9310"
+    assert outcome["status"]["bridge_port"] == 9310
+    assert outcome["status"]["default_bridge_port"] == 8765
+    assert outcome["status"]["bridge_url"] == "ws://127.0.0.1:9310"
+
+
+@requires_node
+def test_changing_the_port_reconnects_and_survives_the_worker() -> None:
+    outcome = _node_worker_eval(
+        """
+        await globalThis.__waitFor(() => globalThis.__sockets.length, "the first socket");
+        const changed = await globalThis.__message({
+          type: "companion.setBridgePort", port: "9420",
+        });
+        await globalThis.__waitFor(() => globalThis.__sockets.length > 1, "the new socket");
+        // The router answers a failure as {error}; it never rejects, which is
+        // exactly what the popup reads and turns into a message.
+        const bad = await globalThis.__message({type: "companion.setBridgePort", port: 80});
+        const refused = bad && bad.error ? String(bad.error) : null;
+        return {
+          changed: changed.bridge_port,
+          urls: globalThis.__sockets.map(item => item.url),
+          stored: globalThis.__local().companion_bridge_port,
+          refused,
+          afterRefusal: (await globalThis.__message({type: "companion.status"})).bridge_port,
+        };
+        """,
+        prelude=f"globalThis.__setToken('export const BRIDGE_TOKEN = \"{TEST_TOKEN}\";');",
+    )
+    assert outcome["changed"] == 9420
+    assert outcome["urls"][0] == "ws://127.0.0.1:8765"
+    assert outcome["urls"][-1] == "ws://127.0.0.1:9420"
+    # Written down, so the next worker Chrome starts dials the same server.
+    assert outcome["stored"] == 9420
+    # A privileged port is refused outright rather than failing inside a
+    # connect nobody is watching, and the working setting is left alone.
+    assert "between 1024 and 65535" in outcome["refused"]
+    assert outcome["afterRefusal"] == 9420
+
+
+def test_the_companion_manifest_matches_the_server_version() -> None:
+    # setup_current_chrome compares the two and reloads a companion that is
+    # older, so a manifest left behind by a release makes every session start
+    # with a self-update that changes nothing.
+    manifest = json.loads((EXTENSION_DIR / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["version"] == main.__version__
+
+
+def test_the_popup_and_its_script_describe_the_same_page() -> None:
+    """A popup is not covered by any other test, and it fails silently.
+
+    ``querySelector`` returns null for an id that was renamed, and the popup then
+    throws on load with an empty panel and nothing in the log a user would find.
+    """
+    markup = (EXTENSION_DIR / "popup.html").read_text(encoding="utf-8")
+    script = (EXTENSION_DIR / "popup.js").read_text(encoding="utf-8")
+    styles = (EXTENSION_DIR / "popup.css").read_text(encoding="utf-8")
+
+    ids = set(re.findall(r'id="([^"]+)"', markup))
+    referenced = set(re.findall(r'querySelector\("#([^"]+)"\)', script))
+    assert not referenced - ids, (
+        f"popup.js reads element(s) {sorted(referenced - ids)} that popup.html does not "
+        "define; the popup would throw on load."
+    )
+
+    used_classes = {
+        name for group in re.findall(r'class="([^"]+)"', markup) for name in group.split()
+    }
+    styled = set(re.findall(r"\.([a-z-]+)\s*[{,]", styles))
+    assert not styled - used_classes, (
+        f"popup.css styles class(es) {sorted(styled - used_classes)} that no element uses."
+    )

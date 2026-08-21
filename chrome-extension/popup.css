@@ -55,6 +55,37 @@ dd[data-state="current"] { color: #4ade80; }
 dd[data-state="update"] { color: #fbbf24; }
 dd[data-state="error"] { color: #f87171; }
 
+details {
+  margin: 0 0 14px;
+  border: 1px solid #334155;
+  border-radius: 10px;
+  background: #172033;
+}
+
+summary {
+  padding: 10px 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.setting { padding: 0 12px 12px; }
+.setting + .setting { border-top: 1px solid #334155; padding-top: 12px; }
+.hint { margin: 4px 0 8px; color: #94a3b8; }
+.hint code { color: #cbd5e1; }
+
+.setting-row { display: flex; gap: 8px; }
+.setting-row input {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 9px;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  background: #0f172a;
+  color: inherit;
+  font: inherit;
+}
+.setting-row button { padding: 7px 12px; }
+
 .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 button {
   padding: 8px 10px;

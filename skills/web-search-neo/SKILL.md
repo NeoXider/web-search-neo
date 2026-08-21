@@ -278,10 +278,19 @@ Each step is exactly one `web_action` action object, so
 `web_info(topic="action_schema", params={"action": "<name>"})` is the reference for what a
 step may contain. A `README.md` written into every store repeats this next to the files.
 
+The `variables` map is optional: placeholders are declared from the steps themselves, so
+`op=list` and `op=show` report what a hand-written macro wants without it. Put a name in
+`variables` only to give it a default.
+
 ### Recording, writing, and replaying
 
-`macro op=record name=hh-apply` starts capturing; drive the task once with ordinary actions;
-`macro op=save` keeps what dispatched. Only actions that *succeeded* are recorded, so a wrong
+`macro op=record name=hh-apply session_id=work` starts capturing that session; drive the task
+once with ordinary actions; `macro op=save` keeps what dispatched. A recording belongs to one
+`session_id`, so agents working side by side record independently and no agent's clicks land in
+another's macro. Name the session when you save or cancel if more than one recording is open —
+with one open it is inferred, with two a guess is refused. An action that carries no session of
+its own (a `search`, a `fetch_text`) joins the only open recording, and when several are open it
+is left out of all of them and counted in `unattributed_steps` rather than attributed by luck. Only actions that *succeeded* are recorded, so a wrong
 selector you corrected does not enter the script. Every action is recordable, and a replay
 dispatches through the same validated loop: `click` keeps its target whichever form you used
 (selector, `text` plus `role`, or `x`/`y` coordinates), and the scripting, cookie, storage,
@@ -303,6 +312,17 @@ Before replaying a consequential task, call `macro op=preview name=review-form` 
 `variables` planned for `run`. It resolves every placeholder and returns the exact steps with
 `executed=false`, without dispatching an action or changing browser state. This is the review
 point for a final URL, form values, an upload path, or a submit step.
+
+Preview also checks every resolved step against the schema its action publishes and reports
+`steps_valid` plus a `problems` list naming the step index and what is wrong. Run it after
+writing or editing a macro file by hand: a mistyped parameter otherwise surfaces mid-replay,
+once the steps before it have already dispatched.
+
+A recorded macro carries the `session_id` it was recorded against. Pass `session_id` to `run`
+or `preview` to point the whole replay at another tab — a second agent, a second account —
+without editing the file. A macro that already drives two sessions is refused instead of being
+collapsed into one tab, because that would change what it does; give those steps a
+`{{placeholder}}` session instead.
 
 Macros are files and outlive the server; `op=list` summarises them and `op=delete` removes
 one. A macro cannot run another macro — run them in order instead. A replay reports like any

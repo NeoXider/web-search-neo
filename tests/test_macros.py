@@ -20,9 +20,9 @@ def macro_root(tmp_path, monkeypatch):
     # A developer machine may name a project for its own MCP client; a test run
     # must not then write its macros into that project.
     monkeypatch.delenv("WEB_SEARCH_NEO_PROJECT_ROOT", raising=False)
-    main._RECORDING.update({"active": False, "name": "", "steps": [], "project_root": None})
+    main._RECORDINGS.clear()
     yield tmp_path
-    main._RECORDING.update({"active": False, "name": "", "steps": [], "project_root": None})
+    main._RECORDINGS.clear()
 
 
 FORM_STEPS = [
@@ -244,18 +244,24 @@ def _call(**kwargs):
     return asyncio.run(main.browser_macro(**kwargs))
 
 
-def test_record_then_save_captures_dispatched_actions(monkeypatch):
-    _call(op="record", name="recorded")
-    assert main._RECORDING["active"] is True
+def _record(action: str, arguments: dict, session: str | None = "default") -> None:
+    """Feed one dispatched step to the recorder the way the dispatcher does."""
+    main._record_step(action, arguments, arguments.get("session_id", session))
 
-    main._record_step("open", {"url": "https://example.com", "session_id": "s"})
-    main._record_step("click", {"selector": "#go", "session_id": "s"})
+
+def test_record_then_save_captures_dispatched_actions(monkeypatch):
+    _call(op="record", name="recorded", session_id="s")
+    assert main._RECORDINGS["s"]["name"] == "recorded"
+
+    _record("open", {"url": "https://example.com", "session_id": "s"})
+    _record("click", {"selector": "#go", "session_id": "s"})
 
     saved = _call(op="save")
     assert saved["step_count"] == 2
     assert saved["recorded"] is True
+    assert saved["session_id"] == "s"
     # Saving closes the recording, so the next drive does not append to it.
-    assert main._RECORDING["active"] is False
+    assert main._RECORDINGS == {}
     assert macros.load("recorded")["steps"][0]["action"] == "open"
 
 
@@ -293,7 +299,9 @@ def test_macro_records_and_replays_every_click_mode_and_new_actions(monkeypatch)
     )
 
     async def drive():
-        await main.browser_macro(op="record", name="click-all")
+        # The recording names the session it is recording: these actions run on
+        # "s", and a recording opened on another tab must not collect them.
+        await main.browser_macro(op="record", name="click-all", session_id="s")
         await main._execute_actions(
             [
                 {"action": "click", "selector": "#go", "session_id": "s"},
@@ -305,7 +313,7 @@ def test_macro_records_and_replays_every_click_mode_and_new_actions(monkeypatch)
         )
 
     asyncio.run(drive())
-    saved = _call(op="save")
+    saved = _call(op="save", session_id="s")
     assert saved["step_count"] == 5
 
     seen.clear()
@@ -329,25 +337,25 @@ def test_macro_records_and_replays_every_click_mode_and_new_actions(monkeypatch)
 
 def test_recording_over_captured_steps_is_refused():
     _call(op="record", name="first")
-    main._record_step("open", {"url": "https://example.com"})
+    _record("open", {"url": "https://example.com"})
     with pytest.raises(ValueError, match="already open"):
         _call(op="record", name="second")
     # The first recording is intact, not silently replaced.
-    assert main._RECORDING["name"] == "first"
-    assert len(main._RECORDING["steps"]) == 1
+    assert main._RECORDINGS["default"]["name"] == "first"
+    assert len(main._RECORDINGS["default"]["steps"]) == 1
 
 
 def test_recording_over_an_empty_one_is_allowed():
     _call(op="record", name="first")
     _call(op="record", name="second")
-    assert main._RECORDING["name"] == "second"
+    assert main._RECORDINGS["default"]["name"] == "second"
 
 
 def test_cancel_throws_the_recording_away():
     _call(op="record", name="doomed")
-    main._record_step("open", {"url": "https://example.com"})
+    _record("open", {"url": "https://example.com"})
     assert _call(op="cancel")["discarded"] == "doomed"
-    assert main._RECORDING["steps"] == []
+    assert main._RECORDINGS == {}
     with pytest.raises(ValueError):
         macros.load("doomed")
 
@@ -359,11 +367,11 @@ def test_save_without_steps_or_recording_is_refused():
 
 def test_explicit_save_does_not_disturb_an_open_recording():
     _call(op="record", name="live")
-    main._record_step("open", {"url": "https://example.com"})
+    _record("open", {"url": "https://example.com"})
     _call(op="save", name="other", steps=[{"action": "close_all"}])
     # The explicit save is a different macro; the recording is still collecting.
-    assert main._RECORDING["active"] is True
-    assert main._RECORDING["name"] == "live"
+    assert main._RECORDINGS["default"]["name"] == "live"
+    assert len(main._RECORDINGS["default"]["steps"]) == 1
 
 
 def test_explicit_save_will_not_borrow_the_open_recordings_name():
@@ -371,7 +379,7 @@ def test_explicit_save_will_not_borrow_the_open_recordings_name():
     # be saved as, destroying a task already driven by hand.
     macros.save("live", [{"action": "open", "url": "https://real.example"}])
     _call(op="record", name="live")
-    main._record_step("click", {"selector": "#x"})
+    _record("click", {"selector": "#x"})
     with pytest.raises(ValueError, match="requires name"):
         _call(op="save", steps=[{"action": "close_all"}])
     assert macros.load("live")["steps"][0]["url"] == "https://real.example"
@@ -381,8 +389,8 @@ def test_a_macro_call_is_never_captured_into_a_recording():
     # Recording one would build a script the saver refuses outright, leaving the
     # recording unsaveable with only cancel - which loses everything - as a way out.
     _call(op="record", name="outer")
-    main._record_step("open", {"url": "https://example.com"})
-    main._record_step("macro", {"op": "run", "name": "login"})
+    _record("open", {"url": "https://example.com"})
+    _record("macro", {"op": "run", "name": "login"})
     saved = _call(op="save")
     assert saved["step_count"] == 1
 
@@ -459,7 +467,7 @@ def test_concurrent_batches_do_not_interleave_into_one_recording(monkeypatch):
         )
 
     asyncio.run(drive())
-    recorded = [step["url"] for step in main._RECORDING["steps"]]
+    recorded = [step["url"] for step in main._RECORDINGS["default"]["steps"]]
     # Each batch stays contiguous; which batch went first does not matter.
     assert recorded in (["A1", "A2", "B1", "B2"], ["B1", "B2", "A1", "A2"])
 
@@ -884,7 +892,7 @@ def test_recording_remembers_its_project_store_until_save(tmp_path):
     project = tmp_path / "project"
     project.mkdir()
     _call(op="record", name="recorded-local", project_root=str(project))
-    main._record_step("open", {"url": "https://example.com"})
+    _record("open", {"url": "https://example.com"})
     saved = _call(op="save")
     assert saved["name"] == "recorded-local"
     assert macros.load("recorded-local", project)["steps"][0]["url"] == "https://example.com"
@@ -1034,8 +1042,8 @@ def test_auto_that_finds_no_project_records_into_the_user_store(monkeypatch):
     # recorder derive a project directory out of the user store's own path.
     monkeypatch.setattr(macros, "discover_project_root", lambda start=None: None)
     _call(op="record", name="loose", project_root="auto")
-    assert main._RECORDING["project_root"] is None
-    main._record_step("open", {"url": "https://example.com"})
+    assert main._RECORDINGS["default"]["project_root"] is None
+    _record("open", {"url": "https://example.com"})
     saved = _call(op="save")
     assert saved["scope"] == "user"
     assert macros.load("loose")["steps"][0]["url"] == "https://example.com"
@@ -1183,3 +1191,184 @@ def test_an_inline_pack_can_be_a_list_or_an_object(tmp_path):
     )
     assert [item["name"] for item in wrapped["imported"]] == ["from-object"]
     assert wrapped["source"] == "inline pack"
+
+
+def test_a_hand_written_file_declares_the_placeholders_it_uses():
+    # save() declares what it recorded; a file written by hand has the
+    # placeholders and no declaration, and a summary reporting "wants nothing"
+    # is how a caller finds out what a macro needs from a failed run.
+    (macros.macro_root() / "typed.json").write_text(
+        '[{"action": "open", "url": "https://example.com/{{page}}"}]', encoding="utf-8"
+    )
+    assert sorted(macros.load("typed")["variables"]) == ["page"]
+    assert [item["variables"] for item in macros.list_macros()] == [["page"]]
+
+    shown = _call(op="show", name="typed")
+    assert sorted(shown["variables"]) == ["page"]
+
+
+def test_a_declared_default_still_wins_over_the_auto_declaration():
+    macros.save("greet", [{"action": "open", "url": "{{site}}"}], variables={"site": "https://a.test"})
+    assert macros.load("greet")["variables"]["site"] == "https://a.test"
+
+
+def test_preview_checks_every_step_against_its_schema_without_dispatching():
+    # The mistake in a hand-written macro is usually a wrong parameter name, and
+    # without this it surfaces mid-replay, after earlier steps already ran.
+    (macros.macro_root() / "typo.json").write_text(
+        '[{"action": "wait", "selector": "#ready", "timeout_ms": 5000}]', encoding="utf-8"
+    )
+    previewed = _call(op="preview", name="typo")
+    assert previewed["executed"] is False
+    assert previewed["steps_valid"] is False
+    assert previewed["problems"][0]["index"] == 0
+    assert "timeout_ms" in previewed["problems"][0]["error"]
+    assert "timeout_seconds" in previewed["problems"][0]["error"]
+
+    (macros.macro_root() / "misnamed.json").write_text(
+        '[{"action": "teleport", "url": "https://example.com"}]', encoding="utf-8"
+    )
+    assert "Unsupported action" in _call(op="preview", name="misnamed")["problems"][0]["error"]
+
+
+def test_preview_of_a_sound_macro_says_so_and_carries_no_problems():
+    macros.save("sound", [{"action": "open", "url": "{{url}}", "session_id": "s"}])
+    previewed = _call(op="preview", name="sound", variables={"url": "https://example.com"})
+    assert previewed["steps_valid"] is True
+    assert "problems" not in previewed
+    assert previewed["steps"][0]["url"] == "https://example.com"
+
+
+# --- one recording per session ----------------------------------------------
+
+
+def test_two_agents_record_side_by_side_without_stealing_each_others_steps():
+    # The defect this replaces: one shared recording took every dispatched
+    # action, so an agent recording a login got another agent's clicks in the
+    # middle of it and replayed them.
+    _call(op="record", name="agent-a", session_id="a")
+    _call(op="record", name="agent-b", session_id="b")
+
+    _record("open", {"url": "https://a.example", "session_id": "a"})
+    _record("open", {"url": "https://b.example", "session_id": "b"})
+    _record("click", {"selector": "#a", "session_id": "a"})
+
+    saved_a = _call(op="save", session_id="a")
+    saved_b = _call(op="save", session_id="b")
+    assert (saved_a["step_count"], saved_b["step_count"]) == (2, 1)
+    assert macros.load("agent-a")["steps"][0]["url"] == "https://a.example"
+    assert macros.load("agent-b")["steps"] == [
+        {"action": "open", "url": "https://b.example", "session_id": "b"}
+    ]
+
+
+def test_an_action_on_a_session_nobody_records_is_not_captured():
+    _call(op="record", name="mine", session_id="mine")
+    _record("open", {"url": "https://theirs.example", "session_id": "theirs"})
+    _record("open", {"url": "https://mine.example", "session_id": "mine"})
+    saved = _call(op="save", session_id="mine")
+    assert saved["step_count"] == 1
+    assert macros.load("mine")["steps"][0]["url"] == "https://mine.example"
+
+
+def test_the_schema_default_is_attributed_rather_than_treated_as_sessionless():
+    # exclude_unset keeps session_id out of a recorded step, but the action still
+    # ran against the default tab, and calling that "no session" would hand it to
+    # whichever recording happened to be open.
+    assert main._step_session(main._ACTIONS["open"].tool_name, {"url": "u"}) == "default"
+    assert main._step_session(main._ACTIONS["search"].tool_name, {"query": "q"}) is None
+
+
+def test_a_sessionless_action_joins_the_only_recording_that_is_open():
+    _call(op="record", name="solo", session_id="solo")
+    main._record_step("search", {"query": "browser automation"}, None)
+    saved = _call(op="save", session_id="solo")
+    assert saved["step_count"] == 1
+    assert "unattributed_steps" not in saved
+
+
+def test_a_sessionless_action_is_reported_rather_than_guessed_when_two_record():
+    _call(op="record", name="one", session_id="one")
+    _call(op="record", name="two", session_id="two")
+    main._record_step("search", {"query": "browser automation"}, None)
+    _record("open", {"url": "https://one.example", "session_id": "one"})
+
+    saved = _call(op="save", session_id="one")
+    assert saved["step_count"] == 1
+    assert saved["unattributed_steps"] == 1
+    assert "without a session_id" in saved["note"]
+    _call(op="cancel", session_id="two")
+
+
+def test_save_and_cancel_refuse_to_guess_between_two_open_recordings():
+    _call(op="record", name="one", session_id="one")
+    _call(op="record", name="two", session_id="two")
+    _record("open", {"url": "https://one.example", "session_id": "one"})
+    with pytest.raises(ValueError, match="Name the one you mean"):
+        _call(op="save")
+    with pytest.raises(ValueError, match="Name the one you mean"):
+        _call(op="cancel")
+    assert _call(op="save", session_id="one")["name"] == "one"
+
+
+def test_saving_a_recording_that_captured_nothing_says_so():
+    _call(op="record", name="empty", session_id="empty")
+    with pytest.raises(ValueError, match="captured no actions"):
+        _call(op="save", session_id="empty")
+
+
+def test_an_op_naming_a_session_with_no_recording_says_which_are_open():
+    _call(op="record", name="one", session_id="one")
+    with pytest.raises(ValueError, match=r"no recording is open for session_id 'two'"):
+        _call(op="save", session_id="two")
+
+
+# --- replaying a macro in another tab ---------------------------------------
+
+
+def test_run_can_point_a_recorded_macro_at_another_session(monkeypatch):
+    seen: list[dict] = []
+
+    async def fake_execute(actions, continue_on_error=False, record=True):
+        seen.append(actions)
+        return {"success": True, "results": [], "failure_count": 0}
+
+    monkeypatch.setattr(main, "_execute_actions", fake_execute)
+    macros.save(
+        "login",
+        [
+            {"action": "open", "url": "https://example.com", "session_id": "recorded"},
+            {"action": "click", "selector": "#go", "session_id": "recorded"},
+            {"action": "search", "query": "unchanged"},
+        ],
+    )
+    outcome = _call(op="run", name="login", session_id="second-agent")
+    assert outcome["session_override"] == "second-agent"
+    assert [step.get("session_id") for step in seen[0]] == [
+        "second-agent",
+        "second-agent",
+        None,
+    ]
+
+
+def test_retargeting_a_two_session_macro_is_refused_instead_of_collapsed():
+    # Two sessions means two tabs on purpose; running them in one would quietly
+    # change what the macro does.
+    macros.save(
+        "compare",
+        [
+            {"action": "open", "url": "https://a.example", "session_id": "left"},
+            {"action": "open", "url": "https://b.example", "session_id": "right"},
+        ],
+    )
+    with pytest.raises(ValueError, match="already use"):
+        _call(op="run", name="compare", session_id="one-tab")
+
+
+def test_preview_shows_the_retargeted_steps_before_they_run():
+    macros.save("login", [{"action": "open", "url": "https://example.com", "session_id": "recorded"}])
+    previewed = _call(op="preview", name="login", session_id="other")
+    assert previewed["executed"] is False
+    assert previewed["session_override"] == "other"
+    assert previewed["steps"][0]["session_id"] == "other"
+    assert previewed["steps_valid"] is True

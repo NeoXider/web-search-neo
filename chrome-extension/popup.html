@@ -27,9 +27,35 @@
       <dl>
         <div><dt>Controlled tabs</dt><dd id="tabs">—</dd></div>
         <div><dt>Bridge</dt><dd id="bridge">127.0.0.1:8765</dd></div>
+        <div><dt>Next attempt</dt><dd id="next-attempt">—</dd></div>
         <div><dt>Version</dt><dd id="version">—</dd></div>
         <div><dt>GitHub release</dt><dd id="release-status">Checking…</dd></div>
       </dl>
+
+      <details id="settings">
+        <summary>Settings</summary>
+
+        <div class="setting">
+          <label for="port"><strong>Bridge port</strong></label>
+          <p class="hint">
+            Must match <code>WEB_SEARCH_NEO_BRIDGE_PORT</code> on the MCP server.
+            Leave it at <span id="port-default">8765</span> unless you changed that.
+          </p>
+          <div class="setting-row">
+            <input id="port" type="number" min="1024" max="65535" step="1" inputmode="numeric">
+            <button id="save-port" type="button">Apply</button>
+            <button id="reset-port" type="button" class="secondary">Default</button>
+          </div>
+        </div>
+
+        <div class="setting">
+          <strong>Protocol access</strong>
+          <p class="hint" id="cdp-note">
+            The companion forwards only the DevTools methods this MCP uses; anything
+            else is refused inside the extension.
+          </p>
+        </div>
+      </details>
 
       <div class="actions">
         <button id="reconnect" type="button">Reconnect</button>

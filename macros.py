@@ -761,7 +761,14 @@ def _record_from_payload(payload: Any, name: str, source: Path) -> dict[str, Any
     record = dict(payload)
     record["steps"] = validate_steps(record["steps"])
     variables = record.get("variables")
-    record["variables"] = variables if isinstance(variables, dict) else {}
+    # Declared from the steps, not only from the file. ``save`` writes the
+    # declaration for what it recorded, but a file written by hand has the
+    # placeholders and no declaration - and a summary that then reports "wants
+    # nothing" is how a caller learns what a macro needs from a failed run.
+    declared: dict[str, Any] = {found: None for found in sorted(placeholders_in(record["steps"]))}
+    if isinstance(variables, dict):
+        declared.update(variables)
+    record["variables"] = declared
     # Recount rather than trust: these files are hand-edited, and a step_count
     # left behind by an edit misreports the macro everywhere it is shown.
     record["step_count"] = len(record["steps"])

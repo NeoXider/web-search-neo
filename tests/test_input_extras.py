@@ -74,7 +74,15 @@ def test_scroll_with_selector_targets_the_container_holding_the_element(local_si
         assert result["success"] is True
         assert result["selector"] == "#marker"
         assert result["before"]["scroll_y"] == 0
-        after = session.driver.execute_script("return window.__panelScrollTop();")
+        # A wheel event is applied by the compositor, not by the call that sent
+        # it, so a single read right after dispatch races the scroll on a slow
+        # or headless machine. Polling waits for the same outcome instead of
+        # asserting a weaker one: a container that never moves still fails.
+        after = before
+        deadline = time.monotonic() + 5.0
+        while after <= before and time.monotonic() < deadline:
+            time.sleep(0.02)
+            after = session.driver.execute_script("return window.__panelScrollTop();")
         assert after > before
     finally:
         browser_tools.close_session("scroll-selector")
