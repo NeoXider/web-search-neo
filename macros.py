@@ -37,6 +37,61 @@ MAX_STEPS = 10000
 _GUARDED_LEDGER_NAME = ".guarded-macro-ledger.json"
 _GUARDED_LEDGER_LOCK = threading.Lock()
 
+# Where a project keeps its own macros. A project is recognised by a store it
+# already has, and failing that by a repository root: both are directories the
+# project owns for its own reasons, so discovery never invents a location.
+PROJECT_STORE_DIR = ".web-search-neo"
+_PROJECT_MARKERS = (PROJECT_STORE_DIR, ".git")
+AUTO_PROJECT_ROOT = "auto"
+
+# A pack is many macros in one file, which is the shape a project commits,
+# reviews, and copies to the next machine.
+PACK_FORMAT = 1
+PACK_DEFAULT_NAME = "macro-pack.json"
+
+_STORE_NOTES_NAME = "README.md"
+_STORE_NOTES = """# Web Search Neo macros
+
+Every `*.json` file here is one macro: a named list of `web_action` steps that
+replays with `macro op=run name=<file name without .json>`.
+
+The shortest useful file, `open-docs.json`, is the step list itself:
+
+```json
+[
+  {"action": "open", "url": "{{url}}", "session_id": "docs"}
+]
+```
+
+The full form, which is what `macro op=save` writes:
+
+```json
+{
+  "name": "open-docs",
+  "description": "Open one documentation page",
+  "steps": [{"action": "open", "url": "{{url}}", "session_id": "docs"}],
+  "variables": {"url": "https://example.com"}
+}
+```
+
+- `{{placeholder}}` marks what changes between runs. Pass `variables` on each
+  run; an entry in `variables` is that placeholder's default. A placeholder that
+  fills a whole string keeps the type of the value it is given, so a recorded
+  number stays a number.
+- Every step is exactly one `web_action` action object. Ask the server what each
+  action accepts with
+  `web_info(topic="action_schema", params={"action": "<name>"})`.
+- A macro cannot run another macro. Run them one after another instead.
+- Edit these files by hand freely. `macro op=list` reports a file it cannot read
+  as `broken` rather than hiding the ones beside it.
+- `macro op=export` writes every macro here into one pack file, and
+  `macro op=import` reads one back, which is how a macro set moves between
+  projects and machines.
+
+`.guarded-macro-ledger.json` is not a macro. It records the one-time guarded
+operations of this store; deleting it un-reserves every token it holds.
+"""
+
 
 def _sha256_file(path: Path) -> str:
     """Return a lowercase SHA-256 for *path* without loading it all into memory."""
@@ -47,25 +102,106 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def macro_root(project_root: str | os.PathLike[str] | None = None) -> Path:
+def discover_project_root(start: str | os.PathLike[str] | None = None) -> Path | None:
+    """Find the project a macro call belongs to without being told its path.
+
+    A model that has to spell an absolute path on every macro call will
+    eventually leave it out, and the project's macros then land silently in the
+    per-user store, where the next call cannot find them. Discovery removes the
+    chance to forget: ``WEB_SEARCH_NEO_PROJECT_ROOT`` is the deliberate answer
+    when the client can set it, an existing macro store is the next best
+    evidence, and a repository root covers a project that has not saved one yet.
+    """
+    configured = os.getenv("WEB_SEARCH_NEO_PROJECT_ROOT")
+    if configured and configured.strip():
+        candidate = Path(configured.strip()).expanduser()
+        if not candidate.is_dir():
+            raise ValueError(
+                f"WEB_SEARCH_NEO_PROJECT_ROOT is set to '{configured}', which is not an "
+                "existing directory. Correct it or unset it."
+            )
+        return candidate.resolve()
+    try:
+        here = Path(start).expanduser().resolve() if start is not None else Path.cwd().resolve()
+    except OSError:
+        return None
+    # Nearest first: a package inside a repository that keeps its own macros is
+    # its own project, and a marker further up must not reach past it. At one
+    # level an existing store outranks a repository root, which is the order
+    # _PROJECT_MARKERS is written in.
+    for directory in [here, *here.parents]:
+        for marker in _PROJECT_MARKERS:
+            if (directory / marker).exists():
+                return directory
+    return None
+
+
+def resolve_project_root(
+    project_root: str | os.PathLike[str] | None = None,
+) -> Path | None:
+    """Turn what a caller passed into the project directory to use, or ``None``.
+
+    ``None`` means the per-user store unless the environment names a project, so
+    a client configured once per project keeps working without every call
+    repeating the path. ``"auto"`` asks for discovery explicitly.
+    """
+    if project_root is None:
+        return discover_project_root() if os.getenv("WEB_SEARCH_NEO_PROJECT_ROOT") else None
+    if isinstance(project_root, str):
+        text = project_root.strip()
+        if not text:
+            return None
+        if text.lower() == AUTO_PROJECT_ROOT:
+            return discover_project_root()
+        project_root = text
+    project = Path(project_root).expanduser()
+    if not project.is_absolute() or not project.is_dir():
+        raise ValueError(
+            "project_root must be an existing absolute directory, or the word "
+            '"auto" to use the project found from the working directory.'
+        )
+    return project.resolve()
+
+
+def _write_store_notes(root: Path) -> None:
+    """Leave the file format beside the files, once, for whoever opens them next.
+
+    These directories are meant to be edited by hand and committed with the
+    project, so the reader is often a person or a model that has never seen the
+    macro schema and no reason to go looking for it.
+    """
+    notes = root / _STORE_NOTES_NAME
+    try:
+        if not notes.exists():
+            notes.write_text(_STORE_NOTES, encoding="utf-8")
+    except OSError:
+        # A read-only or otherwise unwritable store still replays macros; the
+        # explanation is a convenience and must never fail the call.
+        pass
+
+
+def macro_root(
+    project_root: str | os.PathLike[str] | None = None, create: bool = True
+) -> Path:
     """The directory holding saved macros, created on first use.
+
+    ``create=False`` resolves the same path without touching the filesystem, for
+    the reads: listing a project's macros should not leave a directory behind in
+    a repository that has never saved one.
 
     Macros outlive the server process on purpose: a click path learned once is
     worth keeping, and a model that has to re-record it after every restart will
     just stop using them.
     """
-    if project_root is not None:
-        project = Path(project_root).expanduser()
-        if not project.is_absolute() or not project.is_dir():
-            raise ValueError("project_root must be an existing absolute directory")
-        project = project.resolve()
-        container = project / ".web-search-neo"
+    project = resolve_project_root(project_root)
+    if project is not None:
+        container = project / PROJECT_STORE_DIR
         if container.exists():
             try:
                 container.resolve().relative_to(project)
             except ValueError:
                 raise ValueError("project macro storage escapes project_root; refusing it") from None
-        else:
+        elif create:
             container.mkdir()
         root = container / "macros"
         if root.exists():
@@ -73,12 +209,15 @@ def macro_root(project_root: str | os.PathLike[str] | None = None) -> Path:
                 root.resolve().relative_to(project)
             except ValueError:
                 raise ValueError("project macro storage escapes project_root; refusing it") from None
-        root.mkdir(parents=True, exist_ok=True)
+        elif create:
+            root.mkdir(parents=True, exist_ok=True)
         resolved_root = root.resolve()
         try:
             resolved_root.relative_to(project)
         except ValueError:
             raise ValueError("project macro storage escapes project_root; refusing it") from None
+        if create:
+            _write_store_notes(resolved_root)
         return resolved_root
     configured = os.getenv("WEB_SEARCH_NEO_MACRO_ROOT")
     if configured:
@@ -86,9 +225,50 @@ def macro_root(project_root: str | os.PathLike[str] | None = None) -> Path:
     elif os.getenv("LOCALAPPDATA"):
         root = Path(os.environ["LOCALAPPDATA"]) / "WebSearchNeo" / "macros"
     else:
-        root = Path.home() / ".web-search-neo" / "macros"
-    root.mkdir(parents=True, exist_ok=True)
+        root = Path.home() / PROJECT_STORE_DIR / "macros"
+    if create:
+        root.mkdir(parents=True, exist_ok=True)
+        _write_store_notes(root)
     return root
+
+
+def _macro_files(root: Path) -> list[Path]:
+    """Every file in a store that is meant to be a macro.
+
+    ``glob`` in pathlib matches leading dots, so the guarded-operation ledger
+    sitting beside the macros would otherwise be listed as a macro of its own,
+    with no steps and a name nobody saved.
+    """
+    return sorted(
+        path
+        for path in root.glob("*.json")
+        if path.name != _GUARDED_LEDGER_NAME and path.is_file()
+    )
+
+
+def store_info(project_root: str | os.PathLike[str] | None = None) -> dict[str, Any]:
+    """Say which store a call is using, and where the other one is.
+
+    The commonest way to lose a macro is not a bad file: it is saving into one
+    store and looking for it in the other. Every macro answer carries this, so
+    the question is answered before it has to be asked.
+    """
+    project = resolve_project_root(project_root)
+    root = macro_root(project, create=False)
+    info: dict[str, Any] = {
+        "scope": "project" if project is not None else "user",
+        "project_root": str(project) if project is not None else None,
+        "storage": str(root),
+        "macro_count": len(_macro_files(root)),
+    }
+    if project is not None and not os.getenv("WEB_SEARCH_NEO_PROJECT_ROOT"):
+        user_root = macro_root(None, create=False)
+        info["other_store"] = {
+            "scope": "user",
+            "storage": str(user_root),
+            "macro_count": len(_macro_files(user_root)),
+        }
+    return info
 
 
 def validate_name(name: str) -> str:
@@ -99,8 +279,10 @@ def validate_name(name: str) -> str:
     return name
 
 
-def _macro_path(name: str, project_root: str | os.PathLike[str] | None = None) -> Path:
-    return macro_root(project_root) / f"{validate_name(name)}.json"
+def _macro_path(
+    name: str, project_root: str | os.PathLike[str] | None = None, create: bool = True
+) -> Path:
+    return macro_root(project_root, create) / f"{validate_name(name)}.json"
 
 
 def _guarded_ledger_path(project_root: str | os.PathLike[str] | None = None) -> Path:
@@ -560,6 +742,35 @@ def save(
     return record
 
 
+def _record_from_payload(payload: Any, name: str, source: Path) -> dict[str, Any]:
+    """Return a checked macro record from whatever the file actually held.
+
+    A macro file is meant to be written by hand as often as by the recorder, and
+    the shortest honest thing to write is the step list itself. A bare list is
+    therefore read as the steps of a macro named after its file, so the smallest
+    useful macro is three lines of JSON instead of a wrapper object somebody has
+    to remember the shape of.
+    """
+    if isinstance(payload, list):
+        payload = {"steps": payload}
+    if not isinstance(payload, dict) or "steps" not in payload:
+        raise ValueError(
+            f"macro '{name}' has no 'steps' key; the file is {source}. A macro file is "
+            'either {"name": ..., "steps": [...]} or the bare step list.'
+        )
+    record = dict(payload)
+    record["steps"] = validate_steps(record["steps"])
+    variables = record.get("variables")
+    record["variables"] = variables if isinstance(variables, dict) else {}
+    # Recount rather than trust: these files are hand-edited, and a step_count
+    # left behind by an edit misreports the macro everywhere it is shown.
+    record["step_count"] = len(record["steps"])
+    # The file name is the identity every caller uses. A "name" carried in from a
+    # copied file would otherwise make op=run report a macro nobody asked for.
+    record["name"] = name
+    return record
+
+
 def load(name: str, project_root: str | os.PathLike[str] | None = None) -> dict[str, Any]:
     """Read one macro, checking the shape a hand-edited file could have lost.
 
@@ -567,29 +778,27 @@ def load(name: str, project_root: str | os.PathLike[str] | None = None) -> dict[
     added to a recording - so a wrong shape is a normal mistake and has to read
     as one, rather than as a KeyError from somewhere deep in the replay.
     """
-    path = _macro_path(name, project_root)
+    path = _macro_path(name, project_root, create=False)
     if not path.exists():
+        # Naming the store is the whole diagnosis. "Does not exist" plus an empty
+        # list, said about a store the caller did not know they were reading, is
+        # how a macro that is safely on disk gets recorded a second time.
+        root = macro_root(project_root, create=False)
+        scope = "project" if resolve_project_root(project_root) is not None else "user"
         raise ValueError(
-            f"macro '{name}' does not exist. Saved macros: "
-            f"{[item['name'] for item in list_macros(project_root)]}."
+            f"macro '{name}' does not exist in the {scope} store {root}. Saved there: "
+            f"{[item['name'] for item in list_macros(project_root)]}. A macro saved with a "
+            'project_root needs the same one to run it: pass that path, or "auto".'
         )
     try:
-        record = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"macro '{name}' is not readable JSON: {exc}") from None
-    if not isinstance(record, dict) or "steps" not in record:
-        raise ValueError(f"macro '{name}' has no 'steps' key; the file is {path}.")
-    record["steps"] = validate_steps(record["steps"])
-    variables = record.get("variables")
-    record["variables"] = variables if isinstance(variables, dict) else {}
-    # Recount rather than trust: these files are hand-edited, and a step_count
-    # left behind by an edit misreports the macro everywhere it is shown.
-    record["step_count"] = len(record["steps"])
-    return record
+    return _record_from_payload(payload, validate_name(name), path)
 
 
 def delete(name: str, project_root: str | os.PathLike[str] | None = None) -> bool:
-    path = _macro_path(name, project_root)
+    path = _macro_path(name, project_root, create=False)
     if not path.exists():
         return False
     path.unlink()
@@ -599,33 +808,176 @@ def delete(name: str, project_root: str | os.PathLike[str] | None = None) -> boo
 def list_macros(project_root: str | os.PathLike[str] | None = None) -> list[dict[str, Any]]:
     """Summarise every saved macro, cheaply enough to call before each run.
 
-    A file that is not readable JSON is reported as broken rather than skipped or
-    raised on: one hand-edited macro should not hide the others.
+    A file that does not read as a macro is reported as broken rather than
+    skipped or raised on: one hand-edited file should not hide the others, and a
+    macro that quietly disappears from the list is worse than one that says why.
     """
     summaries: list[dict[str, Any]] = []
-    for path in sorted(macro_root(project_root).glob("*.json")):
+    for path in _macro_files(macro_root(project_root, create=False)):
         try:
-            record = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            record = _record_from_payload(
+                json.loads(path.read_text(encoding="utf-8")), path.stem, path
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             summaries.append({"name": path.stem, "broken": f"{type(exc).__name__}: {exc}"})
             continue
-        # Valid JSON that is not an object is as broken as unreadable JSON here,
-        # and reporting it as broken is what keeps one bad file from hiding the rest.
-        if not isinstance(record, dict):
-            summaries.append(
-                {"name": path.stem, "broken": f"file holds {type(record).__name__}, not an object"}
-            )
-            continue
-        steps = record.get("steps")
         summaries.append(
             {
-                "name": record.get("name") or path.stem,
+                "name": record["name"],
                 "description": record.get("description") or "",
-                # Counted from the steps themselves: a hand-edited file whose
-                # step_count was not updated would otherwise report the old number.
-                "step_count": len(steps) if isinstance(steps, list) else 0,
-                "variables": sorted(record.get("variables") or {}),
+                "step_count": record["step_count"],
+                "variables": sorted(record["variables"]),
                 "saved_at": record.get("saved_at"),
             }
         )
     return summaries
+
+
+def read_pack_file(path: str | os.PathLike[str]) -> Any:
+    """Read a pack file a caller or another project wrote."""
+    source = Path(path).expanduser()
+    if source.is_dir():
+        source = source / PACK_DEFAULT_NAME
+    if not source.is_file():
+        raise ValueError(f"macro pack '{source}' is not an existing file")
+    try:
+        return json.loads(source.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"macro pack '{source}' is not readable JSON: {exc}") from None
+
+
+def write_pack_file(path: str | os.PathLike[str], payload: dict[str, Any]) -> Path:
+    """Write a pack where the caller asked, creating the directory if needed."""
+    target = Path(path).expanduser()
+    if target.is_dir():
+        target = target / PACK_DEFAULT_NAME
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return target.resolve()
+
+
+def default_pack_path(project_root: str | os.PathLike[str] | None = None) -> Path:
+    """Where a pack lands when the caller does not say.
+
+    Beside the macro directory rather than inside it, because a store lists
+    ``*.json`` and a pack sitting among the macros would read as one more macro
+    with a name nobody saved.
+    """
+    return macro_root(project_root).parent / PACK_DEFAULT_NAME
+
+
+def _pack_entries(payload: Any) -> list[Any]:
+    """Accept a pack, a bare list of macros, or one macro object.
+
+    Whoever writes a pack by hand is copying from somewhere - an exported file,
+    another project, a chat answer - and all three shapes turn up. Refusing two
+    of them would only teach the caller to reshape JSON before every import.
+    """
+    if isinstance(payload, dict) and isinstance(payload.get("macros"), list):
+        entries = payload["macros"]
+    elif isinstance(payload, list):
+        entries = payload
+    elif isinstance(payload, dict) and "steps" in payload:
+        entries = [payload]
+    else:
+        raise ValueError(
+            'a macro pack is {"macros": [{"name": ..., "steps": [...]}, ...]}, a bare '
+            "list of those objects, or one macro object with a name and steps"
+        )
+    if not entries:
+        raise ValueError("this macro pack contains no macros")
+    return list(entries)
+
+
+def export_pack(
+    names: list[str] | None = None,
+    project_root: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
+    """Collect a store's macros into one document a project can commit."""
+    if names:
+        selected = [validate_name(str(item).strip()) for item in names]
+    else:
+        listed = list_macros(project_root)
+        broken = [item["name"] for item in listed if "broken" in item]
+        if broken:
+            raise ValueError(
+                f"refusing to export while {broken} cannot be read as macros; fix or "
+                "delete those files first, or export the wanted names explicitly"
+            )
+        selected = [item["name"] for item in listed]
+    if not selected:
+        raise ValueError(
+            f"there are no macros to export in {macro_root(project_root, create=False)}"
+        )
+    exported = []
+    for name in selected:
+        record = load(name, project_root)
+        exported.append(
+            {
+                "name": record["name"],
+                "description": record.get("description") or "",
+                "steps": record["steps"],
+                "variables": record["variables"],
+            }
+        )
+    return {
+        "format": PACK_FORMAT,
+        "exported_at": time.time(),
+        "source": str(macro_root(project_root)),
+        "macros": exported,
+    }
+
+
+def import_pack(
+    payload: Any,
+    project_root: str | os.PathLike[str] | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Write every macro in a pack into one store, refusing to clobber by default.
+
+    Everything is validated before anything is written. A pack whose fourth
+    macro is malformed would otherwise leave three imported and no way to tell,
+    from the error alone, which half of the set is now on disk.
+    """
+    entries = _pack_entries(payload)
+    existing = {item["name"] for item in list_macros(project_root)}
+    planned: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    claimed: set[str] = set()
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError(f"macro {index} in this pack is not an object")
+        name = validate_name(str(entry.get("name") or "").strip())
+        if name in claimed:
+            raise ValueError(f"this pack declares '{name}' twice; names are file names")
+        claimed.add(name)
+        if name in existing and not overwrite:
+            skipped.append(
+                {"name": name, "reason": "already exists; pass overwrite=true to replace it"}
+            )
+            continue
+        steps = validate_steps(entry.get("steps"))
+        variables = entry.get("variables")
+        planned.append(
+            {
+                "name": name,
+                "steps": steps,
+                "description": str(entry.get("description") or ""),
+                "variables": variables if isinstance(variables, dict) else None,
+                "replaced": name in existing,
+            }
+        )
+    imported = []
+    for item in planned:
+        record = save(
+            item["name"], item["steps"], item["description"], item["variables"], project_root
+        )
+        imported.append(
+            {
+                "name": record["name"],
+                "step_count": record["step_count"],
+                "variables": sorted(record["variables"]),
+                "replaced": item["replaced"],
+            }
+        )
+    return {"imported": imported, "skipped": skipped, **store_info(project_root)}

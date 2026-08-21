@@ -1,17 +1,27 @@
 ---
 name: web-search-neo
-description: Use the Web Search Neo MCP server for free web search without API keys, resilient multi-engine fallback, HTTP page fetching, the user's current signed-in Chrome with AI-group tabs, isolated browser profiles, accessibility-level page inspection, form filling and upload, page console and network diagnostics, screenshots, and deterministic canvas/WebGL game testing. Trigger when a task needs current web results, visible work in existing Chrome tabs, authorized browser state, reading or driving a rendered page, diagnosing a broken page, or frame-exact keyboard, mouse, and touch input through the two-tool web_info/web_action contract.
+description: Use the Web Search Neo MCP server for free web search without API keys, resilient multi-engine fallback, HTTP page fetching, the user's current signed-in Chrome with AI-group tabs, isolated browser profiles, accessibility-level page inspection, form filling and upload, page console and network diagnostics, screenshots, deterministic canvas/WebGL game testing, and reusable macros kept as JSON files in the calling project. Trigger when a task needs current web results, visible work in existing Chrome tabs, authorized browser state, reading or driving a rendered page, diagnosing a broken page, recording or replaying a repeated browser flow, or frame-exact keyboard, mouse, and touch input through the two-tool web_info/web_action contract.
 ---
 
 # Web Search Neo
 
-This file is optional. Start with the server's compact runtime playbook,
-`web_info(topic="skill")`. Use `web_info()` with no arguments only when you need its full
-action/topic index, recipes, limits, and pitfalls. Optional names, types, and defaults are
-not in that index. Before sending an optional parameter, read
-`web_info(topic="action_schema", params={"action": "<name>"})` — it also answers for an observation topic, so
-`params={"action": "network"}` lists what `network` accepts. Ask before guessing: a topic
-refuses any parameter it does not list.
+This file is optional: the server describes itself. Four calls answer everything, and
+they are meant to be used in this order.
+
+| Call | Answers |
+| --- | --- |
+| `web_info(topic="actions")` | What can I call? Every action with its summary and required parameters. `params={"group": "macro"}` narrows it to one group (`search`, `fetch`, `session`, `page`, `game`, `macro`). |
+| `web_info(topic="skill")` | How do I work? The compact inspect → act → verify playbook, plus the names of its detailed sections. |
+| `web_info(topic="skill", params={"section": "<name>"})` | The full section: when it applies, the calls in order, the rules that cannot be guessed, and what to avoid. Sections are `start`, `loop`, `locators`, `forms`, `macros`, `guarded`, `parallel`, `search`, `diagnostics`, `games`, `troubleshooting`. |
+| `web_info(topic="action_schema", params={"action": "<name>"})` | Exactly what one action or one observation topic accepts: optional names, types, defaults. |
+
+`web_info()` with no arguments returns the whole contract at once — action index, topics,
+recipes, pitfalls, limits, examples — and is worth one call at the start of a long task.
+Optional parameter names live only in `action_schema`. Ask before guessing: an action or a
+topic refuses any key it does not publish, and the refusal names the allowed list.
+
+When something has already gone wrong, `web_info(topic="skill", params={"section":
+"troubleshooting"})` maps the exact error text to the call that fixes it.
 
 Two tools only. `web_info` reads state; `web_action` performs 1-32 ordered operations.
 One `session_id` controls one page. Reuse it to continue on that page; use a different id
@@ -225,39 +235,105 @@ session; `op=list` shows what is registered and `op=remove` forgets one.
 ## Repeating a task: macros
 
 A task you will do more than once — an application form, a login, a search-and-filter — is
-worth recording instead of re-deriving. `macro op=record name=hh-apply` starts capturing;
-drive the task once with ordinary actions; `macro op=save` keeps what dispatched. Only
-actions that *succeeded* are recorded, so a wrong selector you corrected does not enter the
-script. Every action is recordable, and a replay dispatches through the same validated loop:
-`click` keeps its target whichever form you used (selector, `text` plus `role`, or `x`/`y`
-coordinates), and the scripting, cookie, storage, captcha, stealth, and request-replay actions
-record and replay just like `open`, `fill`, and `submit` do.
+worth recording instead of re-deriving. A macro is one JSON file holding an ordered list of
+`web_action` steps, replayed by name.
 
-Before replaying a consequential task, call `macro op=preview name=review-form` with the
-same `variables` planned for `run`. It resolves every placeholder and returns the exact
-steps with `executed=false`, without dispatching an action or changing browser state. This
-is the review point for a final URL, form values, an upload path, or a submit step.
+### Where macros live
+
+There are two stores, and telling them apart is the single most common macro mistake.
+
+| `project_root` | Store used |
+| --- | --- |
+| omitted | The per-user store, unless `WEB_SEARCH_NEO_PROJECT_ROOT` names a project. |
+| `"auto"` | The project found by walking up from the working directory: `WEB_SEARCH_NEO_PROJECT_ROOT` first, then the nearest `.web-search-neo` directory, then the nearest repository root. |
+| an absolute path | Exactly that project. |
+
+A project's macros are files in `<project_root>/.web-search-neo/macros/`, one `.json` per
+macro, meant to be committed with the project and edited by hand. Every macro answer
+reports `scope`, `project_root`, and `storage`, so a macro that seems to have vanished is
+usually a macro saved into the other store — compare those three fields before re-recording
+anything. `op=list` also reports `other_store`, so the answer is in the result you already
+have.
+
+### The file format
+
+The shortest valid file is the step list itself, `open-docs.json`:
+
+```json
+[{"action": "open", "url": "{{url}}", "session_id": "docs"}]
+```
+
+The full form is what `op=save` writes, and adds a description and the placeholder defaults:
+
+```json
+{
+  "name": "open-docs",
+  "description": "Open one documentation page",
+  "steps": [{"action": "open", "url": "{{url}}", "session_id": "docs"}],
+  "variables": {"url": "https://example.com"}
+}
+```
+
+Each step is exactly one `web_action` action object, so
+`web_info(topic="action_schema", params={"action": "<name>"})` is the reference for what a
+step may contain. A `README.md` written into every store repeats this next to the files.
+
+### Recording, writing, and replaying
+
+`macro op=record name=hh-apply` starts capturing; drive the task once with ordinary actions;
+`macro op=save` keeps what dispatched. Only actions that *succeeded* are recorded, so a wrong
+selector you corrected does not enter the script. Every action is recordable, and a replay
+dispatches through the same validated loop: `click` keeps its target whichever form you used
+(selector, `text` plus `role`, or `x`/`y` coordinates), and the scripting, cookie, storage,
+captcha, stealth, and request-replay actions record and replay just like `open`, `fill`, and
+`submit` do.
+
+You do not have to record at all. `macro op=save name=<name> steps=[...]` writes a macro from
+a step list you wrote yourself, and a file dropped into the macro directory by any other means
+is a macro as soon as it parses.
 
 Replay with `macro op=run name=hh-apply`. The parts that change between runs are
-`{{placeholders}}` in the saved steps: edit them in with `op=save` and explicit `steps`, or
-write them from the start, then pass `variables` on each run. A placeholder that is a whole
-value keeps its type, so a recorded number stays a number. Every placeholder is declared in
-the saved file, so `op=show` tells you what a macro wants without reading its steps, and a
-run missing one names all of them at once rather than failing on the first.
+`{{placeholders}}`: edit them into the file, or write them from the start, then pass
+`variables` on each run. A placeholder that fills a whole value keeps its type, so a recorded
+number stays a number. Every placeholder is declared in the saved file, so `op=show` tells you
+what a macro wants without reading its steps, and a run missing one names all of them at once
+rather than failing on the first.
+
+Before replaying a consequential task, call `macro op=preview name=review-form` with the same
+`variables` planned for `run`. It resolves every placeholder and returns the exact steps with
+`executed=false`, without dispatching an action or changing browser state. This is the review
+point for a final URL, form values, an upload path, or a submit step.
 
 Macros are files and outlive the server; `op=list` summarises them and `op=delete` removes
 one. A macro cannot run another macro — run them in order instead. A replay reports like any
 batch, so check `failure_count` and each `results[i].success`: a saved click path is exactly
 as fragile as the page it was recorded from, and a site redesign invalidates it silently.
 
-The macro engine is universal and domain-neutral. Never add recruitment, commerce, finance,
-or other domain policy to core. Put domain rules in project-owned saved macros/configuration;
-only neutral broadly useful examples belong in the engine repository.
+### Moving a set between projects
 
-Pass an existing absolute `project_root` to any macro operation to use that project's
-`.web-search-neo/macros/` set. Without it, the existing user store remains active. Always pass
-the same project root to `guarded_stage` and `guarded_commit`, because its idempotency ledger
-is project-local too.
+`op=export` collects the active store into one pack file — every macro by default, or just
+`name` if you pass one — and writes it to `path`, defaulting to
+`<project_root>/.web-search-neo/macro-pack.json`. That single file is what a project commits
+or hands to another machine.
+
+`op=import` reads one back from `path`, or from an inline `pack` object, into the store the
+call selects. A name that already exists is skipped and reported, unless `overwrite=true`.
+Nothing is written until every macro in the pack validates, so a bad pack never leaves half a
+set on disk.
+
+```json
+{"actions":[{"action":"macro","op":"import","path":"C:/work/shared/macro-pack.json","project_root":"auto"}]}
+```
+
+### Keeping domain rules out of the engine
+
+The macro engine is universal and domain-neutral. Never add recruitment, commerce, finance,
+or other domain policy to core. Put domain rules in project-owned saved macros and
+configuration; only neutral, broadly useful examples belong in the engine repository. Always
+pass the same project root to `guarded_stage` and `guarded_commit`, because the idempotency
+ledger is project-local too.
+
+### Guarded consequential replays
 
 For a consequential flow, keep exactly one consequential last step: explicit `submit`, or a
 safe `click`. A guarded selector click uses plain CSS and is required to match exactly one live

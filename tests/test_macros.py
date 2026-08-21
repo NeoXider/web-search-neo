@@ -17,6 +17,9 @@ import main
 def macro_root(tmp_path, monkeypatch):
     """Keep every test's macros in its own directory, never the real one."""
     monkeypatch.setenv("WEB_SEARCH_NEO_MACRO_ROOT", str(tmp_path / "macros"))
+    # A developer machine may name a project for its own MCP client; a test run
+    # must not then write its macros into that project.
+    monkeypatch.delenv("WEB_SEARCH_NEO_PROJECT_ROOT", raising=False)
     main._RECORDING.update({"active": False, "name": "", "steps": [], "project_root": None})
     yield tmp_path
     main._RECORDING.update({"active": False, "name": "", "steps": [], "project_root": None})
@@ -68,10 +71,20 @@ def test_broken_file_is_reported_without_hiding_the_others(macro_root):
     assert listed["good"]["step_count"] == 1
 
 
-def test_load_unknown_macro_names_the_saved_ones():
+def test_load_unknown_macro_names_the_store_and_the_saved_ones(tmp_path):
     macros.save("known", [{"action": "close_all"}])
     with pytest.raises(ValueError, match="known"):
         macros.load("missing")
+
+    # The store is the diagnosis: a project macro looked for without its
+    # project_root is missing from a store the caller never meant to read.
+    project = tmp_path / "elsewhere"
+    project.mkdir()
+    macros.save("project-only", [{"action": "close_all"}], project_root=project)
+    with pytest.raises(ValueError, match="user store"):
+        macros.load("project-only")
+    with pytest.raises(ValueError, match=r'project_root needs the same one'):
+        macros.load("project-only")
 
 
 @pytest.mark.parametrize("name", ["", "../escape", "has space", "a" * 65, "semi;colon"])
@@ -920,3 +933,253 @@ def test_guarded_commit_accepts_a_legacy_staged_submit_checkpoint(monkeypatch):
     committed = _call(op="guarded_commit", checkpoint="guard-legacy-token-20260820")
     assert committed["terminal_action"] == "submit"
     assert committed["executed_submit"] is True
+
+
+# --- project stores, hand-written files, and packs ---------------------------
+
+
+def test_a_hand_written_step_list_is_a_macro():
+    # The shortest honest thing to write by hand is the steps themselves, and a
+    # model that has to wrap them in an object gets the wrapper wrong instead.
+    (macros.macro_root() / "typed.json").write_text(
+        '[{"action": "open", "url": "https://example.com"}]', encoding="utf-8"
+    )
+    record = macros.load("typed")
+    assert record["name"] == "typed"
+    assert record["step_count"] == 1
+    assert [item["name"] for item in macros.list_macros()] == ["typed"]
+
+
+def test_a_copied_file_is_the_macro_its_file_name_says():
+    macros.save("original", [{"action": "close_all"}])
+    copied = macros.macro_root() / "copy.json"
+    copied.write_text((macros.macro_root() / "original.json").read_text(encoding="utf-8"), encoding="utf-8")
+    # op=run reports what it ran, and reporting the name the file was copied
+    # from would name a macro the caller never asked for.
+    assert macros.load("copy")["name"] == "copy"
+
+
+def test_the_store_explains_its_own_file_format(tmp_path):
+    project = tmp_path / "documented"
+    project.mkdir()
+    notes = (macros.macro_root(project) / "README.md").read_text(encoding="utf-8")
+    assert "op=run" in notes and "{{placeholder}}" in notes
+
+
+def test_the_guarded_ledger_is_not_listed_as_a_macro(tmp_path):
+    project = tmp_path / "ledgered"
+    project.mkdir()
+    macros.save("real", [{"action": "close_all"}], project_root=project)
+    macros._write_guarded_ledger({"tokens": {}, "resources": {}, "identities": {}}, project)
+    assert [item["name"] for item in macros.list_macros(project)] == ["real"]
+
+
+def test_auto_project_root_takes_the_nearest_marker(tmp_path, monkeypatch):
+    repository = tmp_path / "repository"
+    (repository / ".git").mkdir(parents=True)
+    package = repository / "packages" / "app"
+    package.mkdir(parents=True)
+    (package / ".web-search-neo").mkdir()
+    monkeypatch.chdir(package)
+    assert macros.discover_project_root() == package.resolve()
+    assert macros.resolve_project_root("auto") == package.resolve()
+
+    deeper = repository / "packages" / "other"
+    deeper.mkdir()
+    monkeypatch.chdir(deeper)
+    assert macros.discover_project_root() == repository.resolve()
+
+
+def test_the_environment_can_name_the_project_for_every_call(tmp_path, monkeypatch):
+    project = tmp_path / "configured"
+    project.mkdir()
+    monkeypatch.setenv("WEB_SEARCH_NEO_PROJECT_ROOT", str(project))
+    macros.save("from-env", [{"action": "close_all"}])
+    assert (project / ".web-search-neo" / "macros" / "from-env.json").is_file()
+    assert macros.store_info()["scope"] == "project"
+
+
+def test_a_project_root_the_environment_cannot_find_is_named(tmp_path, monkeypatch):
+    monkeypatch.setenv("WEB_SEARCH_NEO_PROJECT_ROOT", str(tmp_path / "gone"))
+    with pytest.raises(ValueError, match="WEB_SEARCH_NEO_PROJECT_ROOT"):
+        macros.macro_root()
+
+
+def test_every_macro_answer_says_which_store_it_used(tmp_path):
+    project = tmp_path / "reported"
+    project.mkdir()
+    saved = _call(op="save", name="x", steps=[{"action": "close_all"}], project_root=str(project))
+    assert saved["scope"] == "project"
+    assert saved["project_root"] == str(project.resolve())
+    assert saved["other_store"]["scope"] == "user"
+
+    listed = _call(op="list")
+    assert listed["scope"] == "user"
+    assert listed["project_root"] is None
+    assert listed["storage"] == str(macros.macro_root())
+    assert listed["macros"] == []
+
+
+def test_auto_saves_into_the_project_found_from_the_working_directory(tmp_path, monkeypatch):
+    project = tmp_path / "auto-project"
+    (project / ".git").mkdir(parents=True)
+    monkeypatch.chdir(project)
+    saved = _call(op="save", name="local", steps=[{"action": "close_all"}], project_root="auto")
+    assert saved["scope"] == "project"
+    assert (project / ".web-search-neo" / "macros" / "local.json").is_file()
+
+
+def test_auto_that_finds_no_project_records_into_the_user_store(monkeypatch):
+    # "auto" is allowed to find nothing. What it must never do is make the
+    # recorder derive a project directory out of the user store's own path.
+    monkeypatch.setattr(macros, "discover_project_root", lambda start=None: None)
+    _call(op="record", name="loose", project_root="auto")
+    assert main._RECORDING["project_root"] is None
+    main._record_step("open", {"url": "https://example.com"})
+    saved = _call(op="save")
+    assert saved["scope"] == "user"
+    assert macros.load("loose")["steps"][0]["url"] == "https://example.com"
+
+
+def test_export_and_import_move_a_whole_macro_set(tmp_path):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.mkdir()
+    target.mkdir()
+    macros.save("one", [{"action": "open", "url": "{{url}}"}], "first", None, source)
+    macros.save("two", [{"action": "close_all"}], "second", None, source)
+
+    pack = macros.export_pack(None, source)
+    assert [item["name"] for item in pack["macros"]] == ["one", "two"]
+    written = macros.write_pack_file(tmp_path / "set.json", pack)
+
+    outcome = macros.import_pack(macros.read_pack_file(written), target)
+    assert [item["name"] for item in outcome["imported"]] == ["one", "two"]
+    assert macros.load("one", target)["description"] == "first"
+    assert sorted(macros.load("one", target)["variables"]) == ["url"]
+
+
+def test_import_refuses_to_clobber_until_it_is_asked_to(tmp_path):
+    store = tmp_path / "store"
+    store.mkdir()
+    pack = {"macros": [{"name": "one", "steps": [{"action": "close_all"}]}]}
+    assert len(macros.import_pack(pack, store)["imported"]) == 1
+
+    again = macros.import_pack(pack, store)
+    assert again["imported"] == []
+    assert "already exists" in again["skipped"][0]["reason"]
+
+    forced = macros.import_pack(pack, store, overwrite=True)
+    assert forced["imported"][0]["replaced"] is True
+
+
+def test_a_pack_is_written_whole_or_not_at_all(tmp_path):
+    store = tmp_path / "atomic"
+    store.mkdir()
+    with pytest.raises(ValueError, match="action"):
+        macros.import_pack(
+            {
+                "macros": [
+                    {"name": "good", "steps": [{"action": "close_all"}]},
+                    {"name": "bad", "steps": [{"url": "no action key"}]},
+                ]
+            },
+            store,
+        )
+    # Half an imported set is worse than none: the error alone would not say
+    # which half reached the disk.
+    assert macros.list_macros(store) == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"macros": [{"name": "one", "steps": [{"action": "close_all"}]}]},
+        [{"name": "one", "steps": [{"action": "close_all"}]}],
+        {"name": "one", "steps": [{"action": "close_all"}]},
+    ],
+)
+def test_a_pack_accepts_the_shapes_people_actually_paste(tmp_path, payload):
+    store = tmp_path / "shapes"
+    store.mkdir()
+    assert [item["name"] for item in macros.import_pack(payload, store)["imported"]] == ["one"]
+
+
+def test_a_pack_that_is_not_a_pack_says_what_one_looks_like(tmp_path):
+    store = tmp_path / "wrong"
+    store.mkdir()
+    with pytest.raises(ValueError, match="macros"):
+        macros.import_pack({"steps_but_no_name": []}, store)
+    with pytest.raises(ValueError, match="not an existing file"):
+        macros.read_pack_file(tmp_path / "absent.json")
+
+
+def test_the_macro_action_exports_and_imports_between_projects(tmp_path):
+    source = tmp_path / "from"
+    target = tmp_path / "to"
+    source.mkdir()
+    target.mkdir()
+    _call(op="save", name="one", steps=[{"action": "close_all"}], project_root=str(source))
+
+    exported = _call(op="export", project_root=str(source))
+    assert exported["path"] == str((source / ".web-search-neo" / "macro-pack.json").resolve())
+    assert exported["exported"] == ["one"]
+
+    imported = _call(op="import", path=exported["path"], project_root=str(target))
+    assert [item["name"] for item in imported["imported"]] == ["one"]
+    assert imported["scope"] == "project"
+    assert macros.load("one", target)["step_count"] == 1
+
+
+def test_export_of_one_name_takes_only_that_macro(tmp_path):
+    store = tmp_path / "single"
+    store.mkdir()
+    _call(op="save", name="one", steps=[{"action": "close_all"}], project_root=str(store))
+    _call(op="save", name="two", steps=[{"action": "close_all"}], project_root=str(store))
+    exported = _call(op="export", name="two", path=str(tmp_path / "two.json"), project_root=str(store))
+    assert exported["exported"] == ["two"]
+
+
+def test_import_without_a_source_says_what_it_needs():
+    with pytest.raises(ValueError, match="path"):
+        _call(op="import")
+
+
+def test_an_unknown_op_lists_the_ones_that_exist():
+    with pytest.raises(ValueError, match="export, import"):
+        _call(op="teleport")
+
+
+def test_reading_a_project_that_has_no_macros_leaves_nothing_behind(tmp_path):
+    # A model calling op=list to find out where it is must not thereby create a
+    # directory in a repository that never asked for one.
+    project = tmp_path / "untouched"
+    project.mkdir()
+    listed = _call(op="list", project_root=str(project))
+    assert listed["macros"] == []
+    assert listed["macro_count"] == 0
+    assert not (project / ".web-search-neo").exists()
+
+    _call(op="save", name="first", steps=[{"action": "close_all"}], project_root=str(project))
+    assert (project / ".web-search-neo" / "macros" / "first.json").is_file()
+
+
+def test_an_inline_pack_can_be_a_list_or_an_object(tmp_path):
+    # Both are what a caller pastes, and refusing one at the action boundary
+    # while the engine accepts it would only teach reshaping before every call.
+    store = tmp_path / "inline"
+    store.mkdir()
+    listed = _call(
+        op="import",
+        pack=[{"name": "from-list", "steps": [{"action": "close_all"}]}],
+        project_root=str(store),
+    )
+    assert [item["name"] for item in listed["imported"]] == ["from-list"]
+
+    wrapped = _call(
+        op="import",
+        pack={"macros": [{"name": "from-object", "steps": [{"action": "close_all"}]}]},
+        project_root=str(store),
+    )
+    assert [item["name"] for item in wrapped["imported"]] == ["from-object"]
+    assert wrapped["source"] == "inline pack"

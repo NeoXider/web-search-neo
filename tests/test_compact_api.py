@@ -203,9 +203,11 @@ def test_capabilities_names_required_parameters_and_where_the_rest_live():
     assert not any("include_summary" in json.dumps(entry) for entry in actions.values())
     # A ceiling, not a target: every model reads this document on every session,
     # so a rule earns its place here or it lives in a topic. Raised deliberately
-    # twice - once for request replay, once for the parallel-agent pitfall, whose
-    # collision is otherwise silent and costs an agent the page it was working on.
-    assert len(json.dumps(document)) < 12_000
+    # three times - once for request replay, once for the parallel-agent pitfall,
+    # and once for project-local macro stores, where the failure is a macro saved
+    # into one store and looked for in the other, and for the two lines that name
+    # topic=actions and topic=skill as the places the rest of the contract lives.
+    assert len(json.dumps(document)) < 13_000
 
     assert any(
         "ref:" in pitfall and "page_outline" in pitfall for pitfall in document["pitfalls"]
@@ -233,7 +235,7 @@ def test_capabilities_states_the_requirements_that_python_defaults_hide():
     # Unconditional actions keep the plain shape, so the key stays a signal.
     assert "also_required" not in actions["pointer"]
     assert "also_required" not in actions["open"]
-    assert len(json.dumps(document)) < 12_000
+    assert len(json.dumps(document)) < 13_000
 
 
 def test_input_and_touch_reject_exactly_what_the_document_calls_required():
@@ -387,9 +389,13 @@ def test_scroll_screenshot_pagination_and_skill_are_published_for_small_models()
     assert "submit_attempted=false" in submit_guard
     assert "exactly once" in submit_guard
     assert "never click it again" in submit_guard
-    assert len(json.dumps(skill)) < 6_500
+    # The playbook is fetched at the start of a task, so it stays small. The one
+    # raise pays for the section index that turns it into something navigable.
+    assert len(json.dumps(skill)) < 7_000
+    assert "macros" in skill["sections"] and "troubleshooting" in skill["sections"]
+    assert "params={'section'" in skill["read_a_section"]
     skill_schema = asyncio.run(main.web_info("action_schema", {"action": "skill"}))
-    assert skill_schema["params_schema"].get("properties", {}) == {}
+    assert list(skill_schema["params_schema"].get("properties", {})) == ["section"]
 
     filesystem_skill = (
         Path(main.__file__).parent / "skills" / "web-search-neo" / "SKILL.md"
@@ -443,3 +449,56 @@ def test_small_model_parameter_guesses_are_rejected_with_the_published_fix():
         )
     assert "selector" in str(failure.value)
     assert "offset" in str(failure.value)
+
+
+def test_the_action_index_is_reachable_without_the_whole_contract():
+    # A small model that only needs "what can I call" should not have to read
+    # recipes, pitfalls, and examples to find out.
+    index = asyncio.run(main.web_info("actions"))
+    assert set(index["actions"]) == set(main._ACTIONS)
+    assert index["actions"]["open"]["required"] == ["url"]
+    assert "macro" in index["action_groups"]
+    assert "action_schema" in index["next"]
+    assert set(index["info_topics"]) == set(main._INFO_TOPICS)
+
+    narrowed = asyncio.run(main.web_info("actions", {"group": "macro"}))
+    assert list(narrowed["actions"]) == ["macro"]
+    with pytest.raises(ValueError, match="Unknown action group"):
+        asyncio.run(main.web_info("actions", {"group": "nope"}))
+
+
+def test_every_skill_section_opens_and_says_what_it_is_for():
+    listed = asyncio.run(main.web_info("skill"))["sections"]
+    assert set(listed) == set(main._SKILL_SECTIONS)
+    for name in listed:
+        section = asyncio.run(main.web_info("skill", {"section": name}))
+        assert section["section"] == name
+        assert section["summary"]
+        # A section is a page of instructions, not a heading: it either walks
+        # through calls or it lists the symptoms it answers.
+        assert section.get("steps") or section.get("cases")
+    with pytest.raises(ValueError, match="Unknown skill section"):
+        asyncio.run(main.web_info("skill", {"section": "nope"}))
+
+
+def test_the_macro_section_says_where_a_project_keeps_its_files():
+    section = json.dumps(asyncio.run(main.web_info("skill", {"section": "macros"})))
+    assert ".web-search-neo/macros" in section
+    assert "project_root='auto'" in section
+    assert "op='preview'" in section
+    assert "cannot run another macro" in section
+
+    troubleshooting = asyncio.run(main.web_info("skill", {"section": "troubleshooting"}))
+    # The failure this release exists to make legible: saved in one store,
+    # looked for in the other.
+    assert any("does not exist" in case["symptom"] for case in troubleshooting["cases"])
+
+
+def test_the_macro_action_schema_documents_storage_files_and_packs():
+    schema = asyncio.run(main.web_info("action_schema", {"action": "macro"}))
+    properties = schema["input_schema"]["properties"]
+    assert {"op", "name", "steps", "project_root", "path", "pack", "overwrite"} <= set(properties)
+    notes = schema["notes"]
+    assert "auto" in notes["storage"] and "per-user store" in notes["storage"]
+    assert ".web-search-neo/macros/" in notes["files"]
+    assert "export" in notes["packs"] and "overwrite=true" in notes["packs"]

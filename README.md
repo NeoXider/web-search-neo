@@ -40,6 +40,7 @@ Startpage are available as fallbacks.
 - [Reading a page](#reading-a-page) · [Locators](#locators)
 - [Console and network diagnostics](#console-and-network-diagnostics)
 - [Forms and multi-step flows](#forms-and-multi-step-flows) · [Reviewable macros](#reviewable-macros)
+- [Where macros live](#where-macros-live) · [Macro files](#macro-files) · [Macro packs](#macro-packs)
 - [Architecture invariants](ARCHITECTURE.md) · [Project-local and guarded macros](#project-local-and-guarded-macros)
 - [Canvas and WebGL games](#canvas-and-webgl-games) · [Render modes](#render-modes) · [Input latency](#input-latency)
 - [Two-tool MCP contract](#two-tool-mcp-contract) · [Optional agent skill](#optional-agent-skill)
@@ -278,7 +279,7 @@ is no automatic substitute. If you would rather not install an extension at all,
 `profile_mode="temporary"` and `profile_mode="persistent"` drive a Selenium
 browser that needs no companion.
 
-The bundled companion is version 1.3.11. Chrome does not refresh an unpacked
+The bundled companion is version 1.4.0. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. Upgrading *onto*
@@ -890,14 +891,80 @@ check the batch result and freshly inspect the page. For applications, payments,
 messages, or other consequential actions, use the guarded two-phase path below so the exact
 terminal Submit or safe Click is attempted only once after live-state validation.
 
+### Where macros live
+
+There are two stores, and every macro answer reports which one it used, as `scope`,
+`project_root`, and `storage`. A macro that appears to have vanished is almost always a
+macro saved into the other one.
+
+| `project_root` | Store |
+| --- | --- |
+| omitted | The per-user store, unless `WEB_SEARCH_NEO_PROJECT_ROOT` names a project. |
+| `"auto"` | The project found by walking up from the working directory: `WEB_SEARCH_NEO_PROJECT_ROOT` first, then the nearest `.web-search-neo` directory, then the nearest repository root. |
+| an absolute path | Exactly that project. |
+
+`op=list` additionally reports `other_store`, so the question "is it in the other one?" is
+answered by the call that raised it. The nearest marker wins, so a package that keeps its
+own `.web-search-neo` directory inside a larger repository is its own project. Macro names
+are traversal-safe, and the resolved store is additionally required to remain beneath
+`project_root`; a symlink or junction that escapes is refused.
+
+### Macro files
+
+A project's macros are one `.json` file each under
+`<project_root>/.web-search-neo/macros/`, intended to be committed with the project and
+edited by hand. The shortest valid file is the step list itself:
+
+```json
+[{"action": "open", "url": "{{url}}", "session_id": "docs"}]
+```
+
+The full form is what `op=save` writes, and adds the description and placeholder defaults:
+
+```json
+{
+  "name": "open-docs",
+  "description": "Open one documentation page",
+  "steps": [{"action": "open", "url": "{{url}}", "session_id": "docs"}],
+  "variables": {"url": "https://example.com"}
+}
+```
+
+Every step is exactly one `web_action` action object, so
+`web_info(topic="action_schema", params={"action": "<name>"})` is the reference for what a
+step may contain. Each store gets a `README.md` stating this next to the files, because the
+next reader of a committed macro directory is often a model that has never seen the schema.
+A file that cannot be read as a macro is reported by `op=list` as `broken` rather than
+skipped, so one bad hand edit never hides the macros beside it. The guarded-operation
+ledger lives in the same directory and is never listed as a macro.
+
+### Macro packs
+
+`op=export` collects the active store into one pack file — every macro by default, or a
+single `name` — and writes it to `path`, defaulting to
+`<project_root>/.web-search-neo/macro-pack.json`. That one file is what a project commits or
+hands to another machine.
+
+```json
+{"actions":[{"action":"macro","op":"export","project_root":"C:/work/my-project"}]}
+```
+
+`op=import` reads a pack back from `path`, or from an inline `pack` object, into the store
+the call selects. It accepts a pack, a bare list of macro objects, or one macro object,
+because all three are what people actually paste. A name that already exists is skipped and
+reported unless `overwrite=true`, and nothing is written until every macro in the pack
+validates, so a malformed pack never leaves half a set on disk.
+
+```json
+{"actions":[{"action":"macro","op":"import","path":"C:/work/shared/macro-pack.json","project_root":"auto"}]}
+```
+
 ### Project-local and guarded macros
 
 The engine is universal and domain-neutral. Domain rules belong in a saved macro or its
-calling project, never in Web Search Neo core. Pass an existing absolute `project_root` to
-`save`, `list`, `show`, `preview`, `run`, `guarded_stage`, `guarded_commit`, or `delete` to
-use that project's independent macro set under `.web-search-neo/macros/`. Without it, the
-existing per-user macro store remains the default. Macro names are already traversal-safe;
-the resolved project store is additionally required to remain beneath `project_root`.
+calling project, never in Web Search Neo core. Pass `project_root` — an absolute path, or
+`"auto"` — to any macro operation to use that project's independent macro set and its own
+guarded-operation ledger.
 
 Consequential flows use a generic two-phase path. A guarded macro must end in exactly one
 consequential action: explicit `submit`, or a safe `click`. A terminal click must be either
@@ -1108,9 +1175,9 @@ cheapest of the four. Absolute numbers depend on the machine; the ratios do not.
 | `web_info` | Return the whole contract, the built-in automation skill, or one action schema on demand; read search, current Chrome tabs, browser, page outline/text/find, console, network, game, screenshot, or time state. |
 | `web_action` | Execute one or up to 32 ordered setup, search, fetch, tab attach/open, form, input, render, and close actions. Supports fail-fast or `continue_on_error=true`. |
 
-Start with `web_info()`. With no arguments it returns `actions` with each action's summary and its required parameter names, `action_groups`, `info_topics`, `recipes`, `pitfalls`, `limits`, and worked `examples`. Optional names, types, and defaults are deliberately left out of it. Request only the needed, generated JSON Schema with `web_info(topic="action_schema", params={"action": "input"})`, then invoke it through `web_action`. The same call describes an observation topic — `params={"action": "find"}` returns `find`'s parameters — which matters because a topic refuses any argument it does not list, and that list appears nowhere else. This follows the on-demand Tool Search principle used by [official Unreal MCP](https://dev.epicgames.com/documentation/unreal-engine/unreal-mcp-in-unreal-editor): keep the eager tool list small, disclose schemas only when needed, and dispatch actions through a meta-tool. Web Search Neo combines Unreal's list/describe discovery tools into one `web_info`, so only two tools are advertised.
+Start with `web_info()`. With no arguments it returns `actions` with each action's summary and its required parameter names, `action_groups`, `info_topics`, `recipes`, `pitfalls`, `limits`, and worked `examples`. Optional names, types, and defaults are deliberately left out of it. Request only the needed, generated JSON Schema with `web_info(topic="action_schema", params={"action": "input"})`, then invoke it through `web_action`. Two narrower entry points exist for a model that does not want the whole contract at once: `web_info(topic="actions")` is the action index alone, with `params={"group": "macro"}` to narrow it, and `web_info(topic="skill")` is the runtime playbook. The same call describes an observation topic — `params={"action": "find"}` returns `find`'s parameters — which matters because a topic refuses any argument it does not list, and that list appears nowhere else. This follows the on-demand Tool Search principle used by [official Unreal MCP](https://dev.epicgames.com/documentation/unreal-engine/unreal-mcp-in-unreal-editor): keep the eager tool list small, disclose schemas only when needed, and dispatch actions through a meta-tool. Web Search Neo combines Unreal's list/describe discovery tools into one `web_info`, so only two tools are advertised.
 
-Measured on the current build, summing each advertised tool's `name`, `description`, and serialized `inputSchema`: the compact surface is 1,112 characters across two tools, against 24,453 characters across the 43 tools of legacy mode. The self-describing contract behind `web_info()` is 9,095 characters, and it is fetched only when an agent asks for it. Each action in it lists its required parameter names; optional names, types, and defaults stay in `action_schema`, where they cost nothing until needed — and where an observation topic's parameters live too, since a topic accepts exactly the list it publishes and nothing else.
+Measured on the current build, summing each advertised tool's `name`, `description`, and serialized `inputSchema`: the compact surface is 1,278 characters across two tools, against 34,720 characters across the 56 tools of legacy mode. The self-describing contract behind `web_info()` is 12,571 characters, and it is fetched only when an agent asks for it. Each action in it lists its required parameter names; optional names, types, and defaults stay in `action_schema`, where they cost nothing until needed — and where an observation topic's parameters live too, since a topic accepts exactly the list it publishes and nothing else.
 
 Every action is declared once in a single registry that also generates its published schema, and arguments are validated against that same model before the handler runs. An unknown or malformed field returns the offending names and the list of allowed parameters instead of an internal `TypeError`:
 
@@ -1138,7 +1205,32 @@ small local models: inspect → act → verify, schema discovery before guessing
 optional parameters, element pagination and lazy-page scrolling, the three
 screenshot modes, safe visual-coordinate clicks, current-Chrome CSS-only action
 locators, exact href/value matching, and a one-shot final-submit guard. It is
-about 5.5 KB and can be fetched once at the start of an automation task.
+about 6.5 KB and can be fetched once at the start of an automation task.
+
+It also names its detailed sections, which are the part a small model needs when
+a specific job starts rather than at the beginning of the session. Each is opened
+on demand with `web_info(topic="skill", params={"section": "<name>"})` and carries
+what a JSON Schema cannot: when the section applies, the calls in order, the rules
+that are not guessable, and the mistakes to avoid.
+
+| Section | Covers |
+| --- | --- |
+| `start` | Choosing the surface, the first three calls, session naming. |
+| `loop` | Inspect, act once, verify — and what counts as proof. |
+| `locators` | CSS, refs, piercing paths, and which action accepts which. |
+| `forms` | Filling, choice widgets, uploads, the one-shot terminal submit. |
+| `macros` | Recording, project files, placeholders, preview, packs. |
+| `guarded` | The two-phase path for an action that cannot be taken twice. |
+| `parallel` | Session discipline for subagents sharing one server. |
+| `search` | Search and fetch without a browser. |
+| `diagnostics` | Console, network, response bodies, page scripts. |
+| `games` | The render gate, per-frame input, probes. |
+| `troubleshooting` | Symptom, cause, and the call that fixes it. |
+
+The `troubleshooting` section maps the server's own error text — an unknown
+parameter, a stale `ref:`, a macro that "does not exist" because it was saved into
+the other store — onto the call that resolves it, which is what turns a repeated
+failure into one corrected retry.
 
 `web_info()` called with no arguments still returns the entire agent-facing contract: every action with its summary and required parameter names, the observation topics, ready-made recipes, the common mistakes, the hard limits, and runnable examples. Optional parameters — for an action or for a topic — come from `action_schema`, one at a time. An agent that reads either contract needs no external instructions, so the bundled filesystem skill is a convenience, not a requirement.
 
@@ -1161,8 +1253,15 @@ $env:WEB_SEARCH_NEO_BROWSER_USER_AGENT = "..."
 $env:WEB_SEARCH_NEO_PROFILE_ROOT = "D:\BrowserProfiles"
 $env:WEB_SEARCH_NEO_DEBUGGER_ADDRESS = "127.0.0.1:9222"
 $env:WEB_SEARCH_NEO_ALLOW_PLAIN_HTTP = "1"
+$env:WEB_SEARCH_NEO_PROJECT_ROOT = "C:\work\my-project"
 python main.py
 ```
+
+`WEB_SEARCH_NEO_PROJECT_ROOT` names the project whose `.web-search-neo/macros/` set every
+macro call uses when it passes no `project_root` of its own. Setting it per project in the
+MCP client's configuration is the way to give a model a project's macros without it having
+to spell a path on every call. `WEB_SEARCH_NEO_MACRO_ROOT` still points the per-user store
+somewhere specific, and a named project wins over it.
 
 The [bridge daemon](#the-bridge-daemon) has five switches of its own. Set them for the MCP
 server process: a daemon inherits the environment of whichever server spawns it.

@@ -11,13 +11,24 @@ be copied into the MCP repository.
 
 ## Macro storage
 
-- With no `project_root`, macro operations use the backward-compatible per-user store.
+- With no `project_root`, macro operations use the backward-compatible per-user store,
+  unless `WEB_SEARCH_NEO_PROJECT_ROOT` names a project for the whole server process.
 - With an explicit existing absolute `project_root`, every operation uses
   `<project_root>/.web-search-neo/macros/`.
+- `project_root: "auto"` resolves `WEB_SEARCH_NEO_PROJECT_ROOT`, then the nearest ancestor of
+  the working directory holding `.web-search-neo`, then the nearest holding `.git`. Nearest
+  wins, so a package with its own store inside a repository is its own project. Discovery that
+  finds nothing falls back to the per-user store rather than inventing a location.
 - Macro names cannot contain path separators or traversal tokens.
 - The resolved storage directory must remain beneath the resolved project root; symlink or
   junction escape is refused.
 - Each project has an independent macro set and guarded-operation ledger.
+- Every macro operation reports the store it used as `scope`, `project_root`, and `storage`,
+  because the failure mode of two stores is a macro saved into one and read from the other.
+- A macro file is either a full record or the bare step list; the file name is the macro's
+  identity, and a file that does not parse as a macro is reported as broken rather than hidden.
+- Packs are transport, not storage: `export` serialises the active store into one file and
+  `import` validates every entry before writing any of it.
 
 ## Guarded consequential actions
 

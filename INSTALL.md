@@ -2,7 +2,7 @@
 
 This guide installs the MCP server from source and connects it to LM Studio or another stdio-compatible MCP client.
 
-It describes version 1.3.11. The Python package, the server, and the bundled Chrome
+It describes version 1.4.0. The Python package, the server, and the bundled Chrome
 companion carry that same version, and the bridge only accepts a companion able to complete
 the 1.3.0 handshake — see [Updating](#updating) if an older one is already installed.
 
@@ -66,12 +66,17 @@ companion bridge is a separate process and logs separately, to
 collide on Windows. See [The bridge daemon](#the-bridge-daemon).
 
 Macros need no installation inside this clone. With no `project_root`, they use the existing
-per-user store. Passing an existing absolute project directory to any macro operation selects
+per-user store, unless `WEB_SEARCH_NEO_PROJECT_ROOT` names a project for this client — setting
+that variable per project in the MCP configuration is the least error-prone way to give a model
+a project's macros. `project_root: "auto"` finds the project by walking up from the working
+directory. Passing an existing absolute project directory to any macro operation selects
 `<project_root>/.web-search-neo/macros/`, so each project can version or manage its own macro
 set without modifying the MCP repository. Guard checkpoints and the one-time ledger use the
 same selected project store. The resolved macro directory must remain beneath the project
 root; traversal and symlink/junction escape are refused. See `ARCHITECTURE.md` and the
-project-local macro example in `README.md`.
+project-local macro example in `README.md`. Each store writes a `README.md` beside its macro
+files stating the file format, and `macro op=export` / `op=import` move a whole set between
+projects as one pack file.
 
 ## 4. LM Studio configuration
 
@@ -201,7 +206,7 @@ Earlier revisions tried to perform those clicks for you through Windows UI Autom
 code is gone. It depended on the interface language, on which window happened to have focus,
 and on a folder picker that the automation backend does not even enumerate.
 
-The bundled companion is version 1.3.11 and declares five permissions: `alarms`, `debugger`,
+The bundled companion is version 1.4.0 and declares five permissions: `alarms`, `debugger`,
 `storage`, `tabs`, and `tabGroups`. There are no content scripts and no `host_permissions`;
 page access comes from `debugger`, which attaches the Chrome DevTools Protocol to the tabs
 the agent drives. `alarms` exists because Chrome suspends an idle MV3 service worker after
@@ -597,7 +602,7 @@ or when `setup_current_chrome` answered `self_update: "unsupported"` or `"timeou
    very directory **Load unpacked** points at, then reload the extension. Restarting the
    daemon does not help and never did after the daemon learned to re-read the token file:
    it already fetches the current secret from disk before calling anything a mismatch.
-3. Check the card's version. It must read 1.3.11; anything older than 1.3.0 cannot
+3. Check the card's version. It must read 1.4.0; anything older than 1.3.0 cannot
    authenticate at all, and Chrome only picks up the new manifest on reload.
 4. `%LOCALAPPDATA%\WebSearchNeo\bridge-daemon.log` records the bridge's side: `Rejected a
    bridge client that did not present the companion token` confirms that something did reach

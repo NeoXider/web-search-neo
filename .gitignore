@@ -183,3 +183,9 @@ msp_server.log*
 PROGRESS.*.md
 PROGRESS_*.md
 *.audit.md
+
+# A macro store belongs to the project that uses this server, never to the
+# server's own clone: ARCHITECTURE.md keeps concrete domain macros out of here,
+# and a store created by running the engine from its own directory would put
+# them back in.
+.web-search-neo/
