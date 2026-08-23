@@ -20,9 +20,7 @@ def macro_root(tmp_path, monkeypatch):
     # A developer machine may name a project for its own MCP client; a test run
     # must not then write its macros into that project.
     monkeypatch.delenv("WEB_SEARCH_NEO_PROJECT_ROOT", raising=False)
-    main._RECORDINGS.clear()
     yield tmp_path
-    main._RECORDINGS.clear()
 
 
 FORM_STEPS = [
@@ -50,17 +48,13 @@ def test_declared_default_survives_and_beats_auto_declaration():
     assert macros.load("greet")["variables"]["site"] == "https://example.com"
 
 
-def test_list_summarises_and_delete_removes():
+def test_list_summarises_every_macro_in_the_store():
     macros.save("one", [{"action": "close_all"}])
     macros.save("two", FORM_STEPS)
     listed = {item["name"]: item for item in macros.list_macros()}
     assert set(listed) == {"one", "two"}
     assert listed["two"]["step_count"] == 3
     assert listed["two"]["variables"] == ["notes", "target_url"]
-
-    assert macros.delete("one") is True
-    assert macros.delete("one") is False
-    assert [item["name"] for item in macros.list_macros()] == ["two"]
 
 
 def test_broken_file_is_reported_without_hiding_the_others(macro_root):
@@ -244,30 +238,9 @@ def _call(**kwargs):
     return asyncio.run(main.browser_macro(**kwargs))
 
 
-def _record(action: str, arguments: dict, session: str | None = "default") -> None:
-    """Feed one dispatched step to the recorder the way the dispatcher does."""
-    main._record_step(action, arguments, arguments.get("session_id", session))
-
-
-def test_record_then_save_captures_dispatched_actions(monkeypatch):
-    _call(op="record", name="recorded", session_id="s")
-    assert main._RECORDINGS["s"]["name"] == "recorded"
-
-    _record("open", {"url": "https://example.com", "session_id": "s"})
-    _record("click", {"selector": "#go", "session_id": "s"})
-
-    saved = _call(op="save")
-    assert saved["step_count"] == 2
-    assert saved["recorded"] is True
-    assert saved["session_id"] == "s"
-    # Saving closes the recording, so the next drive does not append to it.
-    assert main._RECORDINGS == {}
-    assert macros.load("recorded")["steps"][0]["action"] == "open"
-
-
-def test_macro_records_and_replays_every_click_mode_and_new_actions(monkeypatch):
+def test_a_written_macro_replays_every_click_mode_and_new_action(monkeypatch):
     """Macros share the validated dispatcher, so every click target form and
-    the newer actions record and replay through it instead of a side channel."""
+    the newer actions replay through it instead of a side channel."""
     seen: list[dict] = []
 
     async def fake_click(**kwargs):
@@ -298,25 +271,17 @@ def test_macro_records_and_replays_every_click_mode_and_new_actions(monkeypatch)
         main.ActionSpec("run_script", fake_script, script_spec.tool_name, "page", "s"),
     )
 
-    async def drive():
-        # The recording names the session it is recording: these actions run on
-        # "s", and a recording opened on another tab must not collect them.
-        await main.browser_macro(op="record", name="click-all", session_id="s")
-        await main._execute_actions(
-            [
-                {"action": "click", "selector": "#go", "session_id": "s"},
-                {"action": "click", "text": "Submit", "role": "button", "session_id": "s"},
-                {"action": "click", "x": 120, "y": 40, "session_id": "s"},
-                {"action": "captcha", "session_id": "s"},
-                {"action": "run_script", "script": "return 1", "session_id": "s"},
-            ]
-        )
+    macros.save(
+        "click-all",
+        [
+            {"action": "click", "selector": "#go", "session_id": "s"},
+            {"action": "click", "text": "Submit", "role": "button", "session_id": "s"},
+            {"action": "click", "x": 120, "y": 40, "session_id": "s"},
+            {"action": "captcha", "session_id": "s"},
+            {"action": "run_script", "script": "return 1", "session_id": "s"},
+        ],
+    )
 
-    asyncio.run(drive())
-    saved = _call(op="save", session_id="s")
-    assert saved["step_count"] == 5
-
-    seen.clear()
     outcome = _call(op="run", name="click-all")
     assert outcome["macro"] == "click-all"
     assert outcome["step_count"] == 5
@@ -335,71 +300,11 @@ def test_macro_records_and_replays_every_click_mode_and_new_actions(monkeypatch)
     assert any(item["action"] == "run_script" for item in seen)
 
 
-def test_recording_over_captured_steps_is_refused():
-    _call(op="record", name="first")
-    _record("open", {"url": "https://example.com"})
-    with pytest.raises(ValueError, match="already open"):
-        _call(op="record", name="second")
-    # The first recording is intact, not silently replaced.
-    assert main._RECORDINGS["default"]["name"] == "first"
-    assert len(main._RECORDINGS["default"]["steps"]) == 1
-
-
-def test_recording_over_an_empty_one_is_allowed():
-    _call(op="record", name="first")
-    _call(op="record", name="second")
-    assert main._RECORDINGS["default"]["name"] == "second"
-
-
-def test_cancel_throws_the_recording_away():
-    _call(op="record", name="doomed")
-    _record("open", {"url": "https://example.com"})
-    assert _call(op="cancel")["discarded"] == "doomed"
-    assert main._RECORDINGS == {}
-    with pytest.raises(ValueError):
-        macros.load("doomed")
-
-
-def test_save_without_steps_or_recording_is_refused():
-    with pytest.raises(ValueError, match="open recording"):
-        _call(op="save", name="empty")
-
-
-def test_explicit_save_does_not_disturb_an_open_recording():
-    _call(op="record", name="live")
-    _record("open", {"url": "https://example.com"})
-    _call(op="save", name="other", steps=[{"action": "close_all"}])
-    # The explicit save is a different macro; the recording is still collecting.
-    assert main._RECORDINGS["default"]["name"] == "live"
-    assert len(main._RECORDINGS["default"]["steps"]) == 1
-
-
-def test_explicit_save_will_not_borrow_the_open_recordings_name():
-    # Otherwise one unnamed save overwrites the macro the recording is going to
-    # be saved as, destroying a task already driven by hand.
-    macros.save("live", [{"action": "open", "url": "https://real.example"}])
-    _call(op="record", name="live")
-    _record("click", {"selector": "#x"})
-    with pytest.raises(ValueError, match="requires name"):
-        _call(op="save", steps=[{"action": "close_all"}])
-    assert macros.load("live")["steps"][0]["url"] == "https://real.example"
-
-
-def test_a_macro_call_is_never_captured_into_a_recording():
-    # Recording one would build a script the saver refuses outright, leaving the
-    # recording unsaveable with only cancel - which loses everything - as a way out.
-    _call(op="record", name="outer")
-    _record("open", {"url": "https://example.com"})
-    _record("macro", {"op": "run", "name": "login"})
-    saved = _call(op="save")
-    assert saved["step_count"] == 1
-
-
 def test_run_replays_every_step_through_the_dispatcher(monkeypatch):
     seen: list[dict] = []
 
-    async def fake_execute(actions, continue_on_error=False, record=True):
-        seen.append({"actions": actions, "record": record})
+    async def fake_execute(actions, continue_on_error=False):
+        seen.append({"actions": actions})
         return {"success": True, "results": [], "failure_count": 0}
 
     monkeypatch.setattr(main, "_execute_actions", fake_execute)
@@ -410,8 +315,6 @@ def test_run_replays_every_step_through_the_dispatcher(monkeypatch):
     assert outcome["step_count"] == 3
     assert seen[0]["actions"][0]["url"] == "https://example.com/r/1"
     assert seen[0]["actions"][2]["fields"]["textarea[name=notes]"] == "Hi"
-    # A replay must not be captured into an open recording as its own steps.
-    assert seen[0]["record"] is False
 
 
 def test_preview_resolves_every_step_without_dispatching(monkeypatch):
@@ -443,35 +346,6 @@ def test_preview_requires_every_variable_before_returning_steps():
     assert "notes" in str(excinfo.value)
 
 
-def test_concurrent_batches_do_not_interleave_into_one_recording(monkeypatch):
-    """Two batches sent at once must record as two runs, not as one shuffled script."""
-    started: list[str] = []
-
-    async def slow_handler(**kwargs):
-        # Yield in the middle, which is what a real browser round trip does.
-        started.append(kwargs.get("url") or kwargs.get("selector") or "?")
-        await asyncio.sleep(0.01)
-        return {"success": True}
-
-    spec = main._ACTIONS["close_all"]
-    monkeypatch.setitem(
-        main._ACTIONS, "open", main.ActionSpec("open", slow_handler, spec.tool_name, "page", "s")
-    )
-    monkeypatch.setattr(main, "_validate_arguments", lambda tool, label, arguments: arguments)
-
-    async def drive():
-        await main.browser_macro(op="record", name="ordered")
-        await asyncio.gather(
-            main._execute_actions([{"action": "open", "url": "A1"}, {"action": "open", "url": "A2"}]),
-            main._execute_actions([{"action": "open", "url": "B1"}, {"action": "open", "url": "B2"}]),
-        )
-
-    asyncio.run(drive())
-    recorded = [step["url"] for step in main._RECORDINGS["default"]["steps"]]
-    # Each batch stays contiguous; which batch went first does not matter.
-    assert recorded in (["A1", "A2", "B1", "B2"], ["B1", "B2", "A1", "A2"])
-
-
 def test_run_without_required_variables_says_what_is_missing():
     macros.save("request", FORM_STEPS)
     with pytest.raises(ValueError, match="notes"):
@@ -486,20 +360,14 @@ def test_show_returns_the_stored_record_and_list_is_empty_at_first():
     assert len(shown["steps"]) == 3
 
 
-def test_delete_reports_whether_anything_was_removed():
-    macros.save("request", FORM_STEPS)
-    assert _call(op="delete", name="request")["deleted"] is True
-    assert _call(op="delete", name="request")["deleted"] is False
-
-
-@pytest.mark.parametrize("op", ["run", "preview", "show", "delete", "record"])
+@pytest.mark.parametrize("op", ["run", "preview", "show", "validate"])
 def test_ops_that_need_a_name_say_so(op):
     with pytest.raises(ValueError, match="requires name"):
         _call(op=op)
 
 
 def test_unknown_op_lists_the_real_ones():
-    with pytest.raises(ValueError, match="record"):
+    with pytest.raises(ValueError, match="list, show, validate, preview, run"):
         _call(op="bogus")
 
 
@@ -548,7 +416,7 @@ def test_guarded_macro_stages_asserts_then_commits_submit_once(tmp_path, monkeyp
     macros.save("request", _guarded_steps())
     calls = []
 
-    async def fake_execute(actions, continue_on_error=False, record=True):
+    async def fake_execute(actions, continue_on_error=False):
         calls.append(actions)
         result_data = {} if actions[0]["action"] == "submit" else {"text": "Request 42 ready"}
         results = [
@@ -602,7 +470,7 @@ def test_guarded_macro_stages_then_commits_safe_terminal_click_once(
     macros.save("request-click", [*_guarded_steps()[:-1], terminal])
     calls = []
 
-    async def fake_execute(actions, continue_on_error=False, record=True):
+    async def fake_execute(actions, continue_on_error=False):
         calls.append(actions)
         results = [
             {"index": index, "action": step["action"], "success": True, "data": {}}
@@ -746,7 +614,7 @@ def test_failed_assertion_does_not_create_checkpoint(tmp_path, monkeypatch):
     resource.write_bytes(b"x")
     macros.save("request", _guarded_steps())
 
-    async def fake_execute(actions, continue_on_error=False, record=True):
+    async def fake_execute(actions, continue_on_error=False):
         return {"success": True, "results": [{"data": {}}, {"data": {}}, {"data": {"text": "No"}}]}
 
     monkeypatch.setattr(main, "_execute_actions", fake_execute)
@@ -888,16 +756,18 @@ def test_project_roots_keep_macro_sets_and_ledgers_separate(tmp_path):
         macros.macro_root("relative/project")
 
 
-def test_recording_remembers_its_project_store_until_save(tmp_path):
+def test_a_project_macro_is_only_reachable_with_its_project_root(tmp_path):
+    # A macro written into a project store and then asked for without that
+    # project_root reads exactly like a macro that vanished, so the ops have to
+    # find it with the path and miss it without one.
     project = tmp_path / "project"
     project.mkdir()
-    _call(op="record", name="recorded-local", project_root=str(project))
-    _record("open", {"url": "https://example.com"})
-    saved = _call(op="save")
-    assert saved["name"] == "recorded-local"
-    assert macros.load("recorded-local", project)["steps"][0]["url"] == "https://example.com"
+    macros.save("local", [{"action": "open", "url": "https://example.com"}], project_root=project)
+    shown = _call(op="show", name="local", project_root=str(project))
+    assert shown["steps"][0]["url"] == "https://example.com"
+    assert shown["scope"] == "project"
     with pytest.raises(ValueError, match="does not exist"):
-        macros.load("recorded-local")
+        _call(op="show", name="local")
 
 
 def test_guard_checkpoint_is_available_only_in_its_project(tmp_path):
@@ -933,7 +803,7 @@ def test_guarded_commit_accepts_a_legacy_staged_submit_checkpoint(monkeypatch):
     }
     macros._write_guarded_ledger(ledger)
 
-    async def fake_execute(actions, continue_on_error=False, record=True):
+    async def fake_execute(actions, continue_on_error=False):
         assert actions == [{"action": "submit", "form_selector": "form"}]
         return {"success": True, "results": [], "failure_count": 0}
 
@@ -1016,10 +886,11 @@ def test_a_project_root_the_environment_cannot_find_is_named(tmp_path, monkeypat
 def test_every_macro_answer_says_which_store_it_used(tmp_path):
     project = tmp_path / "reported"
     project.mkdir()
-    saved = _call(op="save", name="x", steps=[{"action": "close_all"}], project_root=str(project))
-    assert saved["scope"] == "project"
-    assert saved["project_root"] == str(project.resolve())
-    assert saved["other_store"]["scope"] == "user"
+    macros.save("x", [{"action": "close_all"}], project_root=project)
+    checked = _call(op="validate", name="x", project_root=str(project))
+    assert checked["scope"] == "project"
+    assert checked["project_root"] == str(project.resolve())
+    assert checked["other_store"]["scope"] == "user"
 
     listed = _call(op="list")
     assert listed["scope"] == "user"
@@ -1028,134 +899,39 @@ def test_every_macro_answer_says_which_store_it_used(tmp_path):
     assert listed["macros"] == []
 
 
-def test_auto_saves_into_the_project_found_from_the_working_directory(tmp_path, monkeypatch):
+def test_auto_reads_the_project_found_from_the_working_directory(tmp_path, monkeypatch):
     project = tmp_path / "auto-project"
     (project / ".git").mkdir(parents=True)
     monkeypatch.chdir(project)
-    saved = _call(op="save", name="local", steps=[{"action": "close_all"}], project_root="auto")
-    assert saved["scope"] == "project"
+    macros.save("local", [{"action": "close_all"}], project_root="auto")
     assert (project / ".web-search-neo" / "macros" / "local.json").is_file()
+    listed = _call(op="list", project_root="auto")
+    assert listed["scope"] == "project"
+    assert [item["name"] for item in listed["macros"]] == ["local"]
 
 
-def test_auto_that_finds_no_project_records_into_the_user_store(monkeypatch):
-    # "auto" is allowed to find nothing. What it must never do is make the
-    # recorder derive a project directory out of the user store's own path.
+def test_auto_that_finds_no_project_falls_back_to_the_user_store(monkeypatch):
+    # "auto" is allowed to find nothing. What it must never do is derive a
+    # project directory out of the user store's own path.
     monkeypatch.setattr(macros, "discover_project_root", lambda start=None: None)
-    _call(op="record", name="loose", project_root="auto")
-    assert main._RECORDINGS["default"]["project_root"] is None
-    _record("open", {"url": "https://example.com"})
-    saved = _call(op="save")
-    assert saved["scope"] == "user"
+    macros.save("loose", [{"action": "open", "url": "https://example.com"}], project_root="auto")
+    listed = _call(op="list", project_root="auto")
+    assert listed["scope"] == "user"
+    assert listed["project_root"] is None
     assert macros.load("loose")["steps"][0]["url"] == "https://example.com"
 
 
-def test_export_and_import_move_a_whole_macro_set(tmp_path):
-    source = tmp_path / "source"
-    target = tmp_path / "target"
-    source.mkdir()
-    target.mkdir()
-    macros.save("one", [{"action": "open", "url": "{{url}}"}], "first", None, source)
-    macros.save("two", [{"action": "close_all"}], "second", None, source)
-
-    pack = macros.export_pack(None, source)
-    assert [item["name"] for item in pack["macros"]] == ["one", "two"]
-    written = macros.write_pack_file(tmp_path / "set.json", pack)
-
-    outcome = macros.import_pack(macros.read_pack_file(written), target)
-    assert [item["name"] for item in outcome["imported"]] == ["one", "two"]
-    assert macros.load("one", target)["description"] == "first"
-    assert sorted(macros.load("one", target)["variables"]) == ["url"]
-
-
-def test_import_refuses_to_clobber_until_it_is_asked_to(tmp_path):
-    store = tmp_path / "store"
-    store.mkdir()
-    pack = {"macros": [{"name": "one", "steps": [{"action": "close_all"}]}]}
-    assert len(macros.import_pack(pack, store)["imported"]) == 1
-
-    again = macros.import_pack(pack, store)
-    assert again["imported"] == []
-    assert "already exists" in again["skipped"][0]["reason"]
-
-    forced = macros.import_pack(pack, store, overwrite=True)
-    assert forced["imported"][0]["replaced"] is True
-
-
-def test_a_pack_is_written_whole_or_not_at_all(tmp_path):
-    store = tmp_path / "atomic"
-    store.mkdir()
-    with pytest.raises(ValueError, match="action"):
-        macros.import_pack(
-            {
-                "macros": [
-                    {"name": "good", "steps": [{"action": "close_all"}]},
-                    {"name": "bad", "steps": [{"url": "no action key"}]},
-                ]
-            },
-            store,
-        )
-    # Half an imported set is worse than none: the error alone would not say
-    # which half reached the disk.
-    assert macros.list_macros(store) == []
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        {"macros": [{"name": "one", "steps": [{"action": "close_all"}]}]},
-        [{"name": "one", "steps": [{"action": "close_all"}]}],
-        {"name": "one", "steps": [{"action": "close_all"}]},
-    ],
-)
-def test_a_pack_accepts_the_shapes_people_actually_paste(tmp_path, payload):
-    store = tmp_path / "shapes"
-    store.mkdir()
-    assert [item["name"] for item in macros.import_pack(payload, store)["imported"]] == ["one"]
-
-
-def test_a_pack_that_is_not_a_pack_says_what_one_looks_like(tmp_path):
-    store = tmp_path / "wrong"
-    store.mkdir()
-    with pytest.raises(ValueError, match="macros"):
-        macros.import_pack({"steps_but_no_name": []}, store)
-    with pytest.raises(ValueError, match="not an existing file"):
-        macros.read_pack_file(tmp_path / "absent.json")
-
-
-def test_the_macro_action_exports_and_imports_between_projects(tmp_path):
-    source = tmp_path / "from"
-    target = tmp_path / "to"
-    source.mkdir()
-    target.mkdir()
-    _call(op="save", name="one", steps=[{"action": "close_all"}], project_root=str(source))
-
-    exported = _call(op="export", project_root=str(source))
-    assert exported["path"] == str((source / ".web-search-neo" / "macro-pack.json").resolve())
-    assert exported["exported"] == ["one"]
-
-    imported = _call(op="import", path=exported["path"], project_root=str(target))
-    assert [item["name"] for item in imported["imported"]] == ["one"]
-    assert imported["scope"] == "project"
-    assert macros.load("one", target)["step_count"] == 1
-
-
-def test_export_of_one_name_takes_only_that_macro(tmp_path):
-    store = tmp_path / "single"
-    store.mkdir()
-    _call(op="save", name="one", steps=[{"action": "close_all"}], project_root=str(store))
-    _call(op="save", name="two", steps=[{"action": "close_all"}], project_root=str(store))
-    exported = _call(op="export", name="two", path=str(tmp_path / "two.json"), project_root=str(store))
-    assert exported["exported"] == ["two"]
-
-
-def test_import_without_a_source_says_what_it_needs():
-    with pytest.raises(ValueError, match="path"):
-        _call(op="import")
-
-
 def test_an_unknown_op_lists_the_ones_that_exist():
-    with pytest.raises(ValueError, match="export, import"):
+    with pytest.raises(ValueError) as excinfo:
         _call(op="teleport")
+    message = str(excinfo.value)
+    assert (
+        "macro op must be list, show, validate, preview, run, guarded_stage or "
+        "guarded_commit, not 'teleport'." in message
+    )
+    # The ops that went away were how a caller wrote a macro, so the refusal has
+    # to say what replaced them rather than only listing what is left.
+    assert "ordinary file operations" in message and "op='validate'" in message
 
 
 def test_reading_a_project_that_has_no_macros_leaves_nothing_behind(tmp_path):
@@ -1168,29 +944,9 @@ def test_reading_a_project_that_has_no_macros_leaves_nothing_behind(tmp_path):
     assert listed["macro_count"] == 0
     assert not (project / ".web-search-neo").exists()
 
-    _call(op="save", name="first", steps=[{"action": "close_all"}], project_root=str(project))
+    macros.save("first", [{"action": "close_all"}], project_root=project)
     assert (project / ".web-search-neo" / "macros" / "first.json").is_file()
-
-
-def test_an_inline_pack_can_be_a_list_or_an_object(tmp_path):
-    # Both are what a caller pastes, and refusing one at the action boundary
-    # while the engine accepts it would only teach reshaping before every call.
-    store = tmp_path / "inline"
-    store.mkdir()
-    listed = _call(
-        op="import",
-        pack=[{"name": "from-list", "steps": [{"action": "close_all"}]}],
-        project_root=str(store),
-    )
-    assert [item["name"] for item in listed["imported"]] == ["from-list"]
-
-    wrapped = _call(
-        op="import",
-        pack={"macros": [{"name": "from-object", "steps": [{"action": "close_all"}]}]},
-        project_root=str(store),
-    )
-    assert [item["name"] for item in wrapped["imported"]] == ["from-object"]
-    assert wrapped["source"] == "inline pack"
+    assert _call(op="list", project_root=str(project))["macro_count"] == 1
 
 
 def test_a_hand_written_file_declares_the_placeholders_it_uses():
@@ -1239,88 +995,224 @@ def test_preview_of_a_sound_macro_says_so_and_carries_no_problems():
     assert previewed["steps"][0]["url"] == "https://example.com"
 
 
-# --- one recording per session ----------------------------------------------
-
-
-def test_two_agents_record_side_by_side_without_stealing_each_others_steps():
-    # The defect this replaces: one shared recording took every dispatched
-    # action, so an agent recording a login got another agent's clicks in the
-    # middle of it and replayed them.
-    _call(op="record", name="agent-a", session_id="a")
-    _call(op="record", name="agent-b", session_id="b")
-
-    _record("open", {"url": "https://a.example", "session_id": "a"})
-    _record("open", {"url": "https://b.example", "session_id": "b"})
-    _record("click", {"selector": "#a", "session_id": "a"})
-
-    saved_a = _call(op="save", session_id="a")
-    saved_b = _call(op="save", session_id="b")
-    assert (saved_a["step_count"], saved_b["step_count"]) == (2, 1)
-    assert macros.load("agent-a")["steps"][0]["url"] == "https://a.example"
-    assert macros.load("agent-b")["steps"] == [
-        {"action": "open", "url": "https://b.example", "session_id": "b"}
-    ]
-
-
-def test_an_action_on_a_session_nobody_records_is_not_captured():
-    _call(op="record", name="mine", session_id="mine")
-    _record("open", {"url": "https://theirs.example", "session_id": "theirs"})
-    _record("open", {"url": "https://mine.example", "session_id": "mine"})
-    saved = _call(op="save", session_id="mine")
-    assert saved["step_count"] == 1
-    assert macros.load("mine")["steps"][0]["url"] == "https://mine.example"
+# --- which session a step belongs to -----------------------------------------
 
 
 def test_the_schema_default_is_attributed_rather_than_treated_as_sessionless():
-    # exclude_unset keeps session_id out of a recorded step, but the action still
-    # ran against the default tab, and calling that "no session" would hand it to
-    # whichever recording happened to be open.
+    # exclude_unset keeps session_id out of a written step, but the action still
+    # runs against the default tab, and calling that "no session" would let a
+    # retarget or a validate reason about a tab that is not the one used.
     assert main._step_session(main._ACTIONS["open"].tool_name, {"url": "u"}) == "default"
     assert main._step_session(main._ACTIONS["search"].tool_name, {"query": "q"}) is None
 
 
-def test_a_sessionless_action_joins_the_only_recording_that_is_open():
-    _call(op="record", name="solo", session_id="solo")
-    main._record_step("search", {"query": "browser automation"}, None)
-    saved = _call(op="save", session_id="solo")
-    assert saved["step_count"] == 1
-    assert "unattributed_steps" not in saved
+# --- op='validate': checking a file without running it -----------------------
 
 
-def test_a_sessionless_action_is_reported_rather_than_guessed_when_two_record():
-    _call(op="record", name="one", session_id="one")
-    _call(op="record", name="two", session_id="two")
-    main._record_step("search", {"query": "browser automation"}, None)
-    _record("open", {"url": "https://one.example", "session_id": "one"})
-
-    saved = _call(op="save", session_id="one")
-    assert saved["step_count"] == 1
-    assert saved["unattributed_steps"] == 1
-    assert "without a session_id" in saved["note"]
-    _call(op="cancel", session_id="two")
+def _write_macro(name: str, payload) -> None:
+    """Put an exact JSON body in the store, including bodies save() would not write."""
+    (macros.macro_root() / f"{name}.json").write_text(
+        payload if isinstance(payload, str) else json.dumps(payload), encoding="utf-8"
+    )
 
 
-def test_save_and_cancel_refuse_to_guess_between_two_open_recordings():
-    _call(op="record", name="one", session_id="one")
-    _call(op="record", name="two", session_id="two")
-    _record("open", {"url": "https://one.example", "session_id": "one"})
-    with pytest.raises(ValueError, match="Name the one you mean"):
-        _call(op="save")
-    with pytest.raises(ValueError, match="Name the one you mean"):
-        _call(op="cancel")
-    assert _call(op="save", session_id="one")["name"] == "one"
+def test_validate_refuses_a_placeholder_inside_a_run_script_script():
+    """The expensive mistake this whole checker exists for.
+
+    A `{{body}}` in a script is pasted in as raw text, so any value with a
+    newline, a quote or a backslash produces broken JavaScript and the step dies
+    with an opaque "Uncaught" from inside the page, halfway through a macro that
+    has already clicked things. Passed through `args` the same value crosses as
+    data, so that spelling must stay clean.
+    """
+    _write_macro(
+        "scripted",
+        {
+            "steps": [
+                {"action": "run_script", "script": "return '{{body}}'.length", "session_id": "s"}
+            ],
+            "variables": {"body": None},
+        },
+    )
+    checked = _call(op="validate", name="scripted")
+    assert checked["valid"] is False
+    assert any("body" in item["error"] and "script" in item["error"] for item in checked["errors"])
+
+    _write_macro(
+        "argued",
+        {
+            "steps": [
+                {
+                    "action": "run_script",
+                    "script": "return arguments[0].length",
+                    "args": ["{{body}}"],
+                    "session_id": "s",
+                }
+            ],
+            "variables": {"body": None},
+        },
+    )
+    passed = _call(op="validate", name="argued")
+    assert passed["errors"] == []
+    assert passed["valid"] is True
 
 
-def test_saving_a_recording_that_captured_nothing_says_so():
-    _call(op="record", name="empty", session_id="empty")
-    with pytest.raises(ValueError, match="captured no actions"):
-        _call(op="save", session_id="empty")
+def test_validate_names_an_action_that_does_not_exist():
+    """A misspelled action used to reach the dispatcher and fail on a live page,
+    after the steps in front of it had already run."""
+    _write_macro("misnamed", [{"action": "teleport", "url": "https://example.com"}])
+    checked = main._validate_macro_file("misnamed")
+    assert checked["valid"] is False
+    assert "teleport" in checked["errors"][0]["error"]
+    assert checked["errors"][0]["index"] == 0
 
 
-def test_an_op_naming_a_session_with_no_recording_says_which_are_open():
-    _call(op="record", name="one", session_id="one")
-    with pytest.raises(ValueError, match=r"no recording is open for session_id 'two'"):
-        _call(op="save", session_id="two")
+def test_validate_reports_a_required_parameter_that_is_missing():
+    """`open` without a url is refused at dispatch, so a macro carrying one is a
+    file that cannot work; saying so costs nothing and saves a half-run replay."""
+    _write_macro("bare-open", [{"action": "open", "session_id": "s"}])
+    checked = main._validate_macro_file("bare-open")
+    assert checked["valid"] is False
+    assert any("url" in item["error"] and "missing" in item["error"] for item in checked["errors"])
+
+
+def test_validate_reports_a_parameter_the_action_has_never_heard_of():
+    """The usual hand-written mistake is a plausible wrong name - timeout_ms for
+    timeout_seconds - which the schema refuses at dispatch and nowhere earlier."""
+    _write_macro("typo", [{"action": "wait", "selector": "#ready", "timeout_ms": 5000}])
+    checked = _call(op="validate", name="typo")
+    assert checked["valid"] is False
+    assert any("timeout_ms" in item["error"] for item in checked["errors"])
+
+
+def test_validate_treats_an_undeclared_placeholder_as_an_error_only_when_variables_exist():
+    """A file that declares `variables` is claiming to list what it wants, so a
+    placeholder missing from that list is a broken claim. A file with no
+    `variables` key never made the claim, and gets told to make it instead."""
+    _write_macro(
+        "half-declared",
+        {
+            "steps": [{"action": "open", "url": "{{url}}", "session_id": "s"}, {"action": "wait", "selector": "{{marker}}", "session_id": "s"}],
+            "variables": {"url": None},
+        },
+    )
+    declared = _call(op="validate", name="half-declared")
+    assert declared["valid"] is False
+    assert any("marker" in item["error"] for item in declared["errors"])
+
+    _write_macro(
+        "undeclared",
+        [
+            {"action": "open", "url": "{{url}}", "session_id": "s"},
+            {"action": "wait", "selector": "#done", "session_id": "s"},
+        ],
+    )
+    silent = _call(op="validate", name="undeclared")
+    assert silent["valid"] is True
+    assert silent["errors"] == []
+    assert any("url" in item["error"] for item in silent["warnings"])
+    assert silent["declared_variables"] == []
+    assert silent["used_placeholders"] == ["url"]
+
+
+def test_validate_warns_about_a_declared_variable_no_step_uses():
+    """Usually the placeholder is spelled differently in the steps, which reads
+    at run time as a variable the caller passed and the macro ignored."""
+    _write_macro(
+        "orphan",
+        {
+            "steps": [{"action": "wait", "selector": "#done", "session_id": "s"}],
+            "variables": {"unused": None},
+        },
+    )
+    checked = _call(op="validate", name="orphan")
+    assert checked["valid"] is True
+    assert any("unused" in item["error"] for item in checked["warnings"])
+
+
+def test_validate_warns_when_the_steps_drive_two_different_sessions():
+    """Two session ids in one macro is almost always a typo in one of them, and
+    at run time it silently opens a second tab that nothing else touches."""
+    _write_macro(
+        "drifted",
+        [
+            {"action": "open", "url": "https://example.com", "session_id": "form"},
+            {"action": "wait", "selector": "#done", "session_id": "from"},
+        ],
+    )
+    checked = _call(op="validate", name="drifted")
+    assert checked["valid"] is True
+    assert any(
+        "form" in item["error"] and "from" in item["error"] for item in checked["warnings"]
+    )
+
+
+def test_validate_warns_about_a_macro_that_never_reads_its_result_back():
+    """A macro whose last act is a click or a submit reports whatever the
+    dispatcher returned, so a submit the site rejected still comes back a
+    success. Trailing housekeeping steps are not the macro's point and must not
+    hide the check that is missing in front of them."""
+    _write_macro(
+        "blind",
+        [
+            {"action": "open", "url": "https://example.com", "session_id": "s"},
+            {"action": "click", "selector": "#send", "session_id": "s"},
+            {"action": "close_all"},
+        ],
+    )
+    blind = _call(op="validate", name="blind")
+    assert blind["valid"] is True
+    assert any("click" in item["error"] for item in blind["warnings"])
+
+    _write_macro(
+        "checked",
+        [
+            {"action": "open", "url": "https://example.com", "session_id": "s"},
+            {"action": "click", "selector": "#send", "session_id": "s"},
+            {"action": "wait", "selector": "#sent", "session_id": "s"},
+            {"action": "close_all"},
+        ],
+    )
+    verified = _call(op="validate", name="checked")
+    assert verified["warnings"] == []
+    assert verified["valid"] is True
+
+
+def test_validate_of_an_unreadable_file_names_the_path_it_read():
+    """Two stores means the answer "your macro is wrong" is useless without the
+    file it is about: the wrong store is the commonest reason for all three."""
+    missing = _call(op="validate", name="absent")
+    assert (missing["success"], missing["valid"]) == (False, False)
+    assert "step_count" not in missing
+    assert len(missing["errors"]) == 1
+    assert str(macros.macro_file("absent")) in missing["errors"][0]["error"]
+
+    _write_macro("broken", "{not json")
+    unparsable = _call(op="validate", name="broken")
+    assert (unparsable["success"], unparsable["valid"]) == (False, False)
+    assert str(macros.macro_file("broken")) in unparsable["errors"][0]["error"]
+
+    _write_macro("wrong-shape", {"name": "wrong-shape", "description": "no steps"})
+    shapeless = _call(op="validate", name="wrong-shape")
+    assert (shapeless["success"], shapeless["valid"]) == (False, False)
+    assert str(macros.macro_file("wrong-shape")) in shapeless["errors"][0]["error"]
+
+
+def test_validate_dispatches_nothing_even_for_a_macro_it_approves(monkeypatch):
+    """The point of checking a macro is to learn what is wrong with it before a
+    single step touches a page, so this op must never reach the dispatcher."""
+
+    async def forbidden_execute(*args, **kwargs):
+        raise AssertionError("validate must not dispatch browser actions")
+
+    monkeypatch.setattr(main, "_execute_actions", forbidden_execute)
+    macros.save("sound", [{"action": "wait", "selector": "#done", "session_id": "s"}])
+    checked = _call(op="validate", name="sound")
+    assert checked["executed"] is False
+    assert checked["valid"] is True
+    assert checked["step_count"] == 1
+    assert checked["path"] == str(macros.macro_file("sound"))
+    assert "Nothing was dispatched" in checked["note"]
 
 
 # --- replaying a macro in another tab ---------------------------------------
@@ -1329,7 +1221,7 @@ def test_an_op_naming_a_session_with_no_recording_says_which_are_open():
 def test_run_can_point_a_recorded_macro_at_another_session(monkeypatch):
     seen: list[dict] = []
 
-    async def fake_execute(actions, continue_on_error=False, record=True):
+    async def fake_execute(actions, continue_on_error=False):
         seen.append(actions)
         return {"success": True, "results": [], "failure_count": 0}
 

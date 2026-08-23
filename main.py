@@ -3,6 +3,7 @@
 import asyncio
 from dataclasses import dataclass
 import functools
+import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
@@ -24,7 +25,7 @@ import msp_search
 from web_client import request
 
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 PROJECT_DIR = Path(__file__).resolve().parent
 log = logging.getLogger("web_search_neo")
@@ -1213,54 +1214,14 @@ async def browser_close_all(
     )
 
 
-# One recording per session_id, because one session_id is one tab and one agent.
-# A single shared recording was silently wrong the moment two agents worked at
-# once: every dispatched action went into whichever recording happened to be
-# open, so an agent recording a login ended up with another agent's clicks in
-# the middle of it, and the macro replayed them. Keying by session is the same
-# boundary the rest of the server already uses.
-_RECORDINGS: dict[str, dict[str, Any]] = {}
-
-# A batch holds this while it dispatches, so two batches recorded into the same
-# script cannot interleave into an order their steps never ran in. Only batches
-# that touch a recorded session take it; everything else stays fully concurrent,
-# which is the point of recording per session in the first place.
-_RECORDING_LOCK = asyncio.Lock()
-
-# The session a recording is opened against when the caller does not say. It is
-# also the default of every session_id parameter, so an agent that never picked
-# an id records exactly the tab it has been driving.
+# The session an action means when the caller does not name one. It is also the
+# default of every session_id parameter, so a macro replayed without an explicit
+# session drives exactly the tab the agent has been driving.
 _DEFAULT_SESSION = "default"
 
 
-def _recording_session(session_id: str | None) -> str:
+def _named_session(session_id: str | None) -> str:
     return str(session_id).strip() if str(session_id or "").strip() else _DEFAULT_SESSION
-
-
-def _open_recording(session_id: str | None, op: str) -> tuple[str, dict[str, Any]]:
-    """Find the recording an op means, refusing an ambiguous guess.
-
-    With one recording open the caller does not have to name it. With two, a
-    guess would save one agent's work under another's name, so it is refused
-    with both session ids rather than resolved by order.
-    """
-    if session_id is not None and str(session_id).strip():
-        session = _recording_session(session_id)
-        recording = _RECORDINGS.get(session)
-        if recording is None:
-            raise ValueError(
-                f"macro op '{op}': no recording is open for session_id '{session}'. "
-                f"Open recordings: {sorted(_RECORDINGS)}."
-            )
-        return session, recording
-    if not _RECORDINGS:
-        raise ValueError(f"macro op '{op}': no recording is open.")
-    if len(_RECORDINGS) > 1:
-        raise ValueError(
-            f"macro op '{op}': {len(_RECORDINGS)} recordings are open "
-            f"({sorted(_RECORDINGS)}). Name the one you mean with session_id."
-        )
-    return next(iter(_RECORDINGS.items()))
 
 
 def _step_problems(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1286,6 +1247,253 @@ def _step_problems(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
         except ValueError as exc:
             problems.append({"index": index, "action": action_name, "error": str(exc)})
     return problems
+
+
+# A placeholder inside a script is the expensive mistake, and the reason this
+# checker exists at all. A `{{body}}` is substituted as raw text into JavaScript,
+# so a value with a newline, a quote or a backslash - which is most real values -
+# produces a syntactically broken program, and the step fails with an opaque
+# "WebDriverException: Uncaught" from inside the page. Variables belong in the
+# script's `args`, where they cross as data.
+_SCRIPT_FIELDS = ("script", "source")
+
+# The steps that read something back. A macro whose last act is to send, click or
+# submit reports whatever the dispatcher happened to return and calls it done;
+# one that ends by waiting for a success marker or reading state can be believed.
+_VERIFYING_ACTIONS = frozenset(
+    {"wait", "wait_challenge", "run_script", "fetch_text", "fetch_links", "search"}
+)
+# Steps that end a macro without being its point, so the "does it check itself"
+# question is asked of what came before them.
+_EPILOGUE_ACTIONS = frozenset({"close", "close_all", "release_inputs", "render"})
+
+
+def _declared_variables(payload: Any) -> dict[str, Any] | None:
+    """What the file itself declares, or None when it declares nothing at all."""
+    if isinstance(payload, dict) and isinstance(payload.get("variables"), dict):
+        return dict(payload["variables"])
+    return None
+
+
+def _unreadable(name: str, path: Any, error: str, fix: str) -> dict[str, Any]:
+    """One shape for every reason a file could not be checked at all."""
+    return {
+        "success": False,
+        "macro": name,
+        "valid": False,
+        "path": str(path),
+        "errors": [{"error": error, "fix": fix}],
+        "warnings": [],
+        "executed": False,
+    }
+
+
+def _validate_macro_file(name: str, project_root: str | None = None) -> dict[str, Any]:
+    """Check a macro file without running a single step of it.
+
+    A macro is a JSON file a person or a generator writes, so the mistakes in one
+    are writing mistakes: a misspelled action, a required parameter left out, a
+    placeholder nobody declared, a session id that drifted halfway through. Every
+    one of those used to surface mid-replay, on a live page, after the steps
+    before it had already clicked something.
+
+    Errors are things that cannot work. Warnings are things that usually mean a
+    typo but might be deliberate, so they never make a macro invalid.
+    """
+    validated_name = macros.validate_name(name)
+    path = macros.macro_file(validated_name, project_root)
+    errors: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+
+    if not path.exists():
+        return _unreadable(
+            validated_name,
+            path,
+            f"No macro file at {path}.",
+            "Check op='list' for the store in use, and the file name.",
+        )
+    try:
+        payload = macros.raw_payload(validated_name, project_root)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return _unreadable(
+            validated_name,
+            path,
+            f"{path} is not readable JSON: {exc}",
+            "Fix the JSON syntax: a macro file is a JSON object or a JSON array of steps.",
+        )
+    except OSError as exc:
+        return _unreadable(
+            validated_name,
+            path,
+            f"{path} could not be read: {exc}",
+            "Check that the file exists and can be read.",
+        )
+
+    declared = _declared_variables(payload)
+    try:
+        record = macros.record_from_payload(payload, validated_name, path)
+    except ValueError as exc:
+        return _unreadable(
+            validated_name,
+            path,
+            str(exc),
+            'A macro file is {"name": ..., "steps": [...]} or the bare list of steps.',
+        )
+
+    steps = record["steps"]
+    sessions: list[str] = []
+    for index, step in enumerate(steps):
+        arguments = dict(step)
+        action_name = str(arguments.pop("action", "")).strip().lower()
+        spec = _ACTIONS.get(action_name)
+        if spec is None:
+            errors.append(
+                {
+                    "index": index,
+                    "action": action_name or None,
+                    "error": _unsupported_action_error(action_name, arguments),
+                    "fix": "Use a published action name; web_info(topic='actions') lists them.",
+                }
+            )
+            continue
+        required, optional = _parameter_names(spec.tool_name)
+        known = set(required) | set(optional)
+        missing = [item for item in required if item not in arguments]
+        schema_hint = (
+            "web_info(topic='action_schema', params={'action': '" + action_name + "'})"
+        )
+        if missing:
+            errors.append(
+                {
+                    "index": index,
+                    "action": action_name,
+                    "error": f"required parameter(s) {missing} are missing",
+                    "fix": f"Add them to step {index}; {schema_hint} has the types.",
+                }
+            )
+        unknown = sorted(key for key in arguments if key not in known)
+        if unknown:
+            errors.append(
+                {
+                    "index": index,
+                    "action": action_name,
+                    "error": (
+                        f"parameter(s) {unknown} are not part of this action and would "
+                        "be refused at dispatch"
+                    ),
+                    "fix": f"Remove them, or read {schema_hint} for the right names.",
+                }
+            )
+        for field in _SCRIPT_FIELDS:
+            value = arguments.get(field)
+            inside = macros.placeholders_in(value) if isinstance(value, str) else set()
+            if inside:
+                errors.append(
+                    {
+                        "index": index,
+                        "action": action_name,
+                        "error": (
+                            f"{sorted(inside)} are substituted as raw text into "
+                            f"'{field}'. A value containing a newline, a quote or a "
+                            "backslash breaks the JavaScript, and the step fails with "
+                            "an opaque error from inside the page."
+                        ),
+                        "fix": (
+                            "Pass the value through args instead, and read it inside "
+                            "the script from arguments[0]."
+                        ),
+                    }
+                )
+        session = arguments.get("session_id")
+        if isinstance(session, str) and session.strip():
+            sessions.append(session.strip())
+
+    used = macros.placeholders_in(steps)
+    if declared is None:
+        if used:
+            warnings.append(
+                {
+                    "error": f"the file declares no 'variables', but its steps use {sorted(used)}",
+                    "fix": (
+                        'Add "variables": {"<name>": null} for each, so op=show says '
+                        "what the macro wants before anyone runs it."
+                    ),
+                }
+            )
+    else:
+        undeclared = sorted(used - set(declared))
+        unused = sorted(set(declared) - used)
+        if undeclared:
+            errors.append(
+                {
+                    "error": f"placeholder(s) {undeclared} are used but not declared in 'variables'",
+                    "fix": "Declare each one, with a default value or null.",
+                }
+            )
+        if unused:
+            warnings.append(
+                {
+                    "error": f"variable(s) {unused} are declared but no step uses them",
+                    "fix": "Remove them, or check how the placeholder is spelled in the steps.",
+                }
+            )
+
+    distinct = sorted(set(sessions))
+    if len(distinct) > 1:
+        warnings.append(
+            {
+                "error": f"the steps drive {len(distinct)} different sessions: {distinct}",
+                "fix": (
+                    "Almost always a typo. Use one session_id throughout, or pass "
+                    "session_id to op='run' to point the whole macro at one tab."
+                ),
+            }
+        )
+
+    # Paired with the step it is about, not with the end of the file: a macro
+    # that ends `submit, close_all` is judged on the submit, and pointing the
+    # finding at the close would send the reader to the wrong line.
+    meaningful = [
+        (index, step)
+        for index, step in enumerate(steps)
+        if str(step.get("action") or "").strip().lower() not in _EPILOGUE_ACTIONS
+    ]
+    if meaningful:
+        last_index, last_step = meaningful[-1]
+        last = str(last_step.get("action") or "").strip().lower()
+        if last not in _VERIFYING_ACTIONS:
+            warnings.append(
+                {
+                    "index": last_index,
+                    "error": f"the macro ends on '{last}' and never reads the result back",
+                    "fix": (
+                        "End with a wait on a success marker, or a run_script that reads "
+                        "the page state. A macro that sends something without checking "
+                        "reports success for a submit that failed."
+                    ),
+                }
+            )
+
+    return {
+        "success": True,
+        "macro": validated_name,
+        "valid": not errors,
+        "path": str(path),
+        "step_count": len(steps),
+        "declared_variables": sorted(declared) if declared is not None else [],
+        "used_placeholders": sorted(used),
+        "errors": errors,
+        "warnings": warnings,
+        "executed": False,
+        "note": (
+            "Nothing was dispatched. "
+            + (
+                "No errors; run op='preview' with the variables to see the final steps."
+                if not errors
+                else f"{len(errors)} error(s) would fail this macro as written."
+            )
+        ),
+    }
 
 
 def _retarget_session(steps: list[dict[str, Any]], session_id: str) -> list[dict[str, Any]]:
@@ -1337,133 +1545,23 @@ async def _macro_store(project_root: str | None) -> dict[str, Any]:
 async def browser_macro(
     op: str = "list",
     name: str | None = None,
-    steps: list[dict[str, Any]] | None = None,
     variables: dict[str, Any] | None = None,
-    description: str = "",
     continue_on_error: bool = False,
     guard: dict[str, Any] | None = None,
     checkpoint: str | None = None,
     project_root: str | None = None,
-    path: str | None = None,
-    pack: dict[str, Any] | list[dict[str, Any]] | None = None,
-    overwrite: bool = False,
     session_id: str | None = None,
 ) -> dict[str, Any]:
-    """Record, replay, guard, and move named macros in this project's or the user's store."""
+    """Check and replay named macro files from this project's or the user's store."""
     op = str(op or "").strip().lower()
 
-    if op == "record":
+    if op == "validate":
         if not name:
-            raise ValueError("macro op 'record' requires name")
-        session = _recording_session(session_id)
-        # Starting over silently would throw away a task already driven by hand,
-        # which is the most expensive thing in the whole feature. Another agent's
-        # recording on another session is not in the way and is left alone.
-        open_here = _RECORDINGS.get(session)
-        if open_here and open_here["steps"]:
-            raise ValueError(
-                f"A recording of '{open_here['name']}' is already open on session_id "
-                f"'{session}' with {len(open_here['steps'])} step(s). Save it with "
-                "op='save', or throw it away with op='cancel', before recording another."
-            )
-        # The resolved project, not the macro directory: "auto" may resolve to
-        # no project at all, and deriving a project back out of the user store's
-        # path would name a directory the caller never chose.
-        discovered = macros.resolve_project_root(project_root)
-        selected_root = str(discovered) if discovered is not None else None
-        _RECORDINGS[session] = {
-            "name": macros.validate_name(name),
-            "steps": [],
-            "project_root": selected_root,
-            "unattributed": 0,
-        }
+            raise ValueError("macro op 'validate' requires name")
         return {
-            "success": True,
-            "recording": True,
-            "name": name,
-            "session_id": session,
-            "note": (
-                f"Actions on session_id '{session}' are captured from now on; work "
-                "another agent does on another session is not. Drive the task once, "
-                "then call macro op='save' to keep it under this name; op='cancel' "
-                "throws the recording away."
-            ),
+            **await asyncio.to_thread(_validate_macro_file, name, project_root),
             **await _macro_store(project_root),
         }
-
-    if op == "cancel":
-        session, recording = _open_recording(session_id, "cancel")
-        _RECORDINGS.pop(session, None)
-        return {
-            "success": True,
-            "recording": False,
-            "discarded": recording["name"],
-            "session_id": session,
-        }
-
-    if op == "save":
-        # An explicit step list is its own macro and must be named as one:
-        # borrowing the open recording's name would overwrite the macro that
-        # recording is going to be saved as, destroying work already done.
-        if steps is not None and not name:
-            raise ValueError(
-                "macro op 'save' with explicit steps requires name; it will not "
-                "borrow the name of the recording that is open."
-            )
-        session = ""
-        recording: dict[str, Any] = {}
-        captured: list[dict[str, Any]] = []
-        if steps is None:
-            if not _RECORDINGS:
-                raise ValueError(
-                    "macro op 'save' needs either explicit steps or an open recording "
-                    "that captured at least one action."
-                )
-            session, recording = _open_recording(session_id, "save")
-            captured = list(recording["steps"])
-            if not captured:
-                raise ValueError(
-                    f"The recording of '{recording['name']}' on session_id '{session}' "
-                    "captured no actions. Drive the task first, or throw the recording "
-                    "away with op='cancel'."
-                )
-        target = name or recording.get("name") or ""
-        if not target:
-            raise ValueError("macro op 'save' requires name")
-        selected_project = project_root
-        if steps is None and selected_project is None:
-            selected_project = recording.get("project_root")
-        record = await asyncio.to_thread(
-            macros.save,
-            target,
-            steps if steps is not None else captured,
-            description,
-            variables,
-            selected_project,
-        )
-        answer: dict[str, Any] = {
-            "success": True,
-            "name": record["name"],
-            "step_count": record["step_count"],
-            "variables": sorted(record["variables"]),
-            "recorded": steps is None,
-        }
-        if steps is None:
-            answer["session_id"] = session
-            dropped = int(recording.get("unattributed") or 0)
-            if dropped:
-                # Said out loud rather than swallowed: these are actions that ran
-                # while more than one recording was open and carried no session of
-                # their own, so no recording could claim them honestly.
-                answer["unattributed_steps"] = dropped
-                answer["note"] = (
-                    f"{dropped} action(s) without a session_id ran while several "
-                    "recordings were open and were left out of every one of them. "
-                    "Check the saved steps, and record alone if they belong here."
-                )
-            _RECORDINGS.pop(session, None)
-        answer.update(await _macro_store(selected_project))
-        return answer
 
     if op == "run":
         if not name:
@@ -1472,14 +1570,14 @@ async def browser_macro(
         resolved = macros.resolve(record["steps"], record.get("variables"), variables)
         if session_id:
             resolved = _retarget_session(resolved, session_id)
-        # A replay is one logical call, so it does not re-enter the recorder and
-        # does not inherit web_action's hand-written 32-action ceiling.
-        outcome = await _execute_actions(resolved, continue_on_error, record=False)
+        # A replay is one logical call, so it does not inherit web_action's
+        # hand-written 32-action ceiling.
+        outcome = await _execute_actions(resolved, continue_on_error)
         return {
             **outcome,
             "macro": record["name"],
             "step_count": len(resolved),
-            **({"session_override": _recording_session(session_id)} if session_id else {}),
+            **({"session_override": _named_session(session_id)} if session_id else {}),
             **await _macro_store(project_root),
         }
 
@@ -1490,7 +1588,7 @@ async def browser_macro(
         resolved = macros.resolve(record["steps"], record.get("variables"), variables)
         checked_guard = await asyncio.to_thread(macros.validate_guard, guard, resolved)
         staged_steps, terminal_step = macros.split_terminal_action(resolved)
-        outcome = await _execute_actions(staged_steps, continue_on_error=False, record=False)
+        outcome = await _execute_actions(staged_steps, continue_on_error=False)
         if not outcome.get("success"):
             return {
                 **outcome,
@@ -1533,7 +1631,7 @@ async def browser_macro(
         if not isinstance(terminal_step, dict):
             raise ValueError("guarded checkpoint has no terminal action; refusing dispatch")
         terminal_action = str(reserved.get("terminal_action") or terminal_step.get("action"))
-        outcome = await _execute_actions([terminal_step], False, record=False)
+        outcome = await _execute_actions([terminal_step], False)
         return {
             **outcome,
             "executed_terminal_action": True,
@@ -1562,7 +1660,7 @@ async def browser_macro(
             "step_count": len(resolved),
             "steps": resolved,
             "executed": False,
-            **({"session_override": _recording_session(session_id)} if session_id else {}),
+            **({"session_override": _named_session(session_id)} if session_id else {}),
             "steps_valid": not problems,
             **({"problems": problems} if problems else {}),
             "note": (
@@ -1587,55 +1685,11 @@ async def browser_macro(
         record = await asyncio.to_thread(macros.load, name, project_root)
         return {"success": True, **record, **await _macro_store(project_root)}
 
-    if op == "delete":
-        if not name:
-            raise ValueError("macro op 'delete' requires name")
-        return {
-            "success": True,
-            "deleted": await asyncio.to_thread(macros.delete, name, project_root),
-            "name": name,
-            **await _macro_store(project_root),
-        }
-
-    if op == "export":
-        # One name exports one macro; no name exports the whole store, which is
-        # the thing a project actually commits.
-        payload = await asyncio.to_thread(
-            macros.export_pack, [name] if name else None, project_root
-        )
-        target = path or str(macros.default_pack_path(project_root))
-        written = await asyncio.to_thread(macros.write_pack_file, target, payload)
-        return {
-            "success": True,
-            "path": str(written),
-            "exported": [item["name"] for item in payload["macros"]],
-            "macro_count_exported": len(payload["macros"]),
-            "note": (
-                "This file is the whole macro set. Commit it with the project, and "
-                "read it back anywhere with op='import' and this path."
-            ),
-            **await _macro_store(project_root),
-        }
-
-    if op == "import":
-        if pack is None and not path:
-            raise ValueError(
-                "macro op 'import' needs path (a pack file, or the directory holding "
-                f"{macros.PACK_DEFAULT_NAME}) or pack (the pack object itself)"
-            )
-        payload = (
-            pack
-            if pack is not None
-            else await asyncio.to_thread(macros.read_pack_file, path)
-        )
-        outcome = await asyncio.to_thread(
-            macros.import_pack, payload, project_root, overwrite
-        )
-        return {"success": True, "source": path or "inline pack", **outcome}
-
     raise ValueError(
-        "macro op must be record, save, preview, run, guarded_stage, guarded_commit, "
-        f"list, show, delete, export, import, or cancel, not '{op}'"
+        "macro op must be list, show, validate, preview, run, guarded_stage or "
+        f"guarded_commit, not '{op}'. Macros are JSON files: create, edit, rename "
+        "and delete them with ordinary file operations, then check the result with "
+        "op='validate'."
     )
 
 
@@ -1883,7 +1937,7 @@ _ACTIONS: dict[str, ActionSpec] = {
             "macro",
             browser_macro,
             "macro",
-            "Record a task once; replay it by name from this project's macro files.",
+            "Check and replay named macro files from this project's macro store.",
         ),
         _action("captcha", browser_captcha, "page", "Detect a captcha and wait it out or solve it."),
         _action(
@@ -2174,14 +2228,13 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
         },
     },
     "macros": {
-        "summary": "Record a task once, keep it as a project file, replay it by name with variables.",
+        "summary": "A macro is a JSON file of steps in the project's store; check it, preview it, replay it by name.",
         "when": "The second time you are about to drive the same flow, or when a project should own a reusable click path.",
         "steps": [
             "macro op='list' first: it answers which store is active (scope), where its files are (storage), and what is already saved.",
-            "macro op='record' name='<name>' project_root='auto' - then drive the task once with ordinary actions. Only actions that succeed are captured.",
-            "macro op='save' keeps the recording. Or write the steps yourself: macro op='save' name='<name>' steps=[...] needs no recording at all.",
-            "Edit the saved file by hand to turn the changing parts into {{placeholders}}; they are declared automatically on the next save.",
-            "macro op='preview' name='<name>' variables={...} resolves every placeholder and returns the exact steps without dispatching anything. This is the review point.",
+            "Write <name>.json in that storage directory: a JSON array of web_action step objects, or {name, description, steps, variables}. Put {{placeholders}} where values change and declare each one under variables.",
+            "macro op='validate' name='<name>' project_root='auto' reads the file and dispatches nothing. Fix every error it reports; read the warnings.",
+            "macro op='preview' name='<name>' variables={...} resolves every placeholder and returns the exact steps, still dispatching nothing. This is the review point.",
             "macro op='run' name='<name>' variables={...} replays it.",
         ],
         "rules": [
@@ -2190,11 +2243,12 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
             "A macro file is one JSON file per macro, in <project_root>/.web-search-neo/macros/. The bare step list is a valid file; so is {name, description, steps, variables}. A README beside them states the format.",
             "A placeholder filling a whole string keeps its type, so a recorded number replays as a number. A run missing values names all of them at once.",
             "A macro cannot run another macro. Run them one after another.",
-            "op='export' writes the whole store into one pack file (default <project_root>/.web-search-neo/macro-pack.json); op='import' reads a pack back, and skips names that already exist unless overwrite=true.",
+            "There is no write API. Creating, editing, renaming, copying and deleting a macro are file operations; op='validate' is how you check the result before a live run.",
+            "Never put a {{placeholder}} inside a run_script script. It is pasted in as raw text, so any value with a newline or a quote breaks the JavaScript and the step fails with an opaque page error. Pass it through args and read arguments[0].",
             "A replay is a batch: check failure_count and every results[i].success. A saved click path is exactly as fragile as the page it was recorded from.",
         ],
         "avoid": [
-            "Saving a project's macros without project_root and then looking for them with it.",
+            "Writing a project's macro into the per-user store and then looking for it with project_root, or the reverse.",
             "Running a consequential macro without a preview first.",
             "Putting domain rules in the server. The engine is neutral; the policy belongs in the project's macro files.",
         ],
@@ -2214,7 +2268,7 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
         "summary": "The two-phase path for an action that cannot be taken twice.",
         "when": "A submit or click that sends, buys, applies, publishes, or otherwise cannot be undone.",
         "steps": [
-            "Save a macro whose last step is exactly one consequential action: an explicit submit, or a click by plain CSS, or by exact text plus an explicit role.",
+            "Write a macro whose last step is exactly one consequential action: an explicit submit, or a click by plain CSS, or by exact text plus an explicit role.",
             "macro op='guarded_stage' with the guard object. Everything except that last step runs, and live assertions are checked against the fresh results.",
             "Review the staged result in full: the URL that was opened, the values that were read back, the assertions that passed.",
             "macro op='guarded_commit' once, with the checkpoint staging returned.",
@@ -2445,9 +2499,11 @@ _FRAME_CSS = "Frame to work inside: plain CSS only - a ref or a '>>>' path is re
 _ACTION_NOTES = {
     "macro": {
         "ops": (
-            "record/save/cancel capture a task; preview/run replay it; list/show/delete "
-            "manage the files; export/import move a whole set; guarded_stage/guarded_commit "
-            "are the two-phase path for an action that must happen at most once."
+            "list/show read the store; validate checks a file without running it; "
+            "preview resolves its placeholders and dispatches nothing; run replays it; "
+            "guarded_stage/guarded_commit are the two-phase path for an action that must "
+            "happen at most once. A macro is a JSON file: create, edit, rename and delete "
+            "it with ordinary file operations."
         ),
         "storage": (
             "project_root='auto' resolves WEB_SEARCH_NEO_PROJECT_ROOT, then an existing "
@@ -2459,21 +2515,24 @@ _ACTION_NOTES = {
         "files": (
             "One JSON file per macro under <project_root>/.web-search-neo/macros/. The "
             "bare step list is a valid file, and so is {name, description, steps, "
-            "variables}; a README written beside them states the format. Hand-edit them "
-            "freely - a file that cannot be read is reported as broken by op='list' "
-            "instead of hiding the ones beside it."
+            "variables}; a README written beside them states the format. Write and edit "
+            "them directly - a file that cannot be read is reported as broken by "
+            "op='list' instead of hiding the ones beside it."
         ),
         "variables": (
-            "{{placeholder}} marks what changes between runs. Placeholders are declared "
-            "automatically on save, so op='show' says what a macro wants; a run missing "
-            "values names all of them at once. A placeholder filling a whole string keeps "
-            "the type of its value."
+            "{{placeholder}} marks what changes between runs; declare each one under "
+            "'variables', where its value is the default. op='show' says what a macro "
+            "wants, and a run missing values names all of them at once. A placeholder "
+            "filling a whole string keeps the type of its value. Never put one inside a "
+            "script: it is pasted in as raw text and breaks the JavaScript. Pass it "
+            "through args - op='validate' refuses this one as an error."
         ),
-        "packs": (
-            "op='export' writes every macro of the active store into one pack file "
-            "(default <project_root>/.web-search-neo/macro-pack.json, or path); "
-            "op='import' reads one back from path or from an inline pack object, and "
-            "skips a name that already exists unless overwrite=true."
+        "validate": (
+            "op='validate' reads the file and dispatches nothing: unknown actions, "
+            "missing or unknown parameters, placeholders inside a script, placeholders "
+            "no 'variables' entry declares. Warnings for a declared-but-unused variable, "
+            "steps that drift between session ids, and a macro that ends without reading "
+            "its result back. Each finding carries index, error and fix."
         ),
         "preview": (
             "op='preview' resolves every placeholder and returns the exact steps with "
@@ -2711,9 +2770,9 @@ _RECIPES = {
     ],
     "macro": [
         "macro {op: list, project_root: auto} (which store, which macros)",
-        "macro {op: record, name}, drive the task once, macro {op: save}",
-        "edit the file: turn what changes into {{placeholders}}",
-        "macro {op: preview, name, variables} to review",
+        "write <name>.json in that store: the step list, {{placeholders}} for what changes",
+        "macro {op: validate, name} until it reports valid",
+        "macro {op: preview, name, variables} to review the final steps",
         "macro {op: run, name, variables}",
     ],
     "existing_tab": ["browser_tabs", "attach_tab {tab_id}", "page_elements", "act"],
@@ -2808,14 +2867,9 @@ _EXAMPLES = {
         "actions": [
             {
                 "action": "macro",
-                "op": "save",
+                "op": "validate",
                 "name": "open-report",
                 "project_root": "auto",
-                "description": "Open one daily report",
-                "steps": [
-                    {"action": "open", "url": "{{url}}", "session_id": "report"}
-                ],
-                "variables": {"url": "https://example.com/reports/today"},
             },
             {
                 "action": "macro",
@@ -3108,32 +3162,14 @@ async def web_action(
 async def _execute_actions(
     actions: list[dict[str, Any]],
     continue_on_error: bool = False,
-    record: bool = True,
 ) -> dict[str, Any]:
     """Run an ordered action list, validating each against its published schema.
 
     ``web_action`` and a macro replay share this loop rather than each having
     their own: a macro that ran its steps down a second, laxer path would drift
-    from the calls it was recorded from, which is the one thing a saved click
-    path cannot afford. ``record=False`` keeps a replay out of the recorder, so
-    running a macro while recording does not inline its steps.
-
-    While a recording is open, the batches being recorded run one at a time: two
-    sent at once would otherwise interleave into a script whose steps never ran
-    in that order. Nothing is serialised when no recording is open.
+    from the calls its file was validated against, which is the one thing a
+    saved click path cannot afford.
     """
-    if record and _RECORDINGS and _touches_a_recording(actions):
-        async with _RECORDING_LOCK:
-            return await _dispatch_actions(actions, continue_on_error, record)
-    return await _dispatch_actions(actions, continue_on_error, record)
-
-
-async def _dispatch_actions(
-    actions: list[dict[str, Any]],
-    continue_on_error: bool,
-    record: bool,
-) -> dict[str, Any]:
-    """Validate and run each action of one batch in order, reporting every one."""
     results: list[dict[str, Any]] = []
     for index, raw_action in enumerate(actions):
         if not isinstance(raw_action, dict):
@@ -3161,11 +3197,6 @@ async def _dispatch_actions(
             reported_failure = (
                 isinstance(data, dict) and data.get("success") is False
             )
-            # Record what actually dispatched, not what was typed: the step kept
-            # is the validated one, so a macro replays the call the schema
-            # accepted rather than a shorthand that happened to work today.
-            if record and not reported_failure:
-                _record_step(action_name, validated, _step_session(spec.tool_name, validated))
             results.append(
                 {
                     "index": index,
@@ -3218,53 +3249,6 @@ def _step_session(tool_name: str, arguments: dict[str, Any]) -> str | None:
         return value.strip()
     default = fields["session_id"].default
     return default if isinstance(default, str) and default else None
-
-
-def _touches_a_recording(actions: list[dict[str, Any]]) -> bool:
-    """Whether a batch could write into any open recording.
-
-    Read from the raw actions on purpose: this only decides whether to serialise
-    the batch, so a best-effort answer before validation is enough, and being
-    wrong costs concurrency rather than correctness.
-    """
-    for action in actions:
-        if not isinstance(action, dict):
-            continue
-        spec = _ACTIONS.get(str(action.get("action") or "").strip().lower())
-        if spec is None:
-            continue
-        session = _step_session(spec.tool_name, action)
-        if session is None or session in _RECORDINGS:
-            return True
-    return False
-
-
-def _record_step(action_name: str, arguments: dict[str, Any], session: str | None) -> None:
-    """Append one dispatched action to the recording that owns its session.
-
-    A ``macro`` call is never captured. Recording one would build a script the
-    saver then refuses - a macro cannot run a macro - leaving the recording
-    unsaveable and the only way out the one that throws the work away. Managing
-    macros while recording a task is a normal thing to do, so it stays silent.
-
-    An action with no session of its own - a search, a fetch - belongs to the
-    only recording open, and to none when there are several: guessing there
-    would put one agent's search into another agent's macro, which is the whole
-    defect this routing exists to remove.
-    """
-    if action_name == "macro" or not _RECORDINGS:
-        return
-    step = {"action": action_name, **arguments}
-    if session is not None:
-        recording = _RECORDINGS.get(session)
-        if recording is not None:
-            recording["steps"].append(step)
-        return
-    if len(_RECORDINGS) == 1:
-        next(iter(_RECORDINGS.values()))["steps"].append(step)
-        return
-    for recording in _RECORDINGS.values():
-        recording["unattributed"] += 1
 
 
 def stop_bridge_daemon() -> int:

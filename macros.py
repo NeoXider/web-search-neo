@@ -44,11 +44,6 @@ PROJECT_STORE_DIR = ".web-search-neo"
 _PROJECT_MARKERS = (PROJECT_STORE_DIR, ".git")
 AUTO_PROJECT_ROOT = "auto"
 
-# A pack is many macros in one file, which is the shape a project commits,
-# reviews, and copies to the next machine.
-PACK_FORMAT = 1
-PACK_DEFAULT_NAME = "macro-pack.json"
-
 _STORE_NOTES_NAME = "README.md"
 _STORE_NOTES = """# Web Search Neo macros
 
@@ -63,7 +58,7 @@ The shortest useful file, `open-docs.json`, is the step list itself:
 ]
 ```
 
-The full form, which is what `macro op=save` writes:
+The full form:
 
 ```json
 {
@@ -76,17 +71,19 @@ The full form, which is what `macro op=save` writes:
 
 - `{{placeholder}}` marks what changes between runs. Pass `variables` on each
   run; an entry in `variables` is that placeholder's default. A placeholder that
-  fills a whole string keeps the type of the value it is given, so a recorded
-  number stays a number.
+  fills a whole string keeps the type of the value it is given, so a number in
+  the file replays as a number. Never put a placeholder inside a `run_script`
+  script: it is pasted in as raw text, and a value with a newline or a quote
+  breaks the JavaScript. Pass it through `args` instead.
 - Every step is exactly one `web_action` action object. Ask the server what each
   action accepts with
   `web_info(topic="action_schema", params={"action": "<name>"})`.
 - A macro cannot run another macro. Run them one after another instead.
-- Edit these files by hand freely. `macro op=list` reports a file it cannot read
-  as `broken` rather than hiding the ones beside it.
-- `macro op=export` writes every macro here into one pack file, and
-  `macro op=import` reads one back, which is how a macro set moves between
-  projects and machines.
+- These files are the whole API for writing a macro. Create, edit, rename, copy
+  and delete them like any other file; there is no MCP action that writes one.
+  `macro op=list` reports a file it cannot read as `broken` rather than hiding
+  the ones beside it, and `macro op=validate name=<name>` checks one without
+  running a single step.
 
 `.guarded-macro-ledger.json` is not a macro. It records the one-time guarded
 operations of this store; deleting it un-reserves every token it holds.
@@ -283,6 +280,27 @@ def _macro_path(
     name: str, project_root: str | os.PathLike[str] | None = None, create: bool = True
 ) -> Path:
     return macro_root(project_root, create) / f"{validate_name(name)}.json"
+
+
+def macro_file(name: str, project_root: str | os.PathLike[str] | None = None) -> Path:
+    """Where one macro lives, whether or not it is there yet.
+
+    Public because a macro is a file the caller edits: a checker that could not
+    name the path would be telling somebody their macro is wrong without saying
+    which of two stores it read.
+    """
+    return _macro_path(name, project_root, create=False)
+
+
+def raw_payload(name: str, project_root: str | os.PathLike[str] | None = None) -> Any:
+    """The file's JSON exactly as written, with no defaults filled in.
+
+    ``load`` normalises - it declares every placeholder it finds, so a variable
+    the author forgot to declare comes back looking declared. A checker has to
+    see what the author actually wrote, so it reads through this instead.
+    """
+    path = _macro_path(name, project_root, create=False)
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _guarded_ledger_path(project_root: str | os.PathLike[str] | None = None) -> Path:
@@ -742,7 +760,7 @@ def save(
     return record
 
 
-def _record_from_payload(payload: Any, name: str, source: Path) -> dict[str, Any]:
+def record_from_payload(payload: Any, name: str, source: Path) -> dict[str, Any]:
     """Return a checked macro record from whatever the file actually held.
 
     A macro file is meant to be written by hand as often as by the recorder, and
@@ -801,15 +819,7 @@ def load(name: str, project_root: str | os.PathLike[str] | None = None) -> dict[
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"macro '{name}' is not readable JSON: {exc}") from None
-    return _record_from_payload(payload, validate_name(name), path)
-
-
-def delete(name: str, project_root: str | os.PathLike[str] | None = None) -> bool:
-    path = _macro_path(name, project_root, create=False)
-    if not path.exists():
-        return False
-    path.unlink()
-    return True
+    return record_from_payload(payload, validate_name(name), path)
 
 
 def list_macros(project_root: str | os.PathLike[str] | None = None) -> list[dict[str, Any]]:
@@ -822,7 +832,7 @@ def list_macros(project_root: str | os.PathLike[str] | None = None) -> list[dict
     summaries: list[dict[str, Any]] = []
     for path in _macro_files(macro_root(project_root, create=False)):
         try:
-            record = _record_from_payload(
+            record = record_from_payload(
                 json.loads(path.read_text(encoding="utf-8")), path.stem, path
             )
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
@@ -838,153 +848,3 @@ def list_macros(project_root: str | os.PathLike[str] | None = None) -> list[dict
             }
         )
     return summaries
-
-
-def read_pack_file(path: str | os.PathLike[str]) -> Any:
-    """Read a pack file a caller or another project wrote."""
-    source = Path(path).expanduser()
-    if source.is_dir():
-        source = source / PACK_DEFAULT_NAME
-    if not source.is_file():
-        raise ValueError(f"macro pack '{source}' is not an existing file")
-    try:
-        return json.loads(source.read_text(encoding="utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"macro pack '{source}' is not readable JSON: {exc}") from None
-
-
-def write_pack_file(path: str | os.PathLike[str], payload: dict[str, Any]) -> Path:
-    """Write a pack where the caller asked, creating the directory if needed."""
-    target = Path(path).expanduser()
-    if target.is_dir():
-        target = target / PACK_DEFAULT_NAME
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return target.resolve()
-
-
-def default_pack_path(project_root: str | os.PathLike[str] | None = None) -> Path:
-    """Where a pack lands when the caller does not say.
-
-    Beside the macro directory rather than inside it, because a store lists
-    ``*.json`` and a pack sitting among the macros would read as one more macro
-    with a name nobody saved.
-    """
-    return macro_root(project_root).parent / PACK_DEFAULT_NAME
-
-
-def _pack_entries(payload: Any) -> list[Any]:
-    """Accept a pack, a bare list of macros, or one macro object.
-
-    Whoever writes a pack by hand is copying from somewhere - an exported file,
-    another project, a chat answer - and all three shapes turn up. Refusing two
-    of them would only teach the caller to reshape JSON before every import.
-    """
-    if isinstance(payload, dict) and isinstance(payload.get("macros"), list):
-        entries = payload["macros"]
-    elif isinstance(payload, list):
-        entries = payload
-    elif isinstance(payload, dict) and "steps" in payload:
-        entries = [payload]
-    else:
-        raise ValueError(
-            'a macro pack is {"macros": [{"name": ..., "steps": [...]}, ...]}, a bare '
-            "list of those objects, or one macro object with a name and steps"
-        )
-    if not entries:
-        raise ValueError("this macro pack contains no macros")
-    return list(entries)
-
-
-def export_pack(
-    names: list[str] | None = None,
-    project_root: str | os.PathLike[str] | None = None,
-) -> dict[str, Any]:
-    """Collect a store's macros into one document a project can commit."""
-    if names:
-        selected = [validate_name(str(item).strip()) for item in names]
-    else:
-        listed = list_macros(project_root)
-        broken = [item["name"] for item in listed if "broken" in item]
-        if broken:
-            raise ValueError(
-                f"refusing to export while {broken} cannot be read as macros; fix or "
-                "delete those files first, or export the wanted names explicitly"
-            )
-        selected = [item["name"] for item in listed]
-    if not selected:
-        raise ValueError(
-            f"there are no macros to export in {macro_root(project_root, create=False)}"
-        )
-    exported = []
-    for name in selected:
-        record = load(name, project_root)
-        exported.append(
-            {
-                "name": record["name"],
-                "description": record.get("description") or "",
-                "steps": record["steps"],
-                "variables": record["variables"],
-            }
-        )
-    return {
-        "format": PACK_FORMAT,
-        "exported_at": time.time(),
-        "source": str(macro_root(project_root)),
-        "macros": exported,
-    }
-
-
-def import_pack(
-    payload: Any,
-    project_root: str | os.PathLike[str] | None = None,
-    overwrite: bool = False,
-) -> dict[str, Any]:
-    """Write every macro in a pack into one store, refusing to clobber by default.
-
-    Everything is validated before anything is written. A pack whose fourth
-    macro is malformed would otherwise leave three imported and no way to tell,
-    from the error alone, which half of the set is now on disk.
-    """
-    entries = _pack_entries(payload)
-    existing = {item["name"] for item in list_macros(project_root)}
-    planned: list[dict[str, Any]] = []
-    skipped: list[dict[str, Any]] = []
-    claimed: set[str] = set()
-    for index, entry in enumerate(entries):
-        if not isinstance(entry, dict):
-            raise ValueError(f"macro {index} in this pack is not an object")
-        name = validate_name(str(entry.get("name") or "").strip())
-        if name in claimed:
-            raise ValueError(f"this pack declares '{name}' twice; names are file names")
-        claimed.add(name)
-        if name in existing and not overwrite:
-            skipped.append(
-                {"name": name, "reason": "already exists; pass overwrite=true to replace it"}
-            )
-            continue
-        steps = validate_steps(entry.get("steps"))
-        variables = entry.get("variables")
-        planned.append(
-            {
-                "name": name,
-                "steps": steps,
-                "description": str(entry.get("description") or ""),
-                "variables": variables if isinstance(variables, dict) else None,
-                "replaced": name in existing,
-            }
-        )
-    imported = []
-    for item in planned:
-        record = save(
-            item["name"], item["steps"], item["description"], item["variables"], project_root
-        )
-        imported.append(
-            {
-                "name": record["name"],
-                "step_count": record["step_count"],
-                "variables": sorted(record["variables"]),
-                "replaced": item["replaced"],
-            }
-        )
-    return {"imported": imported, "skipped": skipped, **store_info(project_root)}

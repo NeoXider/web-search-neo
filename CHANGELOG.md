@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.7.0
+
+A macro is a JSON file, and now that is all it is. The write half of the `macro` action -
+the recorder and the pack transport - is gone, and a checker that runs before the page does
+has taken its place.
+
+- Remove `op=record`, `op=save` and `op=cancel`, and with them the whole recording machinery:
+  the per-session recording registry, the batch lock that serialised recorded dispatches, the
+  interception in the action loop, and the attribution rules for a step that named no session.
+  The recorder was never self-sufficient - its own contract told the caller to save the
+  recording and then hand-edit the JSON to turn the changing parts into `{{placeholders}}`, so
+  the path ended in an editor either way. Over a full day of live use all four working macros
+  (`gmail-send`, `proton-send`, `tg-send`, `hh-reply`) were written directly as JSON and the
+  recorder was not used once, while it carried a class of defects of its own: races between
+  concurrent batches, steps landing in the wrong open recording, a name borrowed by an
+  explicit save, steps lost when `record` was called twice.
+- Remove `op=delete`, `op=export` and `op=import`. When a macro is a file, deleting one is
+  deleting a file and moving a set is copying a directory; a second, weaker API for the same
+  thing was one more place for a store to be chosen wrongly. The pack format goes with them.
+- Add `op=validate`, which reads a macro file and dispatches nothing. Errors: an action name
+  the server does not have, a required parameter missing, a parameter that is not part of that
+  action and would be refused at dispatch, a placeholder used but not declared in `variables`,
+  and a `{{placeholder}}` inside a `run_script` script. That last one is why this exists - the
+  value is pasted into the JavaScript as raw text, so any newline, quote or backslash produces
+  a broken program and the step fails with an opaque `Uncaught` from inside the page, several
+  steps into a live form. Warnings, which never make a macro invalid: a declared variable no
+  step uses, steps drifting between two `session_id` values, and a macro whose last meaningful
+  step neither waits nor reads anything back. Every finding carries the step index, what is
+  wrong, and how to fix it.
+- Rewrite the `macro` recipe, the `macros` skill section and the action's own notes around the
+  path that is now the real one: write the JSON, `validate`, `preview` with variables, `run`.
+  The old recipe described the recorder and was simply wrong after this change.
+- The macro file format is untouched. All sixteen macros in use - fourteen in a project store,
+  two in the per-user one - load, resolve and preview exactly as before.
+
+
 ## 1.6.0
 
 A day of real use - about a hundred job applications filed by five agents through one server -

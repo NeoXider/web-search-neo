@@ -497,11 +497,16 @@ def test_the_macro_section_says_where_a_project_keeps_its_files():
     assert any("does not exist" in case["symptom"] for case in troubleshooting["cases"])
 
 
-def test_the_macro_action_schema_documents_storage_files_and_packs():
+def test_the_macro_action_schema_documents_storage_files_and_checking():
     schema = asyncio.run(main.web_info("action_schema", {"action": "macro"}))
     properties = schema["input_schema"]["properties"]
-    assert {"op", "name", "steps", "project_root", "path", "pack", "overwrite"} <= set(properties)
+    assert {"op", "name", "variables", "project_root", "session_id"} <= set(properties)
+    # The write half of the action is gone: a macro is a file, so there is no
+    # parameter that carries steps, a pack, or a path to write one to.
+    assert not {"steps", "path", "pack", "overwrite", "description"} & set(properties)
     notes = schema["notes"]
     assert "auto" in notes["storage"] and "per-user store" in notes["storage"]
     assert ".web-search-neo/macros/" in notes["files"]
-    assert "export" in notes["packs"] and "overwrite=true" in notes["packs"]
+    assert "packs" not in notes
+    # The one rule that costs a live run when it is not said.
+    assert "script" in notes["validate"] and "args" in notes["variables"]

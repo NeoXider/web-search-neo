@@ -75,8 +75,8 @@ set without modifying the MCP repository. Guard checkpoints and the one-time led
 same selected project store. The resolved macro directory must remain beneath the project
 root; traversal and symlink/junction escape are refused. See `ARCHITECTURE.md` and the
 project-local macro example in `README.md`. Each store writes a `README.md` beside its macro
-files stating the file format, and `macro op=export` / `op=import` move a whole set between
-projects as one pack file.
+files stating the file format. There is no operation that writes a macro: the files are
+written and moved with ordinary file tools, and `macro op=validate` checks one before it runs.
 
 ## 4. LM Studio configuration
 

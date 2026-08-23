@@ -40,7 +40,7 @@ Startpage are available as fallbacks.
 - [Reading a page](#reading-a-page) · [Locators](#locators)
 - [Console and network diagnostics](#console-and-network-diagnostics)
 - [Forms and multi-step flows](#forms-and-multi-step-flows) · [Reviewable macros](#reviewable-macros)
-- [Where macros live](#where-macros-live) · [Macro files](#macro-files) · [Macro packs](#macro-packs)
+- [Where macros live](#where-macros-live) · [Macro files](#macro-files) · [There is no write API](#there-is-no-write-api)
 - [Architecture invariants](ARCHITECTURE.md) · [Project-local and guarded macros](#project-local-and-guarded-macros)
 - [Canvas and WebGL games](#canvas-and-webgl-games) · [Render modes](#render-modes) · [Input latency](#input-latency)
 - [Two-tool MCP contract](#two-tool-mcp-contract) · [Optional agent skill](#optional-agent-skill)
@@ -279,7 +279,7 @@ is no automatic substitute. If you would rather not install an extension at all,
 `profile_mode="temporary"` and `profile_mode="persistent"` drive a Selenium
 browser that needs no companion.
 
-The bundled companion is version 1.5.0. Chrome does not refresh an unpacked
+The bundled companion is version 1.7.0. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. Upgrading *onto*
@@ -908,9 +908,10 @@ through `network` and `network_body`.
 
 ## Reviewable macros
 
-Use the `macro` action to record and replay a repeated browser flow. Before a
-consequential replay, preview the exact resolved steps with the same variables
-that will be passed to `run`:
+A macro is a JSON file of `web_action` steps that lives in the calling project. Write it
+with an editor, check it with `op=validate`, and replay it by name. Before a consequential
+replay, preview the exact resolved steps with the same variables that will be passed to
+`run`:
 
 ```json
 {"actions":[{"action":"macro","op":"preview","name":"document-submit","variables":{"target_url":"https://forms.example/requests/42","resource_path":"C:/docs/request-42.pdf"},"project_root":"C:/work/my-project"}]}
@@ -933,21 +934,32 @@ check the batch result and freshly inspect the page. For applications, payments,
 messages, or other consequential actions, use the guarded two-phase path below so the exact
 terminal Submit or safe Click is attempted only once after live-state validation.
 
-### Recording, and agents working at once
+### Checking a macro before it runs
 
-A recording belongs to one `session_id`: `macro op=record name=… session_id=work` captures
-what happens on that tab and nothing else. Agents running side by side therefore record
-independently, which is the only way the feature is safe in a server they share — a single
-shared recording collected every dispatched action, so an agent recording a login silently
-got another agent's clicks in the middle of it and replayed them.
+`op=validate` reads a macro file and dispatches nothing at all. It is the check that
+belongs before the first live run of a hand-written or generated macro, and it reports
+every finding with the step index, what is wrong, and how to fix it.
 
-`save` and `cancel` infer the recording when one is open and refuse to guess when two are,
-naming both sessions. An action with no session of its own — a `search`, a `fetch_text` —
-joins the only open recording; with several open it is left out of all of them and reported
-as `unattributed_steps` on the saved macro, rather than attributed by luck.
+```json
+{"actions":[{"action":"macro","op":"validate","name":"document-submit","project_root":"auto"}]}
+```
+
+Errors are things that cannot work: an action name the server does not have, a required
+parameter missing, a parameter that is not part of that action and would be refused at
+dispatch, a placeholder used but not declared in `variables` — and, above all, a
+`{{placeholder}}` inside a `run_script` script. That last one is the expensive mistake: the
+value is pasted into the JavaScript as raw text, so anything containing a newline, a quote
+or a backslash produces a syntactically broken program and the step fails with an opaque
+`Uncaught` from inside the page. Pass the value through `args` and read it from
+`arguments[0]` instead.
+
+Warnings never make a macro invalid, because each of them can be deliberate: a variable
+declared and never used, steps that drift between two different `session_id` values, and a
+macro whose last meaningful step neither waits nor reads anything back — one that sends
+something and then reports whatever the dispatcher happened to return.
 
 A replay can be pointed somewhere else: `session_id` on `run` or `preview` rewrites the
-session of every step, so a macro recorded in one tab runs in another without editing the
+session of every step, so a macro written for one tab runs in another without editing the
 file. A macro that already drives two sessions is refused rather than collapsed into one,
 because two tabs were the point; give those steps a `{{placeholder}}` session instead.
 
@@ -979,7 +991,7 @@ edited by hand. The shortest valid file is the step list itself:
 [{"action": "open", "url": "{{url}}", "session_id": "docs"}]
 ```
 
-The full form is what `op=save` writes, and adds the description and placeholder defaults:
+The full form adds the description and the placeholder defaults:
 
 ```json
 {
@@ -1000,26 +1012,22 @@ A file that cannot be read as a macro is reported by `op=list` as `broken` rathe
 skipped, so one bad hand edit never hides the macros beside it. The guarded-operation
 ledger lives in the same directory and is never listed as a macro.
 
-### Macro packs
+### There is no write API
 
-`op=export` collects the active store into one pack file — every macro by default, or a
-single `name` — and writes it to `path`, defaulting to
-`<project_root>/.web-search-neo/macro-pack.json`. That one file is what a project commits or
-hands to another machine.
+A macro is a file, and that is the whole of it. Creating, editing, renaming, copying,
+committing and deleting macros are ordinary file operations, done with the tools that
+already do them well; the `macro` action only reads (`list`, `show`, `validate`), resolves
+(`preview`) and replays (`run`, `guarded_stage`, `guarded_commit`). Moving a set between
+machines is copying a directory.
 
-```json
-{"actions":[{"action":"macro","op":"export","project_root":"C:/work/my-project"}]}
-```
-
-`op=import` reads a pack back from `path`, or from an inline `pack` object, into the store
-the call selects. It accepts a pack, a bare list of macro objects, or one macro object,
-because all three are what people actually paste. A name that already exists is skipped and
-reported unless `overwrite=true`, and nothing is written until every macro in the pack
-validates, so a malformed pack never leaves half a set on disk.
-
-```json
-{"actions":[{"action":"macro","op":"import","path":"C:/work/shared/macro-pack.json","project_root":"auto"}]}
-```
+This used to include a recorder, and the recorder is gone. It was never self-sufficient:
+its own contract told the caller to save the recording and then hand-edit the JSON to turn
+the changing parts into `{{placeholders}}`, so the path ended in an editor either way. Over
+a full day of live use, every macro that actually worked was written directly as JSON and
+the recorder was not used once, while it carried a class of defects of its own — races
+between concurrent batches, steps attributed to the wrong open recording, a name quietly
+borrowed by an explicit save. `op=validate` replaces it with the part that was actually
+missing: a check that runs before the page does.
 
 ### Project-local and guarded macros
 
@@ -1281,7 +1289,7 @@ that are not guessable, and the mistakes to avoid.
 | `loop` | Inspect, act once, verify — and what counts as proof. |
 | `locators` | CSS, refs, piercing paths, and which action accepts which. |
 | `forms` | Filling, choice widgets, uploads, the one-shot terminal submit. |
-| `macros` | Recording, project files, placeholders, preview, packs. |
+| `macros` | Project files, placeholders, validate, preview, replay. |
 | `guarded` | The two-phase path for an action that cannot be taken twice. |
 | `parallel` | Session discipline for subagents sharing one server. |
 | `search` | Search and fetch without a browser. |
