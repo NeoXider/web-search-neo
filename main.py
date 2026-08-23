@@ -24,7 +24,7 @@ import msp_search
 from web_client import request
 
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 PROJECT_DIR = Path(__file__).resolve().parent
 log = logging.getLogger("web_search_neo")
@@ -352,6 +352,7 @@ async def browser_open_page(
     debugger_address: str | None = None,
     current_tab_id: int | None = None,
     tab_group: str = chrome_bridge.DEFAULT_TAB_GROUP,
+    agent_label: str | None = None,
 ) -> dict[str, Any]:
     """Open in the current Chrome's agent tab group by default; auto falls back to Selenium."""
     return await asyncio.to_thread(
@@ -367,6 +368,7 @@ async def browser_open_page(
         debugger_address,
         current_tab_id,
         tab_group,
+        agent_label,
     )
 
 
@@ -384,8 +386,9 @@ async def browser_open_pages(
     tab_group: str = chrome_bridge.DEFAULT_TAB_GROUP,
 ) -> dict[str, Any]:
     """Open up to four pages, using the current Chrome's agent tab group by default."""
-    if not urls or len(urls) > browser_tools.MAX_SESSIONS:
-        raise ValueError(f"Provide 1-{browser_tools.MAX_SESSIONS} URLs")
+    cap = browser_tools.max_sessions()
+    if not urls or len(urls) > cap:
+        raise ValueError(f"Provide 1-{cap} URLs")
     ids = session_ids or [f"page-{index + 1}" for index in range(len(urls))]
     if len(ids) != len(urls) or len(set(ids)) != len(ids):
         raise ValueError("session_ids must be unique and match the number of URLs")
@@ -447,10 +450,11 @@ async def browser_setup_current_chrome(wait_seconds: float = 1.0) -> dict[str, A
 async def browser_attach_tab(
     tab_id: int,
     session_id: str = "default",
+    agent_label: str | None = None,
 ) -> dict[str, Any]:
     """Attach a reusable MCP session to one existing Chrome tab without navigating it."""
     return await asyncio.to_thread(
-        browser_tools.attach_current_tab, tab_id, session_id
+        browser_tools.attach_current_tab, tab_id, session_id, agent_label
     )
 
 
@@ -462,6 +466,7 @@ async def browser_get_page_elements(
     include_buttons: bool = True,
     limit: int = 200,
     offset: int = 0,
+    max_chars: int = browser_tools.DEFAULT_RESPONSE_CHAR_BUDGET,
 ) -> dict[str, Any]:
     """Get rendered links, forms, fields, and buttons with CSS selectors."""
     return await asyncio.to_thread(
@@ -472,6 +477,7 @@ async def browser_get_page_elements(
         include_buttons,
         limit,
         offset,
+        max_chars,
     )
 
 
@@ -482,6 +488,7 @@ async def browser_page_outline(
     include_occlusion: bool = True,
     output: Literal["text", "json"] = "text",
     frame_selector: str | None = None,
+    max_chars: int = browser_tools.DEFAULT_RESPONSE_CHAR_BUDGET,
 ) -> dict[str, Any]:
     """Outline the page: roles, names, states, refs, and boxes, including shadow DOM."""
     return await asyncio.to_thread(
@@ -492,6 +499,7 @@ async def browser_page_outline(
             include_occlusion=include_occlusion,
             output=output,
             frame_selector=frame_selector,
+            max_chars=max_chars,
         )
     )
 
@@ -554,6 +562,7 @@ async def browser_find(
     limit: int = 5,
     visible_only: bool = True,
     frame_selector: str | None = None,
+    max_chars: int = browser_tools.DEFAULT_RESPONSE_CHAR_BUDGET,
 ) -> dict[str, Any]:
     """Find elements by meaning and get refs back, instead of reading the whole page."""
     return await asyncio.to_thread(
@@ -565,6 +574,7 @@ async def browser_find(
             limit=limit,
             visible_only=visible_only,
             frame_selector=frame_selector,
+            max_chars=max_chars,
         )
     )
 
@@ -1192,9 +1202,15 @@ async def browser_close(session_id: str = "default") -> dict[str, Any]:
 
 
 @mcp.tool()
-async def browser_close_all() -> dict[str, Any]:
-    """Close every browser session and release all Chrome processes."""
-    return await asyncio.to_thread(browser_tools.close_all_sessions)
+async def browser_close_all(
+    agent_label: str | None = None,
+    scope: Literal["mine", "all"] = "mine",
+    include_foreign: bool = False,
+) -> dict[str, Any]:
+    """Close the sessions this agent_label owns; scope='all' closes every agent's."""
+    return await asyncio.to_thread(
+        browser_tools.close_all_sessions, agent_label, scope, include_foreign
+    )
 
 
 # One recording per session_id, because one session_id is one tab and one agent.
@@ -1886,7 +1902,12 @@ _ACTIONS: dict[str, ActionSpec] = {
         _action(
             "close", browser_close, "session", "Close one session; a claimed current-Chrome tab stays open."
         ),
-        _action("close_all", browser_close_all, "session", "Close every session owned by this server."),
+        _action(
+            "close_all",
+            browser_close_all,
+            "session",
+            "Close the sessions your agent_label owns; scope='all' closes every agent's.",
+        ),
     )
 }
 
@@ -2396,7 +2417,7 @@ _INFO_TOPICS = {
     "execute_js": "Run a JavaScript snippet in a session's page and read its return value.",
     "screenshot": "PNG viewport, full-page, or exact page-region image.",
     "game_probe": "Canvas/WebGL/iframe surfaces, FPS, focus, console, held input.",
-    "browser_status": "Chrome availability and named session state.",
+    "browser_status": "Chrome availability, one session's state, and the roster of every session this server holds: owner label, tab, last page, idle time, busy flag, N of M in use.",
     "browser_tabs": "Tabs open in the user's Chrome, with ids and groups.",
     "search_status": "Search providers, live availability, latency, cooldowns.",
 }
@@ -2569,9 +2590,10 @@ _ACTION_NOTES = {
     },
     "close_all": {
         "browser_gone": "A list of session ids left alone because their Chrome is gone; closed_all stays true, since nothing of ours was left to leak.",
-        "scope": "Every session in this MCP server, including ones other agents opened - subagents share the server. Close your own session_id unless you mean to end everybody's work.",
+        "scope": "Defaults to scope='mine': only the sessions opened with your agent_label (or, with no label, the unlabelled ones). kept_sessions names what was left running and who owns it. scope='all' closes every agent's sessions in this MCP server - that is the old behaviour, and it ends other subagents' work.",
     },
     "browser_status": {
+        "roster": "sessions lists every session in this server with agent_label, current_tab_id, tab_group, last_url/last_title, created_at, last_used_at, idle_seconds and busy; sessions_open/max_sessions/sessions_free are the occupancy, and max_sessions_source says whether the cap came from the environment, the companion popup, or the default. last_url/last_title are where a session was last seen, not a fresh read - another agent's tab is never touched to answer this.",
         "browser_gone": "session_open=false with browser_gone=true means the session was dropped because its Chrome restarted; follow the 'next' field and open the page again.",
         "co_tenants": "sessions_in_use names the sessions another caller of this server is inside right now; shared_session=true means this very session is one of them. current_chrome.daemon.clients counts the MCP servers sharing the browser and .claims lists every tab any of them drives, with mine telling ours apart.",
     },
@@ -2720,7 +2742,8 @@ _PITFALLS = [
     "challenge_detected means a CAPTCHA is in the way: use captcha, never hammer clicks. captcha_widgets lists ones merely present; ignore those.",
     "find low_confidence=true means it is guessing: re-query with other words or a role, do not click matches[0].",
     "profile_mode=current drives the user's real Chrome; close closes a tab the agent opened and leaves an attach_tab tab open.",
-    "Parallel agents must each choose their own session_id: subagents share one MCP server, so two on the default drive one tab and navigate each other's page - browser_status reports shared_session. close_all ends every agent's sessions, not only yours.",
+    "Parallel agents must each choose their own session_id: subagents share one MCP server, so two on the default drive one tab and navigate each other's page - browser_status reports shared_session. Pass agent_label on open so browser_status can say who is where, and so close_all (scope='mine' by default) ends only your own sessions; scope='all' still ends everybody's.",
+    "page_elements, page_outline and find are bounded by max_chars as well as by limit: budget_truncated=true means the answer was cut to fit, and range[*].next_offset is where to continue. Raise max_chars only if your context can take it.",
     "Automation stays background-only by default and never changes window state. show is the sole foreground opt-in; call it only when the user explicitly asks to see the session.",
     "In render=step nothing moves until input or step runs, so a screenshot taken first shows the old frame.",
     "Always release_inputs after hold, and return render to normal before you finish.",
@@ -2932,6 +2955,10 @@ def _capabilities(action_name: str | None = None) -> dict[str, Any]:
     groups: dict[str, list[str]] = {}
     for name, spec in _ACTIONS.items():
         groups.setdefault(spec.group, []).append(name)
+    # The cap alone was never the useful number: an agent that reads "8" and
+    # finds all eight taken has learned nothing it could not have learned by
+    # failing. How many are free is the answer to the question it was asking.
+    occupancy = browser_tools.sessions_overview()
     return {
         "server": "Web Search Neo",
         "version": __version__,
@@ -2949,7 +2976,12 @@ def _capabilities(action_name: str | None = None) -> dict[str, Any]:
         "examples": {name: _EXAMPLES[name] for name in _CONTRACT_EXAMPLE_NAMES},
         "limits": {
             "ordered_actions_per_call": 32,
-            "parallel_browser_sessions": browser_tools.MAX_SESSIONS,
+            "parallel_browser_sessions": occupancy["max_sessions"],
+            "browser_sessions_open": occupancy["sessions_open"],
+            "browser_sessions_free": occupancy["sessions_free"],
+            "browser_sessions_busy": len(occupancy["sessions_in_use"]),
+            "max_sessions_source": occupancy["max_sessions_source"],
+            "response_char_budget_default": browser_tools.DEFAULT_RESPONSE_CHAR_BUDGET,
             "input_actions_per_batch": "16 key + 16 pointer",
             "automatic_captcha": False,
             "captcha_modes": ["fallback", "manual"],

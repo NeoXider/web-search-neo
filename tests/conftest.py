@@ -246,6 +246,8 @@ def clean_browser_sessions():
     except ImportError:
         yield
         return
-    browser_tools.close_all_sessions()
+    # scope="all" on purpose: close_all now defaults to "mine", and a test that
+    # labelled its sessions would otherwise leak them into the next test.
+    browser_tools.close_all_sessions(scope="all")
     yield
-    browser_tools.close_all_sessions()
+    browser_tools.close_all_sessions(scope="all")

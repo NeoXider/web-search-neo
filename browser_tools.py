@@ -55,30 +55,96 @@ from web_client import validate_http_url
 logger = logging.getLogger(__name__)
 
 
+DEFAULT_MAX_SESSIONS = 8
+# A typo is the only thing this ceiling still catches. It is deliberately far
+# above any real fan-out: 64 tabs under a debugger will run a desktop out of
+# memory long before the number itself refuses anything, whereas "6400" typed
+# into the setting is caught here instead of at the swap file.
+MAX_SESSIONS_CEILING = 64
+
+
 def _max_sessions() -> int:
     """How many browser sessions this process will hold at once.
 
-    Four is the default because four visible Chrome tabs under a debugger is
-    already a lot of memory on an ordinary desktop, and because a model that
-    opens sessions it never closes should hit a wall early rather than late.
+    Eight is the default. Four was chosen when a session meant a Chrome process;
+    in ``profile_mode="current"`` - the mode every agent actually uses - a session
+    is one tab of the user's already-running Chrome, and a tab costs tens of
+    megabytes, not hundreds. Four turned out to be a wall real work hit: a run of
+    five parallel agents filing job applications had its fifth agent refused a
+    page for its whole run and file nothing, which is a far worse outcome than
+    the memory the low number was protecting.
 
     It is a setting rather than a constant because the cap is per process and
-    agents are not: a run with five subagents, each wanting its own session
+    agents are not: a run with nine subagents, each wanting its own session
     through one MCP server, hits it through no fault of its own, and the only
     remedies used to be editing this file or making the agents queue. Read once
     at import, since raising it under a running server would not free the memory
-    the old number was protecting.
+    the old number was protecting - the companion setting below is the live one.
     """
     try:
-        wanted = int(os.getenv("WEB_SEARCH_NEO_MAX_SESSIONS", "") or 4)
+        wanted = int(os.getenv("WEB_SEARCH_NEO_MAX_SESSIONS", "") or DEFAULT_MAX_SESSIONS)
     except ValueError:
-        return 4
+        return DEFAULT_MAX_SESSIONS
     # One session is the floor: zero would refuse every open with a message about
     # closing something first, and there would be nothing to close.
-    return max(1, min(wanted, 64))
+    return max(1, min(wanted, MAX_SESSIONS_CEILING))
 
 
 MAX_SESSIONS = _max_sessions()
+
+
+def _environment_sets_max_sessions() -> bool:
+    """True when the server's own environment names a cap, which then wins.
+
+    An operator who wrote the number into the MCP server's environment said it
+    about this server. The popup setting is the user saying it about this Chrome,
+    and it must not silently overrule a value someone deployed on purpose.
+    """
+    return bool((os.getenv("WEB_SEARCH_NEO_MAX_SESSIONS") or "").strip())
+
+
+def _companion_max_sessions() -> int | None:
+    """The cap the Chrome companion's popup is carrying, if it is carrying one.
+
+    The extension cannot reach into this process, but it already tells it things:
+    its hello names the browser, and the daemon relays that dictionary to every
+    connected MCP server, where ``ChromeBridge.browser_info`` holds it. The popup
+    setting rides in the same dictionary, so the path is the one the bridge port
+    already uses in reverse and nothing new had to be invented for it.
+
+    ``None`` whenever no companion is connected or the companion is older than
+    this feature, in which case the environment default stands. It is read live
+    rather than cached: the popup is meant to take effect without restarting the
+    MCP server, and lowering it never has to free anything - it only refuses the
+    next open.
+    """
+    try:
+        info = get_chrome_bridge().browser_info()
+    except Exception:  # A bridge that cannot be asked is not an answer of zero.
+        return None
+    raw = info.get("max_sessions")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+        return None
+    try:
+        wanted = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return max(1, min(wanted, MAX_SESSIONS_CEILING))
+
+
+def effective_max_sessions() -> tuple[int, str]:
+    """Return the cap in force and where it came from ('environment'|'companion'|'default')."""
+    if _environment_sets_max_sessions():
+        return MAX_SESSIONS, "environment"
+    from_companion = _companion_max_sessions()
+    if from_companion is not None:
+        return from_companion, "companion"
+    return MAX_SESSIONS, "default"
+
+
+def max_sessions() -> int:
+    """The cap in force right now; see :func:`effective_max_sessions`."""
+    return effective_max_sessions()[0]
 # How many elements a CSS selector matches, asked of the page. Both driver kinds
 # run scripts; only Selenium's has ``find_elements``, so anything that has to
 # work in ``profile_mode="current"`` counts this way.
@@ -269,6 +335,22 @@ class BrowserSession:
     stealth_identifier: str | None = None
     lock: SessionLock = field(default_factory=SessionLock)
     last_used: float = field(default_factory=time.monotonic)
+    # Who opened this session, in the opener's own words. Nothing in an MCP call
+    # carries caller identity, so this is the only way one agent's tab can be
+    # told from another's - and it is why `close_all` can now leave other
+    # agents' work alone. Optional on purpose: a caller that says nothing is
+    # anonymous, not refused.
+    agent_label: str | None = None
+    # Wall-clock, unlike `last_used`, because these two are reported to a reader
+    # and a monotonic number means nothing to one.
+    created_at: float = field(default_factory=time.time)
+    last_used_at: float = field(default_factory=time.time)
+    # The last page this session was seen on, recorded whenever a call summarises
+    # it. The status topic reports every session at once, and asking another
+    # agent's tab for its URL would mean waiting on that agent's lock - so what
+    # is reported is the last thing seen, labelled as such.
+    last_url: str | None = None
+    last_title: str | None = None
 
 
 _sessions: dict[str, BrowserSession] = {}
@@ -287,6 +369,191 @@ def _validate_session_id(session_id: str) -> str:
             "session_id must be 1-64 characters using letters, digits, '.', '_' or '-'"
         )
     return session_id
+
+
+# A perception answer has to fit in the context of the model that asked for it.
+# `limit` counted things, which is not the same question: 200 controls on a
+# hh.ru vacancy page came back as 83,616 characters, more than a small model's
+# whole window, and the tool call was thrown away after the page had already
+# been loaded and paid for. So the answers are also measured in characters.
+#
+# 18,000 is chosen to sit just under the ~20k the text topics already default to
+# and well inside a 32k window with room for the conversation around it.
+DEFAULT_RESPONSE_CHAR_BUDGET = 18_000
+MIN_RESPONSE_CHAR_BUDGET = 2_000
+MAX_RESPONSE_CHAR_BUDGET = 200_000
+
+
+def _response_char_budget(max_chars: object) -> int:
+    """Clamp a requested character budget; anything unreadable falls back to the default."""
+    try:
+        wanted = int(max_chars)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return DEFAULT_RESPONSE_CHAR_BUDGET
+    return max(MIN_RESPONSE_CHAR_BUDGET, min(wanted, MAX_RESPONSE_CHAR_BUDGET))
+
+
+def _measure(value: Any) -> int:
+    """Size a payload the way the transport will: as JSON, non-ASCII unescaped."""
+    try:
+        return len(json.dumps(value, ensure_ascii=False, default=str))
+    except (TypeError, ValueError):
+        return len(str(value))
+
+
+def _fit_lists_to_budget(
+    payload: dict[str, Any],
+    list_keys: tuple[str, ...],
+    budget: int,
+    finalize: Any = None,
+) -> dict[str, Any]:
+    """Trim the entry lists of a result until the whole answer fits ``budget``.
+
+    Prefixes only. Every one of these topics pages with ``offset``, so keeping
+    the first N of each list leaves ``next_offset`` meaning exactly what it
+    meant; dropping from the middle would make the paging a lie.
+
+    Entries are taken round-robin across the lists rather than filling the first
+    one to the brim, because a page whose buttons matter is not helped by a
+    budget spent entirely on its links.
+
+    ``finalize`` is called with the trimmed payload whenever it changes. It is
+    for the bookkeeping that depends on what survived - ``returned``, ``range``,
+    ``next_offset`` - which grows the answer slightly as it fills in, and would
+    otherwise push a payload that just fitted a few characters over the line it
+    was trimmed to.
+
+    Returns the report of what happened; the payload is trimmed in place.
+    """
+    lists = {key: list(payload.get(key) or []) for key in list_keys if key in payload}
+    total_entries = sum(len(items) for items in lists.values())
+    full_size = _measure(payload)
+    if full_size <= budget or not total_entries:
+        return {
+            "chars_returned": full_size,
+            "char_budget": budget,
+            "budget_truncated": False,
+        }
+    # Everything that is not an entry list has to be paid for first: the counts,
+    # the ranges and the page summary go out whatever happens, because they are
+    # what tells the caller there is more to fetch.
+    skeleton = {key: value for key, value in payload.items() if key not in lists}
+    for key in lists:
+        skeleton[key] = []
+    remaining = budget - _measure(skeleton)
+    costs = {key: [_measure(entry) + 1 for entry in items] for key, items in lists.items()}
+    taken = {key: 0 for key in lists}
+    index = 0
+    progressing = True
+    while progressing and remaining > 0:
+        progressing = False
+        for key in lists:
+            position = taken[key]
+            if position >= len(lists[key]):
+                continue
+            cost = costs[key][position]
+            if cost > remaining:
+                continue
+            remaining -= cost
+            taken[key] += 1
+            progressing = True
+        index += 1
+        if index > 100_000:  # Defensive: no page has this many controls.
+            break
+    def _publish() -> int:
+        for key, items in lists.items():
+            payload[key] = items[: taken[key]]
+        if finalize is not None:
+            finalize(payload)
+        return _measure(payload)
+
+    size = _publish()
+    # Give back what the bookkeeping took. One entry at a time from the longest
+    # list, so the balance the round-robin built is kept; bounded because each
+    # pass removes an entry and there are finitely many.
+    while size > budget and sum(taken.values()) > 0:
+        longest = max(taken, key=lambda key: taken[key])
+        taken[longest] -= 1
+        size = _publish()
+    kept = sum(taken.values())
+    return {
+        "chars_returned": _measure(payload),
+        "char_budget": budget,
+        "chars_before_budget": full_size,
+        "budget_truncated": True,
+        "entries_returned": kept,
+        "entries_before_budget": total_entries,
+        "budget_note": (
+            f"The full answer was {full_size} characters; {kept} of {total_entries} "
+            f"entries were kept to stay inside max_chars={budget}. Read the rest with "
+            "offset (see range[*].next_offset), narrow the request with the include_* "
+            "flags, or raise max_chars if your context can take it."
+        ),
+    }
+
+
+def _fit_text_to_budget(payload: dict[str, Any], text_key: str, budget: int) -> dict[str, Any]:
+    """Clip one long text field so the whole answer fits ``budget``.
+
+    Used where the bulk is a rendered blob rather than a list - the outline's
+    text form - and the caller's lever is ``limit`` rather than ``offset``, which
+    is what the note says instead of pointing at a page that does not exist.
+    """
+    full_size = _measure(payload)
+    text = payload.get(text_key)
+    if full_size <= budget or not isinstance(text, str) or not text:
+        return {"chars_returned": full_size, "char_budget": budget, "budget_truncated": False}
+    overhead = _measure({**payload, text_key: ""})
+    room = max(0, budget - overhead)
+    def _on_a_line_boundary(value: str) -> str:
+        """Half a node is worse than one node fewer."""
+        newline = value.rfind("\n")
+        return value[:newline] if newline > len(value) // 2 else value
+
+    clipped = _on_a_line_boundary(text[:room])
+    payload[text_key] = clipped
+    # A character of text is not a character of JSON - a newline is two, a quote
+    # is two, and an outline is mostly newlines - so the first cut is an estimate
+    # and this loop is what makes the promise true. It converges quickly because
+    # each pass removes the whole measured excess.
+    for _ in range(8):
+        overshoot = _measure(payload) - budget
+        if overshoot <= 0 or not clipped:
+            break
+        clipped = _on_a_line_boundary(clipped[: max(0, len(clipped) - overshoot)])
+        payload[text_key] = clipped
+    return {
+        "chars_returned": _measure(payload),
+        "char_budget": budget,
+        "chars_before_budget": full_size,
+        "budget_truncated": True,
+        "budget_note": (
+            f"The full answer was {full_size} characters and was clipped to stay inside "
+            f"max_chars={budget}. Ask for fewer nodes with limit, scope the read with "
+            "frame_selector, or raise max_chars if your context can take it."
+        ),
+    }
+
+
+_AGENT_LABEL_LIMIT = 64
+
+
+def _normalize_agent_label(agent_label: object) -> str | None:
+    """Tidy an owner label, refusing nothing.
+
+    An agent introducing itself is doing the server a favour, so a label is
+    never a reason to fail a call: whitespace goes, an over-long one is cut, and
+    an empty one is simply no label. Control characters are stripped because the
+    label is echoed back into a status report a human reads.
+    """
+    if agent_label is None:
+        return None
+    text = "".join(
+        character for character in str(agent_label) if character.isprintable()
+    ).strip()
+    if not text:
+        return None
+    return text[:_AGENT_LABEL_LIMIT]
 
 
 def _bounded_size(width: int, height: int) -> tuple[int, int]:
@@ -695,7 +962,9 @@ def _create_session(
     debugger_address: str | None = None,
     current_tab_id: int | None = None,
     tab_group: str = DEFAULT_TAB_GROUP,
+    agent_label: str | None = None,
 ) -> BrowserSession:
+    agent_label = _normalize_agent_label(agent_label)
     profile_mode = _resolve_profile_mode(profile_mode, headless)
     mode, selected_profile, address, browser_key = _profile_configuration(
         session_id, profile_mode, profile_id, debugger_address
@@ -732,8 +1001,18 @@ def _create_session(
                     raise ValueError(
                         "Session already exists with different browser/profile options; close it first"
                     )
+                # Re-opening a URL in a session already held is the ordinary way
+                # an agent works, and it is the second call that often carries
+                # the label. Adopting it here means the owner is recorded from
+                # whenever it was first offered rather than only at creation. A
+                # label already on the session is left alone: an id in two
+                # agents' hands is exactly the collision `shared_session` warns
+                # about, and rewriting the owner would hide it.
+                if agent_label and not existing.agent_label:
+                    existing.agent_label = agent_label
                 return existing
-            at_cap = len(_sessions) + len(_pending_sessions) >= MAX_SESSIONS
+            cap, cap_source = effective_max_sessions()
+            at_cap = len(_sessions) + len(_pending_sessions) >= cap
             if not (at_cap and not swept):
                 if at_cap:
                     oldest = min(
@@ -742,13 +1021,25 @@ def _create_session(
                     stalest = next(
                         (name for name, item in _sessions.items() if item is oldest), None
                     )
+                    owners = {
+                        name: item.agent_label
+                        for name, item in _sessions.items()
+                        if item.agent_label
+                    }
                     raise RuntimeError(
-                        f"Maximum of {MAX_SESSIONS} browser sessions reached; close one first. "
+                        f"Maximum of {cap} browser sessions reached; close one first. "
                         f"Open: {sorted(_sessions)}."
+                        + (f" Owners: {owners}." if owners else "")
                         + (f" Least recently used: '{stalest}'." if stalest else "")
                         + " The cap counts every session in this MCP server, so parallel "
                         "agents share it; raise it with WEB_SEARCH_NEO_MAX_SESSIONS in the "
-                        "server's environment if they all genuinely need a page at once."
+                        "server's environment, or in the companion extension's popup under "
+                        "Settings, if they all genuinely need a page at once."
+                        + (
+                            " The current cap comes from the companion popup."
+                            if cap_source == "companion"
+                            else ""
+                        )
                     )
                 selected_current_tab_id = (
                     int(current_tab_id)
@@ -831,6 +1122,7 @@ def _create_session(
             owns_browser=mode != "attach",
             # A tab we created is ours to clean up; a claimed one belongs to the user.
             owns_tab=mode == "current" and current_tab_id is None,
+            agent_label=agent_label,
         )
     finally:
         if session is None:
@@ -989,6 +1281,7 @@ def _get_session(session_id: str) -> BrowserSession:
             f"Open sessions: {open_sessions}."
         )
     session.last_used = time.monotonic()
+    session.last_used_at = time.time()
     return session
 
 
@@ -1345,6 +1638,16 @@ def _action_summary(
 def _page_summary(driver: webdriver.Chrome, session_id: str) -> dict[str, Any]:
     probe = driver.execute_script(_PAGE_SUMMARY_SCRIPT) or {}
     challenge = probe.pop("challenge", None) or {}
+    # Every observation passes through here, so this is the cheapest honest place
+    # to remember where a session is: the status topic can then describe all of
+    # them without waiting on a lock each one's own agent is holding.
+    with _sessions_lock:
+        session = _sessions.get(session_id)
+    if session is not None:
+        if isinstance(probe.get("url"), str):
+            session.last_url = probe["url"]
+        if isinstance(probe.get("title"), str):
+            session.last_title = probe["title"]
     return {
         "session_id": session_id,
         **probe,
@@ -1429,6 +1732,7 @@ def open_page(
     debugger_address: str | None = None,
     current_tab_id: int | None = None,
     tab_group: str = DEFAULT_TAB_GROUP,
+    agent_label: str | None = None,
 ) -> dict[str, Any]:
     """Open a URL in a reusable rendered browser session."""
     normalized = validate_http_url(url)
@@ -1444,6 +1748,7 @@ def open_page(
         debugger_address,
         current_tab_id,
         tab_group,
+        agent_label,
     )
     # Read before the lock: taking it first would wait the other caller out and
     # then report an empty room. This is the moment two agents that both took the
@@ -1549,6 +1854,7 @@ def setup_current_chrome_companion(wait_seconds: float = 1.0) -> dict[str, Any]:
 def attach_current_tab(
     tab_id: int,
     session_id: str = "default",
+    agent_label: str | None = None,
 ) -> dict[str, Any]:
     """Attach a named MCP session to an existing Chrome tab without navigating it.
 
@@ -1569,6 +1875,7 @@ def attach_current_tab(
         None,
         int(tab_id),
         DEFAULT_TAB_GROUP,
+        agent_label,
     )
     try:
         with session.lock:
@@ -1779,6 +2086,43 @@ return output;
 """
 
 
+_ELEMENT_LIST_KEYS = ("links", "forms", "fields", "buttons", "iframes")
+
+
+def _restate_element_ranges(payload: dict[str, Any]) -> None:
+    """Re-derive ``returned``/``range`` from what is actually in the payload.
+
+    Called only after the character budget shortened a list, so that ``has_more``
+    and ``next_offset`` describe the answer that was sent rather than the one
+    that was collected.
+    """
+    counts = payload.get("found")
+    if not isinstance(counts, dict):
+        return
+    offset = int(payload.get("offset") or 0)
+    returned: dict[str, int] = {}
+    ranges: dict[str, Any] = {}
+    for key, total in counts.items():
+        rows = payload.get(key)
+        kept = len(rows) if isinstance(rows, list) else 0
+        try:
+            available = int(total)
+        except (TypeError, ValueError):
+            available = kept
+        start = min(offset, available)
+        end = start + kept
+        returned[key] = kept
+        ranges[key] = {
+            "start": start,
+            "end": end,
+            "next_offset": end if end < available else None,
+            "has_more": end < available,
+        }
+    payload["returned"] = returned
+    payload["range"] = ranges
+    payload["truncated"] = any(value["has_more"] for value in ranges.values())
+
+
 def get_page_elements(
     session_id: str = "default",
     include_links: bool = True,
@@ -1786,6 +2130,7 @@ def get_page_elements(
     include_buttons: bool = True,
     limit: int = 200,
     offset: int = 0,
+    max_chars: int = DEFAULT_RESPONSE_CHAR_BUDGET,
 ) -> dict[str, Any]:
     """Return stable selectors and metadata for rendered page controls.
 
@@ -1793,9 +2138,16 @@ def get_page_elements(
     reported as a ``host >>> control`` path, which the action tools resolve. Every
     entry carries ``visible`` and, when it is not, ``hidden_reason``, so a control
     no click can reach is never handed over looking like an ordinary one.
+
+    ``limit`` counts controls and ``max_chars`` counts the answer. Both are
+    needed: 200 controls is a modest number and was 83k characters on a real job
+    board, which no small model could receive. When the budget bites, the lists
+    are cut to a prefix, ``budget_truncated`` is true and ``range[*].next_offset``
+    still points at the next page.
     """
     limit = max(1, min(int(limit), 1000))
     offset = max(0, min(int(offset), 20_000))
+    budget = _response_char_budget(max_chars)
     session = _get_session(session_id)
     with session.lock:
         # This topic has no frame_selector: it always answers for the whole page.
@@ -1812,7 +2164,16 @@ def get_page_elements(
             bool(include_forms),
             bool(include_buttons),
         )
-        return {**_page_summary(session.driver, session_id), **elements}
+        payload = {**_page_summary(session.driver, session_id), **(elements or {})}
+        # The per-list bookkeeping the script filled in was about the row limit;
+        # after a budget cut it would over-report what was sent, and
+        # `next_offset` would skip whatever the budget dropped. Restating it is
+        # part of fitting rather than a step after it, because the restated
+        # numbers are themselves part of what has to fit.
+        report = _fit_lists_to_budget(
+            payload, _ELEMENT_LIST_KEYS, budget, finalize=_restate_element_ranges
+        )
+        return {**payload, **report}
 
 
 def wait_for_element(
@@ -3446,8 +3807,15 @@ def get_page_outline(
     include_occlusion: bool = True,
     output: str = "text",
     frame_selector: str | None = None,
+    max_chars: int = DEFAULT_RESPONSE_CHAR_BUDGET,
 ) -> dict[str, Any]:
-    """Return the accessibility outline: roles, names, states, refs, and boxes."""
+    """Return the accessibility outline: roles, names, states, refs, and boxes.
+
+    ``limit`` counts nodes; ``max_chars`` bounds the answer, because 200 nodes of
+    a dense application are far larger than 200 nodes of a form and only the
+    second number is the one a model's context is measured in.
+    """
+    budget = _response_char_budget(max_chars)
     session = _get_session(session_id)
     with session.lock:
         driver = session.driver
@@ -3463,7 +3831,15 @@ def get_page_outline(
             )
         finally:
             _leave_element_frame(driver)
-        return {**result, "session_id": session_id, "frame_selector": frame_selector}
+        payload = {**result, "session_id": session_id, "frame_selector": frame_selector}
+        # Two shapes, one budget: the text form is one blob, the json form is a
+        # node list that pages the same way the element lists do.
+        report = (
+            _fit_text_to_budget(payload, "outline", budget)
+            if "outline" in payload
+            else _fit_lists_to_budget(payload, ("nodes",), budget)
+        )
+        return {**payload, **report}
 
 
 def get_page_text(
@@ -3537,8 +3913,15 @@ def find_elements(
     limit: int = 5,
     visible_only: bool = True,
     frame_selector: str | None = None,
+    max_chars: int = DEFAULT_RESPONSE_CHAR_BUDGET,
 ) -> dict[str, Any]:
-    """Find elements by meaning instead of dumping the whole page to the model."""
+    """Find elements by meaning instead of dumping the whole page to the model.
+
+    Five matches is a small answer on most pages and not on all of them - a match
+    inside a deep component carries a long piercing path - so ``max_chars`` bounds
+    this one too, on the same terms as the other perception topics.
+    """
+    budget = _response_char_budget(max_chars)
     session = _get_session(session_id)
     with session.lock:
         driver = session.driver
@@ -3549,7 +3932,14 @@ def find_elements(
             )
         finally:
             _leave_element_frame(driver)
-        return {**result, "session_id": session_id, "frame_selector": frame_selector}
+        payload = {**result, "session_id": session_id, "frame_selector": frame_selector}
+
+        def _restate(current: dict[str, Any]) -> None:
+            current["returned"] = len(current.get("matches") or [])
+            current["truncated"] = True
+
+        report = _fit_lists_to_budget(payload, ("matches",), budget, finalize=_restate)
+        return {**payload, **report}
 
 
 def _drain_browser_log(session: BrowserSession) -> list[dict[str, Any]]:
@@ -6859,7 +7249,82 @@ def show_session(session_id: str = "default") -> dict[str, Any]:
         }
 
 
+def _iso_local(timestamp: float | None) -> str | None:
+    """Format a wall-clock timestamp the way a reader can compare against a clock."""
+    if not timestamp:
+        return None
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(timestamp)))
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def sessions_overview() -> dict[str, Any]:
+    """Describe every session this server holds, and how much of the cap is left.
+
+    This is the answer to "who is where", which nothing used to be able to give:
+    parallel agents share one process, and until a session carried an owner label
+    the only thing a reader could see was a list of ids somebody chose.
+
+    Deliberately driverless. Asking each session's tab for its URL would mean
+    taking that session's lock, so one agent mid-navigation would stall the
+    status call of everybody else - and status is exactly what a stuck run reads
+    first. Everything here is already in memory: the last page each session was
+    *seen* on, recorded by whatever call last summarised it, plus who owns it,
+    which tab it drives and whether another thread is inside it right now.
+    """
+    cap, cap_source = effective_max_sessions()
+    with _sessions_lock:
+        items = sorted(_sessions.items())
+        rows = [
+            {
+                "session_id": name,
+                "agent_label": session.agent_label,
+                "current_tab_id": session.current_tab_id,
+                "tab_group": session.tab_group,
+                "profile_mode": session.profile_mode,
+                "headless": session.headless,
+                # "Last seen", not "current": see the docstring. A session that
+                # has never been summarised reports None rather than a guess.
+                "last_url": session.last_url,
+                "last_title": session.last_title,
+                "created_at": _iso_local(session.created_at),
+                "last_used_at": _iso_local(session.last_used_at),
+                "idle_seconds": round(max(0.0, time.monotonic() - session.last_used), 1),
+                "busy": bool(session.lock.busy),
+                "concurrent_callers": session.lock.concurrent_callers,
+            }
+            for name, session in items
+        ]
+    busy = [row["session_id"] for row in rows if row["busy"]]
+    return {
+        "sessions": rows,
+        "sessions_open": len(rows),
+        "max_sessions": cap,
+        "max_sessions_source": cap_source,
+        "sessions_free": max(0, cap - len(rows)),
+        "sessions_in_use": sorted(busy),
+        "sessions_summary": f"{len(rows)} of {cap} browser sessions open, {len(busy)} busy right now.",
+        "sessions_page_note": (
+            "last_url/last_title are where each session was last seen, not a fresh "
+            "read: another agent's tab is not touched to answer this."
+        ),
+    }
+
+
 def get_status(session_id: str = "default") -> dict[str, Any]:
+    """Return browser availability, one session's state, and the whole roster.
+
+    The roster is gathered first, before the named session's lock is taken:
+    ``busy`` is about who is inside a session *now*, and taking a lock to find
+    out would wait that very fact out.
+    """
+    overview = sessions_overview()
+    status = _describe_status(session_id)
+    return {**status, **overview}
+
+
+def _describe_status(session_id: str = "default") -> dict[str, Any]:
     """Return browser availability and current session state."""
     session_id = _validate_session_id(session_id)
     with _sessions_lock:
@@ -7267,17 +7732,48 @@ def close_session(session_id: str = "default", close_tab: bool | None = None) ->
     }
 
 
-def close_all_sessions() -> dict[str, Any]:
-    """Close every session, including the Chrome tabs the server itself opened.
+def close_all_sessions(
+    agent_label: str | None = None,
+    scope: str = "mine",
+    include_foreign: bool = False,
+) -> dict[str, Any]:
+    """Close this caller's sessions - or, asked explicitly, everybody's.
 
-    Reports what would not release, so ``close_all`` can name a leaked tab
-    instead of answering a flat "closed_all: true" over the top of it - and names
-    the sessions whose browser was already gone, which release cleanly precisely
-    because nothing of ours was left to release.
+    ``close_all`` used to mean every session in the process. Inside one MCP
+    server that is every *agent's* session, so one subagent tidying up after
+    itself ended four other agents' work mid-form, and the only defence was a
+    line in every brief telling agents never to call it. A rule nobody can
+    enforce is not a boundary; an owner is.
+
+    ``scope="mine"`` (the default) closes the sessions whose ``agent_label``
+    matches ``agent_label``. A caller that gives no label owns the sessions that
+    have none - anonymous sessions belong to anonymous callers, which is the only
+    consistent reading and keeps the old behaviour for a run where nobody labels
+    anything. ``scope="all"`` (or ``include_foreign=True``) closes everything, as
+    before, and is what process exit uses.
+
+    Whatever the scope, the answer names both halves: what was closed and what
+    was left standing, with its owner. A tidy-up that quietly skipped four
+    sessions would be as confusing as one that quietly closed them.
     """
+    wanted = str(scope or "mine").strip().lower()
+    if wanted not in {"mine", "all"}:
+        raise ValueError("scope must be 'mine' or 'all'")
+    if include_foreign:
+        wanted = "all"
+    owner = _normalize_agent_label(agent_label)
     with _sessions_lock:
-        sessions = sorted(_sessions.items())
-        _sessions.clear()
+        everything = sorted(_sessions.items())
+        if wanted == "all":
+            sessions = everything
+            kept: list[tuple[str, BrowserSession]] = []
+        else:
+            sessions = [
+                item for item in everything if (item[1].agent_label or None) == owner
+            ]
+            kept = [item for item in everything if (item[1].agent_label or None) != owner]
+        for session_id, _ in sessions:
+            _sessions.pop(session_id, None)
     tabs_closed = 0
     problems: dict[str, str] = {}
     browsers_gone: list[str] = []
@@ -7289,11 +7785,32 @@ def close_all_sessions() -> dict[str, Any]:
             browsers_gone.append(session_id)
         if outcome["problem"]:
             problems[session_id] = outcome["problem"]
+    with _sessions_lock:
+        remaining = sorted(_sessions)
     return {
         "closed_all": not problems,
+        "scope": wanted,
+        "agent_label": owner,
         "closed_sessions": [session_id for session_id, _ in sessions],
         "tabs_closed": tabs_closed,
-        "active_sessions": [],
+        "active_sessions": remaining,
+        # Always both halves, even when the second is empty: a caller has to be
+        # able to tell "nothing else was open" from "four of somebody else's
+        # sessions are still running".
+        "kept_sessions": [
+            {"session_id": name, "agent_label": item.agent_label} for name, item in kept
+        ],
+        "scope_note": (
+            "scope='all' closed every session in this MCP server, including other "
+            "agents'."
+            if wanted == "all"
+            else (
+                "Closed only the sessions owned by "
+                + (f"'{owner}'" if owner else "no agent_label (anonymous)")
+                + f"; {len(kept)} session(s) belonging to other agents were left "
+                "running. Pass scope='all' to close those too."
+            )
+        ),
         **({"warnings": problems} if problems else {}),
         **(
             {
@@ -7317,4 +7834,13 @@ def start_current_chrome_bridge() -> dict[str, Any]:
     return bridge.status(0.0)
 
 
-atexit.register(close_all_sessions)
+def _close_everything_at_exit() -> dict[str, Any]:
+    """Process exit is the one place where "everybody's" is the right scope.
+
+    Nobody is left to own a session once the interpreter is going down, and a
+    tab kept open on ownership grounds would simply be a leak with a rationale.
+    """
+    return close_all_sessions(scope="all")
+
+
+atexit.register(_close_everything_at_exit)

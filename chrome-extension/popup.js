@@ -13,6 +13,10 @@ const portInput = document.querySelector("#port");
 const savePortButton = document.querySelector("#save-port");
 const resetPortButton = document.querySelector("#reset-port");
 const portDefaultNode = document.querySelector("#port-default");
+const maxSessionsInput = document.querySelector("#max-sessions");
+const saveMaxSessionsButton = document.querySelector("#save-max-sessions");
+const resetMaxSessionsButton = document.querySelector("#reset-max-sessions");
+const maxSessionsDefaultNode = document.querySelector("#max-sessions-default");
 const nextAttemptNode = document.querySelector("#next-attempt");
 const GITHUB_URL = "https://github.com/NeoXider/web-search-neo";
 const RELEASES_API = "https://api.github.com/repos/NeoXider/web-search-neo/releases?per_page=1";
@@ -43,6 +47,15 @@ function render(state) {
   // Never overwrite a port the user is in the middle of typing.
   if (document.activeElement !== portInput && state.bridge_port) {
     portInput.value = String(state.bridge_port);
+  }
+  if (state.default_max_sessions) {
+    maxSessionsDefaultNode.textContent = String(state.default_max_sessions);
+  }
+  if (state.max_sessions_ceiling) {
+    maxSessionsInput.max = String(state.max_sessions_ceiling);
+  }
+  if (document.activeElement !== maxSessionsInput && state.max_sessions) {
+    maxSessionsInput.value = String(state.max_sessions);
   }
   // "Waiting" with no end in sight reads as broken. The backoff is deliberate
   // and the popup is the only place that can say so.
@@ -188,6 +201,33 @@ async function applyPort(value) {
     resetPortButton.disabled = false;
   }
 }
+
+async function applyMaxSessions(value) {
+  saveMaxSessionsButton.disabled = true;
+  resetMaxSessionsButton.disabled = true;
+  messageNode.textContent = "Applying session limit…";
+  try {
+    const state = await send("companion.setMaxSessions", {max_sessions: value});
+    render(state);
+    messageNode.textContent =
+      `Parallel sessions set to ${state.max_sessions}; the MCP server picks it up on reconnect.`;
+  } catch (error) {
+    messageNode.textContent = error.message;
+    await refresh();
+  } finally {
+    saveMaxSessionsButton.disabled = false;
+    resetMaxSessionsButton.disabled = false;
+  }
+}
+
+saveMaxSessionsButton.addEventListener("click", () => applyMaxSessions(maxSessionsInput.value));
+resetMaxSessionsButton.addEventListener("click", () => {
+  maxSessionsInput.value = maxSessionsDefaultNode.textContent;
+  return applyMaxSessions(maxSessionsDefaultNode.textContent);
+});
+maxSessionsInput.addEventListener("keydown", event => {
+  if (event.key === "Enter") applyMaxSessions(maxSessionsInput.value);
+});
 
 savePortButton.addEventListener("click", () => applyPort(portInput.value));
 resetPortButton.addEventListener("click", () => {

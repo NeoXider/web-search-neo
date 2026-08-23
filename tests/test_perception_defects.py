@@ -687,6 +687,7 @@ def test_page_elements_paginates_the_whole_dom_and_scroll_materialises_lazy_cont
             include_forms=False,
             limit=1000,
             offset=0,
+            max_chars=browser_tools.MAX_RESPONSE_CHAR_BUDGET,
         )
         assert first["found"]["buttons"] == 1206
         assert first["returned"]["buttons"] == 1000
@@ -707,6 +708,7 @@ def test_page_elements_paginates_the_whole_dom_and_scroll_materialises_lazy_cont
             include_forms=False,
             limit=1000,
             offset=1000,
+            max_chars=browser_tools.MAX_RESPONSE_CHAR_BUDGET,
         )
         assert second["returned"]["buttons"] == 206
         assert second["range"]["buttons"]["next_offset"] is None
@@ -726,6 +728,7 @@ def test_page_elements_paginates_the_whole_dom_and_scroll_materialises_lazy_cont
             include_forms=False,
             limit=1000,
             offset=0,
+            max_chars=browser_tools.MAX_RESPONSE_CHAR_BUDGET,
         )
         assert after["found"]["buttons"] == 1207
         last = browser_tools.get_page_elements(
@@ -734,10 +737,44 @@ def test_page_elements_paginates_the_whole_dom_and_scroll_materialises_lazy_cont
             include_forms=False,
             limit=1000,
             offset=1000,
+            max_chars=browser_tools.MAX_RESPONSE_CHAR_BUDGET,
         )
         assert any(button["id"] == "lazy-button" for button in last["buttons"])
     finally:
         browser_tools.close_session("defect-elements-pagination")
+
+def test_a_thousand_controls_do_not_come_back_as_a_hundred_thousand_characters(
+    local_site,
+):
+    """The defect this budget exists for: a real page answered `page_elements`
+    with 83,616 characters, which the model that asked could not receive."""
+    _open_or_skip(
+        _fixture(local_site, "scroll_and_many.html"), "defect-elements-budget"
+    )
+    try:
+        result = browser_tools.get_page_elements(
+            session_id="defect-elements-budget",
+            include_links=False,
+            include_forms=False,
+            limit=1000,
+        )
+        assert result["budget_truncated"] is True
+        assert result["chars_returned"] <= result["char_budget"]
+        assert result["chars_before_budget"] > result["char_budget"]
+        # And the paging still works from where the budget stopped.
+        kept = len(result["buttons"])
+        assert result["range"]["buttons"]["next_offset"] == kept
+        rest = browser_tools.get_page_elements(
+            session_id="defect-elements-budget",
+            include_links=False,
+            include_forms=False,
+            limit=1000,
+            offset=kept,
+        )
+        assert rest["buttons"][0]["id"] != result["buttons"][0]["id"]
+    finally:
+        browser_tools.close_session("defect-elements-budget")
+
 
 
 # ---------------------------------------------------------------------------

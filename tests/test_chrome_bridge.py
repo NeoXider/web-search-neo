@@ -719,6 +719,11 @@ def test_popup_controls_have_unique_ids() -> None:
     assert len(ids) == len(set(ids))
     assert {"release-status", "release-tabs", "check-release", "open-github"} <= set(ids)
     assert {"port", "save-port", "reset-port", "next-attempt"} <= set(ids)
+    # The session limit is a setting a user has to be able to find without
+    # reading the server's environment; the popup is where the port already is.
+    assert {
+        "max-sessions", "save-max-sessions", "reset-max-sessions", "max-sessions-default",
+    } <= set(ids)
 
 
 @requires_node
@@ -730,6 +735,7 @@ const ids = [
   "enabled", "reconnect", "release-tabs", "status", "tabs", "bridge", "version",
   "release-status", "message", "check-release", "open-github",
   "port", "save-port", "reset-port", "port-default", "next-attempt",
+  "max-sessions", "save-max-sessions", "reset-max-sessions", "max-sessions-default",
 ];
 const nodes = new Map(ids.map(id => [id, {{
   textContent: "", title: "", value: "", dataset: {{}}, checked: false, disabled: false,
@@ -741,14 +747,26 @@ globalThis.document = {{
 }};
 let opened = null;
 const sent = [];
+// The fake worker remembers what it was told, exactly as the real one does:
+// a status read after a setting change has to report the setting, not the
+// default, or the popup would appear to lose every change on its next refresh.
+let heldPort = 8765;
+let heldMaxSessions = 8;
 globalThis.chrome = {{
   runtime: {{sendMessage: async message => {{
     sent.push(message);
+    if (message.port !== undefined) heldPort = Number(message.port) || heldPort;
+    if (message.max_sessions !== undefined) {{
+      heldMaxSessions = Number(message.max_sessions) || heldMaxSessions;
+    }}
     return {{
       enabled: true, connected: true, connecting: false, controlled_tabs: 2,
-      bridge_url: `ws://127.0.0.1:${{message.port || 8765}}`,
-      bridge_port: Number(message.port) || 8765,
+      bridge_url: `ws://127.0.0.1:${{heldPort}}`,
+      bridge_port: heldPort,
       default_bridge_port: 8765,
+      max_sessions: heldMaxSessions,
+      default_max_sessions: 8,
+      max_sessions_ceiling: 64,
       version: "1.3.4",
     }};
   }}}},
@@ -767,6 +785,9 @@ await new Promise(resolve => setTimeout(resolve, 20));
 nodes.get("port").value = "9001";
 await callbacks["save-port:click"]();
 await new Promise(resolve => setTimeout(resolve, 20));
+nodes.get("max-sessions").value = "12";
+await callbacks["save-max-sessions:click"]();
+await new Promise(resolve => setTimeout(resolve, 20));
 process.stdout.write(JSON.stringify({{
   release: nodes.get("release-status").textContent,
   releaseState: nodes.get("release-status").dataset.state,
@@ -775,6 +796,9 @@ process.stdout.write(JSON.stringify({{
   bridge: nodes.get("bridge").textContent,
   nextAttempt: nodes.get("next-attempt").textContent,
   portMessages: sent.filter(item => item.type === "companion.setBridgePort"),
+  maxSessions: nodes.get("max-sessions").value,
+  maxSessionsDefault: nodes.get("max-sessions-default").textContent,
+  maxSessionsMessages: sent.filter(item => item.type === "companion.setMaxSessions"),
 }}));
 """
     completed = subprocess.run(
@@ -797,6 +821,13 @@ process.stdout.write(JSON.stringify({{
     assert outcome["portMessages"] == [{"type": "companion.setBridgePort", "port": "9001"}]
     assert outcome["bridge"] == "127.0.0.1:9001"
     assert outcome["port"] == "9001"
+    # The session cap is applied the same way the port is: asked of the worker,
+    # then re-rendered from whatever the worker says it now holds.
+    assert outcome["maxSessionsMessages"] == [
+        {"type": "companion.setMaxSessions", "max_sessions": "12"}
+    ]
+    assert outcome["maxSessions"] == "12"
+    assert outcome["maxSessionsDefault"] == "8"
 
 
 @requires_node

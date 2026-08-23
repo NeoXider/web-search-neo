@@ -232,7 +232,7 @@ limits, and worked examples. `web_info(topic="action_schema", params={"action":
 | Semantic page reading | `page_outline`, `page_text`, `element_text`, and `find` return roles, accessible names, states, boxes, and `ref:<epoch>:N` handles across open Shadow DOM and same-origin iframes — and `element_text` hands over the whole content of one element, overflow-clipped tails included. |
 | Visible failures | The `console` and `network` topics surface console output, uncaught exceptions with stack frames, and every HTTP request with status, type, duration, and size — recorded from the session's first navigation, not from the first time someone asks. |
 | Deterministic frames | Gated render modes freeze `performance.now()`/`Date.now()` and queue page timers, so a released frame is a fixed delta instead of the agent's thinking time. |
-| Concurrent work | Search, HTTP fetches, and independent browser sessions run outside the MCP event loop; four browser sessions work in parallel by default (`WEB_SEARCH_NEO_MAX_SESSIONS` raises it). Agents running side by side must each take their own `session_id`, because that is the only thing separating them inside one server. |
+| Concurrent work | Search, HTTP fetches, and independent browser sessions run outside the MCP event loop; eight browser sessions work in parallel by default (the companion popup and `WEB_SEARCH_NEO_MAX_SESSIONS` both move it). Agents running side by side must each take their own `session_id`, because that is the only thing separating them inside one server, and may pass `agent_label` on `open` so `browser_status` can say who is where. |
 
 ## Connect your already-open Chrome
 
@@ -542,10 +542,12 @@ longer accumulates abandoned pages. Both `close` and `close_all` report what the
 could not release — a tab that would not close, a debugger that would not detach
 — instead of answering `closed: true` over the top of it; closing a session that
 was never open stays a no-op and says so in `note`. A tab the user closed by hand
-frees its session slot the next time the four-session cap is reached, so the
-server does not refuse to open a page because of four tabs that no longer exist. `close_all` — and the
+frees its session slot the next time the session cap is reached, so the
+server does not refuse to open a page because of tabs that no longer exist. `close_all` — and the
 shutdown hook that runs it — applies the same rule instead of leaving every
-self-opened tab behind. The MCP doesn't read cookies or passwords; the page
+self-opened tab behind. `close_all` closes only the sessions carrying your own
+`agent_label` unless you pass `scope="all"`, and always reports `kept_sessions`
+so a skipped session is never silent. The MCP doesn't read cookies or passwords; the page
 simply continues using the authorization already present in Chrome.
 
 Teardown is not unconditional, and the exception is the point of it. Tab ids
@@ -632,9 +634,22 @@ the server does the one useful thing instead of pretending otherwise and says so
 `sessions_in_use` lists the sessions another caller is inside right now, and
 `shared_session` with a warning appears on `browser_status` and on `open` when
 this session is one of them. Give each agent its own `session_id` and they get a
-tab each. The four-session cap is per process, so parallel agents share it too;
-`WEB_SEARCH_NEO_MAX_SESSIONS` raises it, and the refusal at the cap says so.
-`close_all` is likewise per process and ends every agent's work, not only yours.
+tab each. The session cap is per process, so parallel agents share it too; it
+defaults to eight, the companion popup carries a user's own number to the server,
+and `WEB_SEARCH_NEO_MAX_SESSIONS` in the server's environment overrides both. The
+refusal at the cap names the setting and the agents holding the slots.
+
+Pass `agent_label` on `open` or `attach_tab` and the session records who opened
+it. Nothing is refused without one — it is a courtesy, not a credential — but two
+things become possible with it. `browser_status` lists every session in the
+server with its owner, tab id and group, the page it was last seen on, when it
+was created and last used, whether another thread is inside it, and `N of M`
+occupancy; `capabilities` carries the same occupancy under `limits`. And
+`close_all` defaults to `scope="mine"`: it closes the sessions with your label
+(or, with no label, the unlabelled ones), lists what it left standing under
+`kept_sessions`, and only ends everyone's work when asked with `scope="all"`.
+Process exit still closes everything, because at that point nobody is left to own
+a session.
 
 Sessions are pinned to the browser run they were opened in. Tab ids restart with
 Chrome, so a session that outlived a restart would address whatever tab inherited
@@ -700,7 +715,7 @@ Four observation topics describe an open session, from semantic structure down t
 | `page_text` | The rendered text, with headings, list items, and table cells preserved. `mode="full"` is the whole `<body>`, same-origin frames and open dialogs included; `mode="main"` narrows to the main-content sub-tree and drops navigation, header, footer, aside, and form chrome. `max_chars=20000`, `include_links=false`. |
 | `element_text` | The whole content of one element — not a clipped slice of the page. `selector` takes CSS, a fresh `ref:<epoch>:N`, or an `a >>> b` piercing path. `full_text=true` reads `textContent`, which no rendering filter may drop, so the tail of a scrolled-out code block or a collapsed panel is returned whole. `mode="text"|"html"|"outer"|"both"` returns the rendered text, `innerHTML`, `outerHTML`, or all three; `max_chars` clips at a paragraph boundary and says so with `truncated`. |
 | `find` | Ranked matches for a plain-language `query` such as `"submit application"`, each with a `ref`, role, name, box, a `match_score` (query against the element alone) and the ranking `score` that adds context. `limit=5`, capped at 25; `visible_only=true` by default, so a control the page has not revealed yet is not a candidate; `role` filters rather than nudges. `low_confidence` means nothing on the page answers the query — the closest few still come back, as the guesses they are — and `ambiguous` means the top two matched *and* ranked equally, so document order picked the winner. `candidates`/`scored`/`matched`/`returned`, `truncated` and `aria_hidden_skipped` account for what was examined, cut, and skipped as hidden from assistive technology. |
-| `page_elements` | The flat lists of links, forms, fields with `<select>` options, and buttons, addressed by CSS selector — or by a piercing path when they live in an open shadow root or a same-origin frame, or by an empty string when nothing addresses them uniquely, which is the honest answer and not a bug to work around. It covers the whole existing DOM, not only the viewport, so a rendered button below the fold is returned before any scroll. Each entry carries `visible` and, when it is not, a `hidden_reason`; visible entries come first. `limit` is capped at 1,000 per category; continue with `offset` and `range.<category>.next_offset` until it is `null`. `found`, `returned`, `truncated`, and `collector_truncated` account for the result and the 20,000-element safety cap. Lazy, infinite, and virtualized controls do not exist until the page creates them: `scroll`, wait, then reread from `offset=0`. Alone among the four it takes no `frame_selector`: it always walks the whole page, open shadow roots, and same-origin frames. |
+| `page_elements` | The flat lists of links, forms, fields with `<select>` options, and buttons, addressed by CSS selector — or by a piercing path when they live in an open shadow root or a same-origin frame, or by an empty string when nothing addresses them uniquely, which is the honest answer and not a bug to work around. It covers the whole existing DOM, not only the viewport, so a rendered button below the fold is returned before any scroll. Each entry carries `visible` and, when it is not, a `hidden_reason`; visible entries come first. `limit` is capped at 1,000 per category; continue with `offset` and `range.<category>.next_offset` until it is `null`. `found`, `returned`, `truncated`, and `collector_truncated` account for the result and the 20,000-element safety cap. `limit` counts controls; `max_chars` (default 18,000) bounds the answer itself, because 200 controls of a real job board came to 83,616 characters — more than a small model could receive. When the budget bites, `budget_truncated` is `true`, `budget_note` says how much was dropped, and `range.<category>.next_offset` is restated to point at the first entry that was not sent. `page_outline` and `find` take the same `max_chars`; `page_text` and `element_text` already had one. Lazy, infinite, and virtualized controls do not exist until the page creates them: `scroll`, wait, then reread from `offset=0`. Alone among the four it takes no `frame_selector`: it always walks the whole page, open shadow roots, and same-origin frames. |
 
 ```json
 {"topic":"page_outline","params":{"session_id":"demo","output":"json","limit":80}}
@@ -1236,7 +1251,7 @@ web_info(topic='action_schema', params={'action': '<name>'}) for the full schema
 
 Existing direct Python imports remain available. For temporary MCP-client migration only, set `WEB_SEARCH_NEO_LEGACY_TOOLS=1` before starting the server to advertise the former narrow tool list instead of the compact default.
 
-Browser state is keyed by `session_id`, and that key is also the boundary between agents working at the same time: one `session_id` is one tab, so parallel agents must not share one. The `open_many` action can create up to four independent sessions concurrently, and `WEB_SEARCH_NEO_MAX_SESSIONS` moves that ceiling. A viewport screenshot with no dimensions preserves the current viewport in every mode. An explicit viewport `width`/`height` pair is exact in isolated Selenium modes and is refused in `current` mode, where the MCP never resizes the user's Chrome; use `mode="region"` there for an exact-size image. Full-page captures above `3840x10000` fail explicitly instead of returning an unlabelled partial image.
+Browser state is keyed by `session_id`, and that key is also the boundary between agents working at the same time: one `session_id` is one tab, so parallel agents must not share one. The `open_many` action can create as many independent sessions concurrently as the session cap allows (eight by default), and the companion popup or `WEB_SEARCH_NEO_MAX_SESSIONS` moves that ceiling. A viewport screenshot with no dimensions preserves the current viewport in every mode. An explicit viewport `width`/`height` pair is exact in isolated Selenium modes and is refused in `current` mode, where the MCP never resizes the user's Chrome; use `mode="region"` there for an exact-size image. Full-page captures above `3840x10000` fail explicitly instead of returning an unlabelled partial image.
 
 Image-guided clicking is available through `pointer` with
 `pointer_action="click"` and viewport CSS `x`/`y`. Take a fresh viewport screenshot;
@@ -1325,7 +1340,7 @@ One more is about the server rather than the bridge:
 
 | Variable | Effect |
 | --- | --- |
-| `WEB_SEARCH_NEO_MAX_SESSIONS` | Browser sessions one server holds at once, default `4`, capped at `64`. Per process, so agents running in parallel share the allowance; the refusal at the cap names this variable. |
+| `WEB_SEARCH_NEO_MAX_SESSIONS` | Browser sessions one server holds at once, default `8`, capped at `64`. Per process, so agents running in parallel share the allowance; the refusal at the cap names this variable. Set here it wins over the companion popup's **Parallel sessions** setting, which is where a user without access to the server's environment changes the same number. |
 
 Only use a proxy you are authorized to use. HTTP sessions use desktop browser headers, connection pooling, bounded response sizes, and conservative retry/backoff. Rendered pages use the installed Chrome's native matching User-Agent unless explicitly overridden.
 

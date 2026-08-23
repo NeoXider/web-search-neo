@@ -30,6 +30,24 @@ be copied into the MCP repository.
 - Packs are transport, not storage: `export` serialises the active store into one file and
   `import` validates every entry before writing any of it.
 
+## Session ownership and answer size
+
+- One `session_id` is one tab and the only boundary between agents sharing a server process.
+  An MCP call carries no caller identity, so an optional `agent_label` on `open` and
+  `attach_tab` is how a session records who opened it. A missing label is never an error.
+- Destructive session operations are owner-scoped by default. `close_all` closes the sessions
+  matching the caller's `agent_label` (with no label, the unlabelled ones) and reports what it
+  left standing; ending every agent's work requires the explicit `scope="all"`. Process exit
+  is the one place that closes everything unasked, because no owner outlives it.
+- The session cap is per process and shared by every agent in it. It is a setting in three
+  places, in this order: the server's own environment, then the companion popup's value
+  relayed through the bridge hello, then the built-in default. The refusal at the cap names
+  the setting and the labels holding the slots.
+- Perception answers are bounded by size as well as by count. A `limit` counts things and
+  cannot bound an answer, so every perception topic also takes `max_chars`, reports
+  `budget_truncated`, and restates its own paging so the continuation offset points at the
+  first entry that was not sent.
+
 ## Guarded consequential actions
 
 The generic `guarded_stage` / `guarded_commit` protocol provides canonical target identity,

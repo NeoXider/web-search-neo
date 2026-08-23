@@ -513,9 +513,13 @@ def test_the_session_cap_is_a_setting_because_agents_outnumber_it(monkeypatch):
     monkeypatch.setenv("WEB_SEARCH_NEO_MAX_SESSIONS", "0")
     assert browser_tools._max_sessions() == 1
     monkeypatch.setenv("WEB_SEARCH_NEO_MAX_SESSIONS", "not a number")
-    assert browser_tools._max_sessions() == 4
+    assert browser_tools._max_sessions() == 8
     monkeypatch.delenv("WEB_SEARCH_NEO_MAX_SESSIONS")
-    assert browser_tools._max_sessions() == 4
+    # Eight, not four: a session in the mode agents actually use is one tab of a
+    # Chrome that is already running, and four of them turned five parallel
+    # agents into four working agents and one that could not open a page at all.
+    assert browser_tools._max_sessions() == 8
+    assert browser_tools.DEFAULT_MAX_SESSIONS == 8
 
 
 def test_the_full_session_cap_names_the_setting_that_lifts_it(monkeypatch):

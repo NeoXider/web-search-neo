@@ -49,6 +49,22 @@
         </div>
 
         <div class="setting">
+          <label for="max-sessions"><strong>Parallel sessions</strong></label>
+          <p class="hint">
+            How many tabs the MCP server may drive at once. Each agent working in
+            parallel needs one of these; the default is
+            <span id="max-sessions-default">8</span>. Applies on reconnect.
+            <code>WEB_SEARCH_NEO_MAX_SESSIONS</code> in the server's own
+            environment, if set there, wins over this.
+          </p>
+          <div class="setting-row">
+            <input id="max-sessions" type="number" min="1" max="64" step="1" inputmode="numeric">
+            <button id="save-max-sessions" type="button">Apply</button>
+            <button id="reset-max-sessions" type="button" class="secondary">Default</button>
+          </div>
+        </div>
+
+        <div class="setting">
           <strong>Protocol access</strong>
           <p class="hint" id="cdp-note">
             The companion forwards only the DevTools methods this MCP uses; anything

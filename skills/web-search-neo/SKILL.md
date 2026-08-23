@@ -27,8 +27,9 @@ Two tools only. `web_info` reads state; `web_action` performs 1-32 ordered opera
 One `session_id` controls one page. Reuse it to continue on that page; use a different id
 when a second reference page must remain open. It is also the only boundary between agents
 working at once: subagents share one MCP server, so two that both leave `session_id` at its
-default drive the same tab and navigate each other's page. Pick your own id. `close_all` ends
-every agent's sessions in that server, so close your own `session_id` instead.
+default drive the same tab and navigate each other's page. Pick your own id, and pass
+`agent_label` on `open` so `browser_status` can show who is where. `close_all` closes only
+your own labelled sessions; `scope="all"` ends every agent's work in that server.
 
 For reliable small-model automation, repeat one rigid loop: inspect fresh DOM, act once,
 then verify fresh DOM/text. Tool success proves an event was dispatched, not that the user
@@ -125,7 +126,7 @@ stay reachable, so local services work unchanged.
   `open` on a claimed session does not navigate the user's tab - it takes a new one in the
   group and reports the tab it gave back as `left_claimed_tab`. `close` removes a tab the
   agent opened and leaves a claimed tab open; `close_all` follows the same rule for every
-  session at once.
+  session you own, and reports the other agents' sessions it left running.
 - Another agent may be driving the same Chrome: `attach_tab` on a tab it already holds is
   refused with who holds it. Pick a different tab or open your own; do not retry.
 - Tabs open in the background and nothing steals the user's focus, so they keep working

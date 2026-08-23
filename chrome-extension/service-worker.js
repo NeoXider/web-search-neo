@@ -21,6 +21,16 @@ import {
 
 const DEFAULT_BRIDGE_PORT = 8765;
 const PORT_KEY = "companion_bridge_port";
+// How many browser sessions the MCP server may hold at once. The extension does
+// not enforce this - it cannot, the sessions live in the server - it carries the
+// user's number to a place that can. The hello already describes this browser to
+// the daemon, and the daemon already relays that description to every connected
+// MCP server, so the setting rides the channel that was there rather than
+// needing one of its own.
+const MAX_SESSIONS_KEY = "companion_max_sessions";
+const DEFAULT_MAX_SESSIONS = 8;
+const MAX_SESSIONS_CEILING = 64;
+let maxSessions = DEFAULT_MAX_SESSIONS;
 // The port used to live only in this line, so a server moved off 8765 meant
 // editing an installed extension and reloading it by hand - a source edit as
 // configuration, in the one file a user has no reason to open. It is a setting
@@ -29,6 +39,14 @@ let bridgePort = DEFAULT_BRIDGE_PORT;
 
 function bridgeUrl() {
   return `ws://127.0.0.1:${bridgePort}`;
+}
+
+function normalizeMaxSessions(value) {
+  const count = Number.parseInt(value, 10);
+  // One is the floor because zero would refuse every open and tell the caller to
+  // close something that cannot exist; the ceiling only catches a typo.
+  if (!Number.isFinite(count) || count < 1 || count > MAX_SESSIONS_CEILING) return null;
+  return count;
 }
 
 function normalizePort(value) {
@@ -898,6 +916,31 @@ async function setBridgePort(value) {
   return reconnectNow();
 }
 
+async function loadMaxSessions() {
+  try {
+    const stored = (await chrome.storage.local.get(MAX_SESSIONS_KEY))?.[MAX_SESSIONS_KEY];
+    maxSessions = normalizeMaxSessions(stored) ?? DEFAULT_MAX_SESSIONS;
+  } catch (error) {
+    console.warn("bridge: could not read the session-limit setting", error);
+    maxSessions = DEFAULT_MAX_SESSIONS;
+  }
+  return maxSessions;
+}
+
+async function setMaxSessions(value) {
+  const count = normalizeMaxSessions(value);
+  if (count === null) {
+    throw new Error(`Parallel sessions must be a whole number between 1 and ${MAX_SESSIONS_CEILING}.`);
+  }
+  if (count === maxSessions) return connectionStatus();
+  maxSessions = count;
+  await chrome.storage.local.set({[MAX_SESSIONS_KEY]: count});
+  // The number travels in the hello, and a hello is only sent on connect, so a
+  // change that did not reconnect would sit in storage doing nothing.
+  await resetBackoff();
+  return reconnectNow();
+}
+
 async function loadEnabled() {
   if (!enabledPromise) {
     enabledPromise = Promise.resolve(chrome.storage.local.get(ENABLED_KEY))
@@ -922,6 +965,9 @@ function connectionStatus() {
     bridge_url: bridgeUrl(),
     bridge_port: bridgePort,
     default_bridge_port: DEFAULT_BRIDGE_PORT,
+    max_sessions: maxSessions,
+    default_max_sessions: DEFAULT_MAX_SESSIONS,
+    max_sessions_ceiling: MAX_SESSIONS_CEILING,
     controlled_tabs: attachedTabs.size,
     next_attempt_at: enabled ? backoff.nextAttemptAt || 0 : 0,
     version: chrome.runtime.getManifest().version,
@@ -1256,6 +1302,7 @@ export async function connect() {
         name: "Chrome",
         extension_version: chrome.runtime.getManifest().version,
         browser_run: run,
+        max_sessions: maxSessions,
       },
     }));
   };
@@ -1369,6 +1416,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     operation = detachAllTabs().then(detached_tabs => ({...connectionStatus(), detached_tabs}));
   } else if (type === "companion.setBridgePort") {
     operation = loadEnabled().then(() => setBridgePort(message.port));
+  } else if (type === "companion.setMaxSessions") {
+    operation = loadEnabled().then(() => setMaxSessions(message.max_sessions));
   } else {
     return false;
   }
@@ -1386,6 +1435,7 @@ if (alarmsAvailable) {
 }
 restoreState();
 loadBridgePort()
+  .then(loadMaxSessions)
   .then(loadEnabled)
   .then(active => {
     setBadge(false);

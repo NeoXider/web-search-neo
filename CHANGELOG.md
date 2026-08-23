@@ -1,5 +1,47 @@
 # Changelog
 
+## 1.6.0
+
+A day of real use - about a hundred job applications filed by five agents through one server -
+produced four defects, all of them about several agents sharing one MCP server.
+
+- Raise the default session cap from 4 to 8. Four was chosen when a session meant a Chrome
+  process; in `profile_mode="current"`, which is what agents actually use, a session is one tab
+  of a Chrome that is already running and costs tens of megabytes, not hundreds. In the run
+  above four agents took every slot and the fifth could not open a single page, so it filed
+  nothing at all - a far worse outcome than the memory the low number was protecting. Eight
+  covers an ordinary fan-out with room to spare and still stops a leaking model early. The
+  ceiling stays 64: it exists to catch a typo, and a desktop runs out of memory long before it.
+- Make the cap settable from the companion extension's popup, under Settings next to the bridge
+  port. The number rides in the hello the extension already sends, which the daemon already
+  relays to every connected MCP server, so no new channel was needed. `WEB_SEARCH_NEO_MAX_SESSIONS`
+  in the server's own environment still wins - a number deployed there was said about that
+  server - and the popup hint says so. `browser_status` and `capabilities` report which of the
+  three sources the cap in force came from.
+- Give `close_all` an owner. It used to close every session in the process, which inside one
+  server is every *agent's* session: one subagent tidying up ended four others' work mid-form,
+  and the only defence was a line in every brief telling agents never to call it. It now
+  defaults to `scope="mine"` and closes the sessions carrying the caller's `agent_label` (with
+  no label, the unlabelled ones), always reporting `kept_sessions` and who owns them.
+  `scope="all"` (or `include_foreign=true`) is the old behaviour, kept and explicit. The
+  shutdown hook still closes everything, because at process exit nobody is left to own a tab.
+- Bound perception answers by size, not only by count. `page_elements` had `limit` and `offset`
+  but nothing measuring the answer: 200 controls on a live job board came back as 83,616
+  characters, which the model that asked could not receive at all. `page_elements`, `page_outline`
+  and `find` now take `max_chars` (default 18,000), trim to a prefix, restate `returned` and
+  `range[*].next_offset` so the continuation offset points at the first entry that was not sent,
+  and say what was dropped in `budget_note`. The budget is shared round-robin across the
+  categories, so a page whose buttons matter is not handed an answer made entirely of links.
+  `page_text` and `element_text` already had honest budgets and are unchanged.
+- Let a session say who opened it. `open` and `attach_tab` take an optional `agent_label`;
+  omitting it is not an error. `browser_status` now carries the whole roster - per session the
+  owner label, tab id and group, profile mode, the page it was last seen on, when it was created
+  and last used, idle seconds, and whether another thread is inside it - plus `N of M` occupancy
+  and where the cap came from. It is answered entirely from memory: asking each tab for its URL
+  would mean waiting on the lock its own agent holds, and status is what a stuck run reads first.
+  `capabilities` reports the same occupancy under `limits`, because "8" tells a blocked agent
+  nothing that failing would not have told it, while "0 free" does.
+
 ## 1.5.0
 
 - Key macro recordings by `session_id`. A single shared recording collected every dispatched
