@@ -109,3 +109,89 @@ def test_title_alone_is_enough_for_a_challenge(local_site):
     assert status["challenge_detected"] is True
     assert status["challenge_type"] == "access_challenge"
     assert status["challenge_evidence"] == ["page heading"]
+
+
+# ---------------------------------------------------------------------------
+# the challenge with no box: it blocks the form, not the page
+# ---------------------------------------------------------------------------
+
+
+def _invisible(local_site, session_id: str) -> dict:
+    _open_or_skip(
+        f"{local_site.base_url}/fixtures/challenges/invisible_turnstile.html", session_id
+    )
+    return browser_tools._challenge_status(browser_tools._get_session(session_id).driver)
+
+
+def test_an_invisible_turnstile_is_reported_instead_of_being_walked_past(local_site):
+    """Twelve applications were lost to this page saying nothing was wrong."""
+    status = _invisible(local_site, "challenge-invisible")
+
+    # It is not in the way of reading the page, so it must not park the agent.
+    assert status["challenge_detected"] is False
+    # But it is in the way of the form, and that is now said out loud.
+    assert status["invisible_challenge_pending"] is True
+    invisible = status["invisible_challenge"]
+    assert invisible["vendor"] == "turnstile"
+    assert invisible["state"] == "token_empty"
+    assert any("cf-turnstile-response" in item for item in invisible["evidence"])
+    assert "captcha action" in invisible["hint"]
+
+
+def test_a_minted_token_ends_the_pending_verdict(local_site):
+    session_id = "challenge-invisible-solved"
+    assert _invisible(local_site, session_id)["invisible_challenge_pending"] is True
+    driver = browser_tools._get_session(session_id).driver
+    driver.execute_script("window.solveChallenge();")
+
+    status = browser_tools._challenge_status(driver)
+    assert status["invisible_challenge_pending"] is False
+    assert "invisible_challenge" not in status
+
+
+def test_an_ordinary_page_carries_the_key_without_a_challenge(local_site):
+    _open_or_skip(f"{local_site.base_url}/page", "challenge-clean")
+    status = browser_tools._challenge_status(
+        browser_tools._get_session("challenge-clean").driver
+    )
+    assert status["invisible_challenge_pending"] is False
+
+
+def test_captcha_detect_no_longer_answers_captcha_present_false(local_site):
+    _invisible(local_site, "challenge-invisible-detect")
+    found = browser_tools.solve_captcha(mode="detect", session_id="challenge-invisible-detect")
+    assert found["captcha_present"] is True
+    assert found["invisible_challenge"]["vendor"] == "turnstile"
+
+
+def test_waiting_does_not_call_an_unsolved_invisible_widget_resolved(local_site):
+    _invisible(local_site, "challenge-invisible-wait")
+    waited = browser_tools.wait_for_challenge_resolution(
+        "challenge-invisible-wait", timeout_seconds=0.3, poll_interval_seconds=0.1
+    )
+    assert waited["resolved"] is False
+    assert waited["timed_out"] is True
+
+
+def test_a_click_that_sends_nothing_says_the_challenge_is_why(local_site):
+    """The Workable failure: the button goes busy and no POST is ever made."""
+    _invisible(local_site, "challenge-invisible-click")
+    clicked = browser_tools.click("#send", session_id="challenge-invisible-click")
+
+    assert clicked["success"] is True
+    assert clicked["submit_blocked_by_challenge"] is True
+    assert "no network request" in clicked["submit_block_reason"]
+
+
+def test_a_click_that_does_send_something_is_left_alone(local_site):
+    """The same page, with the token in place and a request actually made."""
+    session_id = "challenge-invisible-click-ok"
+    _invisible(local_site, session_id)
+    driver = browser_tools._get_session(session_id).driver
+    driver.execute_script(
+        "window.solveChallenge();"
+        "document.getElementById('send').addEventListener('click', () =>"
+        " fetch('/uploads', {method: 'POST', body: 'sent'}));"
+    )
+    clicked = browser_tools.click("#send", session_id=session_id)
+    assert "submit_blocked_by_challenge" not in clicked

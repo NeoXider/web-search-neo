@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Compose</title>
+<link rel="icon" href="data:,">
+<style>#body { min-height: 120px; border: 1px solid #ccc; }</style>
+</head>
+<body>
+<h1>Compose</h1>
+<!-- The shape Gmail's body has: a contenteditable box with a textbox role. -->
+<div id="body" contenteditable="true" role="textbox" aria-label="Message body"></div>
+
+<!-- An editor that folds every line break away, the way a single-line rich
+     input does: whatever is typed, the paragraphs collapse into one. -->
+<div id="oneline" contenteditable="true" role="textbox"></div>
+<script>
+  const oneline = document.getElementById('oneline');
+  oneline.addEventListener('blur', function () {
+    const flat = oneline.innerText.replace(/\s*\n+\s*/g, ' ');
+    if (oneline.innerText !== flat) oneline.textContent = flat;
+  });
+</script>
+</body>
+</html>

@@ -510,3 +510,32 @@ def test_the_macro_action_schema_documents_storage_files_and_checking():
     assert "packs" not in notes
     # The one rule that costs a live run when it is not said.
     assert "script" in notes["validate"] and "args" in notes["variables"]
+
+
+def test_the_contract_names_the_three_silent_failures_it_now_reports():
+    """A behaviour nobody documented is a behaviour no model will look for."""
+    skill = asyncio.run(main.web_info("skill", {}))
+    forms = asyncio.run(main.web_info("skill", {"section": "forms"}))
+    rules = " ".join(forms["rules"])
+    assert "invisible_challenge_pending" in rules and "submit_blocked_by_challenge" in rules
+    assert "upload_state=unconfirmed is not a failed upload" in rules
+
+    click_notes = asyncio.run(main.web_info("action_schema", {"action": "click"}))["notes"]
+    assert "submit_blocked_by_challenge" in click_notes["stalled_submit"]
+
+    upload_notes = asyncio.run(main.web_info("action_schema", {"action": "upload"}))["notes"]
+    for state in ("attached", "taken_by_widget", "unconfirmed"):
+        assert state in upload_notes["upload_state"]
+
+    fill_notes = asyncio.run(main.web_info("action_schema", {"action": "fill"}))["notes"]
+    assert "innerText" in fill_notes["contenteditable"]
+    assert "Shift+Enter" in fill_notes["contenteditable"]
+    assert "clipboard.writeText" in fill_notes["contenteditable_limits"]
+    assert "Telegram" in fill_notes["contenteditable_limits"]
+
+    elements = asyncio.run(main.web_info("action_schema", {"action": "page_elements"}))
+    assert "invisible_challenge" in elements["notes"]["invisible_challenge_pending"]
+
+    # The budgets that keep the contract readable are unchanged, not raised.
+    assert len(json.dumps(main._capabilities())) < 14_000
+    assert len(json.dumps(skill)) < 7_000

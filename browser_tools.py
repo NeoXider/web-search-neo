@@ -1333,8 +1333,31 @@ const WIDGETS = [
 const MARKERS = [
   'script[src*="captcha-sdk.awswaf.com"]', 'script[src*="captcha.awswaf.com"]'
 ];
+// A widget of one of these kinds is a real gate even with no box on the screen:
+// the invisible modes of Turnstile, reCAPTCHA and Smart CAPTCHA render exactly
+// this markup and nothing else, and the page's own submit handler waits on the
+// token they are going to mint. The rest of WIDGETS is left out on purpose -
+// a hidden challenge-form or a display:none article widget says nothing.
+const INVISIBLE_CAPABLE = [
+  'div.cf-turnstile', 'iframe[src*="challenges.cloudflare.com"]',
+  'div.g-recaptcha', 'iframe[src*="recaptcha/api2"]',
+  'iframe[src*="recaptcha/enterprise"]',
+  'div.h-captcha', 'iframe[src*="hcaptcha.com"]',
+  '.smart-captcha', 'iframe[src*="captcha-api.yandex"]'
+];
+// The hidden field every vendor mints its token into. It exists only because the
+// widget script ran, and while it is empty the challenge is unsolved - which is
+// the whole state an invisible widget ever shows.
+const TOKEN_FIELDS = [
+  {selector: 'input[name="cf-turnstile-response"]', vendor: 'turnstile'},
+  {selector: 'textarea[name="g-recaptcha-response"], textarea#g-recaptcha-response', vendor: 'recaptcha'},
+  {selector: 'textarea[name="h-captcha-response"], textarea#h-captcha-response', vendor: 'hcaptcha'},
+  {selector: 'input[name="smart-token"], input[name="smartToken"]', vendor: 'smartcaptcha'}
+];
 const found = [];
 const markers = [];
+const hidden = [];
+const tokens = [];
 // The walk used to stop after 8000 nodes, which a marketplace listing page eats
 // before the first shadow root is entered - and nothing said it had stopped, so
 // "no captcha here" and "gave up looking" read the same. Walking 60000 elements
@@ -1436,11 +1459,33 @@ function scan(root, where, atCenter, depth, outerCover) {
     const selector = matchedSelector(element, WIDGETS);
     if (!selector) continue;
     if (selector === '[data-sitekey]' && !isCaptchaSitekey(element)) continue;
-    if (!isVisible(element)) continue;
+    if (!isVisible(element)) {
+      // An invisible widget used to be dropped here, and with it the only trace
+      // of the challenge holding a submit: no box, no error, no report.
+      if (INVISIBLE_CAPABLE.indexOf(selector) >= 0 && hidden.indexOf(selector + where) < 0) {
+        hidden.push(selector + where);
+      }
+      continue;
+    }
     found.push(selector + where);
     const cover = atCenter ? coverOverCenter(element) : 0;
     if (cover > 0 && Math.max(cover, outerCover) >= BLOCKING_COVER) blocking = true;
     if (found.length >= 3) break;
+  }
+  for (const spec of TOKEN_FIELDS) {
+    let fields = [];
+    try { fields = Array.from(root.querySelectorAll(spec.selector)); } catch (error) { fields = []; }
+    for (const field of fields) {
+      const key = spec.vendor + where;
+      if (tokens.some(token => token.key === key)) continue;
+      tokens.push({
+        key: key,
+        vendor: spec.vendor,
+        where: where.trim(),
+        field: String(field.getAttribute('name') || field.id || spec.vendor),
+        filled: String(field.value || '').trim().length > 0
+      });
+    }
   }
   try {
     for (const element of root.querySelectorAll(MARKERS.join(','))) {
@@ -1481,6 +1526,8 @@ const body = (document.body && document.body.innerText) || '';
 return {
   widgets: found,
   markers: markers,
+  hidden_widgets: hidden,
+  tokens: tokens,
   blocking: blocking,
   truncated: budget.truncated,
   heading: heading.slice(0, 400),
@@ -1555,6 +1602,87 @@ def _interstitial_phrase(heading: str, sparse_body: str) -> tuple[str, str] | No
     return None
 
 
+_VENDOR_NAMES = {
+    "turnstile": "Cloudflare Turnstile",
+    "recaptcha": "reCAPTCHA",
+    "hcaptcha": "hCaptcha",
+    "smartcaptcha": "Yandex SmartCaptcha",
+}
+
+# Which invisible widget belongs to which token field, for the case where the
+# widget rendered but its hidden input has not been created yet.
+_HIDDEN_WIDGET_VENDORS = (
+    ("turnstile", ("cf-turnstile", "challenges.cloudflare.com")),
+    ("recaptcha", ("g-recaptcha", "recaptcha/api2", "recaptcha/enterprise")),
+    ("hcaptcha", ("h-captcha", "hcaptcha.com")),
+    ("smartcaptcha", ("smart-captcha", "captcha-api.yandex")),
+)
+
+
+def _invisible_challenge(probe: dict[str, Any]) -> dict[str, Any] | None:
+    """The unsolved challenge that shows no box, or None when there is none.
+
+    An invisible Turnstile is the reason a submit button sticks on "Submitting…"
+    forever: the site's own handler is waiting for a token that will never come
+    while nobody solves the challenge, no request is made, and nothing is logged.
+    The widget is in the DOM and its hidden field is empty - which is exactly
+    what this reports, because that pair is the whole of the evidence.
+    """
+    tokens = [item for item in (probe.get("tokens") or []) if isinstance(item, dict)]
+    hidden = [str(item) for item in (probe.get("hidden_widgets") or [])]
+    unsolved = [item for item in tokens if not item.get("filled")]
+    # A vendor that already minted a token has nothing pending, so the container
+    # it left in the DOM - Turnstile leaves its own, display:none and all - is
+    # not evidence of anything.
+    answered = {
+        str(item.get("vendor"))
+        for item in tokens
+        if item.get("filled")
+    }
+    hidden = [
+        item
+        for item in hidden
+        if not any(
+            vendor in answered and any(needle in item for needle in needles)
+            for vendor, needles in _HIDDEN_WIDGET_VENDORS
+        )
+    ]
+    if unsolved:
+        vendor = str(unsolved[0].get("vendor") or "captcha")
+        evidence = []
+        for item in unsolved[:2]:
+            where = str(item.get("where") or "").strip()
+            evidence.append(f"{item.get('field')} is empty" + (f" {where}" if where else ""))
+        evidence += hidden[:1]
+        state = "token_empty"
+    elif hidden:
+        vendor = next(
+            (
+                name
+                for name, needles in _HIDDEN_WIDGET_VENDORS
+                if any(needle in hidden[0] for needle in needles)
+            ),
+            "captcha",
+        )
+        evidence = hidden[:3]
+        state = "widget_hidden"
+    else:
+        return None
+    label = _VENDOR_NAMES.get(vendor, "A captcha")
+    return {
+        "vendor": vendor,
+        "state": state,
+        "evidence": evidence[:3],
+        "hint": (
+            f"{label} is on this page and no token has been minted yet, so the "
+            "page's own submit handler can wait for one forever: the button "
+            "stays busy, no request is sent, and nothing is logged. Clear it "
+            "with the captcha action (mode='wait' hands it to the person at the "
+            "browser, mode='solve' needs a solver key) and only then submit."
+        ),
+    }
+
+
 def _classify_challenge(probe: dict[str, Any]) -> dict[str, Any]:
     """Turn raw page markers into a challenge verdict.
 
@@ -1570,6 +1698,11 @@ def _classify_challenge(probe: dict[str, Any]) -> dict[str, Any]:
     ``captcha_scan_incomplete`` says the page was too large or too deeply nested
     for the walk to finish, so an empty ``captcha_widgets`` means "nothing found
     where I looked" rather than "there is nothing here".
+
+    ``invisible_challenge_pending`` is the separate verdict for a widget with no
+    box: it blocks the form rather than the page, so it never raises
+    ``challenge_detected``, and staying silent about it is what made a stuck
+    submit unexplainable.
     """
     widgets = [str(item) for item in (probe.get("widgets") or [])]
     markers = [str(item) for item in (probe.get("markers") or [])]
@@ -1579,42 +1712,50 @@ def _classify_challenge(probe: dict[str, Any]) -> dict[str, Any]:
     sparse_body = str(probe.get("body") or "").lower() if interstitial_page else ""
     phrase = _interstitial_phrase(heading, sparse_body)
     incomplete = bool(probe.get("truncated"))
+    invisible = _invisible_challenge(probe)
+
+    def verdict(**fields: Any) -> dict[str, Any]:
+        answer = {
+            **fields,
+            "captcha_scan_incomplete": incomplete,
+            "invisible_challenge_pending": invisible is not None,
+        }
+        if invisible is not None:
+            answer["invisible_challenge"] = invisible
+        return answer
+
     seen = widgets + markers
     if seen:
         if bool(probe.get("blocking")) or interstitial_page or phrase:
-            return {
-                "challenge_detected": True,
-                "challenge_type": "captcha",
-                "challenge_evidence": seen[:3],
-                "manual_action_required": True,
-                "captcha_widgets": seen,
-                "captcha_scan_incomplete": incomplete,
-            }
-        return {
-            "challenge_detected": False,
-            "challenge_type": None,
-            "challenge_evidence": [],
-            "manual_action_required": False,
-            "captcha_widgets": seen,
-            "captcha_scan_incomplete": incomplete,
-        }
+            return verdict(
+                challenge_detected=True,
+                challenge_type="captcha",
+                challenge_evidence=seen[:3],
+                manual_action_required=True,
+                captcha_widgets=seen,
+            )
+        return verdict(
+            challenge_detected=False,
+            challenge_type=None,
+            challenge_evidence=[],
+            manual_action_required=False,
+            captcha_widgets=seen,
+        )
     if phrase:
-        return {
-            "challenge_detected": True,
-            "challenge_type": phrase[0],
-            "challenge_evidence": [phrase[1]],
-            "manual_action_required": True,
-            "captcha_widgets": [],
-            "captcha_scan_incomplete": incomplete,
-        }
-    return {
-        "challenge_detected": False,
-        "challenge_type": None,
-        "challenge_evidence": [],
-        "manual_action_required": False,
-        "captcha_widgets": [],
-        "captcha_scan_incomplete": incomplete,
-    }
+        return verdict(
+            challenge_detected=True,
+            challenge_type=phrase[0],
+            challenge_evidence=[phrase[1]],
+            manual_action_required=True,
+            captcha_widgets=[],
+        )
+    return verdict(
+        challenge_detected=False,
+        challenge_type=None,
+        challenge_evidence=[],
+        manual_action_required=False,
+        captcha_widgets=[],
+    )
 
 
 def _challenge_status(driver: webdriver.Chrome) -> dict[str, Any]:
@@ -2221,7 +2362,12 @@ def wait_for_challenge_resolution(
     timeout_seconds: float = 180.0,
     poll_interval_seconds: float = 0.5,
 ) -> dict[str, Any]:
-    """Wait for a human to clear a visible challenge while keeping the session open."""
+    """Wait for a human to clear a challenge while keeping the session open.
+
+    An unsolved invisible widget counts as unresolved too: its token field being
+    empty is the same wait, and returning "resolved" over it told the caller the
+    form was free to submit when it was not.
+    """
     timeout = max(0.1, float(timeout_seconds))
     poll_interval = max(0.05, min(float(poll_interval_seconds), 2.0))
     session = _get_session(session_id)
@@ -2230,8 +2376,11 @@ def wait_for_challenge_resolution(
     with session.lock:
         while True:
             challenge = _challenge_status(session.driver)
-            challenge_seen = challenge_seen or bool(challenge["challenge_detected"])
-            if not challenge["challenge_detected"]:
+            blocked = bool(challenge["challenge_detected"]) or bool(
+                challenge.get("invisible_challenge_pending")
+            )
+            challenge_seen = challenge_seen or blocked
+            if not blocked:
                 return {
                     **_page_summary(session.driver, session_id),
                     "success": True,
@@ -2322,7 +2471,12 @@ if (tag === 'select') {
 }
 const type = String(element.type || '').toLowerCase();
 if (type === 'checkbox' || type === 'radio') return {kind: 'checked', value: !!element.checked};
-if (element.isContentEditable) return {kind: 'text', type: type, value: element.textContent};
+// innerText, not textContent: textContent runs every paragraph of a rich editor
+// together, so a body written line by line read back as one line and a fill that
+// had worked was reported as refused.
+if (element.isContentEditable) {
+  return {kind: 'text', type: type, editable: true, value: element.innerText};
+}
 return {kind: 'text', type: type, value: element.value === undefined ? '' : element.value};
 """
 
@@ -2407,18 +2561,55 @@ return true;
 """
 
 
+# Shift+Enter, not Enter: a soft break is what every rich editor turns into a new
+# line, and it is the one that cannot send the message. Plain Enter in a chat
+# composer - Telegram, Slack, an intercom widget - submits what is written so
+# far, which turns a half-written letter into a sent one.
+_SOFT_BREAK_KEY = {
+    "key": "Enter",
+    "code": "Enter",
+    "windowsVirtualKeyCode": 13,
+    "nativeVirtualKeyCode": 13,
+    "modifiers": 8,  # Shift
+}
+
+
+def _insert_soft_break(cdp: Any) -> None:
+    """Type one Shift+Enter through the browser's own input pipeline."""
+    cdp(
+        "Input.dispatchKeyEvent",
+        {"type": "keyDown", "text": "\r", "unmodifiedText": "\r", **_SOFT_BREAK_KEY},
+    )
+    cdp("Input.dispatchKeyEvent", {"type": "keyUp", **_SOFT_BREAK_KEY})
+
+
 def _write_contenteditable(
     driver: webdriver.Chrome, element: Any, text: str
 ) -> str:
-    """Replace a contenteditable's text the way an editor expects to be edited."""
+    """Replace a contenteditable's text the way an editor expects to be edited.
+
+    ``Input.insertText`` inserts one text node, and a text node renders '\\n' as a
+    space: a multi-line letter written into Gmail's body arrived as one run-on
+    paragraph. The text is therefore typed a line at a time with a soft break
+    between the lines, which is the edit an editor turns into real paragraphs.
+    """
     driver.execute_script(_CONTENTEDITABLE_SELECT_SCRIPT, element, text)
+    lines = str(text).replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    wanted = "\n".join(lines)
     cdp = getattr(driver, "execute_cdp_cmd", None)
-    if cdp is not None:
-        cdp("Input.insertText", {"text": text})
-    else:
+    if cdp is None:
         element.send_keys(Keys.CONTROL, "a")
-        element.send_keys(text)
-    return text
+        element.send_keys(wanted)
+        return wanted
+    for index, line in enumerate(lines):
+        if index:
+            _insert_soft_break(cdp)
+        # The first insert is what replaces the selected old content, so it runs
+        # even for an empty first line - otherwise clearing an editor left it
+        # holding everything it had.
+        if line or index == 0:
+            cdp("Input.insertText", {"text": line})
+    return wanted
 
 
 # select_by_value *adds* to the selection of a <select multiple>, so a second fill
@@ -2517,6 +2708,13 @@ def _selection_rejection(state: dict[str, Any], requested: Any) -> str | None:
     return None
 
 
+def _line_breaks_folded(actual: str, requested: str) -> bool:
+    """True when the same words came back with the line breaks squeezed out."""
+    if "\n" not in requested or "\n" in actual:
+        return False
+    return " ".join(actual.split()) == " ".join(requested.split())
+
+
 def _field_rejection(state: dict[str, Any], requested: Any) -> str | None:
     """Explain why the control does not hold what was asked, or return None."""
     kind = state.get("kind")
@@ -2545,6 +2743,16 @@ def _field_rejection(state: dict[str, Any], requested: Any) -> str | None:
     actual = "" if state.get("value") is None else str(state.get("value"))
     if _value_taken(actual, str(requested)):
         return None
+    if state.get("editable") and _line_breaks_folded(actual, str(requested)):
+        # The text is all there; only the shape of it was lost. Saying "the
+        # control did not take the value" and nothing else sent callers round
+        # the same retry loop, because retyping folds it exactly the same way.
+        return (
+            "the editor kept every character but folded the line breaks into one "
+            "paragraph. Paste instead: run_script with user_gesture=true and "
+            "navigator.clipboard.writeText(text), then a real Ctrl+V through the "
+            "input action, which is the only path this editor treats as a paste"
+        )
     rejection = f"the field holds '{actual}' instead of '{requested}'"
     hint = _VALUE_FORMATS.get(str(state.get("type") or ""))
     if hint:
@@ -2590,6 +2798,109 @@ def _attach_files(driver: Any, element: Any, paths: list[str]) -> list[str]:
     element.send_keys("\n".join(paths))
     after = driver.execute_script(_FILE_INPUT_STATE_SCRIPT, element) or {}
     return [str(name) for name in (after.get("names") or [])]
+
+
+# A Dropzone-style widget takes the file off the input the instant it gets it and
+# uploads it itself, so the input is empty a millisecond later. Reading the input
+# back is still the right first question - it is exact when it answers - but an
+# empty one is not an answer at all, and calling it a failure sent a resume that
+# was already on S3 back round the loop as "upload failed".
+_UPLOAD_TRACE_SCRIPT = """
+const names = arguments[0];
+const text = ((document.body && document.body.innerText) || '');
+const values = Array.from(document.querySelectorAll('input, textarea'))
+  .map(node => String(node.value || '')).join(' ');
+const attributes = Array.from(document.querySelectorAll('[title], [data-filename], [aria-label]'))
+  .slice(0, 400)
+  .map(node => [node.getAttribute('title'), node.getAttribute('data-filename'),
+                node.getAttribute('aria-label')].join(' ')).join(' ');
+const haystack = text + ' ' + values + ' ' + attributes;
+const seen = [];
+for (const name of names) {
+  if (name && haystack.indexOf(name) >= 0) seen.push(name);
+}
+return seen;
+"""
+
+# How long the widget is given to show the file it has just swallowed. A dropzone
+# renders its chip in one frame; the network request behind it can take longer,
+# and waiting for that is the caller's job, not this one's.
+_UPLOAD_TRACE_SECONDS = 2.0
+
+
+def _upload_evidence(
+    session: BrowserSession, names: list[str], started_ms: float
+) -> list[str]:
+    """Signs that the page accepted files an input no longer holds.
+
+    Two independent ones: the file's own name turning up in the page, and a
+    request the page made after the attach. Either is enough - a widget that
+    shows a chip has taken the file, and a widget that posts has sent it.
+    """
+    driver = session.driver
+    deadline = time.monotonic() + _UPLOAD_TRACE_SECONDS
+    evidence: list[str] = []
+    while True:
+        try:
+            shown = [str(item) for item in (driver.execute_script(_UPLOAD_TRACE_SCRIPT, names) or [])]
+        except Exception:
+            shown = []
+        evidence = [f"the page now shows '{name}'" for name in shown]
+        posts = [
+            row
+            for row in _requests_since(session, started_ms)
+            if str(row.get("method") or "GET").upper() in {"POST", "PUT", "PATCH"}
+        ]
+        if posts:
+            evidence.append(
+                f"the page made {len(posts)} upload-shaped request(s) after the attach, "
+                f"first {str(posts[0].get('method'))} {str(posts[0].get('url'))[:120]}"
+            )
+        if evidence or time.monotonic() >= deadline:
+            return evidence
+        time.sleep(0.2)
+
+
+def _attach_and_confirm(
+    session: BrowserSession, element: Any, paths: list[str]
+) -> dict[str, Any]:
+    """Attach files and say, honestly, what became of them.
+
+    ``state`` is one of ``attached`` (the input holds them, which is exact),
+    ``taken_by_widget`` (the input was emptied and the page shows the file
+    anyway) or ``unconfirmed`` (the input is empty and nothing else vouches for
+    it). ``unconfirmed`` is deliberately not a failure: on this evidence nobody
+    can tell the two apart, and the caller is told how to look.
+    """
+    started_ms = time.time() * 1000
+    names = _attach_files(session.driver, element, paths)
+    wanted = [Path(path).name for path in paths]
+    if len(names) == len(paths):
+        return {"names": names, "state": "attached", "evidence": []}
+    evidence = _upload_evidence(session, wanted, started_ms)
+    if evidence:
+        return {
+            "names": names or wanted,
+            "state": "taken_by_widget",
+            "evidence": evidence,
+            "note": (
+                "The input is empty because the upload widget took the file off it "
+                "and is sending it itself; the page shows the file, so the attach "
+                "worked. Names are the ones handed over, not read back."
+            ),
+        }
+    return {
+        "names": names,
+        "state": "unconfirmed",
+        "evidence": [],
+        "note": (
+            "The input is empty and nothing on the page names the file yet, so "
+            "whether it was accepted cannot be told from here - this is not proof "
+            "it failed. Look with page_text or elements for the file name or an "
+            "error next to the field, and with the network topic for the upload "
+            "request, before attaching it again."
+        ),
+    }
 
 
 def _held_value(state: dict[str, Any]) -> Any:
@@ -2706,6 +3017,8 @@ def fill_fields(
     session = _get_session(session_id)
     filled: list[str] = []
     uploaded: dict[str, list[str]] = {}
+    upload_states: dict[str, str] = {}
+    upload_notes: dict[str, str] = {}
     values: dict[str, Any] = {}
     errors: dict[str, str] = {}
     with session.lock:
@@ -2790,7 +3103,11 @@ def fill_fields(
                 if not path.is_file():
                     raise ValueError("Upload path is not a file")
                 element = _resolve_element(driver, selector)
-                uploaded[selector] = _attach_files(driver, element, [str(path)])
+                outcome = _attach_and_confirm(session, element, [str(path)])
+                uploaded[selector] = outcome["names"]
+                if outcome["state"] != "attached":
+                    upload_states[selector] = outcome["state"]
+                    upload_notes[selector] = outcome["note"]
             except Exception as exc:
                 errors[selector] = _brief_error(exc)
             finally:
@@ -2799,7 +3116,7 @@ def fill_fields(
 
         if frame_selector:
             _leave_element_frame(driver)
-        return {
+        answer = {
             **_page_summary(driver, session_id),
             "success": not errors,
             "filled": filled,
@@ -2808,6 +3125,12 @@ def fill_fields(
             "errors": errors,
             "frame_selector": frame_selector,
         }
+        if upload_states:
+            # Only when an input did not simply keep its files: the ordinary
+            # upload says everything it needs to in files_uploaded.
+            answer["upload_states"] = upload_states
+            answer["upload_notes"] = upload_notes
+        return answer
 
 
 def _wait_after_action(driver: webdriver.Chrome, wait_seconds: float) -> None:
@@ -2894,6 +3217,7 @@ def click(
         )
     session = _get_session(session_id)
     with session.lock:
+        started_ms = time.time() * 1000
         _enter_action_frame(session.driver, frame_selector, selector)
         try:
             if selector_must_be_unique:
@@ -2937,14 +3261,18 @@ def click(
             # the settle, the page summary - is about the page as a whole.
             _release_action_frame(session.driver, frame_selector, selector)
         _wait_after_action(session.driver, wait_seconds)
-        return {
-            **_page_summary(session.driver, session_id),
-            "success": True,
-            "clicked": selector,
-            "frame_selector": frame_selector,
-            "trusted": trusted,
-            "selector_must_be_unique": selector_must_be_unique,
-        }
+        return _note_stalled_submit(
+            session,
+            {
+                **_page_summary(session.driver, session_id),
+                "success": True,
+                "clicked": selector,
+                "frame_selector": frame_selector,
+                "trusted": trusted,
+                "selector_must_be_unique": selector_must_be_unique,
+            },
+            started_ms,
+        )
 
 
 _ELEMENT_CENTER_SCRIPT = """
@@ -3146,6 +3474,7 @@ def click_text(
     session = _get_session(session_id)
     with session.lock:
         driver = session.driver
+        started_ms = time.time() * 1000
         frame_map, viewport = _pointer_context(driver, frame_selector)
         try:
             _select_frame(driver, frame_selector, css_only=True)
@@ -3178,17 +3507,21 @@ def click_text(
         )
         _auto_advance_render_after_input(session)
         _wait_after_action(driver, wait_seconds)
-        return {
-            **_page_summary(driver, session_id),
-            **result,
-            "success": True,
-            "matched_text": match.get("text", ""),
-            "matched_role": match.get("role", ""),
-            "matched_selector": match.get("selector", ""),
-            "hit_test_unavailable": bool(match.get("hit_test_unavailable")),
-            "exact": bool(exact),
-            "frame_selector": frame_selector,
-        }
+        return _note_stalled_submit(
+            session,
+            {
+                **_page_summary(driver, session_id),
+                **result,
+                "success": True,
+                "matched_text": match.get("text", ""),
+                "matched_role": match.get("role", ""),
+                "matched_selector": match.get("selector", ""),
+                "hit_test_unavailable": bool(match.get("hit_test_unavailable")),
+                "exact": bool(exact),
+                "frame_selector": frame_selector,
+            },
+            started_ms,
+        )
 
 
 _KEY_ALIASES = {
@@ -4083,6 +4416,89 @@ def get_console(
         }
 
 
+def _drain_network_rows(session: BrowserSession) -> tuple[list[dict[str, Any]], int]:
+    """Every recorded request of this session, newest history kept bounded.
+
+    The caller holds ``session.lock``. Both backends are folded here because two
+    readers now need the capture - the network topic and the stalled-submit
+    check - and they must not disagree about what the page did.
+    """
+    driver = session.driver
+    if hasattr(driver, "get_events"):
+        # The tab subscribed when it opened; this only repairs a subscription
+        # that failed then. It can never recover traffic from before it runs,
+        # which is why it cannot be the only place capture is turned on. A
+        # stand-in driver that does not track the flag is already capturing.
+        if not getattr(driver, "events_subscribed", True):
+            driver.subscribe_events(["console", "network"])
+        payload = driver.get_events(kinds=["network"], since_seq=0, limit=500)
+        return list(payload.get("entries") or []), int(
+            (payload.get("dropped") or {}).get("network") or 0
+        )
+    session.network_rows.extend(
+        diagnostics.selenium_network_rows(driver, session.network_pending)
+    )
+    overflow = len(session.network_rows) - 500
+    if overflow > 0:
+        del session.network_rows[:overflow]
+        session.network_dropped += overflow
+    return list(session.network_rows), session.network_dropped
+
+
+def _requests_since(session: BrowserSession, started_ms: float) -> list[dict[str, Any]]:
+    """The requests the page started after ``started_ms`` (epoch milliseconds).
+
+    A request still in flight counts: on the Selenium backend it sits in the
+    pending map until its last log entry arrives, and "the POST has not finished
+    yet" is the opposite of "no POST was ever made".
+    """
+    try:
+        rows, _ = _drain_network_rows(session)
+    except Exception:
+        # The capture is a diagnostic. Losing it must never turn into a failed
+        # click, so an unreadable log simply says nothing about what happened.
+        return []
+    fresh = [row for row in rows if float(row.get("ts") or 0) >= started_ms]
+    for row in list((getattr(session, "network_pending", None) or {}).values()):
+        if float(row.get("ts") or 0) >= started_ms:
+            fresh.append(row)
+    return fresh
+
+
+# How long a click is given to produce a request before silence is worth naming.
+# Below this a fast page has simply not got round to it yet.
+_SUBMIT_SILENCE_SECONDS = 0.4
+
+
+def _note_stalled_submit(
+    session: BrowserSession, result: dict[str, Any], started_ms: float
+) -> dict[str, Any]:
+    """Name the invisible challenge when a click produced no request at all.
+
+    This is the Workable failure exactly: the button turns into "Submitting…",
+    no POST is ever made, the console stays clean, and every retry looks the
+    same. The two facts that explain it - an unsolved widget in the DOM and a
+    network log with nothing new in it - are both already here, so the answer
+    says so instead of leaving the caller to wait it out twelve times.
+    """
+    if not result.get("invisible_challenge_pending"):
+        return result
+    if (time.time() * 1000 - started_ms) < _SUBMIT_SILENCE_SECONDS * 1000:
+        return result
+    if _requests_since(session, started_ms):
+        return result
+    invisible = result.get("invisible_challenge") or {}
+    vendor = _VENDOR_NAMES.get(str(invisible.get("vendor")), "A captcha")
+    result["submit_blocked_by_challenge"] = True
+    result["submit_block_reason"] = (
+        f"The click sent no network request at all, and {vendor} is on the page "
+        "with an empty token field. A submit handler waiting for that token "
+        "never fires and never errors, so clicking again changes nothing: clear "
+        "the challenge with the captcha action first."
+    )
+    return result
+
+
 def get_network(
     session_id: str = "default",
     url_pattern: str | None = None,
@@ -4107,27 +4523,7 @@ def get_network(
     """
     session = _get_session(session_id)
     with session.lock:
-        driver = session.driver
-        if hasattr(driver, "get_events"):
-            # The tab subscribed when it opened; this only repairs a subscription
-            # that failed then. It can never recover traffic from before it runs,
-            # which is why it cannot be the only place capture is turned on. A
-            # stand-in driver that does not track the flag is already capturing.
-            if not getattr(driver, "events_subscribed", True):
-                driver.subscribe_events(["console", "network"])
-            payload = driver.get_events(kinds=["network"], since_seq=0, limit=500)
-            rows = list(payload.get("entries") or [])
-            dropped = int((payload.get("dropped") or {}).get("network") or 0)
-        else:
-            session.network_rows.extend(
-                diagnostics.selenium_network_rows(driver, session.network_pending)
-            )
-            overflow = len(session.network_rows) - 500
-            if overflow > 0:
-                del session.network_rows[:overflow]
-                session.network_dropped += overflow
-            rows = list(session.network_rows)
-            dropped = session.network_dropped
+        rows, dropped = _drain_network_rows(session)
         selected = diagnostics.filter_network(
             rows, url_pattern, types, status_min, status_max, only_errors, limit
         )
@@ -4405,7 +4801,11 @@ def solve_captcha(
     session = _get_session(session_id)
     with session.lock:
         status = _challenge_status(session.driver)
-    if not status.get("challenge_detected") and not status.get("captcha_widgets"):
+    if (
+        not status.get("challenge_detected")
+        and not status.get("captcha_widgets")
+        and not status.get("invisible_challenge_pending")
+    ):
         return {"success": True, "session_id": session_id, "captcha_present": False, **status}
     if mode == "detect":
         return {"success": True, "session_id": session_id, "captcha_present": True, **status}
@@ -7477,6 +7877,12 @@ def upload_file(
 
     ``frame_selector`` names the frame the selector is looked up in, exactly as it
     does for ``find`` and ``page_text``.
+
+    ``upload_state`` says how far the evidence goes: ``attached`` (the input
+    holds the files), ``taken_by_widget`` (a Dropzone-style widget emptied the
+    input but the page shows the file) or ``unconfirmed`` (nothing vouches for it
+    either way - which is not the same as a refusal, and ``note`` says how to
+    check). ``success`` is false only when the attach itself failed.
     """
     if not file_paths:
         raise ValueError("file_paths must not be empty")
@@ -7491,17 +7897,24 @@ def upload_file(
         _enter_action_frame(session.driver, frame_selector, selector)
         try:
             element = _resolve_element(session.driver, selector)
-            attached = _attach_files(session.driver, element, resolved)
+            outcome = _attach_and_confirm(session, element, resolved)
         finally:
             _release_action_frame(session.driver, frame_selector, selector)
-        return {
+        attached = outcome["names"]
+        answer = {
             **_page_summary(session.driver, session_id),
-            "success": len(attached) == len(resolved),
+            "success": True,
             "selector": selector,
             "files_uploaded": {selector: attached},
             "file_names": attached,
+            "upload_state": outcome["state"],
             "frame_selector": frame_selector,
         }
+        if outcome["state"] != "attached":
+            answer["input_cleared_by_widget"] = outcome["state"] == "taken_by_widget"
+            answer["acceptance_evidence"] = outcome["evidence"]
+            answer["note"] = outcome["note"]
+        return answer
 
 
 def _reset_session_runtime_state(session: BrowserSession) -> None:

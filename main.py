@@ -25,7 +25,7 @@ import msp_search
 from web_client import request
 
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 PROJECT_DIR = Path(__file__).resolve().parent
 log = logging.getLogger("web_search_neo")
@@ -2211,6 +2211,8 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
             "Only a <select multiple> takes a list. Checkboxes take 1/yes/on/check or 0/no/off/uncheck. Date, time, range, and colour are set rather than typed, so a bad format is refused untouched.",
             "fill blurs each control it writes, so focus ends on the body: a following press_keys needs target_selector; submit needs no focus.",
             "challenge_detected means a challenge is blocking the page. Use the captcha action; never hammer clicks. captcha_widgets lists ones merely present and can be ignored.",
+            "invisible_challenge_pending=true, or submit_blocked_by_challenge on a click, means a captcha with no box holds the form: the button sticks on 'Submitting…', nothing is sent and nothing is logged. Clear it with the captcha action; retrying or a new session changes nothing.",
+            "upload_state=unconfirmed is not a failed upload: check the page for the file name and network for the request before attaching again. taken_by_widget means it worked and the widget emptied the input.",
             "A heading like 'answer questions' is boilerplate. Only live enabled controls are questions.",
         ],
         "avoid": [
@@ -2441,6 +2443,11 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
                 "fix": "Use the captcha action. mode='wait' hands the visible browser to the user and returns when it clears.",
             },
             {
+                "symptom": "The submit button says 'Submitting…' forever and no request is ever made.",
+                "cause": "An invisible captcha is waiting for a token; the page's own handler waits with it, silently.",
+                "fix": "Look for invisible_challenge_pending or submit_blocked_by_challenge in the answer, clear it with the captcha action, then click once more.",
+            },
+            {
                 "symptom": "A screenshot times out in current Chrome.",
                 "cause": "Chrome is not painting an obscured background window.",
                 "fix": "Nothing. DOM reads and pointer actions still work; do not call show unless the user asked to watch.",
@@ -2551,14 +2558,16 @@ _ACTION_NOTES = {
         "multi_select": "A <select multiple> reads back as a list and only it takes a list of values; a scalar replaces its whole selection rather than adding to it.",
         "sanitisation": "The browser's own tidying is accepted - trimmed whitespace on email/url, CRLF, a handler's case folding - while maxlength truncation and a rewritten value still fail.",
         "typed_controls": "date/time/datetime-local/month/week/range/color are set, not typed: an unparseable value is refused without touching the control and the error names the format.",
-        "contenteditable": "TipTap/ProseMirror/Slate/Quill editors are written like a real edit: the whole content is selected and the text inserted through the browser's input channel, so the editor's own model updates and its change handler fires. The read-back is the editor's textContent.",
-        "files": "A file input is refused in fields; pass files={selector: path}, which replaces the input's selection rather than adding to it.",
+        "contenteditable": "TipTap/ProseMirror/Slate/Quill and Gmail's body are written as a real edit: the content is selected and typed in through the browser's input channel, a line at a time with a soft break (Shift+Enter - never Enter, which sends in a chat composer) between them, so paragraphs survive. The read-back is innerText.",
+        "contenteditable_limits": "An editor that folds the breaks anyway is named as such in errors; the fix is a real paste - run_script with user_gesture=true and navigator.clipboard.writeText(text), then Ctrl+V through input. Telegram Web (#editable-message-text, Teact) never updates its own state from a write at all - its send button stays a microphone - so paste there always.",
+        "files": "A file input is refused in fields; pass files={selector: path}, which replaces the input's selection rather than adding to it. upload_states/upload_notes appear when a widget emptied the input; they mean what upload's upload_state means.",
         "blur": "Every control written is blurred, which is how the last field fires its change event - so focus ends on the body and a following press_keys needs target_selector to reach a field.",
         "frame_selector": _FRAME_ANY,
     },
     "upload": {
         "replaces": "The input is cleared first: this sets its selection to exactly file_paths. Two files means one call with two paths; a second call discards the first file.",
         "files_uploaded": "{selector: [names]}, read back off the input - the same shape fill returns.",
+        "upload_state": "attached = the input holds the files. taken_by_widget = a Dropzone-style widget emptied the input and the page names the file or posted it, so it worked. unconfirmed = nothing vouches either way; that is not a refusal, so read note, check page_text/elements for the name and network for the request before attaching again. success is false only when the attach itself failed.",
         "frame_selector": _FRAME_ANY,
     },
     "submit": {
@@ -2572,6 +2581,7 @@ _ACTION_NOTES = {
         "choice": "Provide exactly one target: selector (CSS, ref handle, or 'a >>> b' piercing path) for the element, text with role for a strict rendered-text match that refuses ambiguity, or x+y for a viewport CSS-pixel point. In current Chrome a CSS selector must be plain CSS, never ref: or >>>.",
         "text": "text clicks the one visible interactive element whose rendered text matches; role narrows by ARIA role and exact=false switches to substring matching. Zero or several matches are refused with samples, so narrow with role or selector rather than retrying.",
         "coords": "x/y click the viewport point in CSS pixels, useful for image-guided clicks from a fresh screenshot. Scale image pixels to reported viewport width/height and recapture after any layout change.",
+        "stalled_submit": "submit_blocked_by_challenge=true means the click produced no network request at all while an unsolved invisible captcha sits on the page: clicking again cannot help, clear it with the captcha action first.",
         "trusted": "trusted=true sends a real trusted mouse sequence at the element's centre (scrolled into view first), so pages that require isTrusted events or read pointer position behave as if a user clicked. Use it when a synthetic click is ignored. It lands on whatever is at that point, like a human pointer.",
         "no_box": "trusted=true needs a visible box; an element with zero size refuses with a clear error instead of falling back silently.",
         "frame_selector": _FRAME_ANY,
@@ -2604,6 +2614,7 @@ _ACTION_NOTES = {
         "scope": "Always the whole page: this topic takes no frame_selector, and it is the only read topic reporting challenge_detected/captcha_widgets.",
         "duplicates": "For repeated labels, compare each returned link href or stable value/attribute. Never choose by array index or nth-child alone.",
         "captcha_scan_incomplete": "true means the captcha walk stopped early, so an empty captcha_widgets is not proof there is none. Every page summary carries this key.",
+        "invisible_challenge_pending": "true means a captcha with no box - an invisible Turnstile and the like - is on the page with an empty token field. It blocks the form, not the page, so challenge_detected stays false; invisible_challenge names the vendor and the evidence. Clear it with the captcha action before submitting. Every page summary carries this key too.",
         "contenteditable": "Only [contenteditable=\"true\"] is listed; a bare contenteditable attribute is a field to page_outline and invisible here.",
         "pagination": "The whole existing DOM is counted before each category is sliced. Use offset plus limit, then follow range.<category>.next_offset until null; reread after scrolling a lazy/infinite page.",
         "limits": "limit is clamped to 1000 per top-level category and offset to 0-20000. collector_truncated.<category>=true means the 20000-item safety cap was hit and found is only the collected prefix. include_forms=false also omits fields.",
@@ -2798,7 +2809,7 @@ _PITFALLS = [
     "Selectors and screenshots die when the page changes; reread or recapture after navigation, rerender, scroll, zoom, resize, or animation.",
     "In current Chrome every action locator is plain CSS: never send ref: from page_outline or >>> to click/fill/wait/upload/submit/input. Other modes accept them only where action_schema says so; refs expire after rerender/navigation.",
     "Repeated text is not identity: compare the exact href/value/stable attribute from a fresh page_elements read, or use click_text with exact text plus role (it refuses ambiguity); never array index or nth-child alone.",
-    "challenge_detected means a CAPTCHA is in the way: use captcha, never hammer clicks. captcha_widgets lists ones merely present; ignore those.",
+    "challenge_detected means a CAPTCHA is in the way: use captcha, never hammer clicks. captcha_widgets lists ones merely present; ignore those. invisible_challenge_pending is the one with no box: it holds the form, so a submit hangs with no request and no error until captcha clears it.",
     "find low_confidence=true means it is guessing: re-query with other words or a role, do not click matches[0].",
     "profile_mode=current drives the user's real Chrome; close closes a tab the agent opened and leaves an attach_tab tab open.",
     "Parallel agents must each choose their own session_id: subagents share one MCP server, so two on the default drive one tab and navigate each other's page - browser_status reports shared_session. Pass agent_label on open so browser_status can say who is where, and so close_all (scope='mine' by default) ends only your own sessions; scope='all' still ends everybody's.",

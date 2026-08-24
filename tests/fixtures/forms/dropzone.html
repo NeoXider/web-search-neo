@@ -1,0 +1,41 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Dropzone attachments</title>
+<link rel="icon" href="data:,"></head>
+<body>
+<h1>Dropzone attachments</h1>
+<p>Every input here empties itself the moment it is given a file, which is what
+Teamtailor, Dropzone and every other widget that uploads on its own behalf does.
+Reading the files back off the input therefore says nothing at all.</p>
+
+<!-- Takes the file and shows a chip with its name: accepted, visibly. -->
+<input id="chip" name="chip" type="file">
+<div id="chips"></div>
+
+<!-- Takes the file and posts it without ever naming it on the page. -->
+<input id="poster" name="poster" type="file">
+
+<!-- Takes the file and shows nothing whatsoever: nobody can tell from here. -->
+<input id="silent" name="silent" type="file">
+
+<script>
+  document.getElementById('chip').addEventListener('change', function (event) {
+    const name = event.target.files[0] ? event.target.files[0].name : '';
+    event.target.value = '';
+    const chip = document.createElement('div');
+    chip.className = 'chip';
+    chip.textContent = name;
+    document.getElementById('chips').appendChild(chip);
+  });
+  document.getElementById('poster').addEventListener('change', function (event) {
+    const body = new FormData();
+    body.append('file', event.target.files[0]);
+    event.target.value = '';
+    fetch('/uploads', {method: 'POST', body: body});
+  });
+  document.getElementById('silent').addEventListener('change', function (event) {
+    event.target.value = '';
+  });
+</script>
+</body>
+</html>

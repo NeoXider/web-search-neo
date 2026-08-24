@@ -1,0 +1,38 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Apply for this role</title>
+  <link rel="icon" href="data:,">
+  <style>.cf-turnstile { display: none; }</style>
+</head>
+<body>
+<h1>Apply for this role</h1>
+<p>This page is a job application form of the kind that hangs forever. The
+challenge on it has no box, no checkbox and no picture: the widget script has
+rendered nothing a person can see, and the only trace of it is the container it
+left behind and the hidden field its token would go into. Everything else on the
+page is ordinary editorial content, long enough that the page is plainly not an
+interstitial, because a detector that treats this as a blocking challenge is as
+wrong as one that says there is no challenge here at all. The submit button
+below behaves exactly like the real one: it goes busy and nothing is ever
+sent.</p>
+<form id="application">
+  <input id="candidate" name="candidate" type="text">
+  <div class="cf-turnstile" data-sitekey="0x000000000000000000"></div>
+  <input type="hidden" name="cf-turnstile-response" value="">
+  <button id="send" type="button">Submit application</button>
+</form>
+<script>
+  document.getElementById('send').addEventListener('click', function () {
+    // The real widget's callback never fires, so the handler waits forever:
+    // no request, no error, no console output. This is the whole defect.
+    this.textContent = 'Submitting…';
+    this.disabled = true;
+  });
+  window.solveChallenge = function () {
+    document.querySelector('input[name="cf-turnstile-response"]').value = 'token-from-a-human';
+  };
+</script>
+</body>
+</html>

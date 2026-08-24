@@ -160,9 +160,19 @@ and has its whole selection replaced by a scalar. Date, time, range and colour c
 set rather than typed, so an unparseable value is refused without touching the control and
 the error names the format. `upload`, and `fill`'s `files` key, *replace* an input's
 selection instead of adding to it. Rich-text editors (`contenteditable`, e.g. TipTap,
-ProseMirror, Slate, Quill) are written as a real edit — the whole content is selected and
-the text inserted through the browser's input channel — so the editor's own model updates
-and its change handler fires; the read-back is the editor's `textContent`.
+ProseMirror, Slate, Quill, Gmail's body) are written as a real edit — the content is
+selected and typed in through the browser's input channel, a line at a time with a soft
+break (Shift+Enter, never Enter, which sends in a chat composer) between the lines, so
+paragraphs survive; the read-back is `innerText`. An editor that folds the breaks away
+anyway is named as such in `errors`, and the way through is a real paste: `run_script` with
+`user_gesture=true` and `navigator.clipboard.writeText(text)`, then `Ctrl+V` through
+`input`. Telegram Web (`#editable-message-text`, Teact) never updates its own state from a
+write — the send button stays a microphone — so paste there always.
+`upload` reports `upload_state`: `attached` (the input holds the files), `taken_by_widget`
+(a Dropzone-style widget emptied the input, and the page names the file or posted it) or
+`unconfirmed` (nothing vouches either way — read `note`, check the page and the `network`
+topic, and do not re-attach on this evidence alone). `success` is false only when the attach
+itself failed; `fill`'s `files` says the same in `upload_states`.
 `fill`, `click`, `submit`, `upload` and `wait` accept `frame_selector`; `wait`'s
 `timeout_seconds` defaults to 10 and is respected as passed — ask for as long as
 the target needs.
@@ -170,7 +180,13 @@ the target needs.
 it, covering at least half the viewport over the centre, so a dismissible modal with a
 captcha in it does not count. `captcha_widgets` lists captchas that are merely present,
 which you can ignore, and `captcha_scan_incomplete: true` means the walk stopped early, so
-an empty list is not proof of absence. All ride on page summaries — `open`, `fill`, `click`,
+an empty list is not proof of absence. `invisible_challenge_pending: true` is the captcha
+with no box — an invisible Turnstile whose token field is still empty. It blocks the *form*,
+not the page, so `challenge_detected` stays false while the submit button sits on
+"Submitting…" and nothing is ever sent; `invisible_challenge` names the vendor and the
+evidence, a `click` that made no request while it is pending answers with
+`submit_blocked_by_challenge`, and only the `captcha` action clears it — retrying, `stealth`
+and a fresh session do not. All ride on page summaries — `open`, `fill`, `click`,
 `submit`, `upload`, `wait_challenge` and the `page_elements` topic — and not on
 `page_outline`, `page_text` or `find`, which build no summary.
 
@@ -373,7 +389,8 @@ waits otherwise.
 A solved token is not a submitted form: some sites submit from the widget's own callback and
 some wait for the button, so re-read the page and submit if it did not. A captcha with no
 sitekey — an image or a behavioural check — cannot be sent to a service at all and has to be
-cleared in the page.
+cleared in the page. `mode=detect` also reports the invisible widget that shows no box, and
+`mode=wait` no longer calls it cleared while its token field is empty.
 
 ## Requests, headers, and staying unremarkable
 

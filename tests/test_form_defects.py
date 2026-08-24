@@ -662,3 +662,134 @@ def test_the_submit_probe_leaves_no_trace_of_itself_in_the_page(local_site):
     assert result["submit_event_fired"] is True  # the watcher really did run
     assert driver.execute_script("return Object.keys(sessionStorage);") == []
     assert driver.execute_script("return Object.keys(window);") == before
+
+
+# ---------------------------------------------------------------------------
+# a widget that empties the input is not an upload that failed
+# ---------------------------------------------------------------------------
+
+
+def test_a_dropzone_that_clears_the_input_is_not_reported_as_a_failure(
+    local_site, tmp_path
+):
+    """The file was on S3 and the chip was on the screen; the answer said false."""
+    _open_or_skip(_form(local_site, "dropzone.html"), "defect-dropzone-chip")
+    resume = tmp_path / "viktor-cv.txt"
+    resume.write_text("cv")
+
+    result = browser_tools.upload_file(
+        "#chip", [str(resume)], session_id="defect-dropzone-chip"
+    )
+
+    assert result["success"] is True
+    assert result["upload_state"] == "taken_by_widget"
+    assert result["input_cleared_by_widget"] is True
+    assert result["file_names"] == ["viktor-cv.txt"]
+    assert any("viktor-cv.txt" in item for item in result["acceptance_evidence"])
+
+
+def test_an_upload_request_counts_even_when_the_page_never_names_the_file(
+    local_site, tmp_path
+):
+    _open_or_skip(_form(local_site, "dropzone.html"), "defect-dropzone-post")
+    resume = tmp_path / "quiet-cv.txt"
+    resume.write_text("cv")
+
+    result = browser_tools.upload_file(
+        "#poster", [str(resume)], session_id="defect-dropzone-post"
+    )
+
+    assert result["upload_state"] == "taken_by_widget"
+    assert any("request" in item for item in result["acceptance_evidence"])
+
+
+def test_an_upload_nobody_can_vouch_for_says_so_instead_of_claiming_failure(
+    local_site, tmp_path
+):
+    _open_or_skip(_form(local_site, "dropzone.html"), "defect-dropzone-silent")
+    resume = tmp_path / "silent-cv.txt"
+    resume.write_text("cv")
+
+    result = browser_tools.upload_file(
+        "#silent", [str(resume)], session_id="defect-dropzone-silent"
+    )
+
+    assert result["upload_state"] == "unconfirmed"
+    assert result["input_cleared_by_widget"] is False
+    assert result["acceptance_evidence"] == []
+    assert "cannot be told from here" in result["note"]
+    assert "not proof" in result["note"]
+
+
+def test_an_ordinary_input_still_answers_with_what_it_holds(local_site, tmp_path):
+    _open_or_skip(_form(local_site, "upload_many.html"), "defect-upload-plain-state")
+    sample = tmp_path / "cv.txt"
+    sample.write_text("cv")
+
+    result = browser_tools.upload_file(
+        "#one", [str(sample)], session_id="defect-upload-plain-state"
+    )
+    assert result["upload_state"] == "attached"
+    assert "note" not in result
+    assert result["file_names"] == ["cv.txt"]
+
+
+def test_fill_reports_the_widget_that_swallowed_its_file(local_site, tmp_path):
+    _open_or_skip(_form(local_site, "dropzone.html"), "defect-dropzone-fill")
+    resume = tmp_path / "filled-cv.txt"
+    resume.write_text("cv")
+
+    result = browser_tools.fill_fields(
+        {}, files={"#chip": str(resume)}, session_id="defect-dropzone-fill"
+    )
+
+    assert result["success"] is True
+    assert result["upload_states"] == {"#chip": "taken_by_widget"}
+    assert result["files_uploaded"] == {"#chip": ["filled-cv.txt"]}
+
+
+# ---------------------------------------------------------------------------
+# a letter written into a rich editor keeps its paragraphs
+# ---------------------------------------------------------------------------
+
+
+LETTER = "Здравствуйте!\n\nМеня зовут Виктор.\nUnity, 7 лет.\n\nВиктор"
+
+
+def test_a_multiline_body_keeps_its_line_breaks_in_a_contenteditable(local_site):
+    """Gmail's body came out as one run-on paragraph, and fill called it an error."""
+    driver = _open_or_skip(_form(local_site, "rich_editor.html"), "defect-editor-lines")
+
+    result = browser_tools.fill_fields({"#body": LETTER}, session_id="defect-editor-lines")
+
+    assert result["success"] is True, result["errors"]
+    written = driver.execute_script("return document.getElementById('body').innerText;")
+    assert written.replace("\r\n", "\n").strip() == LETTER
+    assert result["field_values"]["#body"].replace("\r\n", "\n").strip() == LETTER
+
+
+def test_an_editor_that_folds_the_breaks_says_how_to_paste_instead(local_site):
+    _open_or_skip(_form(local_site, "rich_editor.html"), "defect-editor-folded")
+
+    result = browser_tools.fill_fields(
+        {"#oneline": LETTER}, session_id="defect-editor-folded"
+    )
+
+    assert result["success"] is False
+    complaint = result["errors"]["#oneline"]
+    assert "folded the line breaks" in complaint
+    assert "clipboard.writeText" in complaint and "Ctrl+V" in complaint
+
+
+def test_a_single_line_write_into_an_editor_is_unchanged(local_site):
+    driver = _open_or_skip(_form(local_site, "rich_editor.html"), "defect-editor-single")
+    result = browser_tools.fill_fields({"#body": "Ada"}, session_id="defect-editor-single")
+    assert result["success"] is True
+    assert driver.execute_script("return document.getElementById('body').innerText;").strip() == "Ada"
+
+    # Writing again replaces what was there rather than appending to it.
+    browser_tools.fill_fields({"#body": "Grace"}, session_id="defect-editor-single")
+    assert (
+        driver.execute_script("return document.getElementById('body').innerText;").strip()
+        == "Grace"
+    )
