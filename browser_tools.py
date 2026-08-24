@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import threading
 import time
+from collections.abc import Sequence
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
@@ -37,6 +38,7 @@ from chrome_bridge import (
     ChromeBridgeDriver,
     ChromeBridgeError,
     ChromeBridgeUnavailable,
+    close_current_chrome_tabs,
     get_chrome_bridge,
     list_current_chrome_tabs,
 )
@@ -1985,6 +1987,43 @@ def _companion_status() -> dict[str, Any]:
 def get_current_tabs(wait_seconds: float = 1.0) -> dict[str, Any]:
     """List normal web tabs exposed by the companion extension."""
     return list_current_chrome_tabs(max(0.0, min(float(wait_seconds), 5.0)))
+
+
+def close_tabs(
+    tab_ids: Sequence[int],
+    include_pinned: bool = False,
+    include_claimed: bool = False,
+    wait_seconds: float = 1.0,
+) -> dict[str, Any]:
+    """Close named tabs in the user's Chrome and forget any session left on them.
+
+    Dropping the sessions is the part that does not belong in the bridge. A
+    session whose tab is gone is not merely useless: it still answers to its
+    name, so the next action addressed to it dispatches at a tab id Chrome has
+    reused, and the failure surfaces somewhere else entirely. The claim is
+    released for the same reason - a claim outliving its tab is a number nobody
+    can use and every listing keeps reporting as busy.
+    """
+    outcome = close_current_chrome_tabs(
+        tab_ids,
+        include_pinned=bool(include_pinned),
+        include_claimed=bool(include_claimed),
+        wait_seconds=max(0.0, min(float(wait_seconds), 5.0)),
+    )
+    gone = {entry["tab_id"] for entry in outcome.get("closed") or []}
+    dropped: list[str] = []
+    if gone:
+        with _sessions_lock:
+            for name, session in list(_sessions.items()):
+                if session.current_tab_id in gone:
+                    _sessions.pop(name, None)
+                    dropped.append(name)
+        for tab_id in gone:
+            try:
+                _release_claimed_tab(tab_id)
+            except Exception:  # noqa: BLE001 - tidying must not fail the close
+                logger.warning("Releasing the claim on tab %s failed", tab_id)
+    return {**outcome, "sessions_dropped": sorted(dropped)}
 
 
 def setup_current_chrome_companion(wait_seconds: float = 1.0) -> dict[str, Any]:

@@ -540,7 +540,21 @@ own tab in the `🟢 AI` group and hands the borrowed one back — the debugger
 detaches, and the page the user was reading is neither closed nor navigated. The
 freed tab id comes back as `left_claimed_tab`. `close` removes a tab that the
 agent opened itself, and leaves a claimed tab open and detached, so the group no
-longer accumulates abandoned pages. Both `close` and `close_all` report what they
+longer accumulates abandoned pages; pass `close_tab: true` to close a claimed one
+anyway.
+
+Tabs the agent never opened are closed with `close_tabs`, naming the ids from
+`web_info(topic="browser_tabs")`. There is no close-everything switch: closing a
+tab cannot be undone, so each one is named. Two kinds are skipped rather than
+closed — pinned tabs, which are the set a person keeps on purpose, and tabs
+another agent is driving, where closing one would pull the page out from under a
+running session. `include_pinned` and `include_claimed` override each, and every
+skip says which rule it hit. Whether a tab actually went is decided against a
+fresh tab list rather than against Chrome's acknowledgement, because
+`chrome.tabs.remove` reports failure for a tab the user had already closed by
+hand; a tab that was already gone is reported as `already_gone`, not as an error.
+A session sitting on a closed tab is forgotten and its claim released, so a later
+action cannot dispatch at a tab id Chrome has since reused. Both `close` and `close_all` report what they
 could not release — a tab that would not close, a debugger that would not detach
 — instead of answering `closed: true` over the top of it; closing a session that
 was never open stays a no-op and says so in `note`. A tab the user closed by hand

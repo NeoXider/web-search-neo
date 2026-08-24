@@ -25,7 +25,7 @@ import msp_search
 from web_client import request
 
 
-__version__ = "1.8.0"
+__version__ = "1.8.1"
 
 PROJECT_DIR = Path(__file__).resolve().parent
 log = logging.getLogger("web_search_neo")
@@ -437,6 +437,19 @@ async def browser_open_pages(
 async def browser_list_tabs(wait_seconds: float = 1.0) -> dict[str, Any]:
     """List web tabs in the user's already-open Chrome, including tab group names."""
     return await asyncio.to_thread(browser_tools.get_current_tabs, wait_seconds)
+
+
+@mcp.tool()
+async def browser_close_tabs(
+    tab_ids: list[int],
+    include_pinned: bool = False,
+    include_claimed: bool = False,
+    wait_seconds: float = 1.0,
+) -> dict[str, Any]:
+    """Close named tabs in the user's Chrome; ids come from web_info browser_tabs."""
+    return await asyncio.to_thread(
+        browser_tools.close_tabs, tab_ids, include_pinned, include_claimed, wait_seconds
+    )
 
 
 @mcp.tool()
@@ -1197,9 +1210,18 @@ async def browser_get_status(session_id: str = "default") -> dict[str, Any]:
 
 
 @mcp.tool()
-async def browser_close(session_id: str = "default") -> dict[str, Any]:
-    """Close a browser session and release its Chrome process."""
-    return await asyncio.to_thread(browser_tools.close_session, session_id)
+async def browser_close(
+    session_id: str = "default", close_tab: bool | None = None
+) -> dict[str, Any]:
+    """Close a browser session; close_tab decides the tab's fate explicitly.
+
+    The default is unchanged and deliberate: a tab the server opened closes with
+    the session, a tab claimed with attach_tab is handed back. close_tab=True
+    overrides that for a claimed tab, which is the only way a caller could ask
+    for the tab itself to go - the capability was already in browser_tools and
+    simply had no route out through the action.
+    """
+    return await asyncio.to_thread(browser_tools.close_session, session_id, close_tab)
 
 
 @mcp.tool()
@@ -1954,7 +1976,16 @@ _ACTIONS: dict[str, ActionSpec] = {
             "Re-send a captured or explicit request from the page context.",
         ),
         _action(
-            "close", browser_close, "session", "Close one session; a claimed current-Chrome tab stays open."
+            "close",
+            browser_close,
+            "session",
+            "Close one session; a claimed current-Chrome tab stays open unless close_tab=true.",
+        ),
+        _action(
+            "close_tabs",
+            browser_close_tabs,
+            "session",
+            "Close named tabs in the user's Chrome by id; pinned and other agents' tabs are refused.",
         ),
         _action(
             "close_all",
@@ -2654,8 +2685,14 @@ _ACTION_NOTES = {
         "ownership": "Refused, naming the holder, when another agent is already driving that tab. Pick another tab or open your own; do not retry.",
         "capture": "Console and network are recorded from the claim onwards; whatever the tab did before it was claimed is unrecoverable.",
     },
+    "close_tabs": {
+        "ids": "tab_ids are the ids from web_info(topic='browser_tabs'). There is no close-everything switch on purpose: closing a tab cannot be undone, so each one is named.",
+        "refusals": "Pinned tabs and tabs another agent is driving are skipped rather than closed - the first is the set the user keeps on purpose, the second would pull the page out from under a running session. include_pinned / include_claimed override each. Every skip says which rule it hit.",
+        "outcome": "closed / failed / skipped are decided against a fresh tab list, not against Chrome's acknowledgement: tabs.remove reports failure for a tab the user had already closed by hand. A tab that was already gone lands in skipped with already_gone=true, because that is the outcome the caller wanted.",
+        "sessions": "sessions_dropped names sessions that were sitting on a closed tab and have been forgotten, so a later action cannot dispatch at a tab id Chrome has since reused.",
+    },
     "close": {
-        "tab": "Closes a tab the agent opened, reported as tab_closed; an attach_tab tab is only detached and stays open.",
+        "tab": "Closes a tab the agent opened, reported as tab_closed; an attach_tab tab is only detached and stays open unless close_tab=true. To close tabs the agent never opened, use close_tabs with their ids.",
         "browser_gone": "browser_gone=true with a note means the Chrome it was opened in is gone: nothing was sent, because the tab id now names someone else's tab. Open again, do not retry close.",
     },
     "close_all": {
@@ -2811,7 +2848,7 @@ _PITFALLS = [
     "Repeated text is not identity: compare the exact href/value/stable attribute from a fresh page_elements read, or use click_text with exact text plus role (it refuses ambiguity); never array index or nth-child alone.",
     "challenge_detected means a CAPTCHA is in the way: use captcha, never hammer clicks. captcha_widgets lists ones merely present; ignore those. invisible_challenge_pending is the one with no box: it holds the form, so a submit hangs with no request and no error until captcha clears it.",
     "find low_confidence=true means it is guessing: re-query with other words or a role, do not click matches[0].",
-    "profile_mode=current drives the user's real Chrome; close closes a tab the agent opened and leaves an attach_tab tab open.",
+    "profile_mode=current drives the user's real Chrome; close closes a tab the agent opened and hands an attach_tab tab back. Closing tabs the agent never opened is close_tabs with their ids, not close - close on an attached tab detaches it and reports tab_closed=false.",
     "Parallel agents must each choose their own session_id: subagents share one MCP server, so two on the default drive one tab and navigate each other's page - browser_status reports shared_session. Pass agent_label on open so browser_status can say who is where, and so close_all (scope='mine' by default) ends only your own sessions; scope='all' still ends everybody's.",
     "page_elements, page_outline and find are bounded by max_chars as well as by limit: budget_truncated=true means the answer was cut to fit, and range[*].next_offset is where to continue. Raise max_chars only if your context can take it.",
     "Automation stays background-only by default and never changes window state. show is the sole foreground opt-in; call it only when the user explicitly asks to see the session.",

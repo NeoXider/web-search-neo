@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import atexit
 import base64
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 import json
 import logging
@@ -1851,6 +1851,121 @@ class ChromeBridgeDriver:
         result.setdefault("id", self.tab_id)
         result["detached"] = bool(result.get("detached"))
         return result
+
+
+def close_current_chrome_tabs(
+    tab_ids: Sequence[int],
+    *,
+    include_pinned: bool = False,
+    include_claimed: bool = False,
+    wait_seconds: float = 1.0,
+) -> dict[str, Any]:
+    """Close named tabs in the user's Chrome and report each one's fate.
+
+    Until this existed the only tab the server could close was one it had opened
+    itself: ``close`` on an attached tab detaches and leaves it, which is right
+    for a tab handed back but leaves an agent asked to tidy up with nothing to do
+    it with. The extension has always been able to remove any tab by id, so the
+    gap was only ever on this side.
+
+    Closing someone's tab cannot be undone, so the ids are the caller's to name -
+    there is deliberately no "close everything" here - and two kinds are refused
+    unless asked for by name:
+
+    * pinned tabs, which are the set a person keeps on purpose and the last thing
+      a sweep of "unneeded" tabs should take with it;
+    * tabs another agent is driving, because closing one pulls the page out from
+      under a session mid-run. A tab this server drives is not refused: the
+      caller can see from the listing that it is theirs.
+
+    ``removed: false`` from the extension settles nothing on its own - it answers
+    that way whenever ``chrome.tabs.remove`` throws, and a tab the user closed by
+    hand throws - so each outcome is decided against a fresh tab list rather than
+    against the acknowledgement.
+    """
+    bridge = get_chrome_bridge()
+    status = bridge.status(wait_seconds)
+    requested: list[int] = []
+    skipped: list[dict[str, Any]] = []
+    for raw in tab_ids or []:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            skipped.append({"tab_id": raw, "reason": "not a tab id"})
+            continue
+        if value not in requested:
+            requested.append(value)
+
+    if not status["connected"]:
+        return {**status, "requested": requested, "closed": [], "failed": [],
+                "skipped": skipped}
+
+    listing = list_current_chrome_tabs(0.0)
+    known = {
+        tab.get("id"): tab
+        for tab in (listing.get("tabs") or [])
+        if isinstance(tab, dict)
+    }
+
+    targets: list[int] = []
+    for tab_id in requested:
+        tab = known.get(tab_id)
+        if tab is None:
+            # Already gone is the outcome the caller asked for, not a failure.
+            skipped.append({"tab_id": tab_id, "reason": "no such tab",
+                            "already_gone": True})
+            continue
+        if tab.get("pinned") and not include_pinned:
+            skipped.append({
+                "tab_id": tab_id,
+                "reason": "pinned; pass include_pinned to close it anyway",
+                "title": tab.get("title"),
+                "url": tab.get("url"),
+            })
+            continue
+        if tab.get("driven_by") and not tab.get("driven_by_me") and not include_claimed:
+            skipped.append({
+                "tab_id": tab_id,
+                "reason": "another agent is driving this tab (%s); pass "
+                          "include_claimed to close it anyway" % tab.get("driven_by"),
+                "title": tab.get("title"),
+                "url": tab.get("url"),
+            })
+            continue
+        targets.append(tab_id)
+
+    for tab_id in targets:
+        try:
+            bridge.request("tabs.remove", {"tabId": tab_id}, timeout=5.0)
+        except Exception as exc:  # noqa: BLE001 - the listing below decides, not this
+            LOGGER.warning(
+                "Closing tab %s failed: %s: %s", tab_id, type(exc).__name__, exc
+            )
+
+    after = list_current_chrome_tabs(0.0)
+    still_open = {
+        tab.get("id") for tab in (after.get("tabs") or []) if isinstance(tab, dict)
+    }
+    closed: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    for tab_id in targets:
+        entry = {
+            "tab_id": tab_id,
+            "title": (known.get(tab_id) or {}).get("title"),
+            "url": (known.get(tab_id) or {}).get("url"),
+        }
+        (failed if tab_id in still_open else closed).append(
+            {**entry, "reason": "Chrome did not close it"} if tab_id in still_open else entry
+        )
+
+    return {
+        **status,
+        "requested": requested,
+        "closed": closed,
+        "failed": failed,
+        "skipped": skipped,
+        "tabs_left": len(still_open),
+    }
 
 
 def list_current_chrome_tabs(wait_seconds: float = 1.0) -> dict[str, Any]:
