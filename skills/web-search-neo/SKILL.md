@@ -48,7 +48,7 @@ outcome happened. After navigation or rerender, discard old selectors, refs, and
   reads `textContent`, which no rendering filter may drop, so a scrolled-out code block or a
   collapsed panel gives up its tail. `params.mode="html"|"outer"|"both"` returns markup
   (innerHTML / outerHTML / both plus text).
-- `find`: `params.query="submit application"` returns ranked refs instead of a whole page.
+- `find`: `params.query="submit request"` returns ranked refs instead of a whole page.
   `low_confidence: true` means nothing on the page answers the query - the matches are
   guesses, so read the page instead of clicking one. `ambiguous: true` means two matched
   equally and order alone chose; say which you mean. `role` filters.
@@ -160,13 +160,13 @@ and has its whole selection replaced by a scalar. Date, time, range and colour c
 set rather than typed, so an unparseable value is refused without touching the control and
 the error names the format. `upload`, and `fill`'s `files` key, *replace* an input's
 selection instead of adding to it. Rich-text editors (`contenteditable`, e.g. TipTap,
-ProseMirror, Slate, Quill, Gmail's body) are written as a real edit — the content is
+ProseMirror, Slate, Quill) are written as a real edit — the content is
 selected and typed in through the browser's input channel, a line at a time with a soft
 break (Shift+Enter, never Enter, which sends in a chat composer) between the lines, so
 paragraphs survive; the read-back is `innerText`. An editor that folds the breaks away
 anyway is named as such in `errors`, and the way through is a real paste: `run_script` with
 `user_gesture=true` and `navigator.clipboard.writeText(text)`, then `Ctrl+V` through
-`input`. Telegram Web (`#editable-message-text`, Teact) never updates its own state from a
+`input`. Some chat composers (Teact-based ones included) never update their own state from a
 write — the send button stays a microphone — so paste there always.
 `upload` reports `upload_state`: `attached` (the input holds the files), `taken_by_widget`
 (a Dropzone-style widget emptied the input, and the page names the file or posted it) or
@@ -204,7 +204,7 @@ For any consequential submit use this low-freedom guard:
 
 1. Keep a local state `submit_attempted=false`.
 2. From a fresh DOM, confirm the exact target (`href` where available) and every critical
-   live choice: resume, account, price, recipient, consent, or irreversible option.
+   live choice: attached file or document, account, price, recipient, consent, or irreversible option.
 3. If anything is ambiguous, stop. Otherwise set `submit_attempted=true` as the terminal
    submit is clicked exactly once.
 4. After any result or timeout, never click the same submit again. Inspect fresh URL, text,
@@ -341,8 +341,8 @@ as the page it was written against, and a site redesign invalidates it silently.
 
 ### Keeping domain rules out of the engine
 
-The macro engine is universal and domain-neutral. Never add recruitment, commerce, finance,
-or other domain policy to core. Put domain rules in project-owned saved macros and
+The macro engine is universal and domain-neutral. Never add any business-domain
+policy to core. Put domain rules in project-owned saved macros and
 configuration; only neutral, broadly useful examples belong in the engine repository. Always
 pass the same project root to `guarded_stage` and `guarded_commit`, because the idempotency
 ledger is project-local too.

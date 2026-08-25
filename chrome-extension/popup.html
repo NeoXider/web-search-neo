@@ -3,82 +3,152 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Web Search Neo</title>
+    <title>Web Search Neo Companion</title>
     <link rel="stylesheet" href="popup.css">
   </head>
   <body>
-    <main>
-      <header>
-        <img src="icons/slime-48.png" alt="" width="40" height="40">
-        <div>
-          <h1>Web Search Neo</h1>
-          <p id="status" class="status" data-state="loading">Checking connection…</p>
-        </div>
+    <main id="panel" data-state="loading">
+      <header class="head">
+        <span class="mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" focusable="false">
+            <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/>
+            <circle cx="12" cy="12" r="3.5" fill="currentColor"/>
+          </svg>
+        </span>
+        <h1 class="name">Web Search Neo</h1>
+        <span id="version" class="chip" title="Companion and server version">-</span>
       </header>
 
+      <section id="state-card" class="card" aria-live="polite">
+        <div class="state-row">
+          <span id="pulse" class="pulse" aria-hidden="true"><i></i></span>
+          <p id="status" class="status" role="status" data-state="loading">Starting</p>
+        </div>
+        <p id="next-attempt" class="sub">&nbsp;</p>
+      </section>
+
+      <section class="tiles" aria-label="Live status">
+        <div class="tile">
+          <span class="key">Tabs</span>
+          <span id="tabs" title="Tabs this companion currently controls">-</span>
+        </div>
+        <div class="tile">
+          <span class="key">Sessions</span>
+          <span class="pair"
+            ><span id="max-sessions-value" title="Configured parallel-session limit">-</span
+            ><span class="of" aria-hidden="true">/</span
+            ><span id="max-sessions-ceiling" title="Hard ceiling">64</span></span>
+          <span class="meter" aria-hidden="true"><i id="meter-fill"></i></span>
+        </div>
+        <div class="tile wide">
+          <span class="key">Bridge</span>
+          <span id="bridge" title="Local bridge endpoint">-</span>
+        </div>
+      </section>
+
+      <section id="release-chip" class="release-row" title="Latest GitHub release vs this build">
+        <span id="release-status">Checking</span>
+        <button id="check-release" type="button" class="icon-btn"
+                aria-label="Check GitHub for a newer release" title="Check update">
+          <svg viewBox="0 0 20 20" width="15" height="15" aria-hidden="true" focusable="false">
+            <path d="M10 3a7 7 0 0 1 6.3 4H14v2h6V3l-2.2 2.2A9 9 0 0 0 1.5 8H3.6A7 7 0 0 1 10 3Zm-6.3 10H6v-2H0v6l2.2-2.2A9 9 0 0 0 18.5 12h-2.1A7 7 0 0 1 3.7 13Z"
+                  fill="currentColor"/>
+          </svg>
+        </button>
+        <button id="open-github" type="button" class="icon-btn"
+                aria-label="Open the project repository on GitHub" title="Open GitHub">
+          <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" focusable="false">
+            <path d="M8 0a8 8 0 0 0-2.53 15.59c.4.07.55-.17.55-.38v-1.34c-2.23.48-2.7-1.07-2.7-1.07-.36-.93-.89-1.18-.89-1.18-.73-.5.05-.49.05-.49.8.06 1.23.83 1.23.83.72 1.23 1.88.87 2.33.67.07-.52.28-.88.5-1.08-1.77-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.66 7.66 0 0 1 4 0c1.53-1.03 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.28.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48v2.19c0 .21.15.46.55.38A8 8 0 0 0 8 0Z"
+                  fill="currentColor"/>
+          </svg>
+        </button>
+      </section>
+
       <label class="switch-row">
-        <span>
-          <strong>Companion enabled</strong>
-          <small>Allow the local MCP to control Chrome tabs</small>
+        <span class="switch-text">
+          <strong>Enabled</strong>
+          <small>Let the local MCP drive Chrome tabs</small>
         </span>
-        <input id="enabled" type="checkbox" role="switch" disabled>
+        <input id="enabled" type="checkbox" role="switch"
+               aria-label="Enable the companion" title="Enable the companion" disabled>
       </label>
 
-      <dl>
-        <div><dt>Controlled tabs</dt><dd id="tabs">—</dd></div>
-        <div><dt>Bridge</dt><dd id="bridge">127.0.0.1:8765</dd></div>
-        <div><dt>Next attempt</dt><dd id="next-attempt">—</dd></div>
-        <div><dt>Version</dt><dd id="version">—</dd></div>
-        <div><dt>GitHub release</dt><dd id="release-status">Checking…</dd></div>
-      </dl>
+      <div class="actions">
+        <button id="reconnect" type="button" class="btn"
+                aria-label="Reconnect to the bridge now" title="Reconnect">Reconnect</button>
+        <button id="release-tabs" type="button" class="btn secondary"
+                aria-label="Detach every controlled tab" title="Release tabs">Release tabs</button>
+      </div>
 
       <details id="settings">
-        <summary>Settings</summary>
+        <summary>
+          <span class="gear" aria-hidden="true">
+            <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true" focusable="false">
+              <path d="M11.2 1l.5 2.2c.5.2 1 .4 1.4.8l2.1-.7 1.8 3-1.6 1.5a6 6 0 0 1 0 1.6l1.6 1.5-1.8 3-2.1-.7c-.4.4-.9.6-1.4.8L11.2 17H8.8l-.5-2.2c-.5-.2-1-.4-1.4-.8l-2.1.7-1.8-3 1.6-1.5a6 6 0 0 1 0-1.6L3 6.9l1.8-3 2.1.7c.4-.4.9-.6 1.4-.8L8.8 1h2.4ZM10 7a3 3 0 1 0 0 6 3 3 0 0 0 0-6Z"
+                    fill="currentColor"/>
+            </svg>
+          </span>
+          Settings
+        </summary>
 
         <div class="setting">
-          <label for="port"><strong>Bridge port</strong></label>
+          <label for="port"><strong>Port</strong></label>
           <p class="hint">
-            Must match <code>WEB_SEARCH_NEO_BRIDGE_PORT</code> on the MCP server.
-            Leave it at <span id="port-default">8765</span> unless you changed that.
+            Must match <code>WEB_SEARCH_NEO_BRIDGE_PORT</code>; default
+            <span id="port-default">8765</span>.
           </p>
           <div class="setting-row">
-            <input id="port" type="number" min="1024" max="65535" step="1" inputmode="numeric">
-            <button id="save-port" type="button">Apply</button>
-            <button id="reset-port" type="button" class="secondary">Default</button>
+            <input id="port" type="number" min="1024" max="65535" step="1" inputmode="numeric"
+                   aria-label="Bridge port">
+            <button id="save-port" type="button" class="icon-btn"
+                    aria-label="Apply bridge port" title="Apply">
+              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
+                <path d="M6.5 11.5 3 8l1.4-1.4 2.1 2.1L11.6 3.6 13 5Z" fill="currentColor"/>
+              </svg>
+            </button>
+            <button id="reset-port" type="button" class="icon-btn secondary"
+                    aria-label="Reset bridge port to the default" title="Default">
+              <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true" focusable="false">
+                <path d="M10 3a7 7 0 1 1-6.3 4H1.5A9 9 0 1 0 4 4.6L6.5 7H0V.5Z" fill="currentColor"/>
+              </svg>
+            </button>
           </div>
         </div>
 
         <div class="setting">
-          <label for="max-sessions"><strong>Parallel sessions</strong></label>
+          <label for="max-sessions"><strong>Sessions</strong></label>
           <p class="hint">
-            How many tabs the MCP server may drive at once. Each agent working in
-            parallel needs one of these; the default is
-            <span id="max-sessions-default">8</span>. Applies on reconnect.
-            <code>WEB_SEARCH_NEO_MAX_SESSIONS</code> in the server's own
-            environment, if set there, wins over this.
+            Tabs the MCP may drive at once; default
+            <span id="max-sessions-default">8</span>. Applies on reconnect;
+            the server environment wins.
           </p>
           <div class="setting-row">
-            <input id="max-sessions" type="number" min="1" max="64" step="1" inputmode="numeric">
-            <button id="save-max-sessions" type="button">Apply</button>
-            <button id="reset-max-sessions" type="button" class="secondary">Default</button>
+            <input id="max-sessions" type="number" min="1" max="64" step="1" inputmode="numeric"
+                   aria-label="Parallel session limit">
+            <button id="save-max-sessions" type="button" class="icon-btn"
+                    aria-label="Apply parallel session limit" title="Apply">
+              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
+                <path d="M6.5 11.5 3 8l1.4-1.4 2.1 2.1L11.6 3.6 13 5Z" fill="currentColor"/>
+              </svg>
+            </button>
+            <button id="reset-max-sessions" type="button" class="icon-btn secondary"
+                    aria-label="Reset session limit to the default" title="Default">
+              <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true" focusable="false">
+                <path d="M10 3a7 7 0 1 1-6.3 4H1.5A9 9 0 1 0 4 4.6L6.5 7H0V.5Z" fill="currentColor"/>
+              </svg>
+            </button>
           </div>
         </div>
 
         <div class="setting">
           <strong>Protocol access</strong>
           <p class="hint" id="cdp-note">
-            The companion forwards only the DevTools methods this MCP uses; anything
-            else is refused inside the extension.
+            Only the DevTools methods this MCP issues are forwarded; anything else
+            is refused inside the extension.
           </p>
         </div>
       </details>
 
-      <div class="actions">
-        <button id="reconnect" type="button">Reconnect</button>
-        <button id="release-tabs" type="button" class="secondary">Release tabs</button>
-        <button id="check-release" type="button" class="secondary">Check update</button>
-        <button id="open-github" type="button" class="secondary">Open GitHub</button>
-      </div>
       <p id="message" class="message" aria-live="polite"></p>
     </main>
     <script src="popup.js"></script>

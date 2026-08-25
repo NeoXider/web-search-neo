@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/web-search-neo-hero.jpg" alt="Web Search Neo — free MCP web search and visible browser automation" width="100%">
+  <img src="docs/assets/web-search-neo-cover.png" alt="Web Search Neo — free MCP web search and visible browser automation" width="100%">
 </p>
 
 <h1 align="center">Web Search Neo</h1>
@@ -137,11 +137,11 @@ the Selenium-backed profile modes.
 ```json
 {
   "actions": [
-    {"action": "fill", "session_id": "apply",
-     "fields": {"#candidate-name": "Neo Candidate", "#role": "unity", "#remote": true},
-     "files": {"#resume": "C:/docs/resume.pdf"}},
-    {"action": "submit", "session_id": "apply",
-     "form_selector": "#application", "submit_selector": "#submit-button"}
+    {"action": "fill", "session_id": "intake",
+     "fields": {"#full-name": "Ada Lovelace", "#topic": "demo", "#subscribe": true},
+     "files": {"#attachment": "C:/docs/report.pdf"}},
+    {"action": "submit", "session_id": "intake",
+     "form_selector": "#intake-form", "submit_selector": "#submit-button"}
   ]
 }
 ```
@@ -279,7 +279,7 @@ is no automatic substitute. If you would rather not install an extension at all,
 `profile_mode="temporary"` and `profile_mode="persistent"` drive a Selenium
 browser that needs no companion.
 
-The bundled companion is version 1.8.0. Chrome does not refresh an unpacked
+The bundled companion is version 1.9.0. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. Upgrading *onto*
@@ -302,12 +302,32 @@ A badge reading `OFF` means this companion is not connected and authenticated, w
 
 Keep the companion enabled in one Chrome profile at a time. The bridge holds exactly one companion connection and the most recent authenticated one wins, so a second profile with the companion enabled quietly takes the agent's tabs with it.
 
-### The companion popup
+### Dynamic companion widget
 
-The toolbar popup is where the companion is switched on, watched, and configured.
-Beyond the enable switch, the controlled-tab count, and the release check, it shows
-**Next attempt** — a connection that is merely waiting says when it will try again,
-which is what tells a stalled bridge apart from a deliberate backoff.
+The toolbar popup (also on **Alt+Shift+N**, its suggested shortcut) is where the
+companion is switched on, watched, and configured. It is a compact, icon-first
+widget: one live status line with a pulse marker — `Connected`, `Connecting`,
+`Waiting` plus the retry countdown, `Disabled`, or an error state — then three
+figures: controlled tabs, the parallel-session limit against its ceiling with a
+small capacity meter, and the bridge endpoint. Icon buttons carry accessible
+names (`aria-label`/`title`): release check, repository link, apply/reset port,
+apply/reset session limit. A version chip and a GitHub release check round off
+the top; **Settings** holds the port and session limit. Everything renders from the
+status the service worker reports each second — connected, connecting,
+waiting, disabled, or error — and nothing else: no fabricated connection state,
+no secrets in the UI. Opening the panel is read-only by construction: it never
+navigates, submits, closes, or releases anything on its own.
+
+![Companion widget connected](docs/assets/companion-widget-connected.png)
+
+While the bridge is merely unreachable, the widget says so and shows when the
+next attempt lands, which is what tells a stalled bridge apart from a
+deliberate backoff:
+
+![Companion widget waiting for the bridge](docs/assets/companion-widget-waiting.png)
+
+Opening the panel — by click or by shortcut — performs no navigation and
+controls nothing; it only reads status.
 
 Under **Settings**:
 
@@ -730,8 +750,8 @@ Four observation topics describe an open session, from semantic structure down t
 | `page_outline` | An indented tree of roles, accessible names, states, `ref:<epoch>:N` handles, and boxes. `limit=200` nodes, `output="text"` by default; `output="json"` returns one object per node with `rect`, `page_rect`, `center`, `visible`, `in_viewport`, and `occluded`. |
 | `page_text` | The rendered text, with headings, list items, and table cells preserved. `mode="full"` is the whole `<body>`, same-origin frames and open dialogs included; `mode="main"` narrows to the main-content sub-tree and drops navigation, header, footer, aside, and form chrome. `max_chars=20000`, `include_links=false`. |
 | `element_text` | The whole content of one element — not a clipped slice of the page. `selector` takes CSS, a fresh `ref:<epoch>:N`, or an `a >>> b` piercing path. `full_text=true` reads `textContent`, which no rendering filter may drop, so the tail of a scrolled-out code block or a collapsed panel is returned whole. `mode="text"|"html"|"outer"|"both"` returns the rendered text, `innerHTML`, `outerHTML`, or all three; `max_chars` clips at a paragraph boundary and says so with `truncated`. |
-| `find` | Ranked matches for a plain-language `query` such as `"submit application"`, each with a `ref`, role, name, box, a `match_score` (query against the element alone) and the ranking `score` that adds context. `limit=5`, capped at 25; `visible_only=true` by default, so a control the page has not revealed yet is not a candidate; `role` filters rather than nudges. `low_confidence` means nothing on the page answers the query — the closest few still come back, as the guesses they are — and `ambiguous` means the top two matched *and* ranked equally, so document order picked the winner. `candidates`/`scored`/`matched`/`returned`, `truncated` and `aria_hidden_skipped` account for what was examined, cut, and skipped as hidden from assistive technology. |
-| `page_elements` | The flat lists of links, forms, fields with `<select>` options, and buttons, addressed by CSS selector — or by a piercing path when they live in an open shadow root or a same-origin frame, or by an empty string when nothing addresses them uniquely, which is the honest answer and not a bug to work around. It covers the whole existing DOM, not only the viewport, so a rendered button below the fold is returned before any scroll. Each entry carries `visible` and, when it is not, a `hidden_reason`; visible entries come first. `limit` is capped at 1,000 per category; continue with `offset` and `range.<category>.next_offset` until it is `null`. `found`, `returned`, `truncated`, and `collector_truncated` account for the result and the 20,000-element safety cap. `limit` counts controls; `max_chars` (default 18,000) bounds the answer itself, because 200 controls of a real job board came to 83,616 characters — more than a small model could receive. When the budget bites, `budget_truncated` is `true`, `budget_note` says how much was dropped, and `range.<category>.next_offset` is restated to point at the first entry that was not sent. `page_outline` and `find` take the same `max_chars`; `page_text` and `element_text` already had one. Lazy, infinite, and virtualized controls do not exist until the page creates them: `scroll`, wait, then reread from `offset=0`. Alone among the four it takes no `frame_selector`: it always walks the whole page, open shadow roots, and same-origin frames. |
+| `find` | Ranked matches for a plain-language `query` such as `"submit request"`, each with a `ref`, role, name, box, a `match_score` (query against the element alone) and the ranking `score` that adds context. `limit=5`, capped at 25; `visible_only=true` by default, so a control the page has not revealed yet is not a candidate; `role` filters rather than nudges. `low_confidence` means nothing on the page answers the query — the closest few still come back, as the guesses they are — and `ambiguous` means the top two matched *and* ranked equally, so document order picked the winner. `candidates`/`scored`/`matched`/`returned`, `truncated` and `aria_hidden_skipped` account for what was examined, cut, and skipped as hidden from assistive technology. |
+| `page_elements` | The flat lists of links, forms, fields with `<select>` options, and buttons, addressed by CSS selector — or by a piercing path when they live in an open shadow root or a same-origin frame, or by an empty string when nothing addresses them uniquely, which is the honest answer and not a bug to work around. It covers the whole existing DOM, not only the viewport, so a rendered button below the fold is returned before any scroll. Each entry carries `visible` and, when it is not, a `hidden_reason`; visible entries come first. `limit` is capped at 1,000 per category; continue with `offset` and `range.<category>.next_offset` until it is `null`. `found`, `returned`, `truncated`, and `collector_truncated` account for the result and the 20,000-element safety cap. `limit` counts controls; `max_chars` (default 18,000) bounds the answer itself, because 200 controls of a large directory page came to 83,616 characters — more than a small model could receive. When the budget bites, `budget_truncated` is `true`, `budget_note` says how much was dropped, and `range.<category>.next_offset` is restated to point at the first entry that was not sent. `page_outline` and `find` take the same `max_chars`; `page_text` and `element_text` already had one. Lazy, infinite, and virtualized controls do not exist until the page creates them: `scroll`, wait, then reread from `offset=0`. Alone among the four it takes no `frame_selector`: it always walks the whole page, open shadow roots, and same-origin frames. |
 
 ```json
 {"topic":"page_outline","params":{"session_id":"demo","output":"json","limit":80}}
@@ -889,9 +909,9 @@ choice, submit exactly once, then prove the outcome with fresh DOM/text.
 ```json
 {
   "actions": [
-    {"action": "fill", "session_id": "apply",
-     "fields": {"#candidate-name": "Neo Candidate", "#role": "unity", "#remote": true}},
-    {"action": "submit", "session_id": "apply", "form_selector": "#application"}
+    {"action": "fill", "session_id": "intake",
+     "fields": {"#full-name": "Ada Lovelace", "#topic": "demo", "#subscribe": true}},
+    {"action": "submit", "session_id": "intake", "form_selector": "#intake-form"}
   ]
 }
 ```
@@ -900,8 +920,8 @@ choice, submit exactly once, then prove the outcome with fresh DOM/text.
 - Sanitisation is not refusal. Whitespace trimmed off a `type=email` value, `\r\n` normalised to `\n`, a handler that lower-cases the input — the control kept what you gave it, in its own terms, and all three read back as filled. A byte-for-byte comparison used to call them failures.
 - A `<select multiple>` is the one control that takes a list of values and reads back as one. A scalar sent to it *replaces* the whole selection rather than extending it, and a list sent to anything else is refused.
 - Date, time, datetime-local, month, week, range and colour inputs are set rather than typed, since typing into them depends on the browser's locale. The value is rehearsed on a throwaway input first, so an unparseable one is refused **without touching the control** — no more valid-looking wrong date, no more slider dropped to its midpoint — and the error names the format the control wants.
-- A `contenteditable` editor — TipTap, ProseMirror, Slate, Quill, Gmail's message body — is written as a real edit and keeps its paragraphs: the text goes in a line at a time with a soft break between the lines (Shift+Enter, never Enter, which in a chat composer would send what is written so far), because inserting it in one go puts `\n` inside a single text node where it renders as a space. The read-back is `innerText`, not `textContent`, which ran every paragraph together and reported a fill that had worked as a refusal. If an editor folds the breaks away regardless, the error says exactly that and names the way through: put the text on the clipboard with `run_script` (`user_gesture=true`, `navigator.clipboard.writeText`) and paste it with a real `Ctrl+V` through `input`. Telegram Web's composer (`#editable-message-text`, Teact) never picks up a write at all — its send button stays a microphone — so paste there always.
-- `upload` no longer treats an empty file input as proof of failure. Teamtailor and every other Dropzone-style widget takes the file off the input and uploads it itself, so reading the input back finds nothing a millisecond later while the file is already on S3 and its chip is on the screen. `upload_state` says how far the evidence goes: `attached` (the input holds the files, which is exact), `taken_by_widget` (the input was emptied, and either the page now names the file or a POST/PUT/PATCH followed the attach) or `unconfirmed` (nothing vouches for it either way — which is *not* a refusal; `note` says to look for the name with `page_text`/`elements` and for the request in the `network` topic before attaching again). `success` is false only when the attach itself failed. `fill` with `files` reports the same thing in `upload_states` and `upload_notes`.
+- A `contenteditable` editor — TipTap, ProseMirror, Slate, Quill, a webmail message body — is written as a real edit and keeps its paragraphs: the text goes in a line at a time with a soft break between the lines (Shift+Enter, never Enter, which in a chat composer would send what is written so far), because inserting it in one go puts `\n` inside a single text node where it renders as a space. The read-back is `innerText`, not `textContent`, which ran every paragraph together and reported a fill that had worked as a refusal. If an editor folds the breaks away regardless, the error says exactly that and names the way through: put the text on the clipboard with `run_script` (`user_gesture=true`, `navigator.clipboard.writeText`) and paste it with a real `Ctrl+V` through `input`. Some chat composers never pick up a DOM write at all — their send control stays inert — so paste there always.
+- `upload` no longer treats an empty file input as proof of failure. Any Dropzone-style widget takes the file off the input and uploads it itself, so reading the input back finds nothing a millisecond later while the file is already stored and its chip with the name is on the screen. `upload_state` says how far the evidence goes: `attached` (the input holds the files, which is exact), `taken_by_widget` (the input was emptied, and either the page now names the file or a POST/PUT/PATCH followed the attach) or `unconfirmed` (nothing vouches for it either way — which is *not* a refusal; `note` says to look for the name with `page_text`/`elements` and for the request in the `network` topic before attaching again). `success` is false only when the attach itself failed. `fill` with `files` reports the same thing in `upload_states` and `upload_notes`.
 - `submit` runs native validation first and reports `validation_passed` with the offending field ids, then `submit_triggered` from the fired `submit` event or from the document being replaced — including a reload of the same URL, which a check on url and title alone reported as a failed submit. `submit_default_prevented` marks the SPA case where a handler cancelled the navigation on purpose. `submit_evidence` states in a sentence what the verdict rests on, and `new_tab_opened` warns that a `target="_blank"` result landed in a tab this session does not own — so the `url` and `title` beside it are still this page's, not the answer you are looking for.
 - A checkbox takes `1`/`yes`/`y`/`on`/`check`/`checked` or `0`/`no`/`n`/`off`/`uncheck`/`unchecked`/`""` and refuses anything else, a `<select>` takes an option `value` or its visible text, and a file input must go through `files`/`upload`.
 - Every control `fill` writes is blurred afterwards, because that is the only way the last field of a fill ever fires its `change` event. Three consequences follow and the third bites: focus ends on `document.body`, an autocomplete list the fill opened is dismissed, and a following `press_keys(["ENTER"])` goes to the body rather than the field — pass `target_selector`, or `focus_mode="click"`, when you mean to submit by keyboard. The `files` entries are the exception: nothing is typed into them, so nothing is blurred.
@@ -1296,7 +1316,7 @@ locators, exact href/value matching, and a one-shot final-submit guard. It is
 about 6.5 KB and can be fetched once at the start of an automation task.
 
 It also names its detailed sections, which are the part a small model needs when
-a specific job starts rather than at the beginning of the session. Each is opened
+a specific operation starts rather than at the beginning of the session. Each is opened
 on demand with `web_info(topic="skill", params={"section": "<name>"})` and carries
 what a JSON Schema cannot: when the section applies, the calls in order, the rules
 that are not guessable, and the mistakes to avoid.

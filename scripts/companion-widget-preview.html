@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<!--
+  Companion widget preview harness (non-production).
+
+  Renders the real chrome-extension/popup.html in an iframe with simulated
+  bridge state so screenshots and visual checks work on any machine:
+
+      start a static server from the repository root, then open
+      http://127.0.0.1:8766/scripts/companion-widget-preview.html
+
+  or simply open the file directly in Chrome (file:// works too; the popup
+  preview mode uses no chrome.* API, no network, and no secrets).
+
+  Read-only by design: it opens no tabs, connects nowhere, and never touches
+  the installed companion. The iframe URL parameters are consumed by the
+  production popup itself (?wsn-preview=...); see popup.js "PREVIEW".
+
+  Parameters: state = connected | connecting | waiting | disabled | error,
+  plus tabs, cap, ceiling, port, ver, and update=1.
+-->
+<head>
+  <meta charset="utf-8">
+  <title>Web Search Neo - companion widget preview</title>
+  <style>
+    :root { color-scheme: dark; font: 14px/1.5 system-ui, sans-serif; }
+    body { margin: 0; padding: 24px; background: #0b1220; color: #e8eef9; }
+    h1 { font-size: 16px; margin: 0 0 4px; }
+    p.note { margin: 0 0 16px; color: #9fb0c8; max-width: 70ch; }
+    .states { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }
+    .states button {
+      padding: 7px 13px; border-radius: 8px; border: 1px solid #2b3a55;
+      background: #131c30; color: inherit; cursor: pointer; font: inherit;
+    }
+    .states button.active { border-color: #60a5fa; color: #bfdbfe; }
+    .stage {
+      display: inline-block; padding: 18px; border-radius: 16px;
+      background:
+        radial-gradient(1200px 500px at 20% 0%, rgba(96,165,250,.10), transparent 60%),
+        linear-gradient(160deg, #101a2e, #0c1424);
+    }
+    iframe {
+      width: 360px; height: 600px; border: 0; display: block;
+      border-radius: 14px; box-shadow: 0 18px 50px rgba(0,0,0,.55);
+      background: #0b1220;
+    }
+    code { color: #cddcf5; }
+  </style>
+</head>
+<body>
+  <h1>Companion widget preview</h1>
+  <p class="note">
+    The frame below is the production <code>chrome-extension/popup.html</code> fed
+    simulated state through its read-only preview mode. Nothing here connects to a
+    bridge or to the network. Pick a state for a still screenshot, or
+    select another state.
+  </p>
+  <div class="states" id="states"></div>
+  <div class="stage"><iframe id="frame" title="Companion widget preview"></iframe></div>
+  <script>
+    const STATES = ["connected", "connecting", "waiting", "disabled", "error"];
+    const DEFAULTS = "tabs=3&cap=8&ceiling=64&port=8765";
+    const frame = document.getElementById("frame");
+    const statesBox = document.getElementById("states");
+
+    function show(state) {
+      const query = new URLSearchParams(DEFAULTS);
+      if (state === "error") { query.set("update", "0"); }
+      if (location.search.includes("update=1")) query.set("update", "1");
+      query.set("wsn-preview", state);
+      frame.src = `../chrome-extension/popup.html?${query}`;
+      for (const button of statesBox.querySelectorAll("button")) {
+        button.classList.toggle("active", button.dataset.state === state);
+      }
+      history.replaceState(null, "", `#${state}`);
+    }
+
+    for (const state of STATES) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.dataset.state = state;
+      button.textContent = state;
+      button.addEventListener("click", () => show(state));
+      statesBox.append(button);
+    }
+
+    show(location.hash ? location.hash.slice(1) : "connected");
+  </script>
+</body>
+</html>

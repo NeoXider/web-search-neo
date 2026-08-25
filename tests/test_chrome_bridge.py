@@ -736,9 +736,12 @@ const ids = [
   "release-status", "message", "check-release", "open-github",
   "port", "save-port", "reset-port", "port-default", "next-attempt",
   "max-sessions", "save-max-sessions", "reset-max-sessions", "max-sessions-default",
+  "panel", "state-card", "max-sessions-value", "max-sessions-ceiling",
+  "meter-fill", "release-chip",
 ];
 const nodes = new Map(ids.map(id => [id, {{
   textContent: "", title: "", value: "", dataset: {{}}, checked: false, disabled: false,
+  style: {{width: ""}},
   addEventListener(type, callback) {{ callbacks[`${{id}}:${{type}}`] = callback; }},
 }}]));
 globalThis.document = {{
@@ -791,12 +794,19 @@ await new Promise(resolve => setTimeout(resolve, 20));
 process.stdout.write(JSON.stringify({{
   release: nodes.get("release-status").textContent,
   releaseState: nodes.get("release-status").dataset.state,
+  chipState: nodes.get("release-chip").dataset.state,
   opened,
+  tabs: nodes.get("tabs").textContent,
+  version: nodes.get("version").textContent,
+  panelState: nodes.get("panel").dataset.state,
   port: nodes.get("port").value,
   bridge: nodes.get("bridge").textContent,
   nextAttempt: nodes.get("next-attempt").textContent,
   portMessages: sent.filter(item => item.type === "companion.setBridgePort"),
   maxSessions: nodes.get("max-sessions").value,
+  maxSessionsValue: nodes.get("max-sessions-value").textContent,
+  maxSessionsCeiling: nodes.get("max-sessions-ceiling").textContent,
+  meterFill: nodes.get("meter-fill").style.width,
   maxSessionsDefault: nodes.get("max-sessions-default").textContent,
   maxSessionsMessages: sent.filter(item => item.type === "companion.setMaxSessions"),
 }}));
@@ -810,12 +820,18 @@ process.stdout.write(JSON.stringify({{
     )
     assert completed.returncode == 0, completed.stderr
     outcome = json.loads(completed.stdout)
-    assert outcome["release"] == "Up to date (v1.3.4)"
+    assert outcome["release"] == "latest"
     assert outcome["releaseState"] == "current"
+    assert outcome["chipState"] == "current"
     assert outcome["opened"] == "https://github.com/NeoXider/web-search-neo"
-    # A connected companion has nothing to count down to, and saying "in 60s"
-    # there would read as a connection that is about to drop.
-    assert outcome["nextAttempt"] == "connected"
+    # The widget renders only what the worker reported: two controlled tabs of
+    # the eight-slot allowance, at this build's own version.
+    assert outcome["tabs"] == "2"
+    assert outcome["version"] == "1.3.4"
+    assert outcome["panelState"] == "connected"
+    # A connected companion has nothing to count down to; the subtext echoes
+    # where the bridge is instead of inventing a retry.
+    assert outcome["nextAttempt"] == "127.0.0.1:9001"
     # Applying a port asks the worker for it and re-renders from the answer,
     # rather than assuming the write succeeded.
     assert outcome["portMessages"] == [{"type": "companion.setBridgePort", "port": "9001"}]
@@ -828,6 +844,9 @@ process.stdout.write(JSON.stringify({{
     ]
     assert outcome["maxSessions"] == "12"
     assert outcome["maxSessionsDefault"] == "8"
+    assert outcome["maxSessionsValue"] == "12"
+    assert outcome["maxSessionsCeiling"] == "64"
+    assert outcome["meterFill"] == "18.8%"
 
 
 @requires_node

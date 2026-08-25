@@ -25,7 +25,7 @@ import msp_search
 from web_client import request
 
 
-__version__ = "1.8.2"
+__version__ = "1.9.0"
 
 PROJECT_DIR = Path(__file__).resolve().parent
 log = logging.getLogger("web_search_neo")
@@ -2224,7 +2224,7 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
         ],
         "example": {
             "topic": "find",
-            "params": {"query": "submit application", "session_id": "work"},
+            "params": {"query": "submit request", "session_id": "work"},
         },
     },
     "forms": {

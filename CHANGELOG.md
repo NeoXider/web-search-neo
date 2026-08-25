@@ -1,102 +1,161 @@
 # Changelog
 
+## 1.9.0
+
+Release focus: a dynamic companion widget, a keyboard launch path, and a
+documentation pass that moves every remaining domain-specific example out of
+the repository. The engine stays universal and domain-neutral; project
+workflows keep living under `<project>/.web-search-neo/macros/`.
+
+- Redesign the companion popup as a compact, icon-first widget: inline SVG/CSS
+  icons only (no remote assets, no build step), minimal visible words, all of
+  them English. Refined motion covers a connection pulse, state transitions,
+  hover/press feedback, and an animated capacity meter; every animation and
+  transition is disabled under `prefers-reduced-motion`. Accessibility is kept
+  strong: semantic controls, visible keyboard focus, `aria-label`/`title` on
+  every icon control, readable contrast in both color schemes, and live status
+  regions.
+- Make the widget genuinely dynamic from live bridge state. It renders
+  enabled/disabled/connecting/connected/error from what the service worker
+  reports - never a fabricated "connected" - and shows controlled tabs, the
+  parallel-session limit against its hard ceiling as an animated meter, the
+  bridge endpoint, the next retry countdown, the companion version, and the
+  GitHub release/update state. The one-second refresh and safe error handling
+  are unchanged, and no secret ever reaches the UI.
+- Extend the service-worker status payload with two safe fields: `state`, one
+  derived word per connection state so the popup cannot disagree with the
+  worker, and `failure_kind` (`transport` when nobody answered the port,
+  `auth` when a peer refused this companion's credentials). Loopback and
+  authentication restrictions and the version handshake are untouched.
+- Add a convenient launch path: the extension action opens the widget, and the
+  manifest now suggests **Alt+Shift+N** for it through a `_execute_action`
+  command (changeable at `chrome://extensions/shortcuts`). Opening the widget
+  never navigates, submits, closes, or otherwise touches user tabs.
+- Add two offline harnesses under `scripts/`, both reusing the production
+  popup HTML/CSS/JS rather than a mock design:
+  `companion-widget-preview.html` (open in any browser; read-only simulated
+  states driven by iframe parameters) and `widget_screenshots.py` (headless
+  Chrome PNG captures into `docs/assets`). Neither connects to a bridge,
+  opens tabs, or needs secrets.
+- Documentation is now entirely English and domain-neutral. The 1.8.x
+  changelog entries were translated from Russian and generalized; examples
+  across README, INSTALL, the bundled skill, and docs no longer reference any
+  single business domain, site, macro name, or workflow.
+- Tests extend to the widget: consistent versions across server and extension,
+  the keyboard command, English-only visible UI, icon and switch
+  accessibility, reduced-motion support, no remote assets, dynamic state and
+  capacity rendering, release-check wording, and a scan asserting that no
+  domain-specific public wording returned.
+
 ## 1.8.2
 
-Бенчмарк, гонявший браузерные задачи, за час забил рабочий Chrome пользователя
-группами вкладок. Причина оказалась в умолчании: `profile_mode` по умолчанию —
-`current`, то есть агент, ни разу не упомянувший режим, открывает страницы
-именно в том браузере, где человек работает.
+A benchmark that ran browser tasks spent an hour filling the user's working
+Chrome with tab groups. The cause was the default: `profile_mode` defaults to
+`current`, so an agent that never mentioned a mode opened its pages in exactly
+the browser a person was working in.
 
-- Переменная окружения **`WSN_FORBID_CURRENT_PROFILE`**: при ней любой запрос в
-  рабочий профиль понижается до `temporary` — своего одноразового Chrome.
-  Именно понижение, а не отказ: работа должна продолжиться, просто в другом
-  месте. Подмена не тихая, фактический режим возвращается в каждом ответе как
-  `profile_mode`.
-- Покрыты все написания: `auto` больше не скатывается в рабочий профиль, а
-  `extension` — это второе имя того же `current`, и через него не проскочить.
-- Почему на этой стороне, а не в промпте: попросить агента можно, но слабая
-  модель просьбу проигнорирует, а расплачивается за это человек, который просто
-  запустил задачу.
+- New environment variable **`WSN_FORBID_CURRENT_PROFILE`**: set it and every
+  request aimed at the working profile is demoted to `temporary` - its own
+  disposable Chrome. Demotion, not refusal: the work continues, just somewhere
+  else. The swap is not silent either - every answer reports the effective mode
+  as `profile_mode`.
+- All spellings are covered: `auto` no longer slides into the working profile,
+  and `extension` is a second name for the same `current`, so it cannot be used
+  to slip past the guard either.
+- Why here and not in a prompt: you can ask an agent politely, but a weak model
+  ignores the request, and the person who launched the task pays for it.
 
 ## 1.8.1
 
-Агента попросили прибрать вкладки в браузере, и выяснилось, что закрыть он умеет ровно одну —
-ту, которую сам открыл. `close` на привязанной вкладке отцепляется и оставляет её открытой
-(что правильно для одолженной вкладки и бесполезно для ненужной), а `window.close()` из
-страницы Chrome игнорирует. Расширение при этом всегда умело `tabs.remove` по любому id —
-дыра была только на стороне Python.
+An agent was asked to tidy up browser tabs, and it turned out it could close
+exactly one kind - the ones it had opened itself. `close` on a claimed tab
+detached and left the page open (right for a borrowed tab, useless for an
+unwanted one), and `window.close()` from a page Chrome ignores. The extension
+could always do `tabs.remove` on any id; the gap was only on the Python side.
 
-- Действие **`close_tabs`**: закрывает названные вкладки пользовательского Chrome по id из
-  `web_info(topic='browser_tabs')`. Переключателя «закрыть всё» нет намеренно — закрытие
-  необратимо, поэтому каждая вкладка называется явно.
-- Две категории отказов вместо закрытия, потому что именно так это ломается неприятнее всего:
-  **закреплённые** вкладки — это набор, который человек держит осознанно, и он последнее, что
-  должна унести зачистка «лишнего»; вкладки, которые **ведёт другой агент**, — закрыть такую
-  значит выдернуть страницу из-под чужой сессии на ходу. Снимаются поимённо через
-  `include_pinned` / `include_claimed`, и каждый отказ говорит, в какое правило упёрся.
-- Исход считается по **свежему списку вкладок**, а не по ответу расширения: `tabs.remove`
-  сообщает о неудаче всякий раз, когда `chrome.tabs.remove` бросает исключение, а типичная
-  причина этого — вкладка, которую пользователь только что закрыл руками. Вкладка, которой уже
-  нет, попадает в `skipped` с `already_gone`, потому что это и есть запрошенный результат.
-- Сессия, сидевшая на закрытой вкладке, **забывается**, а её claim освобождается. Иначе она
-  продолжала бы отзываться на своё имя, и следующее действие ушло бы на id, который Chrome
-  успел переиспользовать, — с ошибкой совсем в другом месте.
-- У `close` появился явный параметр **`close_tab`**: способность закрыть привязанную вкладку в
-  `browser_tools` была всегда, но наружу через действие не выводилась.
+- The **`close_tabs`** action: closes named tabs of the user's Chrome by id
+  from `web_info(topic='browser_tabs')`. There is deliberately no
+  close-everything switch - closing is irreversible, so each tab is named.
+- Two skip categories instead of closing, because that is how it hurts most:
+  **pinned** tabs are a set a person keeps on purpose and the last thing a
+  cleanup should carry away, and tabs **driven by another agent**, where
+  closing one pulls the page out from under a running session. Both can be
+  overridden by name via `include_pinned` / `include_claimed`, and every skip
+  says which rule it hit.
+- The outcome is decided against a **fresh tab list**, not against the
+  extension's acknowledgement: `tabs.remove` reports failure whenever it
+  throws, and the typical reason is a tab the user had already closed by hand.
+  A tab that is already gone lands in `skipped` as `already_gone`, because
+  that is the requested outcome.
+- A session sitting on a closed tab is **forgotten** and its claim released.
+  Otherwise it would have kept answering to its name, and the next action would
+  go to an id Chrome had meanwhile reused - failing somewhere else entirely.
+- `close` gained an explicit **`close_tab`** parameter: `browser_tools` could
+  always close a claimed tab, but the ability was not exposed through the
+  action until now.
 
 ## 1.8.0
 
-Двое суток живой работы — около 130 откликов на вакансии через параллельных агентов — дали
-три дефекта, и все три об одном: сервер отвечал уверенно и неправильно. Молчал там, где
-страница уже стояла; ругался там, где всё получилось. Каждый стоил потерянной работы.
+Two days of live use - roughly 130 form submissions driven by parallel agents -
+produced three defects, and all three were the same shape: the server answered
+confidently and wrongly. Silent where the page had already stalled, loud where
+everything had succeeded. Each one cost real work.
 
-- Научить детект видеть **невидимую капчу**. Раньше обход виджетов выбрасывал всё, у чего нет
-  видимой коробки, — а невидимый Turnstile именно такой: в DOM есть `div.cf-turnstile` и
-  `iframe` с `challenges.cloudflare.com`, но ни картинки, ни чекбокса. Обработчик отправки на
-  `apply.workable.com` ждёт токен, которого никто не выдаст: кнопка навсегда уходит в
-  «Submitting…», POST не уходит, консоль чистая. За один заход так потеряно двенадцать
-  подходящих вакансий, и повтор со `stealth` и свежей сессией давал ровно то же самое.
-  Теперь каждая сводка страницы несёт `invisible_challenge_pending`, а при `true` — ещё и
-  `invisible_challenge` с вендором, состоянием (`token_empty` — скрытое поле
-  `cf-turnstile-response` / `g-recaptcha-response` / `h-captcha-response` / `smart-token`
-  пустое; `widget_hidden` — виджет отрисован, поля ещё нет), доказательствами и подсказкой.
-  Это блокирует форму, а не страницу, поэтому `challenge_detected` остаётся `false`: агент не
-  должен парковаться на три минуты там, где страница читается.
-- Признать, что заполненный токен закрывает вопрос: скрытый контейнер, который вендор
-  оставляет в DOM после решения, сам по себе больше ни о чём не говорит.
-- `captcha` с `op=detect` больше не отвечает `captcha_present=false` на такой странице, а
-  ожидание (`mode='wait'`) больше не считает невидимую капчу решённой: пустое токен-поле —
-  это то же самое ожидание, и «resolved» поверх него означало «форму можно отправлять», когда
-  было нельзя.
-- Назвать **зависшую отправку** вслух. Если `click` или `click_text` не породил ни одного
-  сетевого запроса, а на странице нерешённый невидимый виджет, в ответе появляются
-  `submit_blocked_by_challenge=true` и `submit_block_reason`. Оба факта у сервера уже были —
-  перехват сети и обход DOM, — просто никто их не сводил вместе. Проверка идёт по общему
-  сливу сетевого журнала (`_drain_network_rows`), одинаковому для Selenium и для компаньона,
-  и учитывает запросы в полёте: «POST ещё не закончился» — не то же самое, что «POST не было».
-- Сохранить **переводы строк в contenteditable**. `Input.insertText` вставляет один текстовый
-  узел, а в нём `\n` рисуется пробелом, поэтому многострочное письмо приезжало в тело Gmail
-  одним абзацем — и `fill` честно возвращал «The control did not take the value», сравнив
-  ожидаемое с фактическим. Теперь текст набирается построчно, между строками — мягкий перенос
-  (Shift+Enter, а не Enter: в чат-композере Enter отправляет недописанное). Чтение обратно
-  идёт через `innerText`, а не `textContent`, который склеивал абзацы редактора в одну строку
-  и превращал удавшуюся запись в «отказ».
-- Если редактор всё равно схлопнул переносы, сказать это прямо: ошибка теперь называет
-  причину и рабочий путь — `run_script` с `user_gesture=true` и `navigator.clipboard.writeText`,
-  затем настоящий `Ctrl+V` через `input`. Ограничение Telegram Web (`#editable-message-text`,
-  Teact: запись в DOM не поднимает состояние компонента, кнопка отправки остаётся микрофоном)
-  записано в контракт `fill` там же.
-- Перестать считать пустой `input[type=file]` доказательством провала **загрузки**. Teamtailor
-  и любой Dropzone забирают файл с инпута и очищают его — резюме уже на S3, чип с именем на
-  экране, а `upload` возвращал `success:false`. Теперь ответ несёт `upload_state`: `attached`
-  (инпут держит файлы — точный случай), `taken_by_widget` (инпут пуст, но имя файла появилось
-  на странице или ушёл POST/PUT/PATCH после присоединения) или `unconfirmed` (сказать нельзя).
-  `unconfirmed` — не отказ: `note` описывает, как проверить (искать имя через `page_text` и
-  `elements`, запрос — через топик `network`), а `success` теперь ложь только тогда, когда
-  само присоединение упало. У `fill` с `files` то же самое в `upload_states`/`upload_notes`.
-- Дописать контракт там, где поменялось поведение: заметки `fill`, `upload`, `click`,
-  `page_elements`, правила и раздел troubleshooting в скилле, общий список pitfalls. Бюджеты
-  `capabilities` (14000) и `skill` (7000) не подняты — 13401 и 6401.
+- Teach detection to see the **invisible captcha**. Widget traversal used to
+  discard everything without a visible box - and an invisible Turnstile is
+  exactly that: `div.cf-turnstile` and an `iframe` to challenges.cloudflare.com
+  in the DOM, but no picture and no checkbox. A submit handler on such a page
+  waits for a token nobody will mint: the button settles into "Submitting...",
+  no POST leaves the page, the console stays clean. Now every page summary
+  carries `invisible_challenge_pending`, and when true also
+  `invisible_challenge` with the vendor, the state (`token_empty` - the hidden
+  `cf-turnstile-response` / `g-recaptcha-response` / `h-captcha-response` /
+  `smart-token` field is empty; `widget_hidden` - rendered before its field
+  existed), evidence, and advice. It gates the form rather than the page, so
+  `challenge_detected` stays false: the agent should not park for three
+  minutes on a page that reads fine.
+- Admit that a minted token ends the question: a hidden container a vendor
+  leaves in the DOM after solving says nothing by itself anymore.
+- `captcha` with `op=detect` no longer answers `captcha_present=false` on such
+  a page, and waiting (`mode='wait'`) no longer calls an invisible challenge
+  resolved: an empty token field is the same wait, and "resolved" on top of it
+  meant "safe to submit" when it was not.
+- Name the **stalled submit** out loud. If a `click` produced no network
+  request while an invisible widget is pending, the reply carries
+  `submit_blocked_by_challenge=true` and `submit_block_reason`. The server
+  already had both halves - the network tap and the DOM walk - nobody joined
+  them. The check runs on the shared network-log drain, the same for Selenium
+  and the companion, and counts requests in flight: "POST not finished yet" is
+  not the same as "no POST".
+- Preserve **line breaks in contenteditable**. `Input.insertText` inserts one
+  text node, and inside it `\n` renders as a space, so a multi-paragraph
+  message arrived as one paragraph - and `fill` honestly reported "The control
+  did not take the value" after comparing expected with actual. Text is now
+  typed line by line with a soft break between lines (Shift+Enter, never
+  Enter: in a chat composer Enter sends what is written so far). Read-back uses
+  `innerText`, not `textContent`, which ran the editor's paragraphs together
+  and turned a successful write into a refusal.
+- If an editor folds the breaks away anyway, say so: the error names the cause
+  and the working path - `run_script` with `user_gesture=true` and
+  `navigator.clipboard.writeText`, then a real `Ctrl+V` through `input`. Chat
+  composers whose state never updates from a DOM write - the send control
+  stays inert - always need that paste, and the note lives in the `fill`
+  contract.
+- Stop treating an empty `input[type=file]` as proof that an **upload**
+  failed. Any Dropzone-style widget takes the file off the input and uploads it
+  itself: the file is already on its way, the chip with the name is on screen,
+  and `upload` still answered `success:false`. The reply now carries
+  `upload_state`: `attached` (the input holds the files - exact),
+  `taken_by_widget` (the input was emptied, and the page names the file or a
+  POST/PUT/PATCH followed) or `unconfirmed` (cannot say). `unconfirmed` is not
+  a refusal: `note` explains how to verify (look for the name through
+  `page_text`/`elements`, the request through the `network` topic), and
+  `success` is false only when the attach itself failed. `fill` with `files`
+  reports the same thing in `upload_states`/`upload_notes`.
+- Write the contract where behavior changed: notes for `fill`, `upload`,
+  `click`, `page_elements`, skill rules and troubleshooting, the general
+  pitfalls list. The `capabilities` (14000) and `skill` (7000) budgets were
+  not raised - 13401 and 6401.
 
 ## 1.7.0
 
@@ -109,9 +168,9 @@ has taken its place.
   interception in the action loop, and the attribution rules for a step that named no session.
   The recorder was never self-sufficient - its own contract told the caller to save the
   recording and then hand-edit the JSON to turn the changing parts into `{{placeholders}}`, so
-  the path ended in an editor either way. Over a full day of live use all four working macros
-  (`gmail-send`, `proton-send`, `tg-send`, `hh-reply`) were written directly as JSON and the
-  recorder was not used once, while it carried a class of defects of its own: races between
+  the path ended in an editor either way. Over a full day of live use all four
+  working macros in the project store were written directly as JSON and
+  the recorder was not used once, while it carried a class of defects of its own: races between
   concurrent batches, steps landing in the wrong open recording, a name borrowed by an
   explicit save, steps lost when `record` was called twice.
 - Remove `op=delete`, `op=export` and `op=import`. When a macro is a file, deleting one is
@@ -136,7 +195,7 @@ has taken its place.
 
 ## 1.6.0
 
-A day of real use - about a hundred job applications filed by five agents through one server -
+A day of real use - about a hundred form submissions filed by five agents through one server -
 produced four defects, all of them about several agents sharing one MCP server.
 
 - Raise the default session cap from 4 to 8. Four was chosen when a session meant a Chrome
@@ -160,7 +219,7 @@ produced four defects, all of them about several agents sharing one MCP server.
   `scope="all"` (or `include_foreign=true`) is the old behaviour, kept and explicit. The
   shutdown hook still closes everything, because at process exit nobody is left to own a tab.
 - Bound perception answers by size, not only by count. `page_elements` had `limit` and `offset`
-  but nothing measuring the answer: 200 controls on a live job board came back as 83,616
+  but nothing measuring the answer: 200 controls on a large live page came back as 83,616
   characters, which the model that asked could not receive at all. `page_elements`, `page_outline`
   and `find` now take `max_chars` (default 18,000), trim to a prefix, restate `returned` and
   `range[*].next_offset` so the continuation offset points at the first entry that was not sent,

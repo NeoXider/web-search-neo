@@ -8,8 +8,9 @@ that never reloads, the submit button silently does nothing, and somewhere in
 the middle a CAPTCHA appears. This document walks through those cases with the
 exact calls that handle them.
 
-Every example uses the application form fixture from `tests/conftest.py` (route
-`/form`), so the selectors, refs, and outputs below are real, not illustrative.
+Examples mirror the request form fixture in `tests/conftest.py` (route `/form`),
+but use generic labels and selectors so this guide stays domain-neutral. The
+fixture tests remain the executable source of truth for exact live selectors.
 
 - [Look before you type](#look-before-you-type)
 - [Three ways to address an element](#three-ways-to-address-an-element)
@@ -43,12 +44,12 @@ ref:1cffa5bd10c7e703:1  link "Fixture link" -> http://127.0.0.1:59481/relative @
 default not clicked
 ref:1cffa5bd10c7e703:2  button "Run action" @8,110 80x21
 ref:1cffa5bd10c7e703:3  form
-  ref:1cffa5bd10c7e703:4  textbox "Candidate name" [required] @116,152 177x21
-  ref:1cffa5bd10c7e703:5  textbox "Cover letter" @376,131 168x36
-  ref:1cffa5bd10c7e703:6  combobox "Role" value="Python" @583,153 117x19
-  ref:1cffa5bd10c7e703:7  checkbox "Remote" @708,154 13x13
-  Remote
-  ref:1cffa5bd10c7e703:8  file "Resume" @833,152 253x21
+  ref:1cffa5bd10c7e703:4  textbox "Full name" [required] @116,152 177x21
+  ref:1cffa5bd10c7e703:5  textbox "Message" @376,131 168x36
+  ref:1cffa5bd10c7e703:6  combobox "Category" value="Python" @583,153 117x19
+  ref:1cffa5bd10c7e703:7  checkbox "Urgent" @708,154 13x13
+  Urgent
+  ref:1cffa5bd10c7e703:8  file "Attachment" @833,152 253x21
   ref:1cffa5bd10c7e703:9  button "Apply" @1090,152 49x21
 ```
 
@@ -70,7 +71,7 @@ Use `output="json"` when the agent needs geometry rather than a picture:
 ```json
 {
   "kind": "node", "depth": 1, "ref": "ref:1cffa5bd10c7e703:4",
-  "tag": "input", "role": "textbox", "name": "Candidate name",
+  "tag": "input", "role": "textbox", "name": "Full name",
   "states": ["required"], "rect": {"x": 116, "y": 152, "w": 177, "h": 21},
   "page_rect": {"x": 116, "y": 152, "w": 177, "h": 21},
   "center": {"x": 205, "y": 163},
@@ -91,11 +92,11 @@ is its `fields` array for the fixture:
 
 ```json
 [
-  {"selector": "#candidate-name", "tag": "input", "type": "", "label": "Candidate name", "required": true},
-  {"selector": "#cover-letter", "tag": "textarea", "type": "", "label": "Cover letter", "required": false},
-  {"selector": "#role", "tag": "select", "type": "", "label": "Role", "required": false},
-  {"selector": "#remote", "tag": "input", "type": "checkbox", "label": "Remote", "required": false},
-  {"selector": "#resume", "tag": "input", "type": "file", "label": "Resume", "required": false}
+  {"selector": "#full-name", "tag": "input", "type": "", "label": "Full name", "required": true},
+  {"selector": "#message", "tag": "textarea", "type": "", "label": "Message", "required": false},
+  {"selector": "#category", "tag": "select", "type": "", "label": "Category", "required": false},
+  {"selector": "#urgent", "tag": "input", "type": "checkbox", "label": "Urgent", "required": false},
+  {"selector": "#attachment", "tag": "input", "type": "file", "label": "Attachment", "required": false}
 ]
 ```
 
@@ -125,7 +126,7 @@ empty.
 
 | Form | Example | Accepted by | Lifetime |
 | --- | --- | --- | --- |
-| CSS selector | `#candidate-name`, `input[name='candidate_name']` | Everything, everywhere, including companion `current` mode. | As long as the markup keeps that shape. |
+| CSS selector | `#full-name`, `input[name='full_name']` | Everything, everywhere, including companion `current` mode. | As long as the markup keeps that shape. |
 | Ref handle | `ref:1cffa5bd10c7e703:4` | `fill` (fields and files), `upload`, `click`, `wait`, and `submit`'s `form_selector`. | Only in the document it was read from, and only while the element is attached. |
 | Piercing path | `#host >>> #inner` | Same list as ref handles. | As long as each step resolves. |
 
@@ -167,14 +168,14 @@ When selectors are generated (`.css-1x7f9k2 > div:nth-child(3) > input`) or the
 page is unfamiliar, ask for the element instead of guessing it:
 
 ```json
-{"topic":"find","params":{"session_id":"apply","query":"cover letter","limit":5}}
+{"topic":"find","params":{"session_id":"apply","query":"message","limit":5}}
 ```
 
 ```json
 {
   "matches": [
-    {"ref": "ref:f5d9b80a3c2bdf66:5", "role": "textbox", "name": "Cover letter", "score": 128},
-    {"ref": "ref:f5d9b80a3c2bdf66:10", "role": "generic", "name": "Cover letter", "score": 116}
+    {"ref": "ref:f5d9b80a3c2bdf66:5", "role": "textbox", "name": "Message", "score": 128},
+    {"ref": "ref:f5d9b80a3c2bdf66:10", "role": "generic", "name": "Message", "score": 116}
   ],
   "low_confidence": false
 }
@@ -204,10 +205,10 @@ One `fill` action sets as many fields as you like, in the order given:
     "action": "fill",
     "session_id": "apply",
     "fields": {
-      "#candidate-name": "Neo Candidate",
-      "#cover-letter": "Unity and C# experience",
-      "#role": "unity",
-      "#remote": true
+      "#full-name": "A. Requester",
+      "#message": "Please confirm the details above",
+      "#category": "support",
+      "#urgent": true
     }
   }]
 }
@@ -221,7 +222,7 @@ What each control type does:
 | `contenteditable` region | The string, addressed by the editable element itself. The outline reports it as `role: textbox` however the attribute is written, but `page_elements` looks for `[contenteditable="true"]` literally — so a bare `<div contenteditable>` is a field there and appears in no `page_elements` listing. Find those through `page_outline` or `find`. |
 | Checkbox | `true`/`false`, or `"1"`, `"true"`, `"yes"`, `"on"`, `"checked"` for the checked state. The element is clicked only if its state actually has to change. |
 | Radio | `true` selects it. `false` on an already-selected radio is refused with "A selected radio cannot be unchecked directly; select another radio in its group" — that is a real HTML constraint, not a limitation of the tool. |
-| `<select>` | The option `value`; if no option carries it, the visible text is tried. Both `"unity"` and `"Unity Developer"` select the same option in the fixture. |
+| `<select>` | The option `value`; if no option carries it, the visible text is tried. Both `"support"` and `"Support request"` select the same option in the fixture. |
 | `<select multiple>` | A list of values, `["a", "c"]`, and it is the only control that takes one — a list anywhere else is refused with "this control takes one". It reads back as a list too. A scalar is legal and *replaces* the whole selection rather than adding to it, so `"b"` after `["a","c"]` leaves exactly `["b"]`. One `change` fires for the write, not one per option. |
 | Date, time, datetime-local, month, week, range, colour | The string, in the control's own format. These are set directly rather than typed, because typing into them depends on the browser's locale. The value is rehearsed on a throwaway input first, so an unparseable one is refused **without touching the control** — it used to leave a valid-looking wrong date, or drop a slider to its midpoint — and the error names the format: `A date control takes YYYY-MM-DD, for example 2024-01-15`. |
 | File input | Not through `fields`. Use the `files` key or the `upload` action; sending a path in `fields` returns `Use the files argument for file inputs`. |
@@ -233,8 +234,8 @@ Files can travel in the same call:
   "actions": [{
     "action": "fill",
     "session_id": "apply",
-    "fields": {"#candidate-name": "Neo Candidate"},
-    "files": {"#resume": "C:/docs/resume.pdf"}
+    "fields": {"#full-name": "A. Requester"},
+    "files": {"#attachment": "C:/docs/report.pdf"}
   }]
 }
 ```
@@ -247,10 +248,10 @@ reports exactly what happened:
 ```json
 {
   "success": false,
-  "filled": ["#candidate-name", "#cover-letter", "#role", "#remote"],
+  "filled": ["#full-name", "#message", "#category", "#urgent"],
   "field_values": {
-    "#candidate-name": "Ada Lovelace", "#cover-letter": "Unity and C# experience",
-    "#role": "unity", "#remote": true
+    "#full-name": "Ada Lovelace", "#message": "Please confirm the details above",
+    "#category": "support", "#urgent": true
   },
   "files_uploaded": {},
   "errors": {
@@ -261,7 +262,7 @@ reports exactly what happened:
 ```
 
 Four fields are set; one selector was wrong and one control refused the write.
-`success` is `false` whenever `errors` is non-empty, so the agent's job is to read
+`success` is `false` whenever `errors` is non-empty, so the agent's task is to read
 `errors`, fix those selectors — usually by re-reading `page_outline` — and re-send
 only the failed ones. Re-sending the whole map is harmless: the fields already
 filled are simply overwritten with the same values.
@@ -298,7 +299,7 @@ failed; `field_values` says what each one holds now.
 
 ```json
 {
-  "field_values": {"#candidate-name": "Ada Lovelace", "#locked": "", "#missing-field": null},
+  "field_values": {"#full-name": "Ada Lovelace", "#locked": "", "#missing-field": null},
   "errors": {
     "#locked": "ValueError: The control is disabled, so nothing can be written to it",
     "#missing-field": "NoSuchElementException: no such element: ..."
@@ -340,8 +341,8 @@ The cost is that focus ends on `document.body`. Three things follow:
   "actions": [{
     "action": "upload",
     "session_id": "apply",
-    "selector": "#resume",
-    "file_paths": ["C:/docs/resume.pdf", "C:/docs/portfolio.pdf"]
+    "selector": "#attachment",
+    "file_paths": ["C:/docs/report.pdf", "C:/docs/appendix.pdf"]
   }]
 }
 ```
@@ -349,8 +350,8 @@ The cost is that focus ends on `document.body`. Three things follow:
 ```json
 {
   "success": true,
-  "files_uploaded": {"#resume": ["resume.pdf", "portfolio.pdf"]},
-  "file_names": ["resume.pdf", "portfolio.pdf"]
+  "files_uploaded": {"#attachment": ["report.pdf", "appendix.pdf"]},
+  "file_names": ["report.pdf", "appendix.pdf"]
 }
 ```
 
@@ -396,7 +397,7 @@ Native validation runs first. If it fails, nothing is submitted:
   "success": false,
   "validation_passed": false,
   "submit_triggered": false,
-  "validation_errors": [{"id": "candidate-name", "name": "candidate_name", "message": "Please fill out this field."}]
+  "validation_errors": [{"id": "full-name", "name": "full_name", "message": "Please fill out this field."}]
 }
 ```
 

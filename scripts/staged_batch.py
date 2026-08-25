@@ -76,7 +76,7 @@ _QUESTION_MARKERS = (
     "опрос работодателя",
 )
 _TERMINAL_HINT = re.compile(
-    r"submit|apply|send|confirm|purchase|checkout|delete|publish|"
+    r"submit|apply|send|confirm|purchase|checkout|delete|publish|approve|release|"
     r"отклик|отправ|подтверд|купить|удал|оплат",
     re.IGNORECASE,
 )

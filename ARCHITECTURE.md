@@ -1,8 +1,8 @@
 # Architecture invariants
 
 Web Search Neo is a universal browser/search MCP. Its core stays domain-neutral: public APIs,
-storage, validation, guards, and documentation primitives must not encode recruitment, job
-sites, commerce vendors, or any other domain-specific workflow or host policy.
+storage, validation, guards, and documentation primitives must not encode any business-domain
+workflow, vocabulary, or host policy.
 
 Domain behavior belongs in saved macros, templates, and configuration owned by the calling
 project. Only neutral, broadly useful examples may be bundled in this repository. Concrete
@@ -64,7 +64,7 @@ and embedded Submit steps are refused. The checkpoint is consumed before dispatc
 after an ambiguous result fails closed.
 
 Canonical target identity preserves the complete query string because a query parameter can
-be the only distinction between two resources or requisitions on one shared path. URL
+be the only distinction between two records on one shared path. URL
 fragments are excluded because they are client-side navigation state. Core never guesses
 which query parameters are tracking noise; the calling project supplies an already-canonical URL.
 

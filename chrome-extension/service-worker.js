@@ -119,6 +119,11 @@ let reconnectTimer = null;
 let keepaliveTimer = null;
 let lastAttemptAt = 0;
 let backoff = {transport: 0, auth: 0, nextAttemptAt: 0};
+// Why the last attempt failed, as one safe word the popup can show: "transport"
+// means nobody answered the port yet, "auth" means a peer did answer and turned
+// this companion away. Cleared by any verified handshake or an explicit
+// reconnect, never carrying more than that one word to the UI.
+let lastFailure = null;
 let enabled = true;
 let enabledPromise = null;
 // The read-or-mint of the run id, shared by every caller, and the value this
@@ -958,9 +963,10 @@ async function loadEnabled() {
 }
 
 function connectionStatus() {
+  const connected = Boolean(socket && socket.readyState === WebSocket.OPEN && verified);
   return {
     enabled,
-    connected: Boolean(socket && socket.readyState === WebSocket.OPEN && verified),
+    connected,
     connecting,
     bridge_url: bridgeUrl(),
     bridge_port: bridgePort,
@@ -971,7 +977,22 @@ function connectionStatus() {
     controlled_tabs: attachedTabs.size,
     next_attempt_at: enabled ? backoff.nextAttemptAt || 0 : 0,
     version: chrome.runtime.getManifest().version,
+    state: deriveState(connected),
+    failure_kind: lastFailure,
   };
+}
+
+// One word for the widget, derived here so the popup cannot disagree with the
+// worker about what the connection is doing. "error" is reserved for a peer
+// that answered and refused this companion's credentials - a state a user has
+// to fix - while a closed port stays "waiting", which is the ordinary idle
+// state of a machine no server has run on yet.
+function deriveState(connected) {
+  if (!enabled) return "disabled";
+  if (connected) return "connected";
+  if (connecting) return "connecting";
+  if (lastFailure === "auth") return "error";
+  return "waiting";
 }
 
 async function detachAllTabs() {
@@ -1018,6 +1039,9 @@ function reconnectNow() {
   connecting = false;
   if (active) active.close();
   lastAttemptAt = 0;
+  // The user asked for a fresh attempt, so the old verdict should not outlive
+  // it: the popup shows "connecting" until this attempt answers either way.
+  lastFailure = null;
   setBadge(false);
   connectNow();
   return connectionStatus();
@@ -1060,6 +1084,7 @@ function scheduleReconnect(delayMs) {
 function retryAfterFailure(kind) {
   const delay = backoffDelay(kind, backoff[kind]);
   backoff[kind] = Math.min(backoff[kind] + 1, BACKOFF_STREAK_LIMIT);
+  lastFailure = kind;
   scheduleReconnect(delay);
 }
 
@@ -1373,6 +1398,7 @@ function completeHandshake(connection, message, expectedProof) {
   }
   if (connection !== socket || connection.readyState !== WebSocket.OPEN) return;
   verified = true;
+  lastFailure = null;
   // A verified peer proves the wait is over, so the next outage starts counting
   // from the floor again rather than from wherever the last one left off.
   clearReconnect();
