@@ -610,6 +610,21 @@ def _profile_configuration(
     return mode, None, None, None
 
 
+# Set this and no session can drive the user's everyday Chrome, whatever it
+# asks for. It exists because "current" is the default: an agent that never
+# mentions profile_mode lands in the browser its user is working in, and a
+# benchmark or a batch job then fills that browser with tabs and tab groups.
+# Asking the agent nicely does not hold - a weaker model ignores it - so the
+# rule belongs on this side of the boundary.
+_FORBID_CURRENT_ENV = "WSN_FORBID_CURRENT_PROFILE"
+
+
+def _current_profile_forbidden() -> bool:
+    return str(os.environ.get(_FORBID_CURRENT_ENV, "")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
 def _resolve_profile_mode(profile_mode: str, headless: bool | None) -> str:
     mode = profile_mode.strip().lower()
     if mode == "extension":
@@ -617,7 +632,18 @@ def _resolve_profile_mode(profile_mode: str, headless: bool | None) -> str:
     if mode == "auto":
         if headless is True:
             return "temporary"
+        if _current_profile_forbidden():
+            return "temporary"
         return "current" if get_chrome_bridge().wait_connected(1.5) else "temporary"
+    if mode == "current" and _current_profile_forbidden():
+        # Понижение, а не отказ: работа должна продолжиться, просто в своём
+        # браузере. Подмена не тихая — фактический режим возвращается в каждом
+        # ответе как profile_mode, так что видно, где именно всё происходит.
+        logger.info(
+            "profile_mode='current' was downgraded to 'temporary': %s is set",
+            _FORBID_CURRENT_ENV,
+        )
+        return "temporary"
     if mode not in {"current", "temporary", "persistent", "attach"}:
         raise ValueError(
             "profile_mode must be 'auto', 'current', 'temporary', 'persistent', or 'attach'"

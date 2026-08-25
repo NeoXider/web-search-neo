@@ -180,3 +180,40 @@ def test_closing_a_tab_forgets_the_session_sitting_on_it(monkeypatch):
     assert result["sessions_dropped"] == ["doomed"]
     assert "doomed" not in browser_tools._sessions
     assert released == [7]
+
+
+class TestForbidCurrentProfile:
+    """Keeping a run out of the browser its user is working in.
+
+    profile_mode defaults to "current", so an agent that never mentions the
+    mode drives the real Chrome someone is using. For a benchmark or any batch
+    job that means their window fills with tabs. The prompt can ask for better
+    behaviour and a weak model will ignore it, so the switch has to be here.
+    """
+
+    def test_current_is_downgraded_not_refused(self, monkeypatch):
+        """Работа продолжается, просто в своём браузере."""
+        import browser_tools
+        monkeypatch.setenv('WSN_FORBID_CURRENT_PROFILE', '1')
+        assert browser_tools.resolve_profile_mode('current', None) == 'temporary'
+
+    def test_auto_does_not_fall_back_to_the_users_chrome(self, monkeypatch):
+        import browser_tools
+        monkeypatch.setenv('WSN_FORBID_CURRENT_PROFILE', '1')
+        assert browser_tools.resolve_profile_mode('auto', None) == 'temporary'
+
+    def test_extension_alias_is_covered_too(self, monkeypatch):
+        """'extension' is just another spelling of 'current' and must not escape."""
+        import browser_tools
+        monkeypatch.setenv('WSN_FORBID_CURRENT_PROFILE', '1')
+        assert browser_tools.resolve_profile_mode('extension', None) == 'temporary'
+
+    def test_unset_leaves_behaviour_alone(self, monkeypatch):
+        import browser_tools
+        monkeypatch.delenv('WSN_FORBID_CURRENT_PROFILE', raising=False)
+        assert browser_tools.resolve_profile_mode('current', None) == 'current'
+
+    def test_only_truthy_values_switch_it_on(self, monkeypatch):
+        import browser_tools
+        monkeypatch.setenv('WSN_FORBID_CURRENT_PROFILE', '0')
+        assert browser_tools.resolve_profile_mode('current', None) == 'current'

@@ -25,7 +25,7 @@ import msp_search
 from web_client import request
 
 
-__version__ = "1.8.1"
+__version__ = "1.8.2"
 
 PROJECT_DIR = Path(__file__).resolve().parent
 log = logging.getLogger("web_search_neo")
