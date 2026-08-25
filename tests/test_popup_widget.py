@@ -360,15 +360,24 @@ return results;
             "max_sessions": 32, "max_sessions_ceiling": 64, "next_attempt_at": 0,
         },
     }
+    initial_status = {
+        "enabled": True,
+        "connected": True,
+        "connecting": False,
+        "state": "connected",
+        "failure_kind": None,
+        "controlled_tabs": 2,
+        "max_sessions": 8,
+        "max_sessions_ceiling": 64,
+        "bridge_url": "ws://127.0.0.1:8765",
+        "bridge_port": 8765,
+        "default_bridge_port": 8765,
+        "next_attempt_at": 0,
+        "version": main.__version__,
+    }
     prelude = (
         "globalThis.window = globalThis;\n"
-        f"const STATUS = {json.dumps({
-            'enabled': True, 'connected': True, 'connecting': False, 'state': 'connected',
-            'failure_kind': None, 'controlled_tabs': 2, 'max_sessions': 8,
-            'max_sessions_ceiling': 64, 'bridge_url': 'ws://127.0.0.1:8765',
-            'bridge_port': 8765, 'default_bridge_port': 8765, 'next_attempt_at': 0,
-            'version': main.__version__,
-        })};\n"
+        f"const STATUS = {json.dumps(initial_status)};\n"
         "const SCENARIOS = "
         + json.dumps(scenarios).replace('"JS_NOW_PLUS_230000"', "Date.now() + 230000")
         + ";\n"
