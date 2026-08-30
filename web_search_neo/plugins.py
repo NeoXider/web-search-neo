@@ -39,9 +39,6 @@ def _main() -> types.ModuleType:
     return _m
 
 
-from web_search_neo.msp_search import register_search_provider  # noqa: F401
-
-
 def _ensure_legacy_tool(fn: Callable[..., Any]) -> str:
     """Make sure FastMCP can generate a schema for the handler.
 
