@@ -2,7 +2,7 @@
 
 This guide installs the MCP server from source and connects it to LM Studio or another stdio-compatible MCP client.
 
-It describes version 1.9.1. The Python package, the server, and the bundled Chrome
+It describes version 1.10.0. The Python package, the server, and the bundled Chrome
 companion carry that same version, and the bridge only accepts a companion able to complete
 the 1.3.0 handshake — see [Updating](#updating) if an older one is already installed.
 
@@ -94,7 +94,13 @@ Open LM Studio, go to the MCP integrations/configuration screen, and merge this 
 }
 ```
 
-Replace `cwd` with the directory you cloned. Use forward slashes in JSON on Windows, or escape each backslash as `\\`.
+The repository ships this file in a portable form (`"cwd": "."`) so no machine's path ever gets committed. Pin it to *this* clone before importing — the generator rewrites `mcp_servers.json` with the absolute paths of wherever you cloned, keeps any other MCP servers already listed there, and uses forward slashes so the JSON stays valid on Windows:
+
+```powershell
+python scripts/make_mcp_config.py
+```
+
+Use `--print` to preview without writing. The generated entry is what your client should end up with, for example `"cwd": "C:/path/to/web-search-neo"`.
 
 The configuration deliberately uses `"command": "python"` instead of an absolute interpreter path. If LM Studio cannot find the virtual environment, either launch LM Studio with that environment on `PATH` or use the system Python where you installed `requirements.txt`.
 
@@ -209,7 +215,7 @@ Earlier revisions tried to perform those clicks for you through Windows UI Autom
 code is gone. It depended on the interface language, on which window happened to have focus,
 and on a folder picker that the automation backend does not even enumerate.
 
-The bundled companion is version 1.9.1 and declares five permissions: `alarms`, `debugger`,
+The bundled companion is version 1.10.0 and declares five permissions: `alarms`, `debugger`,
 `storage`, `tabs`, and `tabGroups`. There are no content scripts and no `host_permissions`;
 page access comes from `debugger`, which attaches the Chrome DevTools Protocol to the tabs
 the agent drives. `alarms` exists because Chrome suspends an idle MV3 service worker after
@@ -252,7 +258,7 @@ running the companion takes the agent's tabs over from the first.
 ### The bridge daemon
 
 That listener is not part of the MCP server process. It is a standalone daemon —
-`bridge_daemon.py` — which owns the port, holds the one connection to the companion, and
+`web_search_neo/bridge_daemon.py` — which owns the port, holds the one connection to the companion, and
 relays commands for any number of local MCP clients. You do not install or configure it: an
 MCP server starts it detached as it comes up, if nothing is listening yet, and it then
 outlives that server. Nothing is registered for autostart: no service, no scheduled task, no
@@ -494,6 +500,16 @@ Two cases still need the human:
 Confirm with `web_info(topic="browser_status")` that `current_chrome.connected` is `true`
 before continuing.
 
+### Plugins
+
+Set `WEB_SEARCH_NEO_PLUGINS` to an `os.pathsep`-separated list of plugin `.py`
+files or directories (`;` on Windows, `:` on Linux and macOS). A directory loads
+each top-level `.py` file whose name does not start with `_`. A plugin may
+register during import or expose an optional `register()` hook, which is called
+after import. Use `web_search_neo.plugins.register_action`, `register_topic`,
+and `register_search_provider` to add actions, observation topics, and search
+providers.
+
 ## Optional environment variables
 
 Set these for the MCP server process before it starts.
@@ -504,7 +520,7 @@ Set these for the MCP server process before it starts.
 | `WEB_SEARCH_NEO_PROXY` | Proxy for HTTP fetches, search, and browser sessions. |
 | `WEB_SEARCH_NEO_BROWSER_USER_AGENT` | Override the User-Agent of rendered sessions. |
 | `WEB_SEARCH_NEO_PROFILE_ROOT` | Root directory for `persistent` Chrome profiles. |
-| `WEB_SEARCH_NEO_MAX_SESSIONS` | How many browser sessions one server holds at once, default `4`, capped at `64`. The cap is per process and parallel agents share it, so raise it when several agents each need a page of their own. |
+| `WEB_SEARCH_NEO_MAX_SESSIONS` | How many browser sessions one server holds at once, default `8`, capped at `64`. The cap is per process and parallel agents share it, so raise it when several agents each need a page of their own. |
 | `WEB_SEARCH_NEO_DEBUGGER_ADDRESS` | Default DevTools address for `attach` mode. |
 | `WEB_SEARCH_NEO_BRIDGE_PORT` | Loopback port of the companion bridge, default `8765`. Shared by the daemon and every MCP server; set the companion's own port in its popup under Settings. |
 | `WEB_SEARCH_NEO_BRIDGE_IDLE_SECONDS` | How long the bridge daemon stays up with neither a companion nor a client attached, default `900`. `0` disables the timer. |
@@ -513,6 +529,7 @@ Set these for the MCP server process before it starts.
 | `WEB_SEARCH_NEO_BRIDGE_START_TIMEOUT` | How long startup waits for that first attempt before it continues in the background, default `2` seconds. |
 | `WEB_SEARCH_NEO_ALLOW_PLAIN_HTTP` | Accept unencrypted `http://` to public hosts. |
 | `WEB_SEARCH_NEO_LEGACY_TOOLS` | Advertise the former wide tool list instead of the two compact tools. |
+| `WEB_SEARCH_NEO_PLUGINS` | `os.pathsep`-separated plugin `.py` files or directories; plugins may add actions, observation topics, and search providers. |
 
 The `WEB_SEARCH_NEO_BRIDGE_*` variables reach the daemon as well: a spawned one inherits the
 environment of the server that started it, and one you run yourself with
@@ -610,7 +627,7 @@ or when `setup_current_chrome` answered `self_update: "unsupported"` or `"timeou
    very directory **Load unpacked** points at, then reload the extension. Restarting the
    daemon does not help and never did after the daemon learned to re-read the token file:
    it already fetches the current secret from disk before calling anything a mismatch.
-3. Check the card's version. It must read 1.9.1; anything older than 1.3.0 cannot
+3. Check the card's version. It must read 1.10.0; anything older than 1.3.0 cannot
    authenticate at all, and Chrome only picks up the new manifest on reload.
 4. `%LOCALAPPDATA%\WebSearchNeo\bridge-daemon.log` records the bridge's side: `Rejected a
    bridge client that did not present the companion token` confirms that something did reach

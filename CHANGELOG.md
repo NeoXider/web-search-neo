@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.10.0
+
+Release focus: the engine becomes a real Python package with an open extension core,
+and four browser-slice capabilities land on top of the existing CDP surface.
+Chrome Native Messaging is deliberately deferred to 1.11.
+
+- Move the engine into a proper `web_search_neo/` package: fourteen root-level modules
+  now live under it, intra-package imports are fully qualified, and thin root shims keep
+  `python main.py` and `driver.py` working as before; `pip install -e .` also exposes the
+  `wsn` entry point.
+- Add a plugin API: set `WEB_SEARCH_NEO_PLUGINS` to an os.pathsep-separated list of `.py`
+  files or directories (or publish an entry point in the `web_search_neo.plugins` group)
+  and plugins can add compact `web_action` actions, `web_info` topics, and search providers
+  without touching the core; a broken plugin fails startup loudly instead of being skipped.
+- Add virtual gamepad input: a `gamepad` web action drives engines that read only the
+  Gamepad API over `Emulation.sendGamepadEvents`; on Chrome builds without the CDP method it
+  reports an honest error and its test skips.
+- Add strict CDP virtual time next to the JavaScript frame gate: pause, grant a bounded
+  budget in milliseconds, and resume through `Emulation.setVirtualTimePolicy`, covering code
+  paths the in-page timer patch cannot reach; the two layers compose.
+- Reach into closed shadow roots: perception records each `attachShadow` call per page, so
+  the outline can describe and address elements inside closed roots with ordinary refs.
+- Resolve element refs and piercing locators inside nested same-origin iframes for actions,
+  not only inspection, without switching sessions around.
+- Make the shipped MCP config portable: `scripts/make_mcp_config.py` rewrites
+  `mcp_servers.json` with the absolute paths of wherever you cloned it (the repository ships
+  `"cwd": "."`), and `tests/test_mcp_config.py` pins that no developer path survives.
+- Defer Chrome Native Messaging to 1.11: the stdio pipe framing, size limits, and ACL spec
+  still need pinning down, and native-first needs a split-brain guard against the loopback
+  fallback before it can be trusted; the design is recorded in `docs/native-messaging-design.md`.
+
 ## 1.9.1
 
 Release focus: reliable file uploads from forms inside iframes.

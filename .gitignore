@@ -182,6 +182,7 @@ msp_server.log*
 # а `git status` перестаёт быть сигналом «есть что коммитить».
 PROGRESS.*.md
 PROGRESS_*.md
+PLAN-*.md
 *.audit.md
 
 # A macro store belongs to the project that uses this server, never to the

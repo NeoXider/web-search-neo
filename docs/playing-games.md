@@ -78,7 +78,7 @@ with the wall clock after a run.
 
 The MCP `render` action also accepts `frame_delta_ms` (0.1-1000 ms),
 `freeze_time`, and `gate_timers` if the defaults do not suit a particular
-engine. One knob stays Python-only: `browser_tools.set_render_control(...,
+engine. One knob stays Python-only: `web_search_neo.browser_tools.set_render_control(...,
 key_repeat=False)` turns off [key auto-repeat](#auto-repeat-for-held-keys); the
 MCP action always leaves it on.
 
@@ -302,7 +302,7 @@ action rather than one per tick. Two details matter:
 - re-holding a key that is already down does not silence its repeat.
 
 This is on by default and is not exposed through MCP. The Python API can turn it
-off with `browser_tools.set_render_control("step", session_id, key_repeat=False)`
+off with `web_search_neo.browser_tools.set_render_control("step", session_id, key_repeat=False)`
 for an engine that treats repeats as new presses.
 
 The bundled platformer clears its movement latch on respawn, which is exactly
