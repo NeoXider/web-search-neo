@@ -388,6 +388,13 @@ python main.py --bridge         # run the daemon in the foreground
 python main.py --bridge --stop  # ask a running daemon to exit
 ```
 
+For a companion configured to a non-default port, set the same port in the
+daemon's environment before starting it (or in the MCP server's `env` block):
+
+```powershell
+$env:WEB_SEARCH_NEO_BRIDGE_PORT = "18765"; .\.venv\Scripts\python.exe -m web_search_neo.main --bridge
+```
+
 `--bridge` exits quietly if another daemon already owns the port, because that one
 serves just as well. It prints nothing while it runs either: the daemon logs to
 `%LOCALAPPDATA%\WebSearchNeo\bridge-daemon.log`, foreground or not, and never to

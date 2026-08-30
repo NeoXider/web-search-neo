@@ -274,7 +274,8 @@ def test_windows_daemon_bypasses_a_venv_redirector_without_a_console(
 
     assert captured["command"] == [
         str(pythonw),
-        str(chrome_bridge.DAEMON_ENTRY),
+        "-m",
+        chrome_bridge.DAEMON_MODULE,
         "--bridge",
     ]
     options = captured["kwargs"]
@@ -307,6 +308,11 @@ def test_windows_daemon_uses_the_base_console_interpreter_as_a_safe_fallback(
     assert captured["command"][0] == str(base)
     assert captured["kwargs"]["creationflags"] == chrome_bridge.CREATE_NO_WINDOW
     assert captured["kwargs"]["env"]["__PYVENV_LAUNCHER__"] == venv_python
+
+
+def test_daemon_entry_is_the_packaged_main_module() -> None:
+    assert chrome_bridge.DAEMON_ENTRY == Path(main.__file__).resolve()
+    assert chrome_bridge._daemon_entry_version() == main.__version__
 
 
 def test_posix_daemon_launch_is_unchanged(monkeypatch) -> None:

@@ -68,8 +68,10 @@ class ChromeBridgeUnavailable(ChromeBridgeError):
 
 
 LOGGER = logging.getLogger("web_search_neo.bridge")
-PROJECT_DIR = Path(__file__).resolve().parents[1]
-DAEMON_ENTRY = PROJECT_DIR / "main.py"
+PACKAGE_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = PACKAGE_DIR.parent
+DAEMON_ENTRY = PACKAGE_DIR / "main.py"
+DAEMON_MODULE = "web_search_neo.main"
 _IS_WINDOWS = os.name == "nt"
 
 # Two daemons of the wrong version in a row means another checkout is fighting us
@@ -173,7 +175,7 @@ def spawn_bridge_daemon(port: int) -> None:
         LOGGER.warning("No interpreter to start the bridge daemon with")
         return
     environment = dict(os.environ, WEB_SEARCH_NEO_BRIDGE_PORT=str(port))
-    command = [_daemon_interpreter(environment), str(DAEMON_ENTRY), "--bridge"]
+    command = [_daemon_interpreter(environment), "-m", DAEMON_MODULE, "--bridge"]
     detach: dict[str, Any] = {}
     if _IS_WINDOWS:
         # CREATE_NO_WINDOW is ignored when combined with DETACHED_PROCESS. A
