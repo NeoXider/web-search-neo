@@ -399,7 +399,8 @@ For a hands-off setup, `scripts/bridge_autostart.bat [port]` launches the daemon
 through pythonw (no console window), and running
 `scripts/install_bridge_autostart.bat [port]` once drops that launcher into the
 Windows Startup folder so the bridge is up on every logon. Delete the generated
-startup file to undo.
+startup file to undo. The launcher sets `WEB_SEARCH_NEO_BRIDGE_IDLE_SECONDS=0`,
+so a logon-started bridge does not idle-exit before the next browser session.
 
 `--bridge` exits quietly if another daemon already owns the port, because that one
 serves just as well. It prints nothing while it runs either: the daemon logs to
