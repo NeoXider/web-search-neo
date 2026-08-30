@@ -330,6 +330,59 @@ def test_page_text_reads_the_frame_that_is_the_whole_page(local_site):
         browser_tools.close_session("defect-text-frame")
 
 
+def test_the_outline_shows_a_modal_that_document_order_buried(local_site):
+    """The reported defect: a login wall the caller could see and the outline could not.
+
+    A modal is appended at the end of the body, so a document-order walk spends the
+    whole node budget on the page behind it and stops - truncated, and missing the
+    only thing that could be acted on.
+    """
+    driver = _open_or_skip(_fixture(local_site, "dialog_behind_bulk.html"), "defect-outline-modal")
+    try:
+        result = page_perception.outline(driver, format="json", limit=40)
+        names = [node.get("name") or "" for node in _nodes(result)]
+        assert result["truncated"], "the filler must still overrun the budget"
+        assert result["open_dialogs"] == 1
+        assert any("LOGIN-WALL" in name for name in names) or any(
+            node.get("modal") for node in _nodes(result)
+        ), "the modal is gone from an outline that had room for 40 nodes"
+
+        modal_nodes = [node for node in _nodes(result) if node.get("modal")]
+        assert modal_nodes, "nothing is marked as the overlay"
+        first_filler = next(
+            (index for index, name in enumerate(names) if name.startswith("Filler control")),
+            len(names),
+        )
+        modal_index = _nodes(result).index(modal_nodes[0])
+        assert modal_index < first_filler, "the overlay has to come before the page it covers"
+
+        text = page_perception.outline(driver, limit=40)["outline"]
+        assert "modal" in text, "the text form has to say which node is the overlay"
+    finally:
+        browser_tools.close_session("defect-outline-modal")
+
+
+def test_the_outline_and_page_text_agree_on_what_a_modal_is(local_site):
+    driver = _open_or_skip(_fixture(local_site, "nested_dialogs.html"), "defect-outline-nested")
+    try:
+        # One overlay, not two: an alertdialog inside a dialog is the same overlay,
+        # and both readers count it through the same rule.
+        assert page_perception.page_text(driver, mode="main")["dialogs_appended"] == 1
+        assert page_perception.outline(driver, format="json")["open_dialogs"] == 1
+    finally:
+        browser_tools.close_session("defect-outline-nested")
+
+
+def test_a_page_without_a_modal_reports_none(local_site):
+    driver = _open_or_skip(_fixture(local_site, "articles.html"), "defect-outline-nomodal")
+    try:
+        result = page_perception.outline(driver, format="json")
+        assert result["open_dialogs"] == 0
+        assert not any(node.get("modal") for node in _nodes(result))
+    finally:
+        browser_tools.close_session("defect-outline-nomodal")
+
+
 def test_an_open_dialog_is_not_dropped_by_main_mode(local_site):
     driver = _open_or_skip(_fixture(local_site, "dialog_page.html"), "defect-text-dialog")
     try:

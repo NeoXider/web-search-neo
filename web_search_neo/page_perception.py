@@ -807,6 +807,29 @@ function wsnHiddenBy(el) {
   return '';
 }
 
+function wsnOpenDialogs(root) {
+  // An open modal is the page as far as the person looking at it is concerned, and
+  // both readers have to agree on which ones those are: page_text appends them to
+  // main mode, the outline emits them ahead of the document. One rule, one answer.
+  let dialogs;
+  try {
+    dialogs = document.querySelectorAll('dialog[open], [role="dialog"], [role="alertdialog"]');
+  } catch (error) {
+    return [];
+  }
+  const chosen = [];
+  for (const dialog of dialogs) {
+    if (dialog.tagName === 'DIALOG' && !dialog.open) continue;
+    if (root && (root === dialog || wsnContains(root, dialog))) continue;
+    // An alertdialog inside a dialog is one overlay, not two. Document order puts
+    // the outer one first, so anything inside one already chosen is already covered.
+    if (chosen.some(other => other === dialog || wsnContains(other, dialog))) continue;
+    if (!wsnDisplayed(dialog) || wsnHiddenBy(dialog)) continue;
+    chosen.push(dialog);
+  }
+  return chosen;
+}
+
 function wsnHiddenReason(el) {
   const ancestor = wsnHiddenBy(el);
   if (ancestor) return ancestor;
@@ -1021,6 +1044,7 @@ function wsnWalkChildren(node, depth, context) {
 function wsnVisitElement(el, depth, context) {
   const tag = el.tagName;
   if (WSN_SKIP_TAGS.has(tag)) return;
+  if (context.dialogs && context.dialogs.has(el)) return;
   if (tag === 'SLOT') {
     wsnWalkChildren(el, depth, context);
     return;
@@ -1069,6 +1093,20 @@ function wsnDescend(el, depth, context, node) {
   }
 }
 
+function wsnVisitElementForced(el, depth, context) {
+  // The document walk skips whatever is in context.dialogs, because it was already
+  // emitted up front. This is that up-front pass, so the skip list is lifted for it
+  // and put back afterwards; context.modals is the separate set that stays, because
+  // the nodes still have to be marked as the overlay while they are written.
+  const skipped = context.dialogs;
+  context.dialogs = null;
+  try {
+    wsnVisitElement(el, depth, context);
+  } finally {
+    context.dialogs = skipped;
+  }
+}
+
 function wsnEmit(el, role, depth, context) {
   wsnFlushText(context);
   if (context.out.length >= context.limit) {
@@ -1092,6 +1130,7 @@ function wsnEmit(el, role, depth, context) {
   const node = {
     kind: 'node',
     depth: depth,
+    modal: !!(context.modals && context.modals.has(el)),
     ref: wsnHandle(el, context.registry || wsnRegistryOf(el)),
     tag: tag,
     role: role,
@@ -1197,6 +1236,18 @@ function wsnDescendFrame(el, node, depth, context) {
   wsnWalkRoot(doc, depth + 1, context, inner, frameInfo);
 }
 
+// An open modal is emitted ahead of the page it covers. It is normally appended at
+// the end of the body, so in document order it landed past the node limit on any
+// page with real content: the outline stopped, reported itself truncated, and the
+// one thing the caller could actually act on was the thing it had dropped.
+const openDialogs = wsnOpenDialogs(null);
+ctx.dialogs = new Set(openDialogs);
+ctx.modals = new Set(openDialogs);
+for (const dialog of openDialogs) {
+  if (ctx.truncated) break;
+  wsnVisitElementForced(dialog, 0, ctx);
+}
+wsnFlushText(ctx);
 wsnWalkRoot(document, 0, ctx, WSN_IDENTITY_MAP, null);
 wsnFlushText(ctx);
 
@@ -1209,6 +1260,7 @@ return {
   counts: ctx.counts,
   frames: ctx.frames,
   viewport: ctx.view,
+  open_dialogs: openDialogs.length,
   nodes: ctx.out
 };
 """
@@ -1266,6 +1318,8 @@ def _format_outline_text(nodes: list[dict[str, Any]]) -> str:
                 # without checking. Marked here rather than left to look exact.
                 if node.get("page_rect_approximate"):
                     parts.append("approximate-box")
+        if node.get("modal"):
+            parts.append("modal")
         if node.get("occluded"):
             parts.append("occluded")
         if node.get("visible") is False:
@@ -1286,6 +1340,14 @@ def outline(
     The traversal enters open shadow roots and same-origin iframes; cross-origin
     frames are reported as stubs. Closed shadow roots cannot be walked at all and are
     only counted, so the caller knows the outline is incomplete.
+
+    Open modals come first, ahead of the page they cover, and their nodes carry
+    ``modal: true`` (``modal`` in text); ``open_dialogs`` counts them. A modal is
+    normally appended at the end of the body, so in document order it fell past
+    ``limit`` on any page with real content - the outline stopped, called itself
+    truncated, and the one thing the caller could act on was what it had dropped.
+    Which elements count as modals is the rule ``page_text`` appends by, so the two
+    readers cannot disagree about what is standing in front of the page.
 
     A node inside a frame carries a ref minted in that frame's own document, so its
     epoch differs from the page's ``dom_epoch``; the action tools follow the ref
@@ -1322,6 +1384,7 @@ def outline(
         "frames": raw.get("frames", {}),
         "truncated": bool(raw.get("truncated")),
         "closed_shadow_roots": int(raw.get("closed_shadow_roots") or 0),
+        "open_dialogs": int(raw.get("open_dialogs") or 0),
         "limit": node_limit,
         "occlusion_checked": bool(include_occlusion),
         "format": selected,
@@ -1533,32 +1596,17 @@ function wsnTextWalk(el, budget) {
 }
 
 function wsnAppendDialogs(root) {
-  // An open modal is the page as far as the person looking at it is concerned.
-  // It usually lives outside the main landmark, so main mode would drop the one
-  // thing standing between the caller and everything else.
-  let dialogs;
-  try {
-    dialogs = document.querySelectorAll('dialog[open], [role="dialog"], [role="alertdialog"]');
-  } catch (error) {
-    return 0;
-  }
-  const appended = [];
+  // An open modal usually lives outside the main landmark, so main mode would drop
+  // the one thing standing between the caller and everything else.
+  const dialogs = wsnOpenDialogs(root);
   for (const dialog of dialogs) {
-    if (dialog.tagName === 'DIALOG' && !dialog.open) continue;
-    if (root && (root === dialog || wsnContains(root, dialog))) continue;
-    // An alertdialog inside a dialog is one overlay, not two. Document order puts
-    // the outer one first, so anything already inside what was appended is
-    // already in the text - emitting it again reads as two separate warnings.
-    if (appended.some(other => other === dialog || wsnContains(other, dialog))) continue;
-    if (!wsnDisplayed(dialog) || wsnHiddenBy(dialog)) continue;
     const restore = mainOnly;
     mainOnly = false;  // a login modal is a <form>, which main mode calls chrome
     chunks.push('\n\n');
     wsnTextWalk(dialog, {nodes: 0, depth: 0});
     mainOnly = restore;
-    appended.push(dialog);
   }
-  return appended.length;
+  return dialogs.length;
 }
 
 // 'full' means the whole rendered body. Guessing a main-content sub-tree here is

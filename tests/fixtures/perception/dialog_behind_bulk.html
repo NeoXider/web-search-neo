@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Login wall behind a long page</title><link rel="icon" href="data:,"></head>
+<body>
+<main id="bulk">
+  <h1>A page with more content than the node limit</h1>
+</main>
+<dialog open id="login-wall" aria-label="Sign in by email">
+  <h2>LOGIN-WALL</h2>
+  <input id="wall-email" type="email" aria-label="Email address">
+  <button id="wall-continue">Continue</button>
+</dialog>
+<script>
+  // The modal is the last thing in the body, which is where portals put it. Enough
+  // interactive nodes are generated in front of it that a document-order walk hits
+  // any sane limit long before reaching it.
+  const bulk = document.getElementById('bulk');
+  for (let i = 0; i < 120; i += 1) {
+    const row = document.createElement('button');
+    row.id = 'filler-' + i;
+    row.textContent = 'Filler control ' + i;
+    bulk.appendChild(row);
+  }
+</script>
+</body>
+</html>
