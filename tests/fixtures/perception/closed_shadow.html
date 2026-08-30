@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Closed shadow roots</title><link rel="icon" href="data:,"></head>
+<body>
+<div id="open-host"></div>
+<div id="closed-host"></div>
+<script>
+  const openRoot = document.getElementById('open-host').attachShadow({mode: 'open'});
+  openRoot.innerHTML =
+    '<button id="open-button">Open action</button>' +
+    '<p id="open-state">Open state: idle</p>';
+  openRoot.getElementById('open-button').addEventListener('click', () => {
+    openRoot.getElementById('open-state').textContent = 'Open state: clicked';
+  });
+
+  const closedRoot = document.getElementById('closed-host').attachShadow({mode: 'closed'});
+  closedRoot.innerHTML =
+    '<button id="closed-button">Closed action</button>' +
+    '<p id="closed-state">Closed state: idle</p>' +
+    '<div id="nested-closed-host"></div>';
+  closedRoot.getElementById('closed-button').addEventListener('click', () => {
+    closedRoot.getElementById('closed-state').textContent = 'Closed state: clicked';
+  });
+
+  const nestedRoot = closedRoot.getElementById('nested-closed-host')
+    .attachShadow({mode: 'closed'});
+  nestedRoot.innerHTML =
+    '<button id="nested-closed-button">Nested closed action</button>' +
+    '<p id="nested-closed-state">Nested closed state: idle</p>';
+  nestedRoot.getElementById('nested-closed-button').addEventListener('click', () => {
+    nestedRoot.getElementById('nested-closed-state').textContent =
+      'Nested closed state: clicked';
+  });
+</script>
+</body>
+</html>

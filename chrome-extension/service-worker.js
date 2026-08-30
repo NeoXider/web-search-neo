@@ -406,9 +406,12 @@ async function ensureDebugger(tabId) {
 // of failing a user.
 export const ALLOWED_CDP_METHODS = new Set([
   "DOM.setFileInputFiles",
+  "Emulation.sendGamepadEvents",
   "Emulation.setDeviceMetricsOverride",
   "Emulation.setEmitTouchEventsForMouse",
   "Emulation.setTouchEmulationEnabled",
+  "Emulation.setVirtualTimePolicy",
+  "Emulation.clearVirtualTimePolicy",
   "Input.dispatchKeyEvent",
   "Input.dispatchMouseEvent",
   "Input.dispatchTouchEvent",

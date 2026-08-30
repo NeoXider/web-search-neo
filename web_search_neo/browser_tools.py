@@ -10,6 +10,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import subprocess
 import re
 import threading
 import time
@@ -32,7 +33,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as conditions
 from selenium.webdriver.support.ui import Select, WebDriverWait
 
-from chrome_bridge import (
+from web_search_neo.chrome_bridge import (
     CHROME_EXTENSION_ID,
     DEFAULT_TAB_GROUP,
     ChromeBridgeDriver,
@@ -42,16 +43,16 @@ from chrome_bridge import (
     get_chrome_bridge,
     list_current_chrome_tabs,
 )
-from chrome_bootstrap import (
+from web_search_neo.chrome_bootstrap import (
     EXTENSION_DIR,
     expected_extension_version,
     setup_current_chrome,
 )
-import captcha
-import diagnostics
-import key_table
-import page_perception
-from web_client import validate_http_url
+from web_search_neo import captcha
+from web_search_neo import diagnostics
+from web_search_neo import key_table
+from web_search_neo import page_perception
+from web_search_neo.web_client import validate_http_url
 
 
 logger = logging.getLogger(__name__)
@@ -302,6 +303,7 @@ class BrowserSession:
     key_repeat: bool = True
     render_target_fps: float | None = None
     render_frame_selector: str | None = None
+    render_deterministic: bool = False
     render_bootstrap_registered: bool = False
     render_options: dict[str, Any] = field(
         default_factory=lambda: {
@@ -724,6 +726,27 @@ def _latest_cached_chromedriver() -> Path | None:
     return max(candidates, default=((), None), key=lambda item: item[0])[1]
 
 
+def _driver_popen_kwargs() -> dict[str, Any]:
+    """Popen kwargs that keep chromedriver from allocating a visible console.
+
+    Selenium's own Windows startup info allocates a new hidden console for the
+    driver; under default-terminal adoption a freshly allocated console can
+    still surface as a stray tab. Creating no console at all is stricter, so on
+    Windows pass CREATE_NO_WINDOW plus a hidden show-window state and override
+    the startup info Selenium would otherwise supply through ``popen_kw``.
+    """
+    if os.name != "nt":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    return {
+        "creation_flags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+        "startupinfo": startupinfo,
+    }
+
+
+
 def create_driver(
     width: int = 1440,
     height: int = 900,
@@ -791,7 +814,10 @@ def create_driver(
         if mode == "attach"
         else _latest_cached_chromedriver()
     )
-    service = Service(executable_path=str(cached_driver)) if cached_driver else None
+    service = (
+        Service(executable_path=str(cached_driver), popen_kw=_driver_popen_kwargs())
+        if cached_driver else None
+    )
     try:
         driver = webdriver.Chrome(service=service, options=options)
     except Exception as exc:
@@ -1927,6 +1953,7 @@ def open_page(
         with session.lock:
             previous_mode = session.render_mode
             previous_frame = session.render_frame_selector
+            previous_deterministic = session.render_deterministic
             _reset_session_runtime_state(session)
             # After the reset, so the borrowed tab is given back with no keys
             # held and no frame gate on it, and before anything is sent to the
@@ -1951,6 +1978,9 @@ def open_page(
                 if not state.get("error"):
                     session.render_mode = previous_mode
                     session.render_frame_selector = previous_frame
+                    if previous_deterministic:
+                        _pause_virtual_time(session.driver)
+                        session.render_deterministic = True
                 else:
                     restored = False
         return {
@@ -2153,7 +2183,8 @@ function collect(selectors) {
       return;
     }
     for (const el of all) {
-      if (el.shadowRoot) walk(el.shadowRoot, depth);
+      const shadow = wsnShadowRoot(el);
+      if (shadow) walk(shadow, depth);
       if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {
         if (depth >= WSN_MAX_FRAME_DEPTH) {
           framesTooDeep += 1;
@@ -2340,10 +2371,11 @@ def get_page_elements(
 ) -> dict[str, Any]:
     """Return stable selectors and metadata for rendered page controls.
 
-    Open shadow roots and same-origin frames are included; anything inside one is
-    reported as a ``host >>> control`` path, which the action tools resolve. Every
-    entry carries ``visible`` and, when it is not, ``hidden_reason``, so a control
-    no click can reach is never handed over looking like an ordinary one.
+    Open and captured closed shadow roots plus same-origin frames are included;
+    anything inside one is reported as a ``host >>> control`` path, which the
+    action tools resolve. Every entry carries ``visible`` and, when it is not,
+    ``hidden_reason``, so a control no click can reach is never handed over looking
+    like an ordinary one.
 
     ``limit`` counts controls and ``max_chars`` counts the answer. Both are
     needed: 200 controls is a modest number and was 83k characters on a real job
@@ -3927,6 +3959,43 @@ def press_keys(
         }
 
 
+def gamepad(
+    session_id: str,
+    connected: bool,
+    buttons: list[dict[str, Any]],
+    axes: list[float],
+) -> dict[str, Any]:
+    """Set or clear the single virtual gamepad exposed to the page."""
+    normalized_buttons = [
+        {
+            "touched": bool(button["touched"]),
+            "pressed": bool(button["pressed"]),
+            "value": float(button["value"]),
+        }
+        for button in buttons
+    ]
+    normalized_axes = [float(axis) for axis in axes]
+    session = _get_session(session_id)
+    with session.lock:
+        session.driver.execute_cdp_cmd(
+            "Emulation.sendGamepadEvents",
+            {
+                "id": 0,
+                "connected": bool(connected),
+                "timestamp": time.monotonic() * 1000,
+                "buttons": normalized_buttons,
+                "axes": normalized_axes,
+            },
+        )
+    return {
+        "success": True,
+        "session_id": session_id,
+        "connected": bool(connected),
+        "buttons": normalized_buttons if connected else [],
+        "axes": normalized_axes if connected else [],
+    }
+
+
 class LocatorGone(ValueError):
     """The document that could answer this locator is not open any more.
 
@@ -3997,18 +4066,20 @@ def _release_action_frame(driver: Any, frame_selector: str | None, locator: str)
     _release_locator_frame(driver, locator)
 
 
-def _enter_ref_document(driver: Any, epoch: str) -> str | None:
-    """Switch the driver into the browsing context whose registry minted ``epoch``.
+def _enter_ref_document(
+    driver: Any, epoch: str, target_number: int | None = None
+) -> dict[str, Any]:
+    """Switch into the registry document, or a resolved ref's owner document.
 
     An element reference belongs to one browsing context: handed over from
     another one it is refused as stale, which is why a ref read inside a frame
     could never be acted on. The frame is therefore entered before the ref is
     resolved, and the caller acts while the driver is still there.
 
-    Returns the path of the frame it entered ('' for the top document), or
-    ``None`` when no document in this tab minted the epoch. ``depth_limited`` in
-    the returned dict means the search stopped at its own bound rather than
-    exhausting the tab - a different thing to tell the caller than "it is gone".
+    Perception can store a nested node in an ancestor document's registry. Once
+    that node has resolved, ``target_number`` makes the walk continue to its live
+    ``ownerDocument`` instead of stopping merely because the ancestor epoch
+    matched. Returns the frame path and whether the search hit its depth bound.
 
     The bound is two frames deeper than any topic walks, so a ref that could be
     minted can always be followed back to the document that minted it.
@@ -4016,11 +4087,21 @@ def _enter_ref_document(driver: Any, epoch: str) -> str | None:
     driver.switch_to.default_content()
     path: list[str] = []
     depth_limited = False
+    target_token = (
+        f"{epoch}:{time.monotonic_ns()}" if target_number is not None else ""
+    )
+    current_target_number = target_number
     for _ in range(page_perception.MAX_FRAME_DEPTH + 2):
         try:
-            step = driver.execute_script(page_perception.FRAME_FOR_EPOCH_SCRIPT, epoch)
+            step = driver.execute_script(
+                page_perception.FRAME_FOR_EPOCH_SCRIPT,
+                epoch,
+                current_target_number,
+                target_token,
+            )
         except WebDriverException:
             return {"found": False, "depth_limited": depth_limited}
+        current_target_number = None
         if not isinstance(step, dict):
             return {"found": False, "depth_limited": depth_limited}
         depth_limited = depth_limited or bool(step.get("depth_limited"))
@@ -4039,39 +4120,56 @@ def _enter_ref_document(driver: Any, epoch: str) -> str | None:
 
 
 def _resolve_ref(driver: Any, locator: str, expression: str) -> Any:
-    epoch, _number = page_perception.parse_ref(locator)
+    epoch, number = page_perception.parse_ref(locator)
     driver.switch_to.default_content()
     element = driver.execute_script(f"return {expression};")
-    if element is not None:
-        return element
-    located = _enter_ref_document(driver, epoch)
-    if not located["found"]:
-        _leave_element_frame(driver)
-        if located.get("depth_limited"):
-            # Telling this caller the handle is stale would send them to re-read a
-            # page that hands back the very same handle, forever.
-            raise ValueError(
-                f"Element handle '{locator}' was not found within the "
-                f"{page_perception.MAX_FRAME_DEPTH} frames deep this session walks; "
-                "its document may be nested deeper. Nothing that far in can be "
-                f"acted on by handle. {_POINTER_FALLBACK_HINT}"
+    if element is None:
+        located = _enter_ref_document(driver, epoch)
+        if not located["found"]:
+            _leave_element_frame(driver)
+            if located.get("depth_limited"):
+                # Telling this caller the handle is stale would send them to re-read a
+                # page that hands back the very same handle, forever.
+                raise ValueError(
+                    f"Element handle '{locator}' was not found within the "
+                    f"{page_perception.MAX_FRAME_DEPTH} frames deep this session walks; "
+                    "its document may be nested deeper. Nothing that far in can be "
+                    f"acted on by handle. {_POINTER_FALLBACK_HINT}"
+                )
+            raise LocatorGone(
+                f"Element handle '{locator}' was read from a document that is no longer "
+                "open in this tab - the page, or the frame that held it, was replaced or "
+                "removed - so it is stale. Read the page again with "
+                "web_info(topic='page_outline') and use the handle it reports now."
             )
-        raise LocatorGone(
-            f"Element handle '{locator}' was read from a document that is no longer "
-            "open in this tab - the page, or the frame that held it, was replaced or "
-            "removed - so it is stale. Read the page again with "
-            "web_info(topic='page_outline') and use the handle it reports now."
-        )
-    frame = located.get("frame") or ""
-    element = driver.execute_script(f"return {expression};")
-    if element is not None:
+        frame = located.get("frame") or ""
+        element = driver.execute_script(f"return {expression};")
+        if element is None:
+            _leave_element_frame(driver)
+            where = f"frame '{frame}'" if frame else "the page"
+            raise ValueError(
+                f"Element handle '{locator}' still names {where}, but the element it was "
+                "read from has been removed from it, so it is stale. Read the page again "
+                f"with web_info(topic='page_outline'). {_POINTER_FALLBACK_HINT}"
+            )
+
+    # The registry may live in an ancestor document while the node it stores is
+    # deeper. Selenium must be left in the node's own browsing context for every
+    # action API, even on drivers that happen to tolerate cross-document handles.
+    located = _enter_ref_document(driver, epoch, number)
+    if located["found"]:
         return element
     _leave_element_frame(driver)
-    where = f"frame '{frame}'" if frame else "the page"
-    raise ValueError(
-        f"Element handle '{locator}' still names {where}, but the element it was "
-        "read from has been removed from it, so it is stale. Read the page again "
-        f"with web_info(topic='page_outline'). {_POINTER_FALLBACK_HINT}"
+    if located.get("depth_limited"):
+        raise ValueError(
+            f"Element handle '{locator}' belongs below the "
+            f"{page_perception.MAX_FRAME_DEPTH}-frame action limit. "
+            f"{_POINTER_FALLBACK_HINT}"
+        )
+    raise LocatorGone(
+        f"Element handle '{locator}' was read from a frame document that is no longer "
+        "open in this tab, so it is stale. Read the page again with "
+        "web_info(topic='page_outline') and use the handle it reports now."
     )
 
 
@@ -7117,6 +7215,36 @@ def _apply_render_mode(
         driver.switch_to.default_content()
 
 
+def _pause_virtual_time(driver: webdriver.Chrome) -> None:
+    """Stop native browser time until a deterministic frame grants a budget."""
+    driver.switch_to.default_content()
+    driver.execute_cdp_cmd("Emulation.setVirtualTimePolicy", {"policy": "pause"})
+
+
+def _grant_virtual_time_frame(driver: webdriver.Chrome, budget_ms: float) -> None:
+    """Let native tasks consume at most one render frame of virtual time."""
+    driver.switch_to.default_content()
+    driver.execute_cdp_cmd(
+        "Emulation.setVirtualTimePolicy",
+        {
+            "policy": "pauseIfNetworkFetchesPending",
+            "budget": float(budget_ms),
+            "maxVirtualTimeTaskStarvationCount": 10_000,
+        },
+    )
+
+
+def _resume_virtual_time(driver: webdriver.Chrome) -> None:
+    """Return Chrome to its ordinary clock across old and new CDP versions."""
+    driver.switch_to.default_content()
+    try:
+        driver.execute_cdp_cmd("Emulation.clearVirtualTimePolicy", {})
+    except Exception:
+        # clearVirtualTimePolicy is not present in every Chrome protocol build;
+        # the continue policy is the documented equivalent on those versions.
+        driver.execute_cdp_cmd("Emulation.setVirtualTimePolicy", {"policy": "advance"})
+
+
 def set_render_control(
     mode: str,
     session_id: str = "default",
@@ -7126,6 +7254,7 @@ def set_render_control(
     freeze_time: bool = True,
     gate_timers: bool = True,
     key_repeat: bool = True,
+    deterministic: bool = False,
 ) -> dict[str, Any]:
     """Set normal, continuously throttled, or manual/input-driven frame stepping.
 
@@ -7138,6 +7267,9 @@ def set_render_control(
     selected_mode = mode.strip().lower()
     if selected_mode not in {"normal", "throttled", "step"}:
         raise ValueError("mode must be 'normal', 'throttled', or 'step'")
+    if deterministic and selected_mode == "throttled":
+        raise ValueError("deterministic virtual time is only available in step mode")
+    selected_deterministic = bool(deterministic) and selected_mode == "step"
     fps = max(1.0, min(float(target_fps), 60.0))
     delta = max(0.1, min(float(frame_delta_ms), 1000.0))
     options = {
@@ -7163,9 +7295,14 @@ def set_render_control(
         state = _apply_render_mode(driver, selected_frame, selected_mode, fps, options)
         if state.get("error"):
             raise RuntimeError(state["error"])
+        if selected_deterministic:
+            _pause_virtual_time(driver)
+        elif session.render_deterministic:
+            _resume_virtual_time(driver)
         session.render_options = options
         session.key_repeat = bool(key_repeat)
         session.render_mode = selected_mode
+        session.render_deterministic = selected_deterministic
         session.render_target_fps = fps if selected_mode == "throttled" else None
         session.render_frame_selector = selected_frame if selected_mode != "normal" else None
         return {
@@ -7175,8 +7312,13 @@ def set_render_control(
             "target_fps": session.render_target_fps,
             "frame_selector": session.render_frame_selector,
             "key_repeat": session.key_repeat,
+            "deterministic": session.render_deterministic,
             "input_advances_frame": selected_mode == "step",
-            "engine": "requestAnimationFrame gate",
+            "engine": (
+                "requestAnimationFrame gate + CDP virtual time"
+                if session.render_deterministic
+                else "requestAnimationFrame gate"
+            ),
             **state,
         }
 
@@ -7232,7 +7374,25 @@ def _advance_render_frames(
     driver = session.driver
     frame_selector = session.render_frame_selector
     _repeat_held_keys(session)
-    result = _step_frames_once(driver, frame_selector, frames)
+    if session.render_deterministic:
+        callbacks = 0
+        result: dict[str, Any] = {}
+        for _ in range(frames):
+            _grant_virtual_time_frame(
+                driver, float(session.render_options["frame_delta_ms"])
+            )
+            try:
+                result = _step_frames_once(driver, frame_selector, 1)
+            finally:
+                _pause_virtual_time(driver)
+            if not result.get("success"):
+                break
+            callbacks += int(result.get("callbacks") or 0)
+        if result.get("success"):
+            result["frames"] = frames
+            result["callbacks"] = callbacks
+    else:
+        result = _step_frames_once(driver, frame_selector, frames)
     if not result.get("success") and result.get("error") in {
         "missing_bootstrap",
         "not_step_mode",
@@ -7241,7 +7401,24 @@ def _advance_render_frames(
             driver, frame_selector, "step", 60.0, session.render_options
         )
         if not state.get("error"):
-            result = _step_frames_once(driver, frame_selector, frames)
+            if session.render_deterministic:
+                callbacks = 0
+                for _ in range(frames):
+                    _grant_virtual_time_frame(
+                        driver, float(session.render_options["frame_delta_ms"])
+                    )
+                    try:
+                        result = _step_frames_once(driver, frame_selector, 1)
+                    finally:
+                        _pause_virtual_time(driver)
+                    if not result.get("success"):
+                        break
+                    callbacks += int(result.get("callbacks") or 0)
+                if result.get("success"):
+                    result["frames"] = frames
+                    result["callbacks"] = callbacks
+            else:
+                result = _step_frames_once(driver, frame_selector, frames)
             result["gate_reinstalled"] = True
     if not result.get("success"):
         reason = {
@@ -8033,6 +8210,13 @@ def _reset_session_runtime_state(session: BrowserSession) -> None:
             driver.switch_to.default_content()
         except Exception:
             pass
+    finally:
+        if session.render_deterministic:
+            try:
+                _resume_virtual_time(driver)
+            except Exception:
+                pass
+            session.render_deterministic = False
 
 
 def _clear_injected_state(session: BrowserSession) -> None:

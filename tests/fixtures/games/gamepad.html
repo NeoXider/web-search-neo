@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixture: gamepad harness</title>
+<link rel="icon" href="data:,">
+<style>
+  body { margin: 0; padding: 12px; background: #10131a; color: #d7dde8;
+         font: 13px/1.4 monospace; }
+</style>
+</head>
+<body>
+<p id="hud">waiting for gamepad events</p>
+
+<script>
+(function () {
+  'use strict';
+
+  var log = [];
+  window.__gamepads = log;
+
+  function snapshot(type) {
+    var gamepads = Array.from(navigator.getGamepads())
+      .filter(function (pad) { return pad !== null; })
+      .map(function (pad) {
+        return {
+          index: pad.index,
+          connected: pad.connected,
+          timestamp: pad.timestamp,
+          buttons: Array.from(pad.buttons).map(function (button) {
+            return {
+              touched: button.touched,
+              pressed: button.pressed,
+              value: button.value
+            };
+          }),
+          axes: Array.from(pad.axes)
+        };
+      });
+    log.push({type: type, gamepads: gamepads});
+    if (log.length > 50) log.splice(0, log.length - 50);
+    document.getElementById('hud').textContent = type + ': ' + gamepads.length;
+  }
+
+  window.addEventListener('gamepadconnected', function () { snapshot('connected'); });
+  window.addEventListener('gamepaddisconnected', function () { snapshot('disconnected'); });
+  window.__report = function () { return log.slice(); };
+})();
+</script>
+</body>
+</html>

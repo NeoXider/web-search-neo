@@ -67,18 +67,25 @@ REF_REGISTRY_SCRIPT = r"""
       nodes: new Map(),
       next: 1,
       byNode: new WeakMap(),
-      closedShadowRoots: 0
+      closedShadowRoots: 0,
+      closedShadowRootsByHost: new WeakMap()
     };
   }
-  // Closed shadow roots are unreachable from JavaScript, so the only honest way to
-  // report them is to count them while they are being created.
+  if (!window.__wsnRefs.closedShadowRootsByHost) {
+    window.__wsnRefs.closedShadowRootsByHost = new WeakMap();
+  }
+  // Closed roots are only reachable through the value returned by attachShadow.
+  // Keep that value keyed weakly by its host while retaining the existing count.
   const attachShadow = Element.prototype.attachShadow;
   if (attachShadow && !attachShadow.__wsnPatched) {
     const patched = function (init) {
-      if (init && init.mode === 'closed' && window.__wsnRefs) {
-        window.__wsnRefs.closedShadowRoots += 1;
+      const root = attachShadow.apply(this, arguments);
+      const registry = window.__wsnRefs;
+      if (init && init.mode === 'closed' && registry) {
+        registry.closedShadowRoots += 1;
+        registry.closedShadowRootsByHost.set(this, root);
       }
-      return attachShadow.apply(this, arguments);
+      return root;
     };
     patched.__wsnPatched = true;
     Element.prototype.attachShadow = patched;
@@ -410,8 +417,9 @@ function wsnOccluded(el, rect) {
     const found = root.elementFromPoint ? root.elementFromPoint(x, y) : null;
     if (!found || found === hit) break;
     hit = found;
-    if (!hit.shadowRoot) break;
-    root = hit.shadowRoot;
+    const shadow = wsnShadowRoot(hit);
+    if (!shadow) break;
+    root = shadow;
   }
   if (!hit) return false;
   return !(hit === el || wsnContains(el, hit) || wsnContains(hit, el));
@@ -683,7 +691,10 @@ function wsnRegistryIn(win) {
   } catch (error) {
     return null;  // cross-origin: nothing here can be addressed anyway
   }
-  if (current && current.nodes && current.byNode) return current;
+  if (current && current.nodes && current.byNode) {
+    if (!current.closedShadowRootsByHost) current.closedShadowRootsByHost = new WeakMap();
+    return current;
+  }
   const bytes = new Uint8Array(8);
   if (window.crypto && window.crypto.getRandomValues) window.crypto.getRandomValues(bytes);
   else for (let index = 0; index < bytes.length; index += 1) {
@@ -692,7 +703,8 @@ function wsnRegistryIn(win) {
   let epoch = '';
   for (const byte of bytes) epoch += byte.toString(16).padStart(2, '0');
   const created = {
-    epoch: epoch, nodes: new Map(), next: 1, byNode: new WeakMap(), closedShadowRoots: 0
+    epoch: epoch, nodes: new Map(), next: 1, byNode: new WeakMap(), closedShadowRoots: 0,
+    closedShadowRootsByHost: new WeakMap()
   };
   try {
     win.__wsnRefs = created;
@@ -721,6 +733,20 @@ function wsnRegistryOf(el) {
     win = null;
   }
   return wsnPruneOnce(wsnRegistryIn(win) || wsnRegistry());
+}
+
+function wsnShadowRoot(el) {
+  if (!el) return null;
+  if (el.shadowRoot) return el.shadowRoot;
+  const doc = el.ownerDocument;
+  let registry = null;
+  try {
+    registry = doc && doc.defaultView ? doc.defaultView.__wsnRefs : null;
+  } catch (error) {
+    registry = null;
+  }
+  const roots = registry && registry.closedShadowRootsByHost;
+  return roots && roots.get ? (roots.get(el) || null) : null;
 }
 
 function wsnHandleFor(el) {
@@ -930,7 +956,7 @@ function wsnShadowAncestors(root) {
     return hosts;
   }
   for (const el of elements) {
-    if (!el.shadowRoot) continue;
+    if (!wsnShadowRoot(el)) continue;
     hosts.add(el);
     let parent = el.parentElement;
     while (parent && !hosts.has(parent)) {
@@ -949,7 +975,7 @@ function wsnInteresting(el, role) {
 }
 
 function wsnContainer(el, context) {
-  if (el.shadowRoot) return true;
+  if (wsnShadowRoot(el)) return true;
   if (context.hosts && context.hosts.has(el)) return true;
   if (!el.firstElementChild) return false;
   try {
@@ -1008,8 +1034,9 @@ function wsnVisitElement(el, depth, context) {
     return;
   }
   if (wsnContainer(el, context)) {
-    if (el.shadowRoot) {
-      wsnWalkRoot(el.shadowRoot, depth, context, context.offsets.map,
+    const shadow = wsnShadowRoot(el);
+    if (shadow) {
+      wsnWalkRoot(shadow, depth, context, context.offsets.map,
                   context.offsets.frame);
     } else {
       wsnWalkChildren(el, depth, context);
@@ -1023,8 +1050,9 @@ function wsnVisitElement(el, depth, context) {
 }
 
 function wsnDescend(el, depth, context, node) {
-  if (el.shadowRoot) {
-    wsnWalkRoot(el.shadowRoot, depth, context, context.offsets.map,
+  const shadow = wsnShadowRoot(el);
+  if (shadow) {
+    wsnWalkRoot(shadow, depth, context, context.offsets.map,
                 context.offsets.frame);
     return;
   }
@@ -1483,7 +1511,7 @@ function wsnTextWalk(el, budget) {
   // A host with a shadow root renders only what the shadow tree lays out, and
   // slotted light-DOM nodes are reached through <slot>. Walking both roots emits
   // every slotted node twice.
-  const source = el.shadowRoot ? el.shadowRoot : el;
+  const source = wsnShadowRoot(el) || el;
   // Light-DOM text arrives through the slot with no whitespace of its own, so
   // without a boundary it glues onto whatever the shadow tree emitted before it.
   const slotted = tag === 'SLOT';
@@ -1899,7 +1927,8 @@ function wsnCollect(root, offsets, out, depth) {
   }
   for (const el of elements) {
     if (WSN_SKIP_TAGS.has(el.tagName)) continue;
-    if (el.shadowRoot) wsnCollect(el.shadowRoot, offsets, out, depth);
+    const shadow = wsnShadowRoot(el);
+    if (shadow) wsnCollect(shadow, offsets, out, depth);
     if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {
       if (depth >= WSN_MAX_FRAME_DEPTH) {
         framesTooDeep += 1;
@@ -2267,6 +2296,19 @@ def split_piercing_path(selector: str) -> list[str] | None:
 # driver be in before the node can be handed over at all".
 FRAME_FOR_EPOCH_SCRIPT = _JS_LIB + r"""
 const wanted = String(arguments[0]).toLowerCase();
+const targetNumber = Number(arguments[1] || 0);
+const targetToken = String(arguments[2] || '');
+
+function wsnMatches(win) {
+  if (targetToken) {
+    try {
+      return win.document.__wsnActionRefTarget === targetToken;
+    } catch (error) {
+      return false;
+    }
+  }
+  return wsnEpochOf(win) === wanted;
+}
 
 function wsnEpochOf(win) {
   try {
@@ -2292,7 +2334,8 @@ function wsnFrameElements(root, out) {
     return out;
   }
   for (const el of hosts) {
-    if (el.shadowRoot) wsnFrameElements(el.shadowRoot, out);
+    const shadow = wsnShadowRoot(el);
+    if (shadow) wsnFrameElements(shadow, out);
   }
   return out;
 }
@@ -2303,13 +2346,55 @@ function wsnFrameElements(root, out) {
 const WSN_SEARCH_DEPTH = WSN_MAX_FRAME_DEPTH + 2;
 let depthLimited = false;
 
+function wsnFindTargetDocument(win, depth) {
+  if (!win) return null;
+  if (depth > WSN_SEARCH_DEPTH) {
+    depthLimited = true;
+    return null;
+  }
+  let doc = null;
+  try {
+    doc = win.document;
+    const registry = win.__wsnRefs;
+    if (registry && registry.nodes
+        && String(registry.epoch).toLowerCase() === wanted) {
+      const node = registry.nodes.get(targetNumber);
+      const owner = node && node.isConnected ? node.ownerDocument : null;
+      if (owner && owner.defaultView) return owner;
+    }
+  } catch (error) {
+    return null;
+  }
+  if (!doc) return null;
+  for (const el of wsnFrameElements(doc, [])) {
+    let child = null;
+    try {
+      child = el.contentWindow;
+    } catch (error) {
+      child = null;
+    }
+    const found = child ? wsnFindTargetDocument(child, depth + 1) : null;
+    if (found) return found;
+  }
+  return null;
+}
+
+if (targetNumber) {
+  const targetDocument = wsnFindTargetDocument(window, 0);
+  if (!targetDocument) return {missing: true, depth_limited: depthLimited};
+  try {
+    targetDocument.__wsnActionRefTarget = targetToken;
+  } catch (error) {
+    return {missing: true, depth_limited: depthLimited};
+  }
+}
+
 function wsnHolds(win, depth) {
   if (!win) return false;
   if (depth > WSN_SEARCH_DEPTH) {
     depthLimited = true;
     return false;
   }
-  if (wsnEpochOf(win) === wanted) return true;
   let doc = null;
   try {
     doc = win.document;
@@ -2317,6 +2402,7 @@ function wsnHolds(win, depth) {
     return false;
   }
   if (!doc) return false;
+  if (wsnMatches(win)) return true;
   for (const el of wsnFrameElements(doc, [])) {
     let child = null;
     try {
@@ -2329,7 +2415,12 @@ function wsnHolds(win, depth) {
   return false;
 }
 
-if (wsnEpochOf(window) === wanted) return {here: true};
+if (wsnMatches(window)) {
+  if (targetToken) {
+    try { delete document.__wsnActionRefTarget; } catch (error) {}
+  }
+  return {here: true};
+}
 for (const el of wsnFrameElements(document, [])) {
   let child = null;
   try {
@@ -2350,6 +2441,12 @@ PIERCING_STEP_SCRIPT = r"""
 const parts = arguments[0];
 let root = document;
 let element = null;
+function shadowRootOf(host) {
+  if (host.shadowRoot) return host.shadowRoot;
+  const registry = window.__wsnRefs;
+  const roots = registry && registry.closedShadowRootsByHost;
+  return roots && roots.get ? (roots.get(host) || null) : null;
+}
 for (let index = 0; index < parts.length; index += 1) {
   if (!root || !root.querySelector) return {missing: true, at: index};
   try {
@@ -2359,8 +2456,9 @@ for (let index = 0; index < parts.length; index += 1) {
   }
   if (!element) return {missing: true, at: index};
   if (index === parts.length - 1) return {element: element};
-  if (element.shadowRoot) {
-    root = element.shadowRoot;
+  const shadow = shadowRootOf(element);
+  if (shadow) {
+    root = shadow;
     continue;
   }
   if (element.tagName === 'IFRAME' || element.tagName === 'FRAME') {
@@ -2406,7 +2504,9 @@ def resolve_locator_expression(locator: str) -> str | None:
         "if (!root || !root.querySelector) return null;"
         "element = root.querySelector(part);"
         "if (!element) return null;"
-        "let next = element.shadowRoot;"
+        "const registry = window.__wsnRefs;"
+        "const roots = registry && registry.closedShadowRootsByHost;"
+        "let next = element.shadowRoot || (roots && roots.get ? roots.get(element) : null);"
         "if (!next && element.tagName === 'IFRAME') {"
         "try { next = element.contentDocument; } catch (error) { next = null; }"
         "}"
