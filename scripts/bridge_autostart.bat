@@ -3,6 +3,8 @@ rem WSN bridge daemon launcher. Usage: bridge_autostart.bat [port]
 rem Port precedence: argument, then WEB_SEARCH_NEO_BRIDGE_PORT env var, else 8765.
 cd /d "%~dp0.."
 if not "%~1"=="" set "WEB_SEARCH_NEO_BRIDGE_PORT=%~1"
+rem An autostarted bridge must outlive long Chrome-free gaps: disable the idle exit.
+set "WEB_SEARCH_NEO_BRIDGE_IDLE_SECONDS=0"
 if exist ".venv\Scripts\pythonw.exe" (
     start "" ".venv\Scripts\pythonw.exe" -m web_search_neo.main --bridge
 ) else (
