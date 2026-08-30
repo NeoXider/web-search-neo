@@ -173,6 +173,11 @@ write — the send button stays a microphone — so paste there always.
 `unconfirmed` (nothing vouches either way — read `note`, check the page and the `network`
 topic, and do not re-attach on this evidence alone). `success` is false only when the attach
 itself failed; `fill`'s `files` says the same in `upload_states`.
+When `frame_selector` is provided, file-input lookup and assignment use that
+frame's execution context too: same-origin frames are scoped inside the tab
+target, while cross-origin frames use their child debugger target. This prevents
+a top-level decoy input from being selected and avoids the opaque Chrome
+`Uncaught` error that otherwise occurs for a valid same-origin iframe upload.
 `fill`, `click`, `submit`, `upload` and `wait` accept `frame_selector`; `wait`'s
 `timeout_seconds` defaults to 10 and is respected as passed — ask for as long as
 the target needs.

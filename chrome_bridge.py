@@ -1662,7 +1662,15 @@ class ChromeBridgeDriver:
             raise ValueError(f"No select option matches '{value}'")
 
     def set_file_input_files(self, selector: str, paths: list[str]) -> None:
-        expression = f"document.querySelector({json.dumps(selector)})"
+        # Runtime.evaluate is issued against the selected child target for a
+        # cross-origin frame, but same-origin frames stay in the tab target and
+        # are represented by the frame selector in _wrap_script.  Keep the
+        # lookup in that same execution context; querying the top-level
+        # document here made an otherwise valid upload fail with Chrome's
+        # unhelpful "Uncaught" when the input lived in an iframe.
+        expression = self._wrap_script(
+            "return document.querySelector(arguments[0]);", (selector,), False
+        )
         remote_object = self._evaluate(expression, return_by_value=False)
         object_id = remote_object.get("objectId")
         if not object_id:

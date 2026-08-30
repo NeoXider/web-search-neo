@@ -537,6 +537,12 @@ whichever came first. A ref handle or a piercing path already carries its own
 document, so passing one *and* a `frame_selector` is refused instead of letting
 one of them quietly win.
 
+File inputs follow the same frame boundary. Same-origin iframe uploads resolve
+the input inside that frame's tab-target document; cross-origin uploads use the
+child debugger target returned by `frames.resolve`. This prevents a matching
+top-level input from receiving the file and avoids Chrome's opaque `Uncaught`
+evaluation error when the intended same-origin input is valid.
+
 ## When a CAPTCHA appears
 
 Every page summary carries `challenge_detected`, `challenge_type`,

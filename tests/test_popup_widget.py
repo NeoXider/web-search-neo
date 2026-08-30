@@ -1,4 +1,4 @@
-"""Offline checks for the 1.9.0 companion widget release.
+"""Offline checks for the 1.9.1 companion widget release.
 
 Everything here is static or driven through local stubs: no network, no Chrome,
 no bridge, no secrets. The dynamic rendering path runs popup.js under Node

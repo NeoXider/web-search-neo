@@ -279,7 +279,7 @@ is no automatic substitute. If you would rather not install an extension at all,
 `profile_mode="temporary"` and `profile_mode="persistent"` drive a Selenium
 browser that needs no companion.
 
-The bundled companion is version 1.9.0. Chrome does not refresh an unpacked
+The bundled companion is version 1.9.1. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. Upgrading *onto*
@@ -926,6 +926,7 @@ choice, submit exactly once, then prove the outcome with fresh DOM/text.
 - A checkbox takes `1`/`yes`/`y`/`on`/`check`/`checked` or `0`/`no`/`n`/`off`/`uncheck`/`unchecked`/`""` and refuses anything else, a `<select>` takes an option `value` or its visible text, and a file input must go through `files`/`upload`.
 - Every control `fill` writes is blurred afterwards, because that is the only way the last field of a fill ever fires its `change` event. Three consequences follow and the third bites: focus ends on `document.body`, an autocomplete list the fill opened is dismissed, and a following `press_keys(["ENTER"])` goes to the body rather than the field — pass `target_selector`, or `focus_mode="click"`, when you mean to submit by keyboard. The `files` entries are the exception: nothing is typed into them, so nothing is blurred.
 - `fill`, `click`, `submit`, `upload` and `wait` take `frame_selector`, so a form inside an iframe is addressable by name and not only through a ref.
+- File inputs honor that frame context too: same-origin uploads are resolved inside the selected frame in the tab target, while cross-origin uploads use the child debugger target. A top-level matching input is never chosen as a decoy, and valid same-origin uploads no longer surface Chrome's opaque `Uncaught` evaluation error.
 - `wait` takes `present`, `visible`, or `clickable`, and honours its `timeout_seconds` as passed (it defaults to 10). A timeout names the seconds actually waited in its message, so you can ask for as long as the target needs and read back what really happened.
 - After any navigation or step change, read `page_outline` again: old ref handles are stale by definition. `dom_epoch` only tests one direction of that. A different epoch proves your refs are dead; the same epoch proves nothing, because the epoch belongs to the document and a wizard step that swaps its own markup in place keeps it while every ref it issued goes with the old nodes. A ref read inside a frame carries that frame's epoch rather than the page's, so a mismatch there is normal and not staleness at all.
 

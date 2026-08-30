@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.9.1
+
+Release focus: reliable file uploads from forms inside iframes.
+
+- Scope the file-input lookup used by the Chrome companion to the active frame
+  execution context. Same-origin iframe uploads now use the frame selector in
+  the tab target, while cross-origin uploads keep using the resolved child
+  debugger target.
+- Add regression coverage for same-origin and cross-origin frame uploads,
+  including the debugger session used by `DOM.setFileInputFiles`.
+- Document the frame-scoped upload behavior and bump the server, package,
+  companion, and preview versions to 1.9.1.
+
 ## 1.9.0
 
 Release focus: a dynamic companion widget, a keyboard launch path, and a

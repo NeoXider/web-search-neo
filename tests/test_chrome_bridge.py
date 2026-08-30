@@ -22,7 +22,13 @@ import browser_tools
 import chrome_bridge
 import main
 from bridge_daemon import BridgeDaemon
-from chrome_bridge import CHROME_EXTENSION_ID, ChromeBridge, ChromeBridgeDriver, ChromeBridgeError
+from chrome_bridge import (
+    CHROME_EXTENSION_ID,
+    ChromeBridge,
+    ChromeBridgeDriver,
+    ChromeBridgeElement,
+    ChromeBridgeError,
+)
 
 
 TEST_TOKEN = "a1" * 32
@@ -2890,6 +2896,60 @@ class _FakeBridge:
         if method == "network.body":
             return {"request_id": params["requestId"], "mime": "application/json", "body": "{}"}
         raise AssertionError(method)
+
+
+class _FileInputBridge(_FakeBridge):
+    """Record the execution context used by the bridge file-input path."""
+
+    def __init__(self, *, same_origin: bool = True) -> None:
+        super().__init__()
+        self.same_origin = same_origin
+        self.runtime_expressions: list[dict] = []
+        self.file_commands: list[dict] = []
+
+    def request(self, method: str, params: dict | None = None, timeout: float = 20.0):
+        params = params or {}
+        if method == "frames.resolve":
+            self.calls.append((method, params))
+            return {
+                "sameOrigin": self.same_origin,
+                "sessionId": None if self.same_origin else "iframe-session",
+            }
+        if method == "cdp.send":
+            cdp_method = params.get("method")
+            if cdp_method == "Runtime.evaluate":
+                self.runtime_expressions.append(params)
+                return {"result": {"type": "object", "objectId": "file-input"}}
+            if cdp_method == "DOM.setFileInputFiles":
+                self.file_commands.append(params)
+                return {"result": {}}
+        return super().request(method, params, timeout)
+
+
+def test_same_origin_frame_upload_resolves_the_file_input_inside_that_frame() -> None:
+    bridge = _FileInputBridge(same_origin=True)
+    driver = ChromeBridgeDriver(bridge=bridge, tab_group="AI")
+    driver.switch_to.frame(ChromeBridgeElement(driver, "#picker"))
+
+    driver.set_file_input_files("input[type=file]", ["C:\\tmp\\resume.pdf"])
+
+    expression = bridge.runtime_expressions[-1]["params"]["expression"]
+    assert "document.querySelector(\"#picker\")" in expression
+    assert "contentWindow, document=window.document" in expression
+    assert bridge.file_commands[-1]["params"]["objectId"] == "file-input"
+    assert bridge.file_commands[-1]["sessionId"] is None
+
+
+def test_cross_origin_frame_upload_keeps_the_child_target_session() -> None:
+    bridge = _FileInputBridge(same_origin=False)
+    driver = ChromeBridgeDriver(bridge=bridge, tab_group="AI")
+    driver.switch_to.frame(ChromeBridgeElement(driver, "#picker"))
+
+    driver.set_file_input_files("input[type=file]", ["C:\\tmp\\resume.pdf"])
+
+    assert "#picker" not in bridge.runtime_expressions[-1]["params"]["expression"]
+    assert bridge.runtime_expressions[-1]["sessionId"] == "iframe-session"
+    assert bridge.file_commands[-1]["sessionId"] == "iframe-session"
 
 
 def test_driver_opens_new_tabs_in_ai_group_without_taking_the_screen() -> None:
