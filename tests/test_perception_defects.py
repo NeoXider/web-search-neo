@@ -343,12 +343,15 @@ def test_the_outline_shows_a_modal_that_document_order_buried(local_site):
         names = [node.get("name") or "" for node in _nodes(result)]
         assert result["truncated"], "the filler must still overrun the budget"
         assert result["open_dialogs"] == 1
-        assert any("LOGIN-WALL" in name for name in names) or any(
-            node.get("modal") for node in _nodes(result)
-        ), "the modal is gone from an outline that had room for 40 nodes"
+        assert any("LOGIN-WALL" in name for name in names), (
+            "the overlay is gone from an outline that had room for 40 nodes"
+        )
 
-        modal_nodes = [node for node in _nodes(result) if node.get("modal")]
+        # An open <dialog> is not modal - it is an overlay, and only that.
+        assert result["scoped_to_modal"] is False
+        modal_nodes = [node for node in _nodes(result) if node.get("overlay")]
         assert modal_nodes, "nothing is marked as the overlay"
+        assert not any(node.get("modal") for node in _nodes(result))
         first_filler = next(
             (index for index, name in enumerate(names) if name.startswith("Filler control")),
             len(names),
@@ -357,9 +360,68 @@ def test_the_outline_shows_a_modal_that_document_order_buried(local_site):
         assert modal_index < first_filler, "the overlay has to come before the page it covers"
 
         text = page_perception.outline(driver, limit=40)["outline"]
-        assert "modal" in text, "the text form has to say which node is the overlay"
+        assert "overlay" in text, "the text form has to say which node is the overlay"
     finally:
         browser_tools.close_session("defect-outline-modal")
+
+
+def test_a_modal_in_the_top_layer_is_the_whole_outline(local_site):
+    """Nothing behind a modal can be clicked, so nothing behind it is offered."""
+    driver = _open_or_skip(_fixture(local_site, "modal_wall.html"), "defect-outline-topmodal")
+    try:
+        result = page_perception.outline(driver, format="json", limit=200)
+        names = [node.get("name") or "" for node in _nodes(result)]
+        assert result["scoped_to_modal"] is True
+        assert result["modal_dialogs"] == 1
+        assert any("LOGIN-WALL" in name for name in names)
+        assert not result["truncated"], "the page behind is not being walked at all"
+        assert not any(name.startswith("Filler control") for name in names), (
+            "120 controls the browser will not deliver a click to"
+        )
+        # The overlay root carries both claims; its contents are inside it.
+        head = _nodes(result)[0]
+        assert head.get("overlay") is True and head.get("modal") is True
+
+        # The caller can still look behind it on purpose.
+        behind = page_perception.outline(driver, format="json", limit=200, scope="page")
+        behind_names = [node.get("name") or "" for node in _nodes(behind)]
+        assert behind["scoped_to_modal"] is False
+        assert any(name.startswith("Filler control") for name in behind_names)
+    finally:
+        browser_tools.close_session("defect-outline-topmodal")
+
+
+def test_an_author_declared_modal_scopes_the_outline_too(local_site):
+    driver = _open_or_skip(_fixture(local_site, "aria_modal_wall.html"), "defect-outline-ariamodal")
+    try:
+        result = page_perception.outline(driver, format="json", limit=200)
+        names = [node.get("name") or "" for node in _nodes(result)]
+        assert result["scoped_to_modal"] is True
+        assert any("ARIA-WALL" in name for name in names)
+        assert not any(name.startswith("Filler control") for name in names)
+    finally:
+        browser_tools.close_session("defect-outline-ariamodal")
+
+
+def test_a_plain_dialog_does_not_hide_the_page_behind_it(local_site):
+    """role="dialog" and a bare open attribute are not modality.
+
+    The web uses both for drawers and inline panels. Scoping to one of those would
+    hide a page that is perfectly usable, so those overlays are only moved to the
+    front - which is all the original defect needed.
+    """
+    driver = _open_or_skip(_fixture(local_site, "dialog_behind_bulk.html"), "defect-outline-plain")
+    try:
+        result = page_perception.outline(driver, format="json", limit=200)
+        names = [node.get("name") or "" for node in _nodes(result)]
+        assert result["scoped_to_modal"] is False
+        assert result["open_dialogs"] == 1
+        assert any("LOGIN-WALL" in name for name in names), "still first, still present"
+        assert any(name.startswith("Filler control") for name in names), (
+            "the page behind a non-modal overlay is still a page"
+        )
+    finally:
+        browser_tools.close_session("defect-outline-plain")
 
 
 def test_the_outline_and_page_text_agree_on_what_a_modal_is(local_site):

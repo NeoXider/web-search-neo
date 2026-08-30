@@ -807,27 +807,52 @@ function wsnHiddenBy(el) {
   return '';
 }
 
-function wsnOpenDialogs(root) {
-  // An open modal is the page as far as the person looking at it is concerned, and
-  // both readers have to agree on which ones those are: page_text appends them to
-  // main mode, the outline emits them ahead of the document. One rule, one answer.
-  let dialogs;
+function wsnPickOverlays(selector, root) {
+  let candidates;
   try {
-    dialogs = document.querySelectorAll('dialog[open], [role="dialog"], [role="alertdialog"]');
+    candidates = document.querySelectorAll(selector);
   } catch (error) {
     return [];
   }
   const chosen = [];
-  for (const dialog of dialogs) {
-    if (dialog.tagName === 'DIALOG' && !dialog.open) continue;
-    if (root && (root === dialog || wsnContains(root, dialog))) continue;
+  for (const overlay of candidates) {
+    if (overlay.tagName === 'DIALOG' && !overlay.open) continue;
+    if (root && (root === overlay || wsnContains(root, overlay))) continue;
     // An alertdialog inside a dialog is one overlay, not two. Document order puts
     // the outer one first, so anything inside one already chosen is already covered.
-    if (chosen.some(other => other === dialog || wsnContains(other, dialog))) continue;
-    if (!wsnDisplayed(dialog) || wsnHiddenBy(dialog)) continue;
-    chosen.push(dialog);
+    if (chosen.some(other => other === overlay || wsnContains(other, overlay))) continue;
+    if (!wsnDisplayed(overlay) || wsnHiddenBy(overlay)) continue;
+    chosen.push(overlay);
   }
   return chosen;
+}
+
+function wsnOpenDialogs(root) {
+  // An open overlay is the page as far as the person looking at it is concerned, and
+  // both readers have to agree on which ones those are: page_text appends them to
+  // main mode, the outline puts them first. One rule, one answer.
+  return wsnPickOverlays('dialog[open], [role="dialog"], [role="alertdialog"]', root);
+}
+
+function wsnModalDialogs(root) {
+  // The overlays that make the rest of the page unreachable, and say so themselves.
+  // ':modal' is the browser's own answer - it matches exactly what showModal() and
+  // fullscreen put in the top layer, where events genuinely cannot reach anything
+  // behind. 'aria-modal="true"' is the author declaring the same thing for assistive
+  // technology, which is told to ignore everything outside the overlay.
+  //
+  // A bare role="dialog" is not enough and is deliberately not here: the web uses it
+  // for non-modal drawers, popovers and inline panels, and scoping the outline to one
+  // of those would hide a page that is perfectly usable.
+  let modal = [];
+  try {
+    modal = wsnPickOverlays('dialog:modal, [aria-modal="true"]', root);
+  } catch (error) {
+    modal = [];
+  }
+  if (modal.length) return modal;
+  // Engines without ':modal' throw on the whole selector above, so ask again without it.
+  return wsnPickOverlays('[aria-modal="true"]', root);
 }
 
 function wsnHiddenReason(el) {
@@ -929,6 +954,7 @@ _EPOCH_SCRIPT = _JS_LIB + "\nreturn wsnRegistry().epoch;\n"
 _OUTLINE_SCRIPT = _JS_LIB + r"""
 const limit = arguments[0];
 const includeOcclusion = arguments[1];
+const scope = arguments[2];
 const registry = wsnPruneOnce(wsnRegistry());
 
 const ctx = {
@@ -1130,6 +1156,7 @@ function wsnEmit(el, role, depth, context) {
   const node = {
     kind: 'node',
     depth: depth,
+    overlay: !!(context.overlays && context.overlays.has(el)),
     modal: !!(context.modals && context.modals.has(el)),
     ref: wsnHandle(el, context.registry || wsnRegistryOf(el)),
     tag: tag,
@@ -1236,20 +1263,36 @@ function wsnDescendFrame(el, node, depth, context) {
   wsnWalkRoot(doc, depth + 1, context, inner, frameInfo);
 }
 
-// An open modal is emitted ahead of the page it covers. It is normally appended at
-// the end of the body, so in document order it landed past the node limit on any
-// page with real content: the outline stopped, reported itself truncated, and the
-// one thing the caller could actually act on was the thing it had dropped.
+// A modal is normally appended at the end of the body, so in document order it
+// landed past the node limit on any page with real content: the outline stopped,
+// reported itself truncated, and the one thing the caller could act on was the
+// thing it had dropped.
+//
+// When the overlay declares itself modal, the page behind it is not merely further
+// down the list - it cannot be reached at all, and describing hundreds of controls
+// that will not respond is worse than not describing them. So the outline is scoped
+// to the overlay and says it did that. Everything else - a bare role="dialog", a
+// drawer, an inline panel - is only moved to the front, because the page behind
+// those is still a page.
 const openDialogs = wsnOpenDialogs(null);
-ctx.dialogs = new Set(openDialogs);
-ctx.modals = new Set(openDialogs);
-for (const dialog of openDialogs) {
+const modalDialogs = scope === 'page' ? [] : wsnModalDialogs(null);
+const scopedToModal = modalDialogs.length > 0;
+const front = scopedToModal ? modalDialogs : openDialogs;
+ctx.dialogs = new Set(front);
+// Two different claims, so two flags: 'overlay' is described ahead of the page,
+// 'modal' also means nothing behind it can be reached. Every modal is an overlay;
+// a drawer with role="dialog" is an overlay and nothing more.
+ctx.overlays = new Set(front);
+ctx.modals = new Set(modalDialogs);
+for (const overlay of front) {
   if (ctx.truncated) break;
-  wsnVisitElementForced(dialog, 0, ctx);
+  wsnVisitElementForced(overlay, 0, ctx);
 }
 wsnFlushText(ctx);
-wsnWalkRoot(document, 0, ctx, WSN_IDENTITY_MAP, null);
-wsnFlushText(ctx);
+if (!scopedToModal) {
+  wsnWalkRoot(document, 0, ctx, WSN_IDENTITY_MAP, null);
+  wsnFlushText(ctx);
+}
 
 return {
   url: String(location.href),
@@ -1261,6 +1304,8 @@ return {
   frames: ctx.frames,
   viewport: ctx.view,
   open_dialogs: openDialogs.length,
+  modal_dialogs: modalDialogs.length,
+  scoped_to_modal: scopedToModal,
   nodes: ctx.out
 };
 """
@@ -1320,6 +1365,8 @@ def _format_outline_text(nodes: list[dict[str, Any]]) -> str:
                     parts.append("approximate-box")
         if node.get("modal"):
             parts.append("modal")
+        elif node.get("overlay"):
+            parts.append("overlay")
         if node.get("occluded"):
             parts.append("occluded")
         if node.get("visible") is False:
@@ -1334,6 +1381,7 @@ def outline(
     limit: int = 200,
     include_occlusion: bool = True,
     format: str = "text",
+    scope: str = "auto",
 ) -> dict[str, Any]:
     """Return the accessibility outline of the page as compact text or JSON nodes.
 
@@ -1341,13 +1389,24 @@ def outline(
     frames are reported as stubs. Closed shadow roots cannot be walked at all and are
     only counted, so the caller knows the outline is incomplete.
 
-    Open modals come first, ahead of the page they cover, and their nodes carry
-    ``modal: true`` (``modal`` in text); ``open_dialogs`` counts them. A modal is
-    normally appended at the end of the body, so in document order it fell past
-    ``limit`` on any page with real content - the outline stopped, called itself
-    truncated, and the one thing the caller could act on was what it had dropped.
-    Which elements count as modals is the rule ``page_text`` appends by, so the two
-    readers cannot disagree about what is standing in front of the page.
+    An overlay is normally appended at the end of the body, so in document order it
+    fell past ``limit`` on any page with real content - the outline stopped, called
+    itself truncated, and the one thing the caller could act on was what it dropped.
+    Overlays are therefore described first and carry ``overlay: true`` (``overlay``
+    in text). ``open_dialogs`` counts them, and which elements count is the rule
+    ``page_text`` appends by, so the two readers cannot disagree about what is
+    standing in front of the page.
+
+    When an overlay declares itself modal the page behind it cannot be reached at
+    all, so the outline is scoped to the overlay: ``scoped_to_modal`` is true,
+    ``modal_dialogs`` counts them, and their nodes carry ``modal: true`` (``modal``
+    in text). Modal means the platform's own answer - ``:modal``, which matches what
+    ``showModal()`` and fullscreen put in the top layer, or an author's
+    ``aria-modal="true"``. A bare ``role="dialog"`` is not modal: the web uses it for
+    drawers and inline panels, and scoping to one of those would hide a usable page.
+
+    ``scope='page'`` describes the whole document even while a modal is open, for a
+    caller that means to look behind it. ``scope='auto'`` is the default above.
 
     A node inside a frame carries a ref minted in that frame's own document, so its
     epoch differs from the page's ``dom_epoch``; the action tools follow the ref
@@ -1372,7 +1431,12 @@ def outline(
     selected = str(format or "text").strip().lower()
     if selected not in {"text", "json"}:
         raise ValueError("format must be 'text' or 'json'")
-    raw = driver.execute_script(_OUTLINE_SCRIPT, node_limit, bool(include_occlusion))
+    requested_scope = str(scope or "auto").strip().lower()
+    if requested_scope not in {"auto", "page"}:
+        raise ValueError("scope must be 'auto' or 'page'")
+    raw = driver.execute_script(
+        _OUTLINE_SCRIPT, node_limit, bool(include_occlusion), requested_scope
+    )
     if not isinstance(raw, dict):
         raise RuntimeError("Page outline script returned an unexpected result")
     nodes = [node for node in raw.get("nodes") or [] if isinstance(node, dict)]
@@ -1385,6 +1449,9 @@ def outline(
         "truncated": bool(raw.get("truncated")),
         "closed_shadow_roots": int(raw.get("closed_shadow_roots") or 0),
         "open_dialogs": int(raw.get("open_dialogs") or 0),
+        "modal_dialogs": int(raw.get("modal_dialogs") or 0),
+        "scoped_to_modal": bool(raw.get("scoped_to_modal")),
+        "scope": requested_scope,
         "limit": node_limit,
         "occlusion_checked": bool(include_occlusion),
         "format": selected,

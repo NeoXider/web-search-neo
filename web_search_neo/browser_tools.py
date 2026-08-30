@@ -4304,12 +4304,18 @@ def get_page_outline(
     output: str = "text",
     frame_selector: str | None = None,
     max_chars: int = DEFAULT_RESPONSE_CHAR_BUDGET,
+    scope: str = "auto",
 ) -> dict[str, Any]:
     """Return the accessibility outline: roles, names, states, refs, and boxes.
 
     ``limit`` counts nodes; ``max_chars`` bounds the answer, because 200 nodes of
     a dense application are far larger than 200 nodes of a form and only the
     second number is the one a model's context is measured in.
+
+    Overlays are described first, and when one declares itself modal the answer is
+    scoped to it and says so through ``scoped_to_modal`` - the page behind a modal
+    cannot be clicked, so listing it is worse than leaving it out. Pass
+    ``scope='page'`` to describe the whole document anyway.
     """
     budget = _response_char_budget(max_chars)
     session = _get_session(session_id)
@@ -4324,6 +4330,7 @@ def get_page_outline(
                 limit=limit,
                 include_occlusion=include_occlusion,
                 format=output,
+                scope=scope,
             )
         finally:
             _leave_element_frame(driver)

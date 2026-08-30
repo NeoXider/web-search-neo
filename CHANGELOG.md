@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.10.1
+
+Release focus: the outline stops losing the one thing on the page that can be acted on.
+
+- Describe overlays before the page they cover. A modal is normally appended at the end of
+  the body, so a document-order walk spent the whole node budget on the page behind it and
+  stopped: the outline came back truncated and missing the login wall that was standing on
+  screen, readable by hand through JS and absent from the description of the page. Overlay
+  nodes carry `overlay: true` (`overlay` in the text form) and `open_dialogs` counts them.
+- Scope the outline to an overlay that declares itself modal, reported through
+  `scoped_to_modal` and `modal_dialogs`, with those nodes marked `modal`. Modal means the
+  platform's own answer — `:modal`, which matches exactly what `showModal()` and fullscreen
+  put in the top layer, or an author's `aria-modal="true"`. Nothing behind those can receive
+  a click, so listing hundreds of controls that will not respond is worse than leaving them
+  out. A bare `role="dialog"` is deliberately not modal: the web uses it for drawers and
+  inline panels, and scoping to one of those would hide a page that works.
+- Add `scope="page"` to `browser_page_outline` for a caller that means to look behind an
+  open modal; `scope="auto"` is the default described above.
+- Move the rule for what counts as an overlay into one place in the shared JS library.
+  `page_text` has appended open dialogs to main mode all along and carried its own copy of
+  that rule; both readers now decide by the same one, so they cannot disagree about what is
+  standing in front of the page.
+
 ## 1.10.0
 
 Release focus: the engine becomes a real Python package with an open extension core,

@@ -504,8 +504,14 @@ async def browser_page_outline(
     output: Literal["text", "json"] = "text",
     frame_selector: str | None = None,
     max_chars: int = browser_tools.DEFAULT_RESPONSE_CHAR_BUDGET,
+    scope: Literal["auto", "page"] = "auto",
 ) -> dict[str, Any]:
-    """Outline the page: roles, names, states, refs, and boxes, including shadow DOM."""
+    """Outline the page: roles, names, states, refs, and boxes, including shadow DOM.
+
+    Overlays come first, and an overlay that declares itself modal is the whole
+    answer - `scoped_to_modal` says so. Nothing behind a modal can be clicked, so it
+    is left out rather than offered. Use scope="page" to look behind one on purpose.
+    """
     return await asyncio.to_thread(
         functools.partial(
             browser_tools.get_page_outline,
@@ -515,6 +521,7 @@ async def browser_page_outline(
             output=output,
             frame_selector=frame_selector,
             max_chars=max_chars,
+            scope=scope,
         )
     )
 

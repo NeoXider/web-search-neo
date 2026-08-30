@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Login wall declared with aria-modal</title><link rel="icon" href="data:,">
+<style>
+  #overlay { position: fixed; inset: 0; background: rgba(0,0,0,.6); }
+  #sheet { position: fixed; top: 20%; left: 25%; width: 50%; background: #fff; padding: 24px; }
+</style>
+</head>
+<body>
+<main id="bulk">
+  <h1>The page the sheet is covering</h1>
+</main>
+<div id="overlay"></div>
+<div id="sheet" role="dialog" aria-modal="true" aria-label="Sign in by email">
+  <h2>ARIA-WALL</h2>
+  <input id="sheet-email" type="email" aria-label="Email address">
+  <button id="sheet-continue">Continue</button>
+</div>
+<script>
+  const bulk = document.getElementById('bulk');
+  for (let i = 0; i < 120; i += 1) {
+    const row = document.createElement('button');
+    row.id = 'filler-' + i;
+    row.textContent = 'Filler control ' + i;
+    bulk.appendChild(row);
+  }
+</script>
+</body>
+</html>

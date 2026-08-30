@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Login wall in the top layer</title><link rel="icon" href="data:,"></head>
+<body>
+<main id="bulk">
+  <h1>A page nobody can touch right now</h1>
+</main>
+<dialog id="login-wall" aria-label="Sign in by email">
+  <h2>LOGIN-WALL</h2>
+  <input id="wall-email" type="email" aria-label="Email address">
+  <button id="wall-continue">Continue</button>
+</dialog>
+<script>
+  const bulk = document.getElementById('bulk');
+  for (let i = 0; i < 120; i += 1) {
+    const row = document.createElement('button');
+    row.id = 'filler-' + i;
+    row.textContent = 'Filler control ' + i;
+    bulk.appendChild(row);
+  }
+  // showModal, not the open attribute: this puts the dialog in the top layer, where
+  // the browser genuinely blocks events to everything behind it.
+  document.getElementById('login-wall').showModal();
+</script>
+</body>
+</html>
