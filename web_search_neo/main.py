@@ -16,18 +16,19 @@ from bs4 import BeautifulSoup
 from mcp.server.fastmcp import FastMCP, Image
 from pydantic import ValidationError
 
-import bridge_daemon
-import browser_tools
-import chrome_bridge
-import macros
-import msp_date_time
-import msp_search
-from web_client import request
+from web_search_neo import bridge_daemon
+from web_search_neo import browser_tools
+from web_search_neo import chrome_bridge
+from web_search_neo import macros
+from web_search_neo import msp_date_time
+from web_search_neo import msp_search
+from web_search_neo import plugins
+from web_search_neo.web_client import request
 
 
-__version__ = "1.9.1"
+__version__ = "1.10.0"
 
-PROJECT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = Path(__file__).resolve().parents[1]
 log = logging.getLogger("web_search_neo")
 log.setLevel(logging.INFO)
 if not log.handlers:
@@ -3314,6 +3315,9 @@ def stop_bridge_daemon() -> int:
 
 
 def main() -> None:
+    # Plugins (WEB_SEARCH_NEO_PLUGINS or entry points) may add actions,
+    # info topics, and search providers before the surface is published.
+    plugins.load_plugins()
     arguments = sys.argv[1:]
     if "--bridge" in arguments:
         if "--stop" in arguments:

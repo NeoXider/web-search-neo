@@ -33,6 +33,7 @@ Startpage are available as fallbacks.
 - [Quick start](#quick-start) · [Connect to LM Studio](#connect-to-lm-studio)
 - [**Examples**](#examples) — copy-paste calls for the six things people do most
 - [Deep dives: playing games](docs/playing-games.md) · [complex forms](docs/complex-forms.md)
+- [Extending Web Search Neo](docs/extending.md) — plugin actions, observation topics, and search providers
 - [Why Web Search Neo](#why-web-search-neo) — the capability table
 - [Connect your already-open Chrome](#connect-your-already-open-chrome) · [The bridge daemon](#the-bridge-daemon) · [Bridge authentication](#bridge-authentication)
 - [Search behavior](#search-behavior) · [CAPTCHA and challenge modes](#captcha-and-challenge-modes)
@@ -279,7 +280,7 @@ is no automatic substitute. If you would rather not install an extension at all,
 `profile_mode="temporary"` and `profile_mode="persistent"` drive a Selenium
 browser that needs no companion.
 
-The bundled companion is version 1.9.1. Chrome does not refresh an unpacked
+The bundled companion is version 1.10.0. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. Upgrading *onto*
