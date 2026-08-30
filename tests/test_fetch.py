@@ -6,8 +6,8 @@ import time
 import pytest
 import requests
 
-import main
-from web_client import request, validate_http_url
+from web_search_neo import main
+from web_search_neo.web_client import request, validate_http_url
 
 
 def test_fetch_url_text_uses_local_http_and_strips_non_visible_content(local_site):

@@ -19,7 +19,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import chrome_bridge
+from web_search_neo import chrome_bridge
 
 
 class FakeBridge:
@@ -162,7 +162,7 @@ def test_nothing_is_sent_when_chrome_is_not_connected(wired):
 
 def test_closing_a_tab_forgets_the_session_sitting_on_it(monkeypatch):
     """A session on a dead tab would dispatch at whatever id Chrome reuses."""
-    import browser_tools
+    from web_search_neo import browser_tools
 
     monkeypatch.setattr(
         browser_tools, "close_current_chrome_tabs",
@@ -193,27 +193,27 @@ class TestForbidCurrentProfile:
 
     def test_current_is_downgraded_not_refused(self, monkeypatch):
         """Работа продолжается, просто в своём браузере."""
-        import browser_tools
+        from web_search_neo import browser_tools
         monkeypatch.setenv('WSN_FORBID_CURRENT_PROFILE', '1')
         assert browser_tools.resolve_profile_mode('current', None) == 'temporary'
 
     def test_auto_does_not_fall_back_to_the_users_chrome(self, monkeypatch):
-        import browser_tools
+        from web_search_neo import browser_tools
         monkeypatch.setenv('WSN_FORBID_CURRENT_PROFILE', '1')
         assert browser_tools.resolve_profile_mode('auto', None) == 'temporary'
 
     def test_extension_alias_is_covered_too(self, monkeypatch):
         """'extension' is just another spelling of 'current' and must not escape."""
-        import browser_tools
+        from web_search_neo import browser_tools
         monkeypatch.setenv('WSN_FORBID_CURRENT_PROFILE', '1')
         assert browser_tools.resolve_profile_mode('extension', None) == 'temporary'
 
     def test_unset_leaves_behaviour_alone(self, monkeypatch):
-        import browser_tools
+        from web_search_neo import browser_tools
         monkeypatch.delenv('WSN_FORBID_CURRENT_PROFILE', raising=False)
         assert browser_tools.resolve_profile_mode('current', None) == 'current'
 
     def test_only_truthy_values_switch_it_on(self, monkeypatch):
-        import browser_tools
+        from web_search_neo import browser_tools
         monkeypatch.setenv('WSN_FORBID_CURRENT_PROFILE', '0')
         assert browser_tools.resolve_profile_mode('current', None) == 'current'

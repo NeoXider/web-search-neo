@@ -585,7 +585,7 @@ async def run_workflow(
         raise ConfigError(f"Unknown terminal stage approvals: {sorted(unknown_approvals)}")
 
     if info_call is None or action_call is None:
-        import main as neo
+        from web_search_neo import main as neo
 
         info_call = info_call or (lambda topic, params: neo.web_info(topic, params))
         action_call = action_call or (

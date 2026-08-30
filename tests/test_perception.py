@@ -5,8 +5,8 @@ import re
 import pytest
 from selenium.common.exceptions import WebDriverException
 
-import browser_tools
-import page_perception
+from web_search_neo import browser_tools
+from web_search_neo import page_perception
 
 
 SHADOW_FIXTURE = """

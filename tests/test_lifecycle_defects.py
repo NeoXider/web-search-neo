@@ -14,13 +14,13 @@ import time
 
 import pytest
 
-from chrome_bridge import (
+from web_search_neo.chrome_bridge import (
     ChromeBridge,
     ChromeBridgeDriver,
     ChromeBridgeError,
     ChromeBridgeUnavailable,
 )
-import browser_tools
+from web_search_neo import browser_tools
 
 
 class _SwitchTo:

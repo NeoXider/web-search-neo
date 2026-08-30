@@ -8,9 +8,9 @@ import time
 import pytest
 from selenium.common.exceptions import WebDriverException
 
-import browser_tools
-from chrome_bridge import ChromeBridgeError
-import diagnostics
+from web_search_neo import browser_tools
+from web_search_neo.chrome_bridge import ChromeBridgeError
+from web_search_neo import diagnostics
 
 
 def _open_or_skip(url: str, session_id: str, **kwargs):

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-import browser_tools
+from web_search_neo import browser_tools
 
 
 class _Companion:

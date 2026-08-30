@@ -18,7 +18,7 @@ from urllib.parse import quote_plus
 from bs4 import BeautifulSoup
 from ddgs import DDGS
 
-from web_client import request
+from web_search_neo.web_client import request
 
 
 DEFAULT_ENGINE = "duckduckgo"

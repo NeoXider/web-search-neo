@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-import macros
-import main
+from web_search_neo import macros
+from web_search_neo import main
 
 
 @pytest.fixture(autouse=True)

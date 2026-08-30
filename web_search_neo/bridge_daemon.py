@@ -37,7 +37,7 @@ import time
 from typing import Any
 import uuid
 
-import bridge_auth
+from web_search_neo import bridge_auth
 
 
 CHROME_EXTENSION_ID = "ndbmcjhbdjpefojkoljacjhammmcigao"

@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-import main
+from web_search_neo import main
 
 
 CHALLENGE_RESPONSE = {

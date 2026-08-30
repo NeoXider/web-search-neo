@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from selenium.common.exceptions import WebDriverException
 
-import main
+from web_search_neo import main
 
 
 INPUT_ACTIONS = ("input", "press_keys", "pointer", "touch")
@@ -401,7 +401,7 @@ def test_scroll_screenshot_pagination_and_skill_are_published_for_small_models()
     assert list(skill_schema["params_schema"].get("properties", {})) == ["section"]
 
     filesystem_skill = (
-        Path(main.__file__).parent / "skills" / "web-search-neo" / "SKILL.md"
+        Path(main.__file__).parents[1] / "skills" / "web-search-neo" / "SKILL.md"
     ).read_text(encoding="utf-8")
     assert 'web_info(topic="skill")' in filesystem_skill
     assert "only action locator" in filesystem_skill

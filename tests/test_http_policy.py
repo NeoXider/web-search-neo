@@ -6,7 +6,7 @@ import ipaddress
 
 import pytest
 
-import web_client
+from web_search_neo import web_client
 
 
 @pytest.fixture(autouse=True)

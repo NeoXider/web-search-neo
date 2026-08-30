@@ -17,7 +17,7 @@ from pathlib import Path
 
 APP_DIR_NAME = "WebSearchNeo"
 TOKEN_FILE_NAME = "bridge-token"
-EXTENSION_DIR = (Path(__file__).resolve().parent / "chrome-extension").resolve()
+EXTENSION_DIR = (Path(__file__).resolve().parents[1] / "chrome-extension").resolve()
 EXTENSION_TOKEN_FILE = EXTENSION_DIR / "bridge-token.js"
 
 _TOKEN_PATTERN = re.compile(r"^[0-9a-f]{64}$")

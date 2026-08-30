@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-import browser_tools
-import captcha
+from web_search_neo import browser_tools
+from web_search_neo import captcha
 
 
 class _CannedDriver:

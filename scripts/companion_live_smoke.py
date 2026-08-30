@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from chrome_bridge import (  # noqa: E402
+from web_search_neo.chrome_bridge import (  # noqa: E402
     DEFAULT_TAB_GROUP,
     ChromeBridgeDriver,
     get_chrome_bridge,

@@ -13,7 +13,7 @@ import pytest
 from selenium.common.exceptions import WebDriverException
 from selenium.webdriver.common.by import By
 
-import browser_tools
+from web_search_neo import browser_tools
 
 
 PLATFORMER = "/fixtures/games/platformer.html"

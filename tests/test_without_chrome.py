@@ -13,8 +13,8 @@ import json
 import pytest
 from selenium.common.exceptions import WebDriverException
 
-import browser_tools
-import main
+from web_search_neo import browser_tools
+from web_search_neo import main
 
 
 class _OfflineBridge:
@@ -79,7 +79,7 @@ def test_fetch_actions_do_not_need_a_browser(no_chrome, local_site):
 
 
 def test_search_still_runs_without_a_browser(no_chrome, monkeypatch):
-    import msp_search
+    from web_search_neo import msp_search
 
     monkeypatch.setattr(msp_search, "ENGINE_ORDER", ["duckduckgo"])
     monkeypatch.setitem(

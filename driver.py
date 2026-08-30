@@ -6,7 +6,7 @@ import warnings
 
 from selenium import webdriver
 
-from browser_tools import create_driver
+from web_search_neo.browser_tools import create_driver
 
 
 def get_driver(log=None) -> webdriver.Chrome:

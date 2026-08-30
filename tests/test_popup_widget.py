@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-import main
+from web_search_neo import main
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXTENSION_DIR = PROJECT_ROOT / "chrome-extension"

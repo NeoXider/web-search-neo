@@ -17,8 +17,8 @@ from urllib.request import urlopen
 import pytest
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
-import browser_tools
-import main
+from web_search_neo import browser_tools
+from web_search_neo import main
 
 
 class _FakeSwitchTo:

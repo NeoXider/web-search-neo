@@ -13,9 +13,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import browser_tools  # noqa: E402
-import main  # noqa: E402
-import msp_search  # noqa: E402
+from web_search_neo import browser_tools  # noqa: E402
+from web_search_neo import main  # noqa: E402
+from web_search_neo import msp_search  # noqa: E402
 
 
 def main_smoke() -> int:

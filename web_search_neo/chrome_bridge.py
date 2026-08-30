@@ -28,9 +28,9 @@ import uuid
 
 from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
 
-import bridge_auth
-import bridge_daemon
-from bridge_daemon import (
+from web_search_neo import bridge_auth
+from web_search_neo import bridge_daemon
+from web_search_neo.bridge_daemon import (
     CHROME_EXTENSION_ID,
     DEFAULT_HOST,
     MAX_FRAME_BYTES,
@@ -38,7 +38,7 @@ from bridge_daemon import (
     TOKEN_MISMATCH_REASON,
     close_quietly,
 )
-from key_table import MODIFIER_BITS, resolve_key
+from web_search_neo.key_table import MODIFIER_BITS, resolve_key
 
 
 # The tab group the agent's pages land in. It carries the project's mascot so a
@@ -68,7 +68,7 @@ class ChromeBridgeUnavailable(ChromeBridgeError):
 
 
 LOGGER = logging.getLogger("web_search_neo.bridge")
-PROJECT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = Path(__file__).resolve().parents[1]
 DAEMON_ENTRY = PROJECT_DIR / "main.py"
 _IS_WINDOWS = os.name == "nt"
 
@@ -215,7 +215,7 @@ def _env_seconds(name: str, fallback: float) -> float:
 def _package_version() -> str:
     """The server version, read late: main defines it after it imports us."""
     try:
-        import main
+        from web_search_neo import main
 
         return str(main.__version__)
     except Exception:

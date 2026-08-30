@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-import browser_tools
+from web_search_neo import browser_tools
 
 
 class _CannedDriver:
@@ -236,7 +236,7 @@ def test_remove_actually_calls_the_cdp_removal():
 
 
 def test_all_three_actions_are_registered():
-    import main
+    from web_search_neo import main
 
     for name in ("set_extra_headers", "stealth", "replay_request"):
         assert name in main._ACTIONS

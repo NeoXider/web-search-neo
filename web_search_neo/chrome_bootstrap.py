@@ -25,12 +25,12 @@ import time
 from pathlib import Path
 from typing import Any
 
-import bridge_auth
-from chrome_bridge import CHROME_EXTENSION_ID, get_chrome_bridge
+from web_search_neo import bridge_auth
+from web_search_neo.chrome_bridge import CHROME_EXTENSION_ID, get_chrome_bridge
 
 
 EXTENSION_NAME = "Web Search Neo Companion"
-EXTENSION_DIR = (Path(__file__).resolve().parent / "chrome-extension").resolve()
+EXTENSION_DIR = (Path(__file__).resolve().parents[1] / "chrome-extension").resolve()
 
 
 def prepare_bridge_token() -> dict[str, Any]:

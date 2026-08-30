@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-import bridge_auth
-import chrome_bootstrap
+from web_search_neo import bridge_auth
+from web_search_neo import chrome_bootstrap
 
 
 @pytest.fixture(autouse=True)

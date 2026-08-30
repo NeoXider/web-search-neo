@@ -242,7 +242,7 @@ def local_site() -> LocalSite:
 def clean_browser_sessions():
     """Never leak Chrome processes or session state between tests."""
     try:
-        import browser_tools
+        from web_search_neo import browser_tools
     except ImportError:
         yield
         return

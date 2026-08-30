@@ -13,8 +13,8 @@ import time
 import pytest
 from selenium.common.exceptions import WebDriverException
 
-import browser_tools
-import key_table
+from web_search_neo import browser_tools
+from web_search_neo import key_table
 
 
 POINTER_FIXTURE = "/fixtures/games/pointer.html"

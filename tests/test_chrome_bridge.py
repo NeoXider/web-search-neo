@@ -16,19 +16,13 @@ import pytest
 from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect
 
-import bridge_auth
-import bridge_daemon
-import browser_tools
-import chrome_bridge
-import main
-from bridge_daemon import BridgeDaemon
-from chrome_bridge import (
-    CHROME_EXTENSION_ID,
-    ChromeBridge,
-    ChromeBridgeDriver,
-    ChromeBridgeElement,
-    ChromeBridgeError,
-)
+from web_search_neo import bridge_auth
+from web_search_neo import bridge_daemon
+from web_search_neo import browser_tools
+from web_search_neo import chrome_bridge
+from web_search_neo import main
+from web_search_neo.bridge_daemon import BridgeDaemon
+from web_search_neo.chrome_bridge import CHROME_EXTENSION_ID, ChromeBridge, ChromeBridgeDriver, ChromeBridgeElement, ChromeBridgeError
 
 
 TEST_TOKEN = "a1" * 32
@@ -3461,7 +3455,7 @@ def _allowed_cdp_methods() -> set[str]:
 
 def _cdp_names_in_python() -> set[str]:
     """Every DevTools method name written in the modules that drive the bridge."""
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[1] / "web_search_neo"
     found: set[str] = set()
     for name in ("chrome_bridge.py", "browser_tools.py", "page_perception.py", "diagnostics.py"):
         found |= {

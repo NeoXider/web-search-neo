@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import msp_search
+from web_search_neo import msp_search
 
 
 RESULT = [{"title": "Result", "url": "https://example.test", "snippet": "ok"}]
