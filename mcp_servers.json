@@ -2,8 +2,10 @@
   "mcpServers": {
     "web-search-neo": {
       "command": "python",
-      "args": ["main.py"],
-      "cwd": "C:/Git/PythonUrlFeatch"
+      "args": [
+        "main.py"
+      ],
+      "cwd": "."
     }
   }
 }
