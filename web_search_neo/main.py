@@ -955,6 +955,23 @@ async def browser_scroll(
 
 
 @mcp.tool()
+async def browser_reload(
+    session_id: str = "default",
+    hard: bool = False,
+    wait_seconds: float = 0.5,
+) -> dict[str, Any]:
+    """Reload the page in place; hard=true bypasses the cache."""
+    return await asyncio.to_thread(
+        functools.partial(
+            browser_tools.reload_page,
+            session_id=session_id,
+            hard=hard,
+            wait_seconds=wait_seconds,
+        )
+    )
+
+
+@mcp.tool()
 async def browser_touch(
     touch_action: Literal["tap", "press", "move", "release", "swipe", "cancel"],
     points: list[dict[str, Any]] | None = None,
@@ -1956,6 +1973,12 @@ _ACTIONS: dict[str, ActionSpec] = {
             "release_inputs", browser_release_inputs, "game", "Release every held key and pointer button."
         ),
         _action("submit", browser_submit_form, "page", "Submit a form."),
+        _action(
+            "reload",
+            browser_reload,
+            "page",
+            "Reload the current page in place; hard=true bypasses the cache.",
+        ),
         _action(
             "inject_script", browser_inject_script, "page", "Run code before each document's scripts."
         ),

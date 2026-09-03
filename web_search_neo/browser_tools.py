@@ -2133,6 +2133,38 @@ def attach_current_tab(
         raise
 
 
+def reload_page(
+    session_id: str = "default",
+    hard: bool = False,
+    wait_seconds: float = 0.5,
+) -> dict[str, Any]:
+    """Reload the current page in place, keeping the session's tab and history.
+
+    Before this the only reload was ``open`` on the same URL - which re-resolved
+    the profile, re-applied the viewport, and re-armed every bootstrap - or
+    ``run_script`` with ``location.reload()``, which skipped the readiness wait
+    the other page actions do.
+
+    ``hard=True`` bypasses the HTTP cache (``Page.reload`` with
+    ``ignoreCache=true``); the default revalidates the way a normal reload
+    does. Afterwards the call waits exactly like the other page actions and
+    returns the same page-state envelope (url, title, ready_state, ...).
+    """
+    session = _get_session(session_id)
+    with session.lock:
+        driver = session.driver
+        send = getattr(driver, "execute_cdp_cmd", None)
+        if send is not None:
+            driver.execute_cdp_cmd("Page.reload", {"ignoreCache": bool(hard)})
+        else:
+            # A backend without CDP (today there is none in production, but the
+            # contract of this driver surface allows one): WebDriver's own
+            # reload, which is always a normal, cache-respecting one.
+            driver.refresh()
+        _wait_after_action(driver, wait_seconds)
+        return {**_page_summary(driver, session_id), "hard": bool(hard)}
+
+
 # Shares the perception helpers so a selector, a visibility verdict and the
 # aria-hidden rule mean the same thing here as in page_outline; the two topics
 # disagreeing about what is on the page is the failure this avoids.

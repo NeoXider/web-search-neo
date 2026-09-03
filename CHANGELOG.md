@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Add the `reload` page action: reloads the current page in place, keeping the
+  session's tab and history, and returns the same page-state envelope (url,
+  title, ready_state, ...) as the other page actions. `hard=true` bypasses the
+  HTTP cache (`Page.reload` with `ignoreCache=true`); the default revalidates
+  like a normal reload. A backend without CDP falls back to WebDriver's own
+  refresh. Before this the only reload was `open` on the same URL or
+  `run_script` with `location.reload()`.
+
 ## 1.10.1
 
 Release focus: the outline stops losing the one thing on the page that can be acted on.
