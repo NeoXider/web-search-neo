@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Label each agent's tab in the tab strip. In `profile_mode="current"`, `open`
+  and `attach_tab` install a small script via
+  `Page.addScriptToEvaluateOnNewDocument` that prefixes `document.title` with
+  `[agent_label] ` (or `[session_id] ` without a label), re-applies the prefix
+  when the page rewrites its title (MutationObserver on `<title>` plus a
+  `DOMContentLoaded` pass), and hides the prefix from page-side
+  `document.title` reads through a shadow accessor - so the strip shows who is
+  where while pages and title-comparing macros keep seeing the real title.
+  Read topics (`page_outline`, `page_text`, `browser_status`, ...) strip the
+  prefix back off as a backup. Headless, persistent, and attach sessions are
+  never touched; handing a borrowed tab back removes the prefix. Opt out per
+  call with `label_tab=false` or for the whole server with
+  `WEB_SEARCH_NEO_LABEL_TABS=0`.
 - Add the `reload` page action: reloads the current page in place, keeping the
   session's tab and history, and returns the same page-state envelope (url,
   title, ready_state, ...) as the other page actions. `hard=true` bypasses the

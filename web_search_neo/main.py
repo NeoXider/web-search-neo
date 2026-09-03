@@ -355,6 +355,7 @@ async def browser_open_page(
     current_tab_id: int | None = None,
     tab_group: str = chrome_bridge.DEFAULT_TAB_GROUP,
     agent_label: str | None = None,
+    label_tab: bool = True,
 ) -> dict[str, Any]:
     """Open in the current Chrome's agent tab group by default; auto falls back to Selenium."""
     return await asyncio.to_thread(
@@ -371,6 +372,7 @@ async def browser_open_page(
         current_tab_id,
         tab_group,
         agent_label,
+        label_tab,
     )
 
 
@@ -386,6 +388,7 @@ async def browser_open_pages(
         "auto", "current", "temporary", "persistent", "attach"
     ] = "current",
     tab_group: str = chrome_bridge.DEFAULT_TAB_GROUP,
+    label_tab: bool = True,
 ) -> dict[str, Any]:
     """Open up to four pages, using the current Chrome's agent tab group by default."""
     cap = browser_tools.max_sessions()
@@ -414,6 +417,8 @@ async def browser_open_pages(
                 None,
                 None,
                 tab_group,
+                None,
+                label_tab,
             )
             return {"success": True, **page, "error": None}
         except Exception as exc:
@@ -466,10 +471,11 @@ async def browser_attach_tab(
     tab_id: int,
     session_id: str = "default",
     agent_label: str | None = None,
+    label_tab: bool = True,
 ) -> dict[str, Any]:
     """Attach a reusable MCP session to one existing Chrome tab without navigating it."""
     return await asyncio.to_thread(
-        browser_tools.attach_current_tab, tab_id, session_id, agent_label
+        browser_tools.attach_current_tab, tab_id, session_id, agent_label, label_tab
     )
 
 

@@ -702,6 +702,13 @@ occupancy; `capabilities` carries the same occupancy under `limits`. And
 Process exit still closes everything, because at that point nobody is left to own
 a session.
 
+In `profile_mode="current"` the label is also visible in the tab strip: `open`
+and `attach_tab` prefix the tab's title with `[agent_label] ` (or
+`[session_id] ` without a label), kept across navigations and reloads, while
+page scripts and every read topic keep seeing the unlabelled title. Headless,
+persistent, and attach sessions are never labelled. Pass `label_tab=false`, or
+set `WEB_SEARCH_NEO_LABEL_TABS=0` in the server's environment, to turn it off.
+
 Sessions are pinned to the browser run they were opened in. Tab ids restart with
 Chrome, so a session that outlived a restart would address whatever tab inherited
 its number — quite possibly one of the user's. Such a session is dropped, with an

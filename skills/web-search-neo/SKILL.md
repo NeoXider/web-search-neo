@@ -28,7 +28,9 @@ One `session_id` controls one page. Reuse it to continue on that page; use a dif
 when a second reference page must remain open. It is also the only boundary between agents
 working at once: subagents share one MCP server, so two that both leave `session_id` at its
 default drive the same tab and navigate each other's page. Pick your own id, and pass
-`agent_label` on `open` so `browser_status` can show who is where. `close_all` closes only
+`agent_label` on `open` so `browser_status` can show who is where. In the user's own
+Chrome (`profile_mode="current"`) the tab strip shows the same owner as an
+`[agent_label] ` title prefix; `label_tab=false` opts out. `close_all` closes only
 your own labelled sessions; `scope="all"` ends every agent's work in that server.
 
 For reliable small-model automation, repeat one rigid loop: inspect fresh DOM, act once,

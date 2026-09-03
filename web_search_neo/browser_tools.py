@@ -345,6 +345,14 @@ class BrowserSession:
     # agents' work alone. Optional on purpose: a caller that says nothing is
     # anonymous, not refused.
     agent_label: str | None = None
+    # The tab-strip label this session applied ("[ag-mail] "), or None when the
+    # tab is unlabelled. Read topics strip exactly this prefix back off, so what
+    # a human sees in the tab strip never leaks into titles macros compare.
+    tab_label_prefix: str | None = None
+    # The Page.addScriptToEvaluateOnNewDocument id that keeps the label alive
+    # across navigations, kept apart from injected_scripts: that list is the
+    # caller's own inject_script bookkeeping, this one is the session's.
+    tab_label_script_id: str | None = None
     # Wall-clock, unlike `last_used`, because these two are reported to a reader
     # and a monotonic number means nothing to one.
     created_at: float = field(default_factory=time.time)
@@ -1842,6 +1850,13 @@ def _page_summary(driver: webdriver.Chrome, session_id: str) -> dict[str, Any]:
         if isinstance(probe.get("url"), str):
             session.last_url = probe["url"]
         if isinstance(probe.get("title"), str):
+            # The tab strip shows the labelled title; every reader gets the
+            # page's own. The page-side shadow already hides the prefix from
+            # document.title reads - this is the backup for a page that tore
+            # the shadow down and wrote the raw prefixed title through.
+            probe["title"] = _strip_tab_label(
+                probe["title"], session.tab_label_prefix
+            )
             session.last_title = probe["title"]
     return {
         "session_id": session_id,
@@ -1865,6 +1880,10 @@ def _leave_claimed_tab(
     """
     if session.profile_mode != "current" or session.owns_tab:
         return None
+    # The borrowed tab goes back to the user exactly as it was found - which
+    # now includes unlabelled: the tab-strip prefix leaves with us, while the
+    # script registration lapses with the debugger detach.
+    _remove_tab_label(session)
     released = session.current_tab_id
     borrowed = session.driver
     driver = create_driver(
@@ -1928,8 +1947,15 @@ def open_page(
     current_tab_id: int | None = None,
     tab_group: str = DEFAULT_TAB_GROUP,
     agent_label: str | None = None,
+    label_tab: bool = True,
 ) -> dict[str, Any]:
-    """Open a URL in a reusable rendered browser session."""
+    """Open a URL in a reusable rendered browser session.
+
+    In ``profile_mode="current"`` the tab is labelled for the tab strip
+    (``[agent_label] ``, or ``[session_id] `` without a label) unless
+    ``label_tab=False`` or ``WEB_SEARCH_NEO_LABEL_TABS`` disables it. Read
+    topics keep reporting the page's own title.
+    """
     normalized = validate_http_url(url)
     session_id = _validate_session_id(session_id)
     width, height = _bounded_size(width, height)
@@ -1961,6 +1987,9 @@ def open_page(
             released_tab = _leave_claimed_tab(session, width, height, tab_group)
             _set_viewport(session.driver, width, height)
             _register_render_bootstrap(session)
+            # Before the navigation, so the label script is already installed
+            # when the new document's own scripts run.
+            _apply_tab_label(session, session_id, label_tab=label_tab)
             session.driver.get(normalized)
             _wait_until_ready(session.driver, timeout_seconds)
             # A new document drops the gate. Re-arm it, because a caller that
@@ -2091,6 +2120,7 @@ def attach_current_tab(
     tab_id: int,
     session_id: str = "default",
     agent_label: str | None = None,
+    label_tab: bool = True,
 ) -> dict[str, Any]:
     """Attach a named MCP session to an existing Chrome tab without navigating it.
 
@@ -2099,6 +2129,10 @@ def attach_current_tab(
     the page load that is already finished, the request that already failed - was
     never recorded and cannot be recovered; reload the page to observe a full
     load.
+
+    The tab is labelled for the tab strip like an opened one (``label_tab``
+    opts out); with no navigation coming, the label is applied to the live
+    document immediately.
     """
     session_id = _validate_session_id(session_id)
     session = _create_session(
@@ -2116,6 +2150,7 @@ def attach_current_tab(
     try:
         with session.lock:
             _register_render_bootstrap(session)
+            _apply_tab_label(session, session_id, label_tab=label_tab)
             return {
                 **_page_summary(session.driver, session_id),
                 "success": True,
@@ -2163,6 +2198,251 @@ def reload_page(
             driver.refresh()
         _wait_after_action(driver, wait_seconds)
         return {**_page_summary(driver, session_id), "hard": bool(hard)}
+
+
+# A tab-strip label so a human looking at the tab bar can tell which tab each
+# agent is driving. `agent_label` already names the owner to *readers* of
+# browser_status; this makes it visible where the user is actually looking.
+#
+# The label lives in the real `<title>` element - that is what the tab strip
+# shows - while page-side JavaScript keeps reading and writing the *unlabelled*
+# title through a shadow accessor on the document instance, so a page that
+# compares or derives from `document.title` never sees the prefix. Writes
+# through the shadow go out prefixed; direct rewrites of the `<title>` element
+# are caught by a MutationObserver and re-prefixed; statically parsed titles
+# are picked up again on DOMContentLoaded. The script is installed with
+# Page.addScriptToEvaluateOnNewDocument, so it runs before the page's own
+# scripts in every new document and survives navigations and reloads.
+_TAB_LABEL_SCRIPT_TEMPLATE = r"""
+(() => {
+  const PREFIX = __WSN_TAB_LABEL_PREFIX__;
+  const KEY = "__wsnTabLabel";
+  const previous = window[KEY];
+  if (previous && previous.prefix === PREFIX) return;
+  if (previous && typeof previous.restore === "function") {
+    try { previous.restore(); } catch (error) {}
+  }
+  const protoDesc = Object.getOwnPropertyDescriptor(Document.prototype, "title");
+  const state = { prefix: PREFIX, real: "", applying: false, observer: null };
+  window[KEY] = state;
+  function titleElement() {
+    return document.querySelector ? document.querySelector("title") : null;
+  }
+  function shownTitle() {
+    const el = titleElement();
+    return el && typeof el.textContent === "string" ? el.textContent : "";
+  }
+  function writeTitle(wanted) {
+    if (protoDesc && typeof protoDesc.set === "function") {
+      protoDesc.set.call(document, wanted);
+      return;
+    }
+    let el = titleElement();
+    if (!el && document.head && document.createElement) {
+      el = document.createElement("title");
+      document.head.appendChild(el);
+    }
+    if (el) el.textContent = wanted;
+  }
+  function render() {
+    const wanted = state.prefix + state.real;
+    if (shownTitle() === wanted) return;
+    state.applying = true;
+    try {
+      writeTitle(wanted);
+    } finally {
+      state.applying = false;
+    }
+  }
+  function adoptShown() {
+    const shown = shownTitle();
+    if (shown.indexOf(state.prefix) === 0) {
+      state.real = shown.slice(state.prefix.length);
+    } else {
+      state.real = shown;
+    }
+  }
+  function sync() {
+    if (state.applying) return;
+    if (shownTitle() === state.prefix + state.real) return;
+    adoptShown();
+    render();
+  }
+  try {
+    Object.defineProperty(document, "title", {
+      configurable: true,
+      enumerable: true,
+      get() { return state.real; },
+      set(value) {
+        const text = value === null || value === undefined ? "" : String(value);
+        state.real = text.indexOf(state.prefix) === 0
+          ? text.slice(state.prefix.length)
+          : text;
+        render();
+      },
+    });
+  } catch (error) {
+    // A page that froze its own document.title keeps working unlabelled to
+    // its scripts; the observer below still prefixes what the tab strip shows.
+  }
+  try {
+    state.observer = new MutationObserver(sync);
+    state.observer.observe(document, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+  } catch (error) {}
+  if (document.addEventListener) {
+    document.addEventListener("DOMContentLoaded", sync);
+  }
+  adoptShown();
+  render();
+  state.restore = function () {
+    try {
+      if (state.observer) state.observer.disconnect();
+    } catch (error) {}
+    try {
+      delete document.title;
+    } catch (error) {}
+    try {
+      if (Object.getOwnPropertyDescriptor(document, "title")) {
+        const el = titleElement();
+        if (el) el.textContent = state.real;
+      } else {
+        document.title = state.real;
+      }
+    } catch (error) {}
+    try {
+      delete window[KEY];
+    } catch (error) {}
+  };
+})();
+"""
+
+_TAB_LABEL_RESTORE_SCRIPT = (
+    "(() => { const labelled = window.__wsnTabLabel;"
+    " if (labelled && typeof labelled.restore === 'function') labelled.restore();"
+    " return true; })()"
+)
+
+_TAB_LABEL_ENV = "WEB_SEARCH_NEO_LABEL_TABS"
+_TAB_LABEL_LIMIT = 24
+
+
+def _tab_labelling_enabled() -> bool:
+    """Whether tab-strip labels may be applied at all.
+
+    Set ``WEB_SEARCH_NEO_LABEL_TABS=0`` (or false/no/off) in the server's
+    environment and no tab is ever touched, whatever the caller passes.
+    """
+    return str(os.environ.get(_TAB_LABEL_ENV, "")).strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+
+
+def _tab_label_prefix(session_id: str, agent_label: str | None) -> str:
+    """Build the short unambiguous prefix for one tab: ``[ag-mail] ``.
+
+    The owner's own words when there is a label, the session id otherwise.
+    Brackets are stripped so the ``[x] `` shape cannot break, runs of
+    whitespace become one dash, and anything long is cut - the tab strip has
+    no room for a sentence.
+    """
+    raw = (agent_label or session_id or "").strip() or session_id
+    safe = re.sub(r"[\[\]]", "", raw)
+    safe = re.sub(r"\s+", "-", safe).strip("-")
+    return f"[{(safe or session_id)[:_TAB_LABEL_LIMIT]}] "
+
+
+def _tab_label_source(prefix: str) -> str:
+    """The label script with its prefix baked in, ready for CDP or execute."""
+    return _TAB_LABEL_SCRIPT_TEMPLATE.replace(
+        "__WSN_TAB_LABEL_PREFIX__", json.dumps(prefix)
+    )
+
+
+def _strip_tab_label(title: Any, prefix: str | None) -> Any:
+    """Take the tab-strip prefix back off a title read from the page.
+
+    Read topics must report the title the page means, not the one the tab
+    strip shows, or macros comparing titles start failing the moment labels
+    are on. Non-strings and foreign prefixes pass through untouched.
+    """
+    if isinstance(title, str) and prefix and title.startswith(prefix):
+        return title[len(prefix):]
+    return title
+
+
+def _remove_tab_label(session: BrowserSession) -> None:
+    """Stop labelling one session's tab and restore its visible title.
+
+    Best-effort throughout: teardown paths call this when the driver may
+    already be half gone, and a label left behind there is cosmetic, never a
+    reason to fail the call. Caller holds the session lock.
+    """
+    driver = session.driver
+    if session.tab_label_prefix:
+        try:
+            driver.execute_script(_TAB_LABEL_RESTORE_SCRIPT)
+        except Exception:
+            pass
+        session.tab_label_prefix = None
+    if session.tab_label_script_id:
+        try:
+            driver.execute_cdp_cmd(
+                "Page.removeScriptToEvaluateOnNewDocument",
+                {"identifier": session.tab_label_script_id},
+            )
+        except Exception:
+            pass
+        session.tab_label_script_id = None
+
+
+def _apply_tab_label(
+    session: BrowserSession, session_id: str, *, label_tab: bool = True
+) -> None:
+    """Label one session's tab for the tab strip, when labelling applies.
+
+    Only ``profile_mode="current"`` tabs are ever touched: those are the ones
+    sitting in the user's own Chrome next to their own tabs. Headless,
+    persistent, and attach sessions are left alone, as is everything when the
+    caller passes ``label_tab=False`` or the environment disables it. Caller
+    holds the session lock.
+    """
+    if (
+        session.profile_mode != "current"
+        or not label_tab
+        or not _tab_labelling_enabled()
+    ):
+        _remove_tab_label(session)
+        return
+    wanted = _tab_label_prefix(session_id, session.agent_label)
+    if session.tab_label_prefix == wanted and session.tab_label_script_id:
+        return
+    _remove_tab_label(session)
+    try:
+        result = session.driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": _tab_label_source(wanted)},
+        )
+    except Exception as exc:
+        logger.warning(
+            "Tab label for session '%s' was skipped: %s: %s",
+            session_id,
+            type(exc).__name__,
+            exc,
+        )
+        return
+    session.tab_label_script_id = str((result or {}).get("identifier") or "")
+    session.tab_label_prefix = wanted
+    # The registration only fires on future documents; the live one - the
+    # attach case, where there is no navigation coming - gets the same script
+    # run in it now.
+    try:
+        session.driver.execute_script(_tab_label_source(wanted))
+    except Exception:
+        pass
 
 
 # Shares the perception helpers so a selector, a visibility verdict and the
