@@ -424,6 +424,7 @@ export const ALLOWED_CDP_METHODS = new Set([
   "Page.bringToFront",
   "Page.captureScreenshot",
   "Page.getLayoutMetrics",
+  "Page.reload",
   "Page.removeScriptToEvaluateOnNewDocument",
   "Runtime.evaluate",
   "Storage.clearCookies",
