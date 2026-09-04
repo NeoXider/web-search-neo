@@ -1,6 +1,18 @@
 # Changelog
 
-## Unreleased
+## 1.10.1
+
+- The companion reconnects on its own. A periodic one-minute alarm now runs
+  alongside the backoff and covers the two states the backoff cannot: a socket
+  that died while the service worker was already evicted, so its close handler
+  never scheduled a retry, and a browser idle long enough that nothing wakes the
+  worker at all. Both used to leave the extension offline until someone clicked
+  the toolbar icon. The heartbeat is armed on install, on browser start, when the
+  switch is turned on and on every worker load, re-arms itself when it fires, and
+  yields to a wait the backoff already owns instead of spending an attempt on top
+  of it.
+
+### Earlier in this release
 
 - Label each agent's tab in the tab strip. In `profile_mode="current"`, `open`
   and `attach_tab` install a small script via

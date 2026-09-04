@@ -85,6 +85,15 @@ const AUTH_RETRY_MAX_MS = 120000;
 const WORKER_IDLE_MS = 30000;
 const TIMER_SAFE_MS = 25000;
 const RECONNECT_ALARM = "bridge-reconnect";
+// The retry above only runs while a wait is pending, and a wait is only pending
+// because an attempt failed. Two ordinary situations leave none: a socket that
+// died while the worker was already evicted, so its close handler never ran, and
+// a browser sitting idle long enough that nothing wakes this file at all. In
+// both the companion stays offline until someone clicks the icon, which is the
+// manual step this alarm removes. It runs on its own schedule whether or not
+// anything else is scheduled; one minute is the shortest period Chrome honours.
+const HEARTBEAT_ALARM = "bridge-heartbeat";
+const HEARTBEAT_MINUTES = 1;
 const ENABLED_KEY = "companion_enabled";
 // Long enough for the answer to a reload request to reach the socket before the
 // worker that wrote it disappears.
@@ -1015,6 +1024,7 @@ async function setEnabled(value) {
   await chrome.storage.local.set({[ENABLED_KEY]: enabled});
   if (!enabled) {
     clearReconnect();
+    stopHeartbeat();
     clearInterval(keepaliveTimer);
     keepaliveTimer = null;
     const active = socket;
@@ -1028,6 +1038,7 @@ async function setEnabled(value) {
     return {...connectionStatus(), detached_tabs};
   }
   setBadge(false);
+  ensureHeartbeat();
   connectNow();
   return connectionStatus();
 }
@@ -1069,6 +1080,33 @@ function clearReconnect() {
   clearTimeout(reconnectTimer);
   reconnectTimer = null;
   if (alarmsAvailable) Promise.resolve(chrome.alarms.clear(RECONNECT_ALARM)).catch(() => {});
+}
+
+// Creating an alarm that already exists just replaces it, so this is safe to
+// call from every entry point and needs no "is it there" bookkeeping.
+function ensureHeartbeat() {
+  if (!alarmsAvailable) return;
+  chrome.alarms.create(HEARTBEAT_ALARM, {
+    periodInMinutes: HEARTBEAT_MINUTES,
+    delayInMinutes: HEARTBEAT_MINUTES,
+  });
+}
+
+function stopHeartbeat() {
+  if (!alarmsAvailable) return;
+  Promise.resolve(chrome.alarms.clear(HEARTBEAT_ALARM)).catch(() => {});
+}
+
+// A live socket needs nothing from us: the keepalive already proves it while the
+// worker is awake. This only matters when there is no socket and no pending
+// attempt, which is precisely the state that used to wait for a click. The
+// streak is cleared first so recovery costs one attempt, not another full cap.
+function heartbeat() {
+  ensureHeartbeat();
+  if (!enabled || socket || connecting) return;
+  if (backoff.nextAttemptAt > Date.now()) return;
+  resetBackoff();
+  startConnect();
 }
 
 function scheduleReconnect(delayMs) {
@@ -1418,7 +1456,10 @@ function completeHandshake(connection, message, expectedProof) {
 
 chrome.runtime.onInstalled.addListener(() => loadEnabled().then(active => {
   setBadge(false);
-  if (active) connectNow();
+  if (active) {
+    ensureHeartbeat();
+    connectNow();
+  }
 }));
 // The run check runs first so the hello that follows carries this run's id, and
 // connecting is not made conditional on it: a browser that is up is worth
@@ -1427,6 +1468,7 @@ chrome.runtime.onStartup.addListener(() => {
   loadEnabled().then(active => {
     setBadge(false);
     if (!active) return;
+    ensureHeartbeat();
     startBrowserRun()
       .catch(error => console.warn("bridge: could not start a browser run", error))
       .then(connectNow);
@@ -1461,6 +1503,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 if (alarmsAvailable) {
   chrome.alarms.onAlarm.addListener(alarm => {
     if (alarm.name === RECONNECT_ALARM && enabled) startConnect();
+    // The heartbeat has to survive an evicted worker, so it re-reads the switch
+    // instead of trusting the module-scope copy this fresh worker has not filled
+    // in yet.
+    if (alarm.name === HEARTBEAT_ALARM) loadEnabled().then(heartbeat);
   });
 }
 restoreState();
@@ -1469,5 +1515,7 @@ loadBridgePort()
   .then(loadEnabled)
   .then(active => {
     setBadge(false);
-    if (active) resumeConnect();
+    if (!active) return;
+    ensureHeartbeat();
+    resumeConnect();
   });

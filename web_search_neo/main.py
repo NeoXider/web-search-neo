@@ -26,7 +26,7 @@ from web_search_neo import plugins
 from web_search_neo.web_client import request
 
 
-__version__ = "1.10.0"
+__version__ = "1.10.1"
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 log = logging.getLogger("web_search_neo")

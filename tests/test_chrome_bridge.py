@@ -966,6 +966,41 @@ def test_a_wait_the_worker_would_not_survive_is_handed_to_an_alarm() -> None:
 
 
 @requires_node
+def test_a_periodic_heartbeat_alarm_is_armed_so_recovery_needs_no_click() -> None:
+    """Without it, a socket that died while the worker slept waits for the icon."""
+    outcome = _node_worker_eval(
+        """
+        await globalThis.__sleep(60);
+        return globalThis.__alarms().filter(alarm => alarm.name === "bridge-heartbeat");
+        """
+    )
+    assert outcome, "the worker armed no heartbeat alarm"
+    assert outcome[-1]["periodInMinutes"] == 1
+
+
+@requires_node
+def test_the_heartbeat_re_arms_itself_and_yields_to_a_pending_attempt() -> None:
+    """It must survive an evicted worker without stealing attempts from the backoff."""
+    outcome = _node_worker_eval(
+        _WORKER_READY
+        + """
+        await worker.connect();
+        const socket = globalThis.__sockets[globalThis.__sockets.length - 1];
+        socket.onclose({code: 1006, reason: ""});
+        const before = globalThis.__sockets.length;
+        globalThis.__fire("alarm", {name: "bridge-heartbeat"});
+        await globalThis.__sleep(60);
+        const beats = globalThis.__alarms().filter(alarm => alarm.name === "bridge-heartbeat");
+        return {before, after: globalThis.__sockets.length, beats: beats.length};
+        """
+    )
+    # The wait the close handler just scheduled is the one that should run, so a
+    # heartbeat landing inside it changes nothing but its own next firing.
+    assert outcome["after"] == outcome["before"], "the heartbeat spent an attempt the backoff owned"
+    assert outcome["beats"] >= 2, "the heartbeat did not re-arm after firing"
+
+
+@requires_node
 def test_without_the_alarms_permission_no_wait_outlives_the_idle_worker() -> None:
     """A timer Chrome would kill mid-wait leaves the bridge offline for good."""
     steps = _node_worker_eval(
