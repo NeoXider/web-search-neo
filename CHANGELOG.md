@@ -1,6 +1,35 @@
 # Changelog
 
+## Unreleased
+
+- Add periodic cleanup of claims whose owner process has died in the bridge daemon.
+  A background thread runs every 30 seconds (configurable via
+  ``WEB_SEARCH_NEO_BRIDGE_CLAIM_CLEANUP_INTERVAL``), checks all active claims,
+  and releases any whose PID (extracted from the ``program#pid`` label) no longer
+  corresponds to a running process.  This prevents tabs from staying permanently
+  occupied when a client process is killed without cleanly releasing its tabs
+  (e.g. `taskkill /F`, OOM, crash).
+  - Labels are parsed for the PID after the ``#`` character; unrecognised formats
+    are left untouched (safer than snatching a tab from a live agent).
+  - Process existence is checked cross-platform via ``os.kill(pid, 0)``:
+    ``ProcessLookupError`` means the process is dead, ``PermissionError`` means
+    it is alive but inaccessible.
+  - After freeing a claim ``_broadcast_state()`` is called so remaining clients
+    see the tab is free.
+  - New constant ``PROCESS_CHECK_INTERVAL = 30`` added beside other daemon
+    settings.
+- Add ``_is_process_alive`` static method using ``os.kill(pid, 0)`` for
+  cross-platform process existence checks.
+- Add ``_cleanup_dead_claims`` method and ``_cleanup_dead_claims_loop`` background
+  thread, started in ``_serve``.
+- Add tests in ``tests/test_claim_cleanup.py``:
+  * claim with non-existing PID is released,
+  * claim with living PID stays,
+  * unrecognised label format is not touched.
+
 ## 1.10.1
+
+...
 
 - The companion reconnects on its own. A periodic one-minute alarm now runs
   alongside the backoff and covers the two states the backoff cannot: a socket

@@ -61,6 +61,11 @@ MAX_BROWSER_RUN_CHARS = 256
 # Zero disables the timer for a machine that would rather keep the port held.
 IDLE_SHUTDOWN_SECONDS = 900.0
 
+# How often to check for dead client processes (seconds). A client that dies
+# without cleanly releasing its tabs leaves claims stuck forever; this interval
+# keeps them from blocking other agents indefinitely.
+PROCESS_CHECK_INTERVAL = 30
+
 LOGGER = logging.getLogger("web_search_neo.bridge.daemon")
 
 _ADDRESS_IN_USE = {errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", errno.EADDRINUSE)}
@@ -343,6 +348,12 @@ class BridgeDaemon:
                     threading.Thread(
                         target=self._watch_idle, name="web-search-neo-bridge-idle", daemon=True
                     ).start()
+                if self.idle_seconds > 0:
+                    threading.Thread(
+                        target=self._cleanup_dead_claims_loop,
+                        name="web-search-neo-bridge-claim-cleanup",
+                        daemon=True,
+                    ).start()
                 LOGGER.info(
                     "Bridge daemon %s listening on %s:%s (pid %s)",
                     self.version or "unversioned",
@@ -378,6 +389,12 @@ class BridgeDaemon:
             )
             self.shutdown()
             return
+
+    def _cleanup_dead_claims_loop(self) -> None:
+        """Periodically scan for and release claims whose owner process is dead."""
+        interval = PROCESS_CHECK_INTERVAL
+        while not self._stopped.wait(interval):
+            self._cleanup_dead_claims()
 
     def _refresh_idle(self) -> None:
         with self._lock:
@@ -663,6 +680,67 @@ class BridgeDaemon:
         for tab_id in dropped:
             self._claims.pop(tab_id, None)
         return dropped
+
+    @staticmethod
+    def _is_process_alive(pid: int) -> bool:
+        """Check if a process with the given PID is still alive.
+
+        Uses ``os.kill(pid, 0)`` which sends signal 0 (no signal) and
+        succeeds only if the process exists.  On Windows ``PermissionError``
+        means the process is alive but inaccessible to us; on Unix the same
+        applies.  ``ProcessLookupError`` means the process has exited.
+
+        Returns
+        -------
+            ``True`` if the process exists, ``False`` if it has terminated.
+        """
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            # Process is alive but we can't signal it; treat as alive.
+            return True
+
+    def _cleanup_dead_claims(self) -> None:
+        """Release claims whose owner process no longer exists.
+
+        Scans every ``PROCESS_CHECK_INTERVAL`` seconds.  For each claim the
+        PID is extracted from the client ``label`` (format ``program#pid``).
+        If the PID is not a positive integer or the process has exited the
+        claim is freed and ``_broadcast_state()`` is called so remaining
+        clients see the tab is free.
+        """
+        with self._lock:
+            dead: list[int] = []
+            for tab_id, claim in self._claims.items():
+                # Label format: "program#pid" or "client#pid"
+                label = claim.client.label
+                pid_str = label.rsplit("#", 1)[-1] if "#" in label else None
+                if pid_str is None:
+                    # Unrecognised format – leave untouched.
+                    continue
+                try:
+                    pid = int(pid_str)
+                except ValueError:
+                    # Not a number – leave untouched (prefer keeping a claim
+                    # rather than stealing a tab from a live agent).
+                    continue
+                if pid <= 0:
+                    continue
+                if not self._is_process_alive(pid):
+                    dead.append(tab_id)
+            for tab_id in dead:
+                self._claims.pop(tab_id, None)
+                LOGGER.info(
+                    "Released tab %s – owner process %s (pid %d) is gone",
+                    tab_id,
+                    claim.client.label,
+                    pid,
+                )
+            if dead:
+                self._broadcast_state()
 
     def _broadcast_state(self) -> None:
         state = self.status()
