@@ -348,12 +348,16 @@ class BridgeDaemon:
                     threading.Thread(
                         target=self._watch_idle, name="web-search-neo-bridge-idle", daemon=True
                     ).start()
-                if self.idle_seconds > 0:
-                    threading.Thread(
-                        target=self._cleanup_dead_claims_loop,
-                        name="web-search-neo-bridge-claim-cleanup",
-                        daemon=True,
-                    ).start()
+                # Deliberately NOT gated on idle_seconds. Releasing the tabs of a dead
+                # owner has nothing to do with the idle-shutdown timer, and the autostart
+                # launcher sets WEB_SEARCH_NEO_BRIDGE_IDLE_SECONDS=0 to keep the bridge
+                # alive - under that gate the cleanup would never run on the very setup
+                # it was written for.
+                threading.Thread(
+                    target=self._cleanup_dead_claims_loop,
+                    name="web-search-neo-bridge-claim-cleanup",
+                    daemon=True,
+                ).start()
                 LOGGER.info(
                     "Bridge daemon %s listening on %s:%s (pid %s)",
                     self.version or "unversioned",
