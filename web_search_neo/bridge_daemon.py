@@ -24,6 +24,7 @@ hello and is told apart by the ``role`` field it adds.
 
 from __future__ import annotations
 
+import ctypes
 from dataclasses import dataclass, field
 import errno
 import json
@@ -32,6 +33,7 @@ from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import re
+import sys
 import threading
 import time
 from typing import Any
@@ -398,7 +400,18 @@ class BridgeDaemon:
         """Periodically scan for and release claims whose owner process is dead."""
         interval = PROCESS_CHECK_INTERVAL
         while not self._stopped.wait(interval):
-            self._cleanup_dead_claims()
+            # One bad scan must not end the reaper. Before this guard a single
+            # unexpected error took the thread with it, silently: claims kept
+            # piling up and nothing in the status said the reaper had stopped.
+            try:
+                self._cleanup_dead_claims()
+            except Exception as exc:  # noqa: BLE001 - a reaper that dies is worse
+                LOGGER.warning(
+                    "Dead-claim scan failed, will retry in %s s: %s: %s",
+                    interval,
+                    type(exc).__name__,
+                    exc,
+                )
 
     def _refresh_idle(self) -> None:
         with self._lock:
@@ -689,15 +702,42 @@ class BridgeDaemon:
     def _is_process_alive(pid: int) -> bool:
         """Check if a process with the given PID is still alive.
 
-        Uses ``os.kill(pid, 0)`` which sends signal 0 (no signal) and
-        succeeds only if the process exists.  On Windows ``PermissionError``
-        means the process is alive but inaccessible to us; on Unix the same
-        applies.  ``ProcessLookupError`` means the process has exited.
+        On POSIX this is ``os.kill(pid, 0)``: signal 0 delivers nothing and
+        succeeds only if the process exists. ``ProcessLookupError`` means it
+        has exited; ``PermissionError`` means it is alive but not ours.
+
+        Windows needs a different call, and the difference is not cosmetic.
+        There ``signal.CTRL_C_EVENT`` **is** 0, so ``os.kill(pid, 0)`` does not
+        probe anything — it tries to deliver a Ctrl+C to a process group. For a
+        PID that is gone it raises a bare ``OSError`` (WinError 87), which is
+        neither of the two exceptions above: it escaped this function, killed
+        the reaper thread on its first dead claim, and claims then sat forever.
+        That is exactly what happened on 09.09.2026 — four tabs held for 6258
+        seconds by a process that had been gone for over an hour. So on Windows
+        we ask the kernel directly instead of signalling anyone.
 
         Returns
         -------
             ``True`` if the process exists, ``False`` if it has terminated.
         """
+        if sys.platform == "win32":
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            ERROR_INVALID_PARAMETER = 87
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                # "Invalid parameter" is how Windows says "no such process".
+                # Anything else (access denied, for one) means it is alive and
+                # merely out of reach, and a live tab must not be stolen.
+                return kernel32.GetLastError() != ERROR_INVALID_PARAMETER
+            try:
+                code = ctypes.c_ulong()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return True
+                return code.value == STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
         try:
             os.kill(pid, 0)
             return True
@@ -705,6 +745,10 @@ class BridgeDaemon:
             return False
         except PermissionError:
             # Process is alive but we can't signal it; treat as alive.
+            return True
+        except OSError:
+            # Never guess "dead" from an error we did not plan for: releasing a
+            # claim out from under a live agent is worse than holding it.
             return True
 
     def _cleanup_dead_claims(self) -> None:
@@ -717,7 +761,7 @@ class BridgeDaemon:
         clients see the tab is free.
         """
         with self._lock:
-            dead: list[int] = []
+            dead: list[tuple[int, str, int]] = []
             for tab_id, claim in self._claims.items():
                 # Label format: "program#pid" or "client#pid"
                 label = claim.client.label
@@ -734,13 +778,16 @@ class BridgeDaemon:
                 if pid <= 0:
                     continue
                 if not self._is_process_alive(pid):
-                    dead.append(tab_id)
-            for tab_id in dead:
+                    # Запоминаем владельца сразу: в сообщении ниже раньше стояли
+                    # `claim` и `pid` из последнего витка первого цикла, и лог
+                    # называл чужую вкладку чужим процессом.
+                    dead.append((tab_id, label, pid))
+            for tab_id, label, pid in dead:
                 self._claims.pop(tab_id, None)
                 LOGGER.info(
                     "Released tab %s – owner process %s (pid %d) is gone",
                     tab_id,
-                    claim.client.label,
+                    label,
                     pid,
                 )
             if dead:
