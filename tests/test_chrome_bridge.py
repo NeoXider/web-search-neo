@@ -3661,3 +3661,50 @@ def test_the_popup_and_its_script_describe_the_same_page() -> None:
     assert not styled - used_classes, (
         f"popup.css styles class(es) {sorted(styled - used_classes)} that no element uses."
     )
+
+
+def test_supervisor_restores_a_dropped_link(monkeypatch):
+    """Связь восстанавливается сама, без запроса от инструмента.
+
+    Раньше клиент ждал следующего вызова: после перезапуска Chrome или ухода
+    демона он просто сидел отключённым, и за переподключение платил тот вызов,
+    который случайно пришёл первым.
+    """
+    bridge = chrome_bridge.ChromeBridge(spawn=False)
+    bridge._supervise_every = 0.01
+    calls = []
+
+    def fake_start():
+        calls.append(time.monotonic())
+        if len(calls) >= 3:
+            bridge._closing = True
+
+    monkeypatch.setattr(bridge, "start", fake_start)
+    bridge._ensure_supervisor()
+    deadline = time.monotonic() + 2.0
+    while len(calls) < 3 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    bridge._closing = True
+    bridge._wake.set()
+    assert len(calls) >= 3, "супервизор должен пробовать снова, пока связи нет"
+
+
+def test_supervisor_leaves_a_live_link_alone(monkeypatch):
+    """Пока связь есть, супервизор не дёргает start."""
+    bridge = chrome_bridge.ChromeBridge(spawn=False)
+    bridge._supervise_every = 0.01
+    bridge._connected.set()
+    calls = []
+    monkeypatch.setattr(bridge, "start", lambda: calls.append(1))
+    bridge._ensure_supervisor()
+    time.sleep(0.15)
+    bridge._closing = True
+    bridge._wake.set()
+    assert calls == [], "у живой связи переподключать нечего"
+
+
+def test_supervisor_can_be_switched_off():
+    bridge = chrome_bridge.ChromeBridge(spawn=False)
+    bridge._supervise_every = 0
+    bridge._ensure_supervisor()
+    assert bridge._supervisor is None

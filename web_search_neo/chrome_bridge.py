@@ -85,6 +85,10 @@ MAX_DAEMON_REPLACEMENTS = 2
 # daemon and never asks one to leave, so it cannot restart the tug-of-war it
 # reports.
 DAEMON_RECHECK_SECONDS = 10.0
+# How often the client tries to restore a link nobody is asking for. A minute is
+# the same cadence the extension heartbeat uses, so both ends recover on their
+# own on the same clock. Set to 0 to switch the supervisor off.
+SUPERVISE_SECONDS = 60.0
 
 # A daemon of another revision refuses the hello and names the protocol it wants
 # in the close reason. That reason is the only thing it ever tells us, so it is
@@ -318,6 +322,16 @@ class ChromeBridge:
         # that keeps that second look passive.
         self._recheck_at = 0.0
         self._probe_only = False
+        # The link used to be rebuilt only by whoever asked for the browser next:
+        # after a drop - a restarted Chrome, a daemon that went away - the client
+        # sat idle until a tool call happened to arrive, and the first call after
+        # the outage was the one that paid for reconnecting. A supervisor makes
+        # the recovery happen on its own, so by the time a call arrives the link
+        # is usually already back.
+        self._supervisor: threading.Thread | None = None
+        self._supervise_every = _env_seconds(
+            "WEB_SEARCH_NEO_BRIDGE_SUPERVISE_SECONDS", SUPERVISE_SECONDS
+        )
 
     @staticmethod
     def _resolve_spawn(
@@ -382,9 +396,39 @@ class ChromeBridge:
                     daemon=True,
                 )
                 self._thread.start()
+            self._ensure_supervisor()
         # The link keeps forming in the background: a caller that needs the
         # browser waits on wait_connected, not on this.
         self._attempted.wait(timeout=max(0.0, self._start_timeout))
+
+    def _supervise(self) -> None:
+        """Keep trying to restore the link while nobody is asking for it.
+
+        Deliberately thin: it calls the same ``start`` an ordinary caller would,
+        so the version-conflict latch and the probe-only rule keep working and a
+        conflict is still not retried in a tight loop.
+        """
+        while not self._closing:
+            if self._wake.wait(self._supervise_every):
+                return
+            if self._closing or self._connected.is_set():
+                continue
+            try:
+                self.start()
+            except Exception as exc:            # noqa: BLE001 - a supervisor never dies
+                LOGGER.debug("Supervisor could not restore the bridge link: %s", exc)
+
+    def _ensure_supervisor(self) -> None:
+        if self._supervise_every <= 0:
+            return
+        if self._supervisor is not None and self._supervisor.is_alive():
+            return
+        self._supervisor = threading.Thread(
+            target=self._supervise,
+            name="web-search-neo-bridge-supervisor",
+            daemon=True,
+        )
+        self._supervisor.start()
 
     def _maintain_link(self) -> None:
         delay = 0.0
