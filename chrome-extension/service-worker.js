@@ -320,6 +320,7 @@ function forgetTab(tabId, dropBuffer = true) {
   attachedTabs.delete(tabId);
   if (dropBuffer) buffers.delete(tabId);
   capture.delete(tabId);
+  requestMocks.delete(Number(tabId));
   for (const [key, entry] of childSessions) {
     if (entry.tabId === tabId) childSessions.delete(key);
   }
@@ -418,9 +419,17 @@ export const ALLOWED_CDP_METHODS = new Set([
   "Emulation.sendGamepadEvents",
   "Emulation.setDeviceMetricsOverride",
   "Emulation.setEmitTouchEventsForMouse",
+  "Emulation.setGeolocationOverride",
+  "Emulation.setLocaleOverride",
+  "Emulation.setTimezoneOverride",
   "Emulation.setTouchEmulationEnabled",
   "Emulation.setVirtualTimePolicy",
   "Emulation.clearVirtualTimePolicy",
+  "Fetch.continueRequest",
+  "Fetch.disable",
+  "Fetch.enable",
+  "Fetch.failRequest",
+  "Fetch.fulfillRequest",
   "Input.dispatchKeyEvent",
   "Input.dispatchMouseEvent",
   "Input.dispatchTouchEvent",
@@ -440,6 +449,91 @@ export const ALLOWED_CDP_METHODS = new Set([
   "Storage.getCookies",
   "Storage.setCookies",
 ]);
+
+// Third-party response stubs, answered inside the extension over the CDP Fetch
+// domain (Fetch.enable + Fetch.fulfillRequest), so the page never sees the
+// real endpoint. One entry per tab; patterns are CDP urlPattern wildcards
+// (`*` matches anything). Non-matching requests are never paused and flow
+// untouched; a handler error continues the request rather than hanging it.
+const requestMocks = new Map();
+
+function mockWildcardMatch(url, pattern) {
+  const escaped = String(pattern).split("*").map(part =>
+    part.replace(/[.+?^${}()|[\]\\]/g, "\\$&")
+  ).join(".*");
+  try {
+    return new RegExp(`^${escaped}$`).test(String(url));
+  } catch (error) {
+    return false;
+  }
+}
+
+function mocksForTab(tabId) {
+  return requestMocks.get(Number(tabId)) || [];
+}
+
+async function rearmFetchInterception(tabId) {
+  const numericId = Number(tabId);
+  const mocks = mocksForTab(numericId);
+  if (!mocks.length) {
+    await cdpSend({tabId: numericId, method: "Fetch.disable"}).catch(() => {});
+    return;
+  }
+  await ensureDebugger(numericId);
+  await cdpSend({
+    tabId: numericId,
+    method: "Fetch.enable",
+    params: {patterns: mocks.map(entry => ({urlPattern: entry.pattern}))},
+  });
+}
+
+function utf8ToBase64(text) {
+  return btoa(unescape(encodeURIComponent(String(text ?? ""))));
+}
+
+async function handleFetchPaused(source, params) {
+  const numericId = Number(source?.tabId);
+  const requestId = params?.requestId;
+  if (!requestId) return;
+  const url = String(params?.request?.url || "");
+  const entry = mocksForTab(numericId).find(item => mockWildcardMatch(url, item.pattern));
+  try {
+    if (!entry) {
+      await cdpSend({tabId: numericId, method: "Fetch.continueRequest", params: {requestId}});
+      return;
+    }
+    const headers = Object.entries(entry.headers || {}).map(([name, value]) => ({
+      name: String(name),
+      value: String(value),
+    }));
+    if (!headers.some(item => item.name.toLowerCase() === "content-type")) {
+      headers.push({name: "Content-Type", value: "application/json"});
+    }
+    await cdpSend({
+      tabId: numericId,
+      method: "Fetch.fulfillRequest",
+      params: {
+        requestId,
+        responseCode: Number(entry.status) || 200,
+        responseHeaders: headers,
+        body: utf8ToBase64(entry.body),
+      },
+    });
+  } catch (error) {
+    console.warn(`bridge: mock handling failed for ${url}`, error);
+    await cdpSend({
+      tabId: numericId,
+      method: "Fetch.continueRequest",
+      params: {requestId},
+    }).catch(() => {});
+  }
+}
+
+if (typeof chrome !== "undefined" && chrome.debugger && chrome.debugger.onEvent) {
+  chrome.debugger.onEvent.addListener((source, method, params) => {
+    if (method === "Fetch.requestPaused") void handleFetchPaused(source, params);
+  });
+}
 
 async function cdpSend({tabId, sessionId, method, params = {}}) {
   await ensureDebugger(tabId);
@@ -706,6 +800,58 @@ const commands = {
     await chrome.debugger.detach({tabId: numericId}).catch(() => {});
     forgetTab(numericId);
     return {detached: true};
+  },
+
+  // Third-party response stubs over the Fetch domain. mock.add stores one
+  // pattern for the tab and re-arms Fetch.enable with the whole pattern set
+  // (enable replaces patterns, so partial updates would drop the rest).
+  // Stubs live on the tab's debugger session: detaching or reloading the
+  // extension lapses them, and mock.list always reports what is live.
+  async "mock.add"({tabId, pattern, status = 200, headers = {}, body = ""}) {
+    const numericId = Number(tabId);
+    const wanted = String(pattern || "").trim();
+    if (!wanted) throw new Error("mock.add needs a url pattern");
+    const code = Number(status) || 200;
+    if (!Number.isInteger(code) || code < 200 || code > 599) {
+      throw new Error(`mock.add status must be an integer 200-599, not '${status}'`);
+    }
+    const entries = mocksForTab(numericId).filter(item => item.pattern !== wanted);
+    entries.push({
+      pattern: wanted,
+      status: code,
+      headers: {...(headers || {})},
+      body: String(body ?? ""),
+    });
+    requestMocks.set(numericId, entries);
+    persistState();
+    await rearmFetchInterception(numericId);
+    return {mocked: true, tabId: numericId, pattern: wanted, mocks: entries.length};
+  },
+
+  async "mock.list"({tabId}) {
+    const numericId = Number(tabId);
+    return {
+      tabId: numericId,
+      mocks: mocksForTab(numericId).map(item => ({
+        pattern: item.pattern,
+        status: item.status,
+        headers: item.headers,
+        body_chars: String(item.body || "").length,
+      })),
+    };
+  },
+
+  async "mock.clear"({tabId, pattern}) {
+    const numericId = Number(tabId);
+    const wanted = pattern === undefined || pattern === null ? "" : String(pattern);
+    let entries = mocksForTab(numericId);
+    const before = entries.length;
+    entries = wanted ? entries.filter(item => item.pattern !== wanted) : [];
+    if (entries.length) requestMocks.set(numericId, entries);
+    else requestMocks.delete(numericId);
+    persistState();
+    await rearmFetchInterception(numericId);
+    return {cleared: before - entries.length, mocks: entries.length};
   },
 
   // Nothing outside Chrome can press "Reload" on an unpacked extension card, so

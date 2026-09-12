@@ -197,6 +197,25 @@ def setup_current_chrome(wait_seconds: float = 1.0) -> dict[str, Any]:
         "manual_steps": guidance["steps"],
         "next": guidance["next"],
         "current_chrome": status,
+        # Driving a tab always raises Chrome's own debugging banner; say so
+        # where the human will read it, with the one supported silence.
+        "debug_banner": {
+            "what": (
+                "Chrome shows 'Web Search Neo Companion started debugging this "
+                "browser' on every tab an agent drives. It is Chrome's mandatory "
+                "banner and cannot be dismissed while the tab is driven; its "
+                "Cancel detaches the debugger and the next agent action brings "
+                "the banner back."
+            ),
+            "silence": (
+                "Quit Chrome completely and relaunch it once with "
+                "--silent-debugger-extension-api (Windows: chrome.exe "
+                "--silent-debugger-extension-api; macOS: open -a 'Google Chrome' "
+                "--args --silent-debugger-extension-api; Linux: google-chrome "
+                "--silent-debugger-extension-api). Selenium modes "
+                "(profile_mode temporary/persistent/isolated) show no banner."
+            ),
+        },
         **self_update,
         **token_info,
     }

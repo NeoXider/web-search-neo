@@ -15,7 +15,7 @@ import re
 import threading
 import time
 from collections.abc import Sequence
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 from urllib.parse import urlsplit
 
 from selenium import webdriver
@@ -337,6 +337,13 @@ class BrowserSession:
     # kept so it can be turned off without the caller tracking it.
     extra_headers: dict[str, str] = field(default_factory=dict)
     stealth_identifier: str | None = None
+    # Per-session fingerprint overrides (isolated/temporary/persistent only).
+    # One real Chrome profile means one fingerprint, so multi-account work gets
+    # one isolated session per account instead of two sessions on one profile.
+    user_agent_override: str | None = None
+    timezone_override: str | None = None
+    locale_override: str | None = None
+    geolocation_override: dict[str, Any] | None = None
     lock: SessionLock = field(default_factory=SessionLock)
     last_used: float = field(default_factory=time.monotonic)
     # Who opened this session, in the opener's own words. Nothing in an MCP call
@@ -353,6 +360,11 @@ class BrowserSession:
     # across navigations, kept apart from injected_scripts: that list is the
     # caller's own inject_script bookkeeping, this one is the session's.
     tab_label_script_id: str | None = None
+    # The activity badge (a green dot on the tab's favicon while an agent is
+    # driving it), same bookkeeping shape as the label: script id plus the last
+    # server-side ping, so pings stay throttled to one a minute per session.
+    tab_activity_script_id: str | None = None
+    activity_pinged_at: float = 0.0
     # Wall-clock, unlike `last_used`, because these two are reported to a reader
     # and a monotonic number means nothing to one.
     created_at: float = field(default_factory=time.time)
@@ -605,11 +617,11 @@ def _profile_configuration(
     mode = profile_mode.strip().lower()
     if mode == "extension":
         mode = "current"
-    if mode not in {"temporary", "persistent", "attach", "current"}:
+    if mode not in {"temporary", "isolated", "persistent", "attach", "current"}:
         raise ValueError(
-            "profile_mode must be 'auto', 'current', 'temporary', 'persistent', or 'attach'"
+            "profile_mode must be 'auto', 'current', 'temporary', 'isolated', 'persistent', or 'attach'"
         )
-    if mode == "temporary":
+    if mode in {"temporary", "isolated"}:
         return mode, None, None, None
     if mode == "persistent":
         selected_profile = _validate_session_id(profile_id or session_id)
@@ -654,9 +666,9 @@ def _resolve_profile_mode(profile_mode: str, headless: bool | None) -> str:
             _FORBID_CURRENT_ENV,
         )
         return "temporary"
-    if mode not in {"current", "temporary", "persistent", "attach"}:
+    if mode not in {"current", "temporary", "isolated", "persistent", "attach"}:
         raise ValueError(
-            "profile_mode must be 'auto', 'current', 'temporary', 'persistent', or 'attach'"
+            "profile_mode must be 'auto', 'current', 'temporary', 'isolated', 'persistent', or 'attach'"
         )
     if mode == "current" and headless is True:
         raise ValueError("profile_mode='current' controls a visible Chrome and cannot be headless")
@@ -673,8 +685,8 @@ def _resolve_headless(profile_mode: str, headless: bool | None) -> bool:
     mode = profile_mode.strip().lower()
     if mode in {"extension", "current"}:
         return False
-    if mode not in {"temporary", "persistent", "attach"}:
-        raise ValueError("profile_mode must be 'temporary', 'persistent', 'attach', or 'current'")
+    if mode not in {"temporary", "isolated", "persistent", "attach"}:
+        raise ValueError("profile_mode must be 'temporary', 'isolated', 'persistent', 'attach', or 'current'")
     if headless is None:
         # An attached browser already has a window mode owned by its launcher;
         # recording it as visible preserves that state without trying to change
@@ -881,9 +893,15 @@ def _claim_tab(tab_id: int) -> dict[str, Any]:
         logger.debug("Could not ask the daemon about tab %s: %s", tab_id, exc)
         return {"status": "unavailable"}
     if str(answer.get("status") or "") == "refused":
+    # The tab is busy: the refusal names the holder, and the guidance keeps a
+    # second agent from queueing behind it. Read-only observation needs the
+    # driving session, which this caller does not own - so the way to look is
+    # a tab of one's own, not this one.
         raise RuntimeError(
-            str(answer.get("reason") or "")
-            or f"Chrome tab {tab_id} is already being driven by another agent."
+            (str(answer.get("reason") or "")
+             or f"Chrome tab {tab_id} is already being driven by another agent.")
+            + " It is busy: do not wait on it or act on it. Open your own tab "
+            "with a fresh session_id instead."
         )
     return answer
 
@@ -1120,6 +1138,9 @@ def _create_session(
                     ):
                         raise RuntimeError(
                             f"Current Chrome tab {selected_current_tab_id} is already claimed by another session"
+                            " in this server. It is busy: observe it read-only only through "
+                            "its own session's page_text/page_outline/screenshot, or open "
+                            "your own tab with a fresh session_id instead of acting on it."
                         )
                     _pending_current_tab_ids.add(selected_current_tab_id)
                 if browser_key:
@@ -1306,15 +1327,25 @@ def _shared_session_note(session_id: str, session: BrowserSession) -> dict[str, 
     concurrent = session.lock.concurrent_callers
     if not concurrent:
         return {}
+    busy = bool(session.lock.busy)
     return {
         "shared_session": True,
+        "session_busy": busy,
         "concurrent_callers": concurrent,
         "shared_session_warning": (
             f"{concurrent} other caller(s) inside this MCP server are driving session "
             f"'{session_id}' at the same time. They share one Chrome tab, so each one's "
             "navigation, scrolling and typing lands in the other's page and results here "
-            "may describe a page this caller did not open. Give each agent its own "
-            "session_id (any name works) and they will get a tab each instead."
+            "may describe a page this caller did not open. "
+            + (
+                "The tab is busy right now: observe it read-only via "
+                "page_text/page_outline/screenshot, or open a new session for your "
+                "own work - acting here will collide mid-run. "
+                if busy
+                else ""
+            )
+            + "Give each agent its own session_id (any name works) and they will get "
+            "a tab each instead."
         ),
     }
 
@@ -1368,6 +1399,114 @@ def _set_viewport(driver: Any, width: int, height: int) -> None:
             "mobile": False,
         },
     )
+
+
+def _apply_context_overrides(
+    driver: Any,
+    profile_mode: str,
+    user_agent: str | None = None,
+    timezone: str | None = None,
+    locale: str | None = None,
+    geolocation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Apply per-session fingerprint overrides; refuse where they cannot apply.
+
+    One real Chrome profile means one fingerprint: overrides are honoured for
+    owned Selenium browsers (temporary/isolated/persistent) and refused with an
+    actionable error for ``current``/``attach``, instead of pretending to apply.
+    """
+    applied: dict[str, Any] = {}
+    wanted = {
+        "user_agent": user_agent,
+        "timezone": timezone,
+        "locale": locale,
+        "geolocation": geolocation,
+    }
+    if profile_mode in {"current", "attach"} and any(
+        value not in (None, "") for value in wanted.values()
+    ):
+        raise ValueError(
+            f" Fingerprint overrides need an owned browser: profile_mode='{profile_mode}'"
+            " shares one real Chrome profile (one fingerprint). Open with"
+            " profile_mode='isolated' (one account = one isolated session) to use"
+            " user_agent/timezone/locale/geolocation."
+        )
+    send = getattr(driver, "execute_cdp_cmd", None)
+    if send is None:
+        if any(value not in (None, "") for value in wanted.values()):
+            raise ValueError("This backend has no CDP channel for fingerprint overrides")
+        return applied
+    if user_agent:
+        driver.execute_cdp_cmd(
+            "Network.setUserAgentOverride", {"userAgent": str(user_agent)}
+        )
+        applied["user_agent"] = str(user_agent)
+    if timezone:
+        driver.execute_cdp_cmd(
+            "Emulation.setTimezoneOverride", {"timezoneId": str(timezone)}
+        )
+        applied["timezone"] = str(timezone)
+    if locale:
+        driver.execute_cdp_cmd(
+            "Emulation.setLocaleOverride", {"locale": str(locale)}
+        )
+        applied["locale"] = str(locale)
+    if geolocation:
+        try:
+            lat = float(geolocation.get("latitude"))
+            lng = float(geolocation.get("longitude"))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ValueError(
+                "geolocation needs {latitude: float, longitude: float, accuracy?: float}"
+            ) from exc
+        accuracy = float(geolocation.get("accuracy", 1.0))
+        driver.execute_cdp_cmd(
+            "Emulation.setGeolocationOverride",
+            {"latitude": lat, "longitude": lng, "accuracy": accuracy},
+        )
+        applied["geolocation"] = {"latitude": lat, "longitude": lng, "accuracy": accuracy}
+    return applied
+
+
+def apply_context_overrides(
+    session_id: str = "default",
+    user_agent: str | None = None,
+    timezone: str | None = None,
+    locale: str | None = None,
+    geolocation: dict[str, Any] | None = None,
+    width: int | None = None,
+    height: int | None = None,
+) -> dict[str, Any]:
+    """Change a live session's fingerprint overrides without reopening it."""
+    session = _get_session(session_id)
+    with session.lock:
+        driver = session.driver
+        if width is not None or height is not None:
+            if session.profile_mode in {"current", "attach"}:
+                raise ValueError(
+                    "Viewport overrides need an owned browser; profile_mode="
+                    f"'{session.profile_mode}' shares the user's window."
+                )
+            current_width = int(width) if width is not None else 1440
+            current_height = int(height) if height is not None else 900
+            _set_viewport(driver, current_width, current_height)
+        applied = _apply_context_overrides(
+            driver, session.profile_mode, user_agent, timezone, locale, geolocation
+        )
+        if user_agent:
+            session.user_agent_override = str(user_agent)
+        if timezone:
+            session.timezone_override = str(timezone)
+        if locale:
+            session.locale_override = str(locale)
+        if geolocation:
+            session.geolocation_override = dict(applied.get("geolocation") or geolocation)
+        return {
+            **_page_summary(driver, session_id),
+            "success": True,
+            "applied": applied,
+            "profile_mode": session.profile_mode,
+        }
 
 
 # A challenge is a live widget, not the word "captcha" in prose. Matching text
@@ -1858,6 +1997,9 @@ def _page_summary(driver: webdriver.Chrome, session_id: str) -> dict[str, Any]:
                 probe["title"], session.tab_label_prefix
             )
             session.last_title = probe["title"]
+        # Every observation already passes through here under the session lock,
+        # so the badge ping rides along instead of costing its own round-trip.
+        _ping_tab_activity(session)
     return {
         "session_id": session_id,
         **probe,
@@ -1884,6 +2026,7 @@ def _leave_claimed_tab(
     # now includes unlabelled: the tab-strip prefix leaves with us, while the
     # script registration lapses with the debugger detach.
     _remove_tab_label(session)
+    _remove_tab_activity(session)
     released = session.current_tab_id
     borrowed = session.driver
     driver = create_driver(
@@ -1948,6 +2091,10 @@ def open_page(
     tab_group: str = DEFAULT_TAB_GROUP,
     agent_label: str | None = None,
     label_tab: bool = True,
+    user_agent: str | None = None,
+    timezone: str | None = None,
+    locale: str | None = None,
+    geolocation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Open a URL in a reusable rendered browser session.
 
@@ -1955,6 +2102,12 @@ def open_page(
     (``[agent_label] ``, or ``[session_id] `` without a label) unless
     ``label_tab=False`` or ``WEB_SEARCH_NEO_LABEL_TABS`` disables it. Read
     topics keep reporting the page's own title.
+
+    ``profile_mode="isolated"`` opens an owned disposable browser (like
+    temporary, but explicit): one account = one isolated session, each with
+    its own fingerprint. ``user_agent``/``timezone``/``locale``/``geolocation``
+    are per-session overrides for owned browsers only; on ``current``/``attach``
+    they are refused instead of silently ignored.
     """
     normalized = validate_http_url(url)
     session_id = _validate_session_id(session_id)
@@ -1986,10 +2139,29 @@ def open_page(
             # new one.
             released_tab = _leave_claimed_tab(session, width, height, tab_group)
             _set_viewport(session.driver, width, height)
+            applied_overrides = _apply_context_overrides(
+                session.driver,
+                session.profile_mode,
+                user_agent,
+                timezone,
+                locale,
+                geolocation,
+            )
+            if user_agent:
+                session.user_agent_override = str(user_agent)
+            if timezone:
+                session.timezone_override = str(timezone)
+            if locale:
+                session.locale_override = str(locale)
+            if geolocation:
+                session.geolocation_override = dict(
+                    applied_overrides.get("geolocation") or geolocation
+                )
             _register_render_bootstrap(session)
             # Before the navigation, so the label script is already installed
             # when the new document's own scripts run.
             _apply_tab_label(session, session_id, label_tab=label_tab)
+            _apply_tab_activity(session, session_id, label_tab=label_tab)
             session.driver.get(normalized)
             _wait_until_ready(session.driver, timeout_seconds)
             # A new document drops the gate. Re-arm it, because a caller that
@@ -2023,15 +2195,62 @@ def open_page(
             "debugger_address": session.debugger_address,
             "current_tab_id": session.current_tab_id,
             "tab_group": session.tab_group,
+            "fingerprint_overrides": {
+                "user_agent": session.user_agent_override,
+                "timezone": session.timezone_override,
+                "locale": session.locale_override,
+                "geolocation": session.geolocation_override,
+            },
             **({"left_claimed_tab": released_tab} if released_tab is not None else {}),
             **shared,
         }
     # RuntimeError rather than ChromeBridgeError (which it covers, being its
     # base): a tab claim refused mid-open raises a plain one, and it used to
     # escape here, leaving the session registered and half moved.
-    except (WebDriverException, RuntimeError, TimeoutError, ConnectionError, OSError):
+    except (WebDriverException, RuntimeError, ValueError, TimeoutError, ConnectionError, OSError):
         close_session(session_id)
         raise
+
+
+# Why the user sees "Web Search Neo Companion started debugging this browser"
+# on driven tabs, and the only way to silence it. The banner is Chrome's own
+# mandatory security UI for chrome.debugger: no extension, flag, or dismissal
+# removes it while a debugger is attached, and pressing its Cancel detaches the
+# debugger - the tab stops answering the agent until the next action attaches
+# again, which brings the banner back. That close-reopen loop is the platform
+# working as designed, not a companion defect. The single supported silence is
+# launching Chrome itself with --silent-debugger-extension-api, which only the
+# person at the keyboard can do (no program may add a flag to a running
+# Chrome). Relay this verbatim instead of retrying, re-attaching, or detaching:
+# none of those remove the banner while the tab is being driven.
+_DEBUG_BANNER = {
+    "what": (
+        "Chrome shows 'Web Search Neo Companion started debugging this browser' "
+        "on every tab an agent is driving. It is Chrome's mandatory banner for "
+        "chrome.debugger and cannot be dismissed while the tab is driven: its "
+        "Cancel detaches the debugger, the tab stops answering, and the next "
+        "agent action re-attaches and the banner returns."
+    ),
+    "silence": (
+        "Quit Chrome completely and launch it once with the "
+        "--silent-debugger-extension-api flag; the banner then never appears "
+        "for extension-driven tabs."
+    ),
+    "steps": [
+        "Windows: quit every Chrome window, then run: "
+        'chrome.exe --silent-debugger-extension-api (or add the flag after the '
+        'target in the shortcut properties, e.g. "C:\\Program Files\\Google\\'
+        'Chrome\\Application\\chrome.exe" --silent-debugger-extension-api).',
+        "macOS: quit Chrome, then run: "
+        "open -a 'Google Chrome' --args --silent-debugger-extension-api.",
+        "Linux: quit Chrome, then run: "
+        "google-chrome --silent-debugger-extension-api.",
+    ],
+    "alternative": (
+        "Drive Selenium modes instead (profile_mode temporary/persistent/isolated): "
+        "a browser the server starts itself shows no banner at all."
+    ),
+}
 
 
 def _companion_status() -> dict[str, Any]:
@@ -2044,12 +2263,19 @@ def _companion_status() -> dict[str, Any]:
     status = dict(get_chrome_bridge().status(0.0))
     expected = expected_extension_version()
     running = str((status.get("browser") or {}).get("extension_version") or "")
+    allowlist = _expected_cdp_methods()
     status.update(
         extension_id=CHROME_EXTENSION_ID,
         extension_directory=str(EXTENSION_DIR),
         expected_version=expected,
         running_version=running or None,
         outdated=bool(running and expected and running != expected),
+        allowed_cdp_methods_size=allowlist["size"],
+        allowed_cdp_methods_hash=allowlist["hash"],
+        allowed_cdp_methods=list(allowlist["methods"]),
+        # The debugging banner is only ever on driven tabs, which exist only
+        # while connected, so this travels exactly when it can be true.
+        **({"debug_banner": _DEBUG_BANNER} if status.get("connected") else {}),
     )
     if not status["connected"]:
         status["next"] = (
@@ -2151,6 +2377,7 @@ def attach_current_tab(
         with session.lock:
             _register_render_bootstrap(session)
             _apply_tab_label(session, session_id, label_tab=label_tab)
+            _apply_tab_activity(session, session_id, label_tab=label_tab)
             return {
                 **_page_summary(session.driver, session_id),
                 "success": True,
@@ -2166,6 +2393,39 @@ def attach_current_tab(
         # be closed by name the caller never saw succeed.
         close_session(session_id)
         raise
+
+
+_ALLOWLIST_CACHE: dict[str, Any] | None = None
+
+
+def _expected_cdp_methods() -> dict[str, Any]:
+    """Read the companion allowlist shipped with this server (cached).
+
+    The ``Page.reload`` outage was a deployment drift: the repo already listed
+    25 methods while the installed extension still forwarded 24, and nothing
+    exposed that gap before the call failed. Publishing the shipped size/hash
+    in status turns the next drift into a visible version skew.
+    """
+    global _ALLOWLIST_CACHE
+    if _ALLOWLIST_CACHE is not None:
+        return _ALLOWLIST_CACHE
+    methods: list[str] = []
+    try:
+        source = (EXTENSION_DIR / "service-worker.js").read_text(encoding="utf-8")
+        block = re.search(
+            r"export const ALLOWED_CDP_METHODS = new Set\(\[(.*?)\]\)",
+            source,
+            re.S,
+        )
+        if block:
+            methods = sorted(set(re.findall(r'"([^"]+)"', block.group(1))))
+    except OSError:
+        methods = []
+    import hashlib
+
+    digest = hashlib.sha256("\n".join(methods).encode("utf-8")).hexdigest()[:16] if methods else None
+    _ALLOWLIST_CACHE = {"methods": methods, "size": len(methods), "hash": digest}
+    return _ALLOWLIST_CACHE
 
 
 def reload_page(
@@ -2184,20 +2444,56 @@ def reload_page(
     ``ignoreCache=true``); the default revalidates the way a normal reload
     does. Afterwards the call waits exactly like the other page actions and
     returns the same page-state envelope (url, title, ready_state, ...).
+
+    When the installed companion predates ``Page.reload`` (it refuses the
+    method), the call falls back to navigating the tab to its current URL so
+    the work continues, and reports ``reload_fallback`` plus an actionable
+    ``companion_note`` telling the user to press Reload at
+    chrome://extensions.
     """
     session = _get_session(session_id)
     with session.lock:
         driver = session.driver
         send = getattr(driver, "execute_cdp_cmd", None)
+        fallback = False
+        companion_note: str | None = None
         if send is not None:
-            driver.execute_cdp_cmd("Page.reload", {"ignoreCache": bool(hard)})
+            try:
+                driver.execute_cdp_cmd("Page.reload", {"ignoreCache": bool(hard)})
+            except Exception as exc:
+                if "Refused DevTools method 'Page.reload'" not in str(exc):
+                    raise
+                # Stale companion: keep working via same-URL navigation.
+                try:
+                    current = driver.current_url
+                except Exception:
+                    current = session.last_url
+                if not current:
+                    raise
+                try:
+                    driver.get(current)
+                except Exception:
+                    # Bridge drivers navigate via tabs; plain drivers via get().
+                    session.driver.get(current)
+                fallback = True
+                expected = expected_extension_version()
+                companion_note = (
+                    "The installed companion refused Page.reload (outdated "
+                    f"extension; this server ships {expected}). Press Reload on "
+                    "its card at chrome://extensions, then run "
+                    "setup_current_chrome. Served via same-URL navigation fallback."
+                )
         else:
             # A backend without CDP (today there is none in production, but the
             # contract of this driver surface allows one): WebDriver's own
             # reload, which is always a normal, cache-respecting one.
             driver.refresh()
         _wait_after_action(driver, wait_seconds)
-        return {**_page_summary(driver, session_id), "hard": bool(hard)}
+        answer = {**_page_summary(driver, session_id), "hard": bool(hard)}
+        if fallback:
+            answer["reload_fallback"] = "navigate"
+            answer["companion_note"] = companion_note
+        return answer
 
 
 # A tab-strip label so a human looking at the tab bar can tell which tab each
@@ -2441,6 +2737,201 @@ def _apply_tab_label(
     # run in it now.
     try:
         session.driver.execute_script(_tab_label_source(wanted))
+    except Exception:
+        pass
+
+
+# A favicon badge marking a tab an agent is driving, so a human sees at a
+# glance which tabs are agent-held. The badge is a green dot composited over
+# the page's own icon (a robot-emoji icon when the page has none to borrow);
+# every ping re-arms a five-minute page-side timer that restores the original
+# icon, so a tab whose agent went quiet stops glowing on its own with no
+# server round-trip. Everything is wrapped defensively: a page that freezes
+# its DOM APIs keeps working unbadged rather than breaking the action.
+_TAB_ACTIVITY_IDLE_SECONDS = 300.0
+_TAB_ACTIVITY_PING_INTERVAL = 60.0
+_TAB_ACTIVITY_SOURCE = r"""
+(() => {
+  const KEY = "__wsnActivity";
+  const IDLE_MS = 5 * 60 * 1000;
+  if (window[KEY] && window[KEY].ping) {
+    try { window[KEY].ping(); } catch (error) {}
+    return;
+  }
+  const state = {links: [], timer: 0};
+  window[KEY] = state;
+  const robotIcon = () => "data:image/svg+xml," + encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+    + '<circle cx="32" cy="32" r="30" fill="#22c55e"/>'
+    + '<circle cx="22" cy="26" r="5" fill="#fff"/><circle cx="42" cy="26" r="5" fill="#fff"/>'
+    + '<rect x="20" y="40" width="24" height="5" rx="2.5" fill="#fff"/></svg>');
+  const snapshot = () => {
+    try {
+      state.links = Array.from(
+        document.querySelectorAll('link[rel~="icon"]')).map(el => el.href || "");
+    } catch (error) { state.links = []; }
+  };
+  const applyIcon = href => {
+    try {
+      const head = document.head || document.documentElement;
+      if (!head) return;
+      let link = document.querySelector('link[data-wsn-activity="1"]');
+      if (!link) {
+        link = document.createElement("link");
+        link.setAttribute("rel", "icon");
+        link.setAttribute("data-wsn-activity", "1");
+        head.appendChild(link);
+      }
+      link.href = href;
+    } catch (error) {}
+  };
+  const restore = () => {
+    try {
+      const badge = document.querySelector('link[data-wsn-activity="1"]');
+      if (badge && badge.parentNode) badge.parentNode.removeChild(badge);
+    } catch (error) {}
+    state.links = [];
+  };
+  const setBadge = () => {
+    try {
+      snapshot();
+      const first = state.links.length ? state.links[0] : "";
+      if (!first) { applyIcon(robotIcon()); return; }
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const canvas = document.createElement("canvas");
+          canvas.width = 64; canvas.height = 64;
+          const ctx = canvas.getContext("2d");
+          if (!ctx) { applyIcon(robotIcon()); return; }
+          ctx.drawImage(img, 0, 0, 64, 64);
+          ctx.fillStyle = "#22c55e";
+          ctx.beginPath(); ctx.arc(50, 50, 15, 0, 7); ctx.fill();
+          ctx.fillStyle = "#ffffff";
+          ctx.font = "bold 22px sans-serif";
+          ctx.textAlign = "center"; ctx.textBaseline = "middle";
+          ctx.fillText("\u25CF", 50, 51);
+          applyIcon(canvas.toDataURL());
+        } catch (error) { applyIcon(robotIcon()); }
+      };
+      img.onerror = () => applyIcon(robotIcon());
+      img.src = first;
+    } catch (error) {}
+  };
+  state.ping = () => {
+    try {
+      if (state.timer) clearTimeout(state.timer);
+      const run = () => { setBadge(); };
+      if (document.readyState === "loading" && !document.head) {
+        document.addEventListener("DOMContentLoaded", run, {once: true});
+      } else {
+        run();
+      }
+      state.timer = setTimeout(restore, IDLE_MS);
+    } catch (error) {}
+  };
+  state.stop = () => {
+    try { if (state.timer) clearTimeout(state.timer); } catch (error) {}
+    state.timer = 0;
+    restore();
+    try { delete window[KEY]; } catch (error) {}
+  };
+  state.ping();
+})();
+"""
+_TAB_ACTIVITY_PING_SCRIPT = (
+    "(() => { const a = window.__wsnActivity;"
+    " if (a && a.ping) a.ping(); return true; })()"
+)
+_TAB_ACTIVITY_STOP_SCRIPT = (
+    "(() => { const a = window.__wsnActivity;"
+    " if (a && a.stop) a.stop(); return true; })()"
+)
+
+
+def _tab_activity_enabled() -> bool:
+    """Whether activity badges may touch a tab at all.
+
+    Shares the tab-strip kill switch: an operator who disabled tab labelling
+    does not want the server drawing on tabs either.
+    """
+    return _tab_labelling_enabled()
+
+
+def _apply_tab_activity(
+    session: BrowserSession, session_id: str, *, label_tab: bool = True
+) -> None:
+    """Badge one session's tab with the agent-activity dot, when it can show.
+
+    Headless tabs have no visible favicon, and ``label_tab=False`` means the
+    caller asked visuals to be left alone - both skip silently. Otherwise the
+    badge script is registered for future documents and run in the live one,
+    exactly like the tab-strip label. Caller holds the session lock.
+    """
+    if session.headless or not label_tab or not _tab_activity_enabled():
+        return
+    if session.tab_activity_script_id:
+        return
+    try:
+        result = session.driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument", {"source": _TAB_ACTIVITY_SOURCE}
+        )
+    except Exception as exc:
+        logger.warning(
+            "Tab activity badge for session '%s' was skipped: %s: %s",
+            session_id,
+            type(exc).__name__,
+            exc,
+        )
+        return
+    session.tab_activity_script_id = str((result or {}).get("identifier") or "")
+    session.activity_pinged_at = time.monotonic()
+    try:
+        session.driver.execute_script(_TAB_ACTIVITY_SOURCE)
+    except Exception:
+        pass
+
+
+def _remove_tab_activity(session: BrowserSession) -> None:
+    """Stop badging one session's tab and restore its favicon.
+
+    Best-effort throughout, like the label removal: teardown paths call this
+    when the driver may already be half gone, and a badge left behind restores
+    itself after five quiet minutes anyway. Caller holds the session lock.
+    """
+    driver = session.driver
+    if not session.tab_activity_script_id:
+        return
+    try:
+        driver.execute_script(_TAB_ACTIVITY_STOP_SCRIPT)
+    except Exception:
+        pass
+    try:
+        driver.execute_cdp_cmd(
+            "Page.removeScriptToEvaluateOnNewDocument",
+            {"identifier": session.tab_activity_script_id},
+        )
+    except Exception:
+        pass
+    session.tab_activity_script_id = None
+
+
+def _ping_tab_activity(session: BrowserSession) -> None:
+    """Re-arm one session's badge when the server last pinged over a minute ago.
+
+    Called from the page summary every action already takes, so pings ride the
+    round-trips that exist rather than adding their own. The five-minute expiry
+    lives page-side: a session that stops acting stops glowing with no call.
+    Never raises; a page that refuses the ping simply keeps its last state.
+    """
+    if not session.tab_activity_script_id:
+        return
+    now = time.monotonic()
+    if now - session.activity_pinged_at < _TAB_ACTIVITY_PING_INTERVAL:
+        return
+    session.activity_pinged_at = now
+    try:
+        session.driver.execute_script(_TAB_ACTIVITY_PING_SCRIPT)
     except Exception:
         pass
 
@@ -2726,12 +3217,74 @@ def get_page_elements(
         return {**payload, **report}
 
 
+def wait_for_condition(
+    script: str,
+    session_id: str = "default",
+    timeout_seconds: float = 10.0,
+    poll_ms: int = 150,
+    frame_selector: str | None = None,
+) -> dict[str, Any]:
+    """Poll one JS expression server-side until it is truthy or the timeout hits.
+
+    This is the atomic wait for SPA hydration and framework state that
+    ``wait`` on a selector cannot express: instead of N round-trips of
+    ``run_script`` polling from the client, the server polls inside the
+    session lock and returns ``{success, value, waited_seconds}`` once.
+    ``script`` is wrapped as ``return (<script>)``; a truthy value ends the
+    wait and is returned as ``value`` (clipped like any script result).
+    """
+    if not str(script or "").strip():
+        raise ValueError("script must not be empty")
+    timeout = max(0.1, float(timeout_seconds))
+    poll = max(0.05, min(float(poll_ms) / 1000.0, 2.0))
+    session = _get_session(session_id)
+    started = time.monotonic()
+    deadline = started + timeout
+    last_value: Any = None
+    last_error: str | None = None
+    with session.lock:
+        _enter_action_frame(session.driver, frame_selector, script)
+        try:
+            while True:
+                try:
+                    last_value = session.driver.execute_script(f"return ({script});")
+                    last_error = None
+                    if last_value:
+                        break
+                except Exception as exc:
+                    last_error = _brief_error(exc)
+                now = time.monotonic()
+                if now >= deadline:
+                    break
+                time.sleep(min(poll, deadline - now))
+            waited = round(time.monotonic() - started, 2)
+            if last_value:
+                return {
+                    **_page_summary(session.driver, session_id),
+                    "success": True,
+                    "script": script,
+                    "value": _clip_result(last_value),
+                    "waited_seconds": waited,
+                    "timeout_seconds": timeout,
+                    "frame_selector": frame_selector,
+                }
+            raise TimeoutException(
+                f"Condition was still falsy after {timeout:g}s"
+                + (f" (last error: {last_error})" if last_error else "")
+                + f" (waited {waited:g}s)"
+            )
+        finally:
+            _release_action_frame(session.driver, frame_selector, script)
+
+
 def wait_for_element(
-    selector: str,
+    selector: str = "",
     session_id: str = "default",
     state: str = "visible",
     timeout_seconds: float = 10.0,
     frame_selector: str | None = None,
+    script: str | None = None,
+    poll_ms: int = 150,
 ) -> dict[str, Any]:
     """Wait for a dynamic element to be present, visible, or clickable.
 
@@ -2739,11 +3292,27 @@ def wait_for_element(
     handle, and a piercing path. ``frame_selector`` names the frame a CSS
     selector is looked up in, exactly as it does for ``find`` and ``page_text``.
 
+    Pass ``script`` instead of ``selector`` to wait on a JS condition (SPA
+    hydration, framework flags): the expression is polled server-side until
+    truthy. ``selector`` and ``script`` are mutually exclusive.
+
     The wait honours ``timeout_seconds`` as passed (it defaults to 10) and
     ``timeout_seconds`` in the result is the wait that was really made. A timeout
     says the same number, so a wait that was cut short cannot read as one that
     ran its course.
     """
+    if script is not None and str(script).strip():
+        if str(selector or "").strip():
+            raise ValueError("Pass either selector or script, not both")
+        return wait_for_condition(
+            script,
+            session_id=session_id,
+            timeout_seconds=timeout_seconds,
+            poll_ms=poll_ms,
+            frame_selector=frame_selector,
+        )
+    if not str(selector or "").strip():
+        raise ValueError("selector must not be empty (or pass script= for a JS condition)")
     if state not in _ELEMENT_STATES:
         raise ValueError("state must be 'present', 'visible', or 'clickable'")
     timeout = max(0.1, float(timeout_seconds))
@@ -2893,9 +3462,8 @@ return {kind: 'text', type: type, value: element.value === undefined ? '' : elem
 # holding, so ``field_values`` answers for every selector it was asked about.
 _FIELD_READ_SCRIPT = "const element = arguments[0];\n" + _FIELD_READ_BODY
 
-# Blurring before the read settles those handlers and fires the `change` event
-# that the last field of a fill otherwise never got, because nothing ever moved
-# off it.
+# Reading after an explicit blur: the default. Blurring settles handlers and
+# fires the `change` event that the last field of a fill otherwise never got.
 _FIELD_STATE_SCRIPT = (
     """
 const element = arguments[0];
@@ -2906,6 +3474,37 @@ if (element.blur) element.blur();
 """
     + _FIELD_READ_BODY
 )
+
+# Reading with the focus left where the write put it: for callers that keep
+# typing into the same control, or drive frameworks that only commit on a later
+# explicit blur/submit. The `change` event such pages expect then fires on that
+# later blur, not here.
+_FIELD_STATE_KEEP_FOCUS_SCRIPT = "const element = arguments[0];\n" + _FIELD_READ_BODY
+
+
+def _type_text_like_typing(driver: Any, element: Any, text: str) -> None:
+    """Emulate typing so focus/input listeners see a keystroke stream.
+
+    ``Input.insertText`` as one block raises a single input event; some
+    frameworks (masked inputs, autocomplete, editors tracking selection) only
+    advance on per-keystroke input. Per-character insertion keeps the focus in
+    the control and raises one input event per character.
+    """
+    wanted = str(text)
+    cdp = getattr(driver, "execute_cdp_cmd", None)
+    try:
+        driver.execute_script("arguments[0].focus();", element)
+    except Exception:
+        pass
+    if cdp is not None:
+        for char in wanted:
+            if char == "\n":
+                _insert_soft_break(cdp)
+            else:
+                cdp("Input.insertText", {"text": char})
+        return
+    for char in wanted:
+        element.send_keys(char)
 
 # Typing into these is not something a keyboard can do: send_keys turned
 # '2024-01-15' into '40115-02-20', and clear() on a slider moved it to its default
@@ -3401,6 +4000,8 @@ def fill_fields(
     files: dict[str, str] | None = None,
     session_id: str = "default",
     frame_selector: str | None = None,
+    blur_after: bool = True,
+    typing: bool = False,
 ) -> dict[str, Any]:
     """Fill controls by CSS selector; file inputs are supplied separately.
 
@@ -3417,6 +4018,14 @@ def fill_fields(
     the list names and nothing else. Date, time, month, week, range and colour
     controls are set rather than typed into, and a value they cannot parse is
     refused instead of replaced with their idea of a default.
+
+    ``blur_after`` (default True) blurs each control after writing, which fires
+    the ``change`` event the last field would otherwise never get - the safe
+    default when many agents share this server, since an uncommitted value is
+    lost data while a moved focus is not. Pass ``blur_after=False`` to leave
+    the focus in the last control written (continued typing, focus listeners).
+    ``typing=True`` emulates keystroke-by-keystroke input with the focus kept,
+    for masked inputs and autocomplete that only advance per input event.
 
     ``frame_selector`` names the frame the CSS selectors are looked up in, exactly
     as it does for ``find`` and ``page_text``.
@@ -3478,10 +4087,14 @@ def fill_fields(
                     expected = _write_by_script(driver, element, input_type, value)
                 elif control.get("editable"):
                     expected = _write_contenteditable(driver, element, str(value))
+                elif typing:
+                    element.clear()
+                    _type_text_like_typing(driver, element, str(value))
                 else:
                     element.clear()
                     element.send_keys(str(value))
-                state = driver.execute_script(_FIELD_STATE_SCRIPT, element) or {}
+                read_script = _FIELD_STATE_SCRIPT if blur_after else _FIELD_STATE_KEEP_FOCUS_SCRIPT
+                state = driver.execute_script(read_script, element) or {}
                 if state.get("kind") == "detached":
                     # The blur fired `change`, and the page rebuilt the control
                     # while it ran. Whatever it kept is the answer.
@@ -3533,6 +4146,8 @@ def fill_fields(
             "files_uploaded": uploaded,
             "errors": errors,
             "frame_selector": frame_selector,
+            "blur_after": bool(blur_after),
+            "typing": bool(typing),
         }
         if upload_states:
             # Only when an input did not simply keep its files: the ordinary
@@ -3731,12 +4346,34 @@ def _clip_result(value: Any) -> Any:
     return value
 
 
+_RETRYABLE_SCRIPT_ERRORS = (
+    "uncaught",
+    "cannot find context",
+    "no such context",
+    "detached",
+    "target crashed",
+    "session closed",
+    "disconnected",
+    "execution context was destroyed",
+    "cannot access before initialization",
+)
+
+
+def _script_error_is_retryable(exc: Exception) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in text for marker in _RETRYABLE_SCRIPT_ERRORS)
+
+
 def execute_js(
     script: str,
     args: list[Any] | None = None,
     session_id: str = "default",
     await_promise: bool = False,
     user_gesture: bool = False,
+    retry_on_uncaught: bool = True,
+    retries: int = 2,
+    retry_delay_ms: int = 300,
+    wait_ready: bool = False,
 ) -> dict[str, Any]:
     """Run a JavaScript snippet in a session's page and report what it returns.
 
@@ -3756,31 +4393,72 @@ def execute_js(
     is the only way to reach the APIs Chrome gates behind one - clipboard writes,
     fullscreen, autoplay with sound. It goes through CDP directly, so ``args``
     are inlined as ``arguments`` rather than passed by the WebDriver protocol.
+
+    A script racing a fresh navigation used to fail sporadically with an opaque
+    ``WebDriverException: Uncaught``: it ran in a detaching document while the
+    new one was still loading. ``retry_on_uncaught`` (default on) retries those
+    transient evaluation failures ``retries`` times with ``retry_delay_ms``
+    between attempts, and reports ``attempts`` so a caller can see the retry
+    happened. ``wait_ready`` additionally settles document readiness before the
+    first attempt (off by default: it costs a round-trip on the hot path).
     """
     session = _get_session(session_id)
     with session.lock:
         driver = session.driver
-        try:
-            if await_promise and not hasattr(driver, "execute_cdp_cmd"):
-                raise ValueError(
-                    "await_promise needs the Chrome bridge driver; with a plain "
-                    "Selenium driver, return the promise object and read it in a "
-                    "later call instead"
-                )
-            if user_gesture:
-                value = _evaluate_with_gesture(driver, script, args, await_promise)
-            else:
-                value = driver.execute_script(script, *(args or []))
-        except Exception as exc:
+        attempts = 0
+        last_exc: Exception | None = None
+        max_attempts = 1 + max(0, int(retries)) if retry_on_uncaught else 1
+        for attempt in range(1, max_attempts + 1):
+            attempts = attempt
+            try:
+                if wait_ready and attempt == 1:
+                    try:
+                        if driver.execute_script("return document.readyState") not in (
+                            None,
+                            "complete",
+                            "interactive",
+                        ):
+                            _wait_until_ready(driver, 2.0)
+                    except Exception:
+                        pass
+                if await_promise and not hasattr(driver, "execute_cdp_cmd"):
+                    raise ValueError(
+                        "await_promise needs the Chrome bridge driver; with a plain "
+                        "Selenium driver, return the promise object and read it in a "
+                        "later call instead"
+                    )
+                if user_gesture:
+                    value = _evaluate_with_gesture(driver, script, args, await_promise)
+                else:
+                    value = driver.execute_script(script, *(args or []))
+            except ValueError:
+                raise
+            except Exception as exc:
+                last_exc = exc
+                if (
+                    retry_on_uncaught
+                    and attempt < max_attempts
+                    and _script_error_is_retryable(exc)
+                ):
+                    time.sleep(max(0.0, float(retry_delay_ms)) / 1000.0)
+                    continue
+                return {
+                    **_page_summary(driver, session_id),
+                    "success": False,
+                    "error": _brief_error(exc),
+                    "attempts": attempts,
+                }
             return {
                 **_page_summary(driver, session_id),
-                "success": False,
-                "error": _brief_error(exc),
+                "success": True,
+                "value": _clip_result(value),
+                "attempts": attempts,
             }
         return {
             **_page_summary(driver, session_id),
-            "success": True,
-            "value": _clip_result(value),
+            "success": False,
+            "error": _brief_error(last_exc) if last_exc else "WebDriverException: Uncaught",
+            "attempts": attempts,
         }
 
 
@@ -5212,11 +5890,11 @@ def cookies(
 
 
 def local_storage(
-    op: str = "read",
+    op: Literal["read", "write", "delete"] = "read",
     session_id: str = "default",
     key: str | None = None,
     value: str | None = None,
-    kind: str = "local",
+    kind: Literal["local", "session"] = "local",
 ) -> dict[str, Any]:
     """Read, write, or delete Web Storage for the open page (localStorage or sessionStorage).
 
@@ -5538,6 +6216,304 @@ def replay_request(
     if not result.get("success"):
         return {"success": False, "session_id": session_id, "error": result.get("error")}
     return {"success": True, "session_id": session_id, "request": spec, "response": result.get("value")}
+
+
+# Third-party response stubs: answering the page with a canned response instead
+# of letting the request reach the network. `replay_request` above re-sends a
+# request on demand; these keep every matching fetch/XHR on the page answered
+# with the stub until cleared.
+#
+# Two mechanisms, chosen by backend. On the Chrome companion the extension
+# intercepts over the CDP Fetch domain (Fetch.enable + Fetch.fulfillRequest),
+# so even requests the page script does not route through fetch/XHR are
+# stubbed. Selenium drivers cannot answer Fetch.requestPaused (there is no
+# event channel), and enabling Fetch without answering would hang the page, so
+# there the stub is an in-page fetch/XHR patch installed with
+# Page.addScriptToEvaluateOnNewDocument (future documents) and applied live to
+# the current one. Both paths share the Python registry below as the source of
+# truth for listing.
+_REQUEST_MOCKS: dict[str, list[dict[str, Any]]] = {}
+_MOCK_STUB_SCRIPT_IDS: dict[str, str] = {}
+_MOCK_BODY_LIMIT = 1_000_000
+
+_MOCK_STUB_SOURCE = r"""
+(() => {
+  if (window.__wsnMockState) return;
+  const state = window.__wsnMockState = {mocks: []};
+  const matchPattern = (url, pattern) => {
+    const escaped = String(pattern).split('*').map(part =>
+      part.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*');
+    try { return new RegExp('^' + escaped + '$').test(String(url)); }
+    catch (error) { return false; }
+  };
+  const findMock = url => state.mocks.find(entry => matchPattern(url, entry.pattern));
+  const stubResponse = entry => new Response(String(entry.body ?? ''), {
+    status: Number(entry.status) || 200,
+    headers: entry.headers || {},
+  });
+  window.__wsnMockSet = mocks => { state.mocks = Array.isArray(mocks) ? mocks : []; };
+  if (window.fetch) {
+    const origFetch = window.fetch.bind(window);
+    window.fetch = (input, init) => {
+      let url = '';
+      try { url = String(input && input.url !== undefined ? input.url : input); }
+      catch (error) { return origFetch(input, init); }
+      const entry = findMock(url);
+      if (!entry) return origFetch(input, init);
+      return Promise.resolve(stubResponse(entry));
+    };
+  }
+  const OrigXHR = window.XMLHttpRequest;
+  function MockXHR() {
+    const xhr = new OrigXHR();
+    let mockUrl = '';
+    const origOpen = xhr.open;
+    xhr.open = function (method, url) {
+      mockUrl = String(url || '');
+      return origOpen.apply(this, arguments);
+    };
+    const origSend = xhr.send;
+    xhr.send = function () {
+      const entry = findMock(mockUrl);
+      if (!entry) return origSend.apply(this, arguments);
+      const self = this;
+      const fire = () => {
+        Object.defineProperty(self, 'status', {value: Number(entry.status) || 200, configurable: true});
+        Object.defineProperty(self, 'responseText', {value: String(entry.body ?? ''), configurable: true});
+        Object.defineProperty(self, 'response', {value: String(entry.body ?? ''), configurable: true});
+        Object.defineProperty(self, 'readyState', {value: 4, configurable: true});
+        if (typeof self.onreadystatechange === 'function') self.onreadystatechange();
+        if (typeof self.onload === 'function') self.onload();
+      };
+      setTimeout(fire, 0);
+    };
+    return xhr;
+  }
+  MockXHR.prototype = OrigXHR.prototype;
+  window.XMLHttpRequest = MockXHR;
+})();
+"""
+
+
+def _validate_mock(
+    url_pattern: str,
+    status: int,
+    headers: dict[str, str] | None,
+    body: str,
+) -> dict[str, Any]:
+    pattern = str(url_pattern or "").strip()
+    if not pattern:
+        raise ValueError("mock needs a url_pattern (CDP wildcard, '*' matches anything)")
+    try:
+        code = int(status)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"mock status must be an integer 200-599, not '{status}'") from exc
+    if not 200 <= code <= 599:
+        raise ValueError(f"mock status must be an integer 200-599, not '{status}'")
+    clean_headers = {str(k): str(v) for k, v in (headers or {}).items()}
+    text = "" if body is None else str(body)
+    if len(text.encode("utf-8")) > _MOCK_BODY_LIMIT:
+        raise ValueError(f"mock body exceeds the {_MOCK_BODY_LIMIT}-byte limit")
+    return {"pattern": pattern, "status": code, "headers": clean_headers, "body": text}
+
+
+def _mock_push_inpage(driver: Any, session_id: str, mocks: list[dict[str, Any]]) -> None:
+    """Install (or refresh) the in-page fetch/XHR stub on a Selenium backend."""
+    if session_id not in _MOCK_STUB_SCRIPT_IDS:
+        result = driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument", {"source": _MOCK_STUB_SOURCE}
+        )
+        script_id = str((result or {}).get("identifier") or "")
+        if script_id:
+            _MOCK_STUB_SCRIPT_IDS[session_id] = script_id
+    driver.execute_script(_MOCK_STUB_SOURCE)
+    driver.execute_script("window.__wsnMockSet(arguments[0]);", list(mocks))
+
+
+def mock_add_request(
+    url_pattern: str,
+    session_id: str = "default",
+    status: int = 200,
+    headers: dict[str, str] | None = None,
+    body: str = "",
+) -> dict[str, Any]:
+    """Stub a third-party endpoint's response directly in the page.
+
+    ``url_pattern`` is a CDP-style wildcard (``*`` matches anything), matched
+    against the full request URL; the first matching stub wins. The page's
+    fetch/XHR keeps working untouched for everything else. Listing shows what
+    is live; clearing restores the real endpoint.
+    """
+    entry = _validate_mock(url_pattern, status, headers, body or "")
+    session = _get_session(session_id)
+    with session.lock:
+        driver = session.driver
+        registry = _REQUEST_MOCKS.setdefault(session_id, [])
+        registry = [item for item in registry if item["pattern"] != entry["pattern"]]
+        registry.append(entry)
+        _REQUEST_MOCKS[session_id] = registry
+        if getattr(driver, "is_extension_bridge", False):
+            try:
+                answer = driver.bridge.request(
+                    "mock.add",
+                    {
+                        "tabId": driver.tab_id,
+                        "pattern": entry["pattern"],
+                        "status": entry["status"],
+                        "headers": entry["headers"],
+                        "body": entry["body"],
+                    },
+                    timeout=15.0,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"mock_add needs companion {expected_extension_version()} or newer "
+                    f"(request stubbing over the Fetch domain): {type(exc).__name__}: {exc}"
+                ) from exc
+            return {
+                **_page_summary(driver, session_id),
+                "success": True,
+                "mocked": True,
+                "pattern": entry["pattern"],
+                "status": entry["status"],
+                "mocks": int((answer or {}).get("mocks", len(registry))),
+            }
+        _mock_push_inpage(driver, session_id, registry)
+        return {
+            **_page_summary(driver, session_id),
+            "success": True,
+            "mocked": True,
+            "pattern": entry["pattern"],
+            "status": entry["status"],
+            "mocks": len(registry),
+        }
+
+
+def mock_list_requests(session_id: str = "default") -> dict[str, Any]:
+    """List the live response stubs for one session."""
+    session = _get_session(session_id)
+    with session.lock:
+        driver = session.driver
+        if getattr(driver, "is_extension_bridge", False):
+            try:
+                answer = driver.bridge.request(
+                    "mock.list", {"tabId": driver.tab_id}, timeout=15.0
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"mock_list needs companion {expected_extension_version()} or newer: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+            live = (answer or {}).get("mocks") or []
+            return {
+                **_page_summary(driver, session_id),
+                "success": True,
+                "mocks": live,
+                "count": len(live),
+            }
+        registry = list(_REQUEST_MOCKS.get(session_id, []))
+        return {
+            **_page_summary(driver, session_id),
+            "success": True,
+            "mocks": [
+                {
+                    "pattern": item["pattern"],
+                    "status": item["status"],
+                    "headers": item["headers"],
+                    "body_chars": len(item["body"]),
+                }
+                for item in registry
+            ],
+            "count": len(registry),
+        }
+
+
+def mock_clear_requests(
+    session_id: str = "default",
+    url_pattern: str | None = None,
+) -> dict[str, Any]:
+    """Drop one (or every) response stub; the real endpoint answers again."""
+    session = _get_session(session_id)
+    with session.lock:
+        driver = session.driver
+        if getattr(driver, "is_extension_bridge", False):
+            try:
+                answer = driver.bridge.request(
+                    "mock.clear",
+                    {"tabId": driver.tab_id, **({"pattern": url_pattern} if url_pattern else {})},
+                    timeout=15.0,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"mock_clear needs companion {expected_extension_version()} or newer: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+            _REQUEST_MOCKS.pop(session_id, None)
+            return {
+                **_page_summary(driver, session_id),
+                "success": True,
+                "cleared": int((answer or {}).get("cleared", 0)),
+                "mocks": int((answer or {}).get("mocks", 0)),
+            }
+        registry = _REQUEST_MOCKS.get(session_id, [])
+        if url_pattern:
+            kept = [item for item in registry if item["pattern"] != str(url_pattern)]
+            cleared = len(registry) - len(kept)
+        else:
+            kept, cleared = [], len(registry)
+        _REQUEST_MOCKS[session_id] = kept
+        try:
+            if kept:
+                driver.execute_script("window.__wsnMockSet(arguments[0]);", list(kept))
+            else:
+                try:
+                    driver.execute_script(
+                        "if (window.__wsnMockSet) window.__wsnMockSet([]);"
+                    )
+                except Exception:
+                    pass
+                script_id = _MOCK_STUB_SCRIPT_IDS.pop(session_id, None)
+                if script_id:
+                    try:
+                        driver.execute_cdp_cmd(
+                            "Page.removeScriptToEvaluateOnNewDocument",
+                            {"identifier": script_id},
+                        )
+                    except Exception:
+                        pass
+        except Exception as exc:
+            return {
+                **_page_summary(driver, session_id),
+                "success": False,
+                "error": _brief_error(exc),
+                "cleared": cleared,
+            }
+        return {
+            **_page_summary(driver, session_id),
+            "success": True,
+            "cleared": cleared,
+            "mocks": len(kept),
+        }
+
+
+def _clear_mock_state(session: BrowserSession, session_id: str | None) -> None:
+    """Best-effort stub teardown for a tab that outlives its session."""
+    if session_id is not None:
+        _REQUEST_MOCKS.pop(session_id, None)
+        _MOCK_STUB_SCRIPT_IDS.pop(session_id, None)
+    driver = session.driver
+    try:
+        if getattr(driver, "is_extension_bridge", False):
+            driver.bridge.request("mock.clear", {"tabId": driver.tab_id}, timeout=5.0)
+        else:
+            try:
+                driver.execute_script(
+                    "if (window.__wsnMockSet) window.__wsnMockSet([]);"
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 def _session_modifiers(session: BrowserSession) -> int:
@@ -8237,26 +9213,48 @@ def sessions_overview() -> dict[str, Any]:
     cap, cap_source = effective_max_sessions()
     with _sessions_lock:
         items = sorted(_sessions.items())
-        rows = [
-            {
-                "session_id": name,
-                "agent_label": session.agent_label,
-                "current_tab_id": session.current_tab_id,
-                "tab_group": session.tab_group,
-                "profile_mode": session.profile_mode,
-                "headless": session.headless,
-                # "Last seen", not "current": see the docstring. A session that
-                # has never been summarised reports None rather than a guess.
-                "last_url": session.last_url,
-                "last_title": session.last_title,
-                "created_at": _iso_local(session.created_at),
-                "last_used_at": _iso_local(session.last_used_at),
-                "idle_seconds": round(max(0.0, time.monotonic() - session.last_used), 1),
-                "busy": bool(session.lock.busy),
-                "concurrent_callers": session.lock.concurrent_callers,
-            }
-            for name, session in items
-        ]
+        rows = []
+        for name, session in items:
+            idle_seconds = round(max(0.0, time.monotonic() - session.last_used), 1)
+            busy = bool(session.lock.busy)
+            # Active means driven right now or within the last five minutes -
+            # the same window the tab's activity badge glows. A human reading
+            # the roster sees which tabs are agent-held; an agent sees which
+            # tabs to observe read-only rather than drive.
+            agent_active = busy or idle_seconds < _TAB_ACTIVITY_IDLE_SECONDS
+            rows.append(
+                {
+                    "session_id": name,
+                    "agent_label": session.agent_label,
+                    "current_tab_id": session.current_tab_id,
+                    "tab_group": session.tab_group,
+                    "profile_mode": session.profile_mode,
+                    "headless": session.headless,
+                    # "Last seen", not "current": see the docstring. A session that
+                    # has never been summarised reports None rather than a guess.
+                    "last_url": session.last_url,
+                    "last_title": session.last_title,
+                    "created_at": _iso_local(session.created_at),
+                    "last_used_at": _iso_local(session.last_used_at),
+                    "idle_seconds": idle_seconds,
+                    "busy": busy,
+                    "concurrent_callers": session.lock.concurrent_callers,
+                    "agent_active": agent_active,
+                    **(
+                        {
+                            "activity_note": (
+                                "An agent is driving this tab now or was within "
+                                "the last 5 minutes (its favicon carries the "
+                                "activity dot). Observe it read-only via "
+                                "page_text/page_outline/screenshot, or open your "
+                                "own session instead of acting on this one."
+                            )
+                        }
+                        if agent_active
+                        else {}
+                    ),
+                }
+            )
     busy = [row["session_id"] for row in rows if row["busy"]]
     return {
         "sessions": rows,
@@ -8538,7 +9536,7 @@ def _reset_session_runtime_state(session: BrowserSession) -> None:
             session.render_deterministic = False
 
 
-def _clear_injected_state(session: BrowserSession) -> None:
+def _clear_injected_state(session: BrowserSession, session_id: str | None = None) -> None:
     """Undo the per-target state we set, for a tab that outlives this session.
 
     Extra HTTP headers and evaluate-on-new-document scripts live on the Chrome
@@ -8565,10 +9563,12 @@ def _clear_injected_state(session: BrowserSession) -> None:
             pass
     session.injected_scripts.clear()
     session.stealth_identifier = None
+    _remove_tab_activity(session)
+    _clear_mock_state(session, session_id)
 
 
 def _shutdown_session(
-    session: BrowserSession, close_tab: bool | None = None
+    session: BrowserSession, close_tab: bool | None = None, session_id: str | None = None
 ) -> dict[str, Any]:
     """Release one session's tab and browser; report what could not be released.
 
@@ -8624,7 +9624,10 @@ def _shutdown_session(
     # session to claim it would inherit them unaware. A tab about to close needs
     # none of this. So the cleanup runs exactly when the tab survives us.
     if not should_close_tab:
-        attempt("clearing injected page state", lambda: _clear_injected_state(session))
+        attempt(
+            "clearing injected page state",
+            lambda: _clear_injected_state(session, session_id),
+        )
     if should_close_tab and hasattr(session.driver, "close_tab"):
         removed = attempt("closing the tab", session.driver.close_tab)
         tab_closed = bool((removed or {}).get("removed"))
@@ -8681,7 +9684,7 @@ def close_session(session_id: str = "default", close_tab: bool | None = None) ->
     outcome: dict[str, Any] = {"tab_closed": False, "browser_gone": False, "problem": None}
     if session is not None:
         with session.lock:
-            outcome = _shutdown_session(session, close_tab)
+            outcome = _shutdown_session(session, close_tab, session_id)
     problem = outcome["problem"]
     return {
         "session_id": session_id,
@@ -8760,7 +9763,7 @@ def close_all_sessions(
     browsers_gone: list[str] = []
     for session_id, session in sessions:
         with session.lock:
-            outcome = _shutdown_session(session)
+            outcome = _shutdown_session(session, None, session_id)
         tabs_closed += int(bool(outcome["tab_closed"]))
         if outcome["browser_gone"]:
             browsers_gone.append(session_id)

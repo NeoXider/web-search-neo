@@ -1632,7 +1632,29 @@ class ChromeBridgeDriver:
             timeout=timeout or self._script_timeout,
         )
         if response.get("exceptionDetails"):
-            detail = response["exceptionDetails"].get("text") or "JavaScript evaluation failed"
+            details = response["exceptionDetails"] or {}
+            text = details.get("text") or "JavaScript evaluation failed"
+            description: str | None = None
+            try:
+                description = (details.get("exception") or {}).get("description")
+            except AttributeError:
+                description = None
+            location = ""
+            line = details.get("lineNumber")
+            column = details.get("columnNumber")
+            if line is not None:
+                try:
+                    location = f" at line {int(line) + 1}"
+                    if column is not None:
+                        location += f":{int(column) + 1}"
+                except (TypeError, ValueError):
+                    location = ""
+            detail = text
+            if description and description != text:
+                first_line = str(description).splitlines()[0][:300]
+                detail = f"{text}: {first_line}{location}" if location else f"{text}: {first_line}"
+            elif location:
+                detail = f"{text}{location}"
             raise WebDriverException(detail)
         return response.get("result") or {}
 

@@ -215,7 +215,7 @@ Earlier revisions tried to perform those clicks for you through Windows UI Autom
 code is gone. It depended on the interface language, on which window happened to have focus,
 and on a folder picker that the automation backend does not even enumerate.
 
-The bundled companion is version 1.10.1 and declares five permissions: `alarms`, `debugger`,
+The bundled companion is version 1.11.0 and declares five permissions: `alarms`, `debugger`,
 `storage`, `tabs`, and `tabGroups`. There are no content scripts and no `host_permissions`;
 page access comes from `debugger`, which attaches the Chrome DevTools Protocol to the tabs
 the agent drives. `alarms` exists because Chrome suspends an idle MV3 service worker after

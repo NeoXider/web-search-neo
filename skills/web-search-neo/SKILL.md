@@ -140,8 +140,21 @@ stay reachable, so local services work unchanged.
   bundled build is reloaded automatically, reported as `self_update`. When it does return
   `manual_steps`, show them to the user word for word and wait: nothing can install the
   extension, or reload a build older than 1.3.1, on their behalf.
+- A tab an agent is driving wears a green activity dot on its favicon; it fades after
+  5 quiet minutes. A dotted tab is agent-held: observe it read-only
+  (`page_text`/`page_outline`/`screenshot`) or open your own session — acting on it
+  collides mid-run, and claiming it is refused with the holder named.
+- Chrome's "started debugging this browser" banner on driven tabs is mandatory platform
+  UI and cannot be dismissed while the tab is driven; its Cancel only detaches until the
+  next action. Silence it by relaunching Chrome once with `--silent-debugger-extension-api`,
+  or drive Selenium modes, which show no banner. Steps live in
+  `browser_status` → `current_chrome.debug_banner`.
 - `auto` falls back to a headless temporary browser; `temporary` and `persistent` also
-  default headless. `headless=false` explicitly permits a visible MCP-owned window.
+  default headless. `isolated` is a disposable owned browser with its own fingerprint —
+  one account, one isolated session — with per-session `user_agent`/`timezone`/`locale`/
+  `geolocation` overrides (owned browsers only; `current`/`attach` share one real profile
+  and refuse overrides). The live `context` action retargets a session without reopening
+  it. `headless=false` explicitly permits a visible MCP-owned window.
   `attach` uses a Chrome you started with a DevTools port and preserves its window mode.
 - No normal action should steal focus. `show` is the sole foreground opt-in; call it only
   when the user explicitly asks to see the controlled tab. It never changes window state.
@@ -182,7 +195,9 @@ a top-level decoy input from being selected and avoids the opaque Chrome
 `Uncaught` error that otherwise occurs for a valid same-origin iframe upload.
 `fill`, `click`, `submit`, `upload` and `wait` accept `frame_selector`; `wait`'s
 `timeout_seconds` defaults to 10 and is respected as passed — ask for as long as
-the target needs.
+the target needs. `wait` also takes `script` instead of `selector`: a JS
+expression polled atomically server-side until truthy, for SPA hydration and
+framework flags (`window.__hydrated === true`) that no selector expresses.
 `challenge_detected` means a challenge is *blocking* — a widget, or a positioned ancestor of
 it, covering at least half the viewport over the centre, so a dismissible modal with a
 captcha in it does not count. `captcha_widgets` lists captchas that are merely present,
@@ -199,7 +214,9 @@ and a fresh session do not. All ride on page summaries — `open`, `fill`, `clic
 
 `fill` blurs every control it writes, which is how the last field fires its `change` event.
 Focus therefore ends on the body: a following `press_keys(["ENTER"])` needs `target_selector`
-to reach a field, and `submit` needs no focus at all.
+to reach a field, and `submit` needs no focus at all. Pass `blur_after=false` to leave
+focus in the last control, and `typing=true` for keystroke-by-keystroke input where a
+masked input or autocomplete only advances per input event.
 
 For a choice widget, do not trust its remembered/default value. Open it, reread the options,
 match exact visible text/value, click the visible option row instead of its hidden
@@ -242,7 +259,9 @@ enough.
 `run_script` takes `user_gesture=true` when the page gates what you need behind a real
 click — clipboard writes, fullscreen, audible autoplay. It runs the same snippet as though a
 person had just clicked; use it only for those APIs, because it bypasses the WebDriver route
-that reports errors most precisely.
+that reports errors most precisely. A script racing a fresh navigation sometimes fails with
+`Uncaught`: that transient failure is retried automatically (`retries=2`, `retry_delay_ms=300`,
+`retry_on_uncaught=false` for exactly one shot), and the answer reports `attempts`.
 
 Web Storage has its own action: `local_storage` reads the whole store as a map, or one
 `key`, and writes or deletes one key, in `local` or `session` `kind`. Reach for it before
@@ -255,6 +274,12 @@ readable — and also sets and clears them. Filter with `domain` (substring) and
 `inject_script` registers code that runs *before* every document's own scripts, which is the
 only way to patch an API a page captures on load. It survives navigation for the life of the
 session; `op=list` shows what is registered and `op=remove` forgets one.
+
+To stub a third-party endpoint rather than re-send a request, use `mock`: `op=add` answers
+every matching fetch/XHR with your status/headers/body (`url_pattern` is a wildcard, `*`
+matches anything, first match wins, everything else reaches the network untouched),
+`op=list` shows live stubs, `op=clear` drops one pattern or all. `replay_request` re-sends
+on demand; `mock` keeps answering until cleared.
 
 ## Repeating a task: macros
 

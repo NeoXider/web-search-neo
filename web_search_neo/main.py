@@ -26,7 +26,7 @@ from web_search_neo import plugins
 from web_search_neo.web_client import request
 
 
-__version__ = "1.10.1"
+__version__ = "1.11.0"
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 log = logging.getLogger("web_search_neo")
@@ -58,13 +58,51 @@ mcp = FastMCP(
 
 
 def _fetch_url_text(
-    url: str, max_chars: int = 50_000, timeout_seconds: float = 20.0
+    url: str,
+    max_chars: int = 50_000,
+    timeout_seconds: float = 20.0,
+    mode: str = "text",
+    headers: dict[str, str] | None = None,
+    save_to: str | None = None,
 ) -> str:
+    """Fetch a URL as readable text, raw source, or straight to a file.
+
+    ``mode="text"`` (default) strips scripts/styles and returns readable text.
+    ``mode="html"``/``"raw"`` return the raw response body (for mining JS
+    bundles and markup without a browser). ``headers`` sends custom request
+    headers. ``save_to`` writes the raw bytes to a file and returns a short
+    confirmation instead of the body.
+    """
+    from web_search_neo.web_client import validate_http_url
+
+    normalized_mode = str(mode or "text").strip().lower()
+    if normalized_mode not in {"text", "html", "raw"}:
+        raise ValueError("mode must be 'text', 'html', or 'raw'")
     log.info("Fetching text from %s", url)
     byte_limit = min(max(1_000_000, int(max_chars) * 8), 10_000_000)
+    extra: dict[str, Any] = {}
+    if headers:
+        if not isinstance(headers, dict):
+            raise ValueError("headers must be a {name: value} map")
+        extra["headers"] = {str(k): str(v) for k, v in headers.items()}
     response = request(
-        url, timeout_seconds=timeout_seconds, max_response_bytes=byte_limit
+        url, timeout_seconds=timeout_seconds, max_response_bytes=byte_limit, **extra
     )
+    if save_to:
+        path = Path(str(save_to)).expanduser()
+        try:
+            resolved = path.resolve()
+        except OSError as exc:
+            raise ValueError(f"save_to is not a writable path: {exc}") from exc
+        parent = resolved.parent
+        if not parent.is_dir():
+            raise ValueError(f"save_to directory does not exist: {parent}")
+        body = response.content
+        resolved.write_bytes(body)
+        return f"Saved {len(body)} bytes from {response.url} to {resolved}"
+    if normalized_mode in {"html", "raw"}:
+        limit = max(1, min(int(max_chars), 500_000))
+        return response.text[:limit]
     soup = BeautifulSoup(response.text, "html.parser")
     for element in soup(["script", "style", "noscript", "template"]):
         element.decompose()
@@ -75,18 +113,37 @@ def _fetch_url_text(
 
 @mcp.tool()
 async def fetch_url_text(
-    url: str, max_chars: int = 50_000, timeout_seconds: float = 20.0
+    url: str,
+    max_chars: int = 50_000,
+    timeout_seconds: float = 20.0,
+    mode: Literal["text", "html", "raw"] = "text",
+    headers: dict[str, str] | None = None,
+    save_to: str | None = None,
 ) -> str:
-    """Download an HTTP(S) page without blocking parallel MCP tool calls."""
-    return await asyncio.to_thread(_fetch_url_text, url, max_chars, timeout_seconds)
+    """Download an HTTP(S) page without blocking parallel MCP tool calls.
+
+    mode='raw'/'html' returns the raw source (JS bundles, markup); headers
+    sends custom request headers; save_to writes the body to a file.
+    """
+    return await asyncio.to_thread(
+        _fetch_url_text, url, max_chars, timeout_seconds, mode, headers, save_to
+    )
 
 
 def _fetch_page_links(
-    url: str, limit: int = 500, timeout_seconds: float = 20.0
+    url: str,
+    limit: int = 500,
+    timeout_seconds: float = 20.0,
+    headers: dict[str, str] | None = None,
 ) -> list[str]:
     log.info("Fetching links from %s", url)
+    extra: dict[str, Any] = {}
+    if headers:
+        if not isinstance(headers, dict):
+            raise ValueError("headers must be a {name: value} map")
+        extra["headers"] = {str(k): str(v) for k, v in headers.items()}
     response = request(
-        url, timeout_seconds=timeout_seconds, max_response_bytes=5_000_000
+        url, timeout_seconds=timeout_seconds, max_response_bytes=5_000_000, **extra
     )
     soup = BeautifulSoup(response.text, "html.parser")
     maximum = max(1, min(int(limit), 5000))
@@ -105,15 +162,22 @@ def _fetch_page_links(
 
 @mcp.tool()
 async def fetch_page_links(
-    url: str, limit: int = 500, timeout_seconds: float = 20.0
+    url: str,
+    limit: int = 500,
+    timeout_seconds: float = 20.0,
+    headers: dict[str, str] | None = None,
 ) -> list[str]:
     """Return de-duplicated absolute links without blocking parallel calls."""
-    return await asyncio.to_thread(_fetch_page_links, url, limit, timeout_seconds)
+    return await asyncio.to_thread(_fetch_page_links, url, limit, timeout_seconds, headers)
 
 
 @mcp.tool()
 async def fetch_urls_text(
-    urls: list[str], max_chars_per_page: int = 20_000, timeout_seconds: float = 20.0
+    urls: list[str],
+    max_chars_per_page: int = 20_000,
+    timeout_seconds: float = 20.0,
+    mode: Literal["text", "html", "raw"] = "text",
+    headers: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch up to 16 pages concurrently and return text or an error per URL."""
     if not urls:
@@ -124,7 +188,7 @@ async def fetch_urls_text(
     async def fetch_one(url: str) -> dict[str, Any]:
         try:
             text = await asyncio.to_thread(
-                _fetch_url_text, url, max_chars_per_page, timeout_seconds
+                _fetch_url_text, url, max_chars_per_page, timeout_seconds, mode, headers, None
             )
             return {"url": url, "success": True, "text": text, "error": None}
         except Exception as exc:
@@ -348,7 +412,7 @@ async def browser_open_page(
     timeout_seconds: float = 20.0,
     headless: bool | None = None,
     profile_mode: Literal[
-        "auto", "current", "temporary", "persistent", "attach"
+        "auto", "current", "temporary", "isolated", "persistent", "attach"
     ] = "current",
     profile_id: str | None = None,
     debugger_address: str | None = None,
@@ -356,23 +420,67 @@ async def browser_open_page(
     tab_group: str = chrome_bridge.DEFAULT_TAB_GROUP,
     agent_label: str | None = None,
     label_tab: bool = True,
+    user_agent: str | None = None,
+    timezone: str | None = None,
+    locale: str | None = None,
+    geolocation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Open in the current Chrome's agent tab group by default; auto falls back to Selenium."""
+    """Open in the current Chrome's agent tab group by default; auto falls back to Selenium.
+
+    profile_mode='isolated' opens a disposable owned browser with its own
+    fingerprint; user_agent/timezone/locale/geolocation override per session
+    (owned browsers only, refused on current/attach).
+    """
     return await asyncio.to_thread(
-        browser_tools.open_page,
-        url,
-        session_id,
-        width,
-        height,
-        timeout_seconds,
-        headless,
-        profile_mode,
-        profile_id,
-        debugger_address,
-        current_tab_id,
-        tab_group,
-        agent_label,
-        label_tab,
+        functools.partial(
+            browser_tools.open_page,
+            url,
+            session_id=session_id,
+            width=width,
+            height=height,
+            timeout_seconds=timeout_seconds,
+            headless=headless,
+            profile_mode=profile_mode,
+            profile_id=profile_id,
+            debugger_address=debugger_address,
+            current_tab_id=current_tab_id,
+            tab_group=tab_group,
+            agent_label=agent_label,
+            label_tab=label_tab,
+            user_agent=user_agent,
+            timezone=timezone,
+            locale=locale,
+            geolocation=geolocation,
+        )
+    )
+
+
+@mcp.tool()
+async def browser_context(
+    session_id: str = "default",
+    user_agent: str | None = None,
+    timezone: str | None = None,
+    locale: str | None = None,
+    geolocation: dict[str, Any] | None = None,
+    width: int | None = None,
+    height: int | None = None,
+) -> dict[str, Any]:
+    """Change a live session's fingerprint overrides without reopening it.
+
+    Owned browsers only (temporary/isolated/persistent); refused on
+    current/attach with an explanation.
+    """
+    return await asyncio.to_thread(
+        functools.partial(
+            browser_tools.apply_context_overrides,
+            session_id=session_id,
+            user_agent=user_agent,
+            timezone=timezone,
+            locale=locale,
+            geolocation=geolocation,
+            width=width,
+            height=height,
+        )
     )
 
 
@@ -385,7 +493,7 @@ async def browser_open_pages(
     timeout_seconds: float = 20.0,
     headless: bool | None = None,
     profile_mode: Literal[
-        "auto", "current", "temporary", "persistent", "attach"
+        "auto", "current", "temporary", "isolated", "persistent", "attach"
     ] = "current",
     tab_group: str = chrome_bridge.DEFAULT_TAB_GROUP,
     label_tab: bool = True,
@@ -678,20 +786,31 @@ async def browser_network_body(
 
 @mcp.tool()
 async def browser_wait_for(
-    selector: str,
+    selector: str = "",
     session_id: str = "default",
-    state: str = "visible",
+    state: Literal["present", "visible", "clickable"] = "visible",
     timeout_seconds: float = 10.0,
     frame_selector: str | None = None,
+    script: str | None = None,
+    poll_ms: int = 150,
 ) -> dict[str, Any]:
-    """Wait for dynamic content to become present, visible, or clickable."""
+    """Wait for dynamic content: an element state, or a JS condition.
+
+    Pass selector for present/visible/clickable, or script (a JS expression,
+    e.g. "window.__hydrated === true") to poll atomically server-side.
+    Selector and script are mutually exclusive.
+    """
     return await asyncio.to_thread(
-        browser_tools.wait_for_element,
-        selector,
-        session_id,
-        state,
-        timeout_seconds,
-        frame_selector,
+        functools.partial(
+            browser_tools.wait_for_element,
+            selector,
+            session_id=session_id,
+            state=state,
+            timeout_seconds=timeout_seconds,
+            frame_selector=frame_selector,
+            script=script,
+            poll_ms=poll_ms,
+        )
     )
 
 
@@ -714,10 +833,24 @@ async def browser_fill_fields(
     files: dict[str, str] | None = None,
     session_id: str = "default",
     frame_selector: str | None = None,
+    blur_after: bool = True,
+    typing: bool = False,
 ) -> dict[str, Any]:
-    """Fill rendered form fields; map CSS selectors to values or local file paths."""
+    """Fill rendered form fields; map CSS selectors to values or local file paths.
+
+    blur_after=false leaves focus in the last control; typing=true emulates
+    keystroke-by-keystroke input for masked/autocomplete fields.
+    """
     return await asyncio.to_thread(
-        browser_tools.fill_fields, fields, files, session_id, frame_selector
+        functools.partial(
+            browser_tools.fill_fields,
+            fields,
+            files,
+            session_id=session_id,
+            frame_selector=frame_selector,
+            blur_after=blur_after,
+            typing=typing,
+        )
     )
 
 
@@ -783,11 +916,17 @@ async def browser_run_script(
     session_id: str = "default",
     await_promise: bool = False,
     user_gesture: bool = False,
+    retry_on_uncaught: bool = True,
+    retries: int = 2,
+    retry_delay_ms: int = 300,
+    wait_ready: bool = False,
 ) -> dict[str, Any]:
     """Execute a JavaScript snippet in a session's page and return its value.
 
     Use for state the DOM reads do not expose (localStorage, virtualised lists,
     framework state) and for mutations without an input-shaped equivalent.
+    Transient post-navigation evaluation failures (Uncaught/detached context)
+    are retried automatically; set retry_on_uncaught=false for exactly one shot.
     """
     return await asyncio.to_thread(
         functools.partial(
@@ -797,6 +936,10 @@ async def browser_run_script(
             session_id=session_id,
             await_promise=await_promise,
             user_gesture=user_gesture,
+            retry_on_uncaught=retry_on_uncaught,
+            retries=retries,
+            retry_delay_ms=retry_delay_ms,
+            wait_ready=wait_ready,
         )
     )
 
@@ -1801,8 +1944,49 @@ async def browser_replay_request(
 
 
 @mcp.tool()
+async def browser_mock(
+    op: Literal["add", "list", "clear"] = "list",
+    url_pattern: str | None = None,
+    session_id: str = "default",
+    status: int = 200,
+    headers: dict[str, str] | None = None,
+    body: str = "",
+) -> dict[str, Any]:
+    """Stub third-party responses in the page: add/list/clear URL-pattern mocks.
+
+    add needs url_pattern (wildcard, '*' matches anything) and answers the
+    match with status/headers/body; list shows live stubs; clear drops one
+    pattern or every stub. Non-matching requests reach the network untouched.
+    """
+    if op == "add":
+        if not (url_pattern or "").strip():
+            raise ValueError("mock op 'add' requires url_pattern")
+        return await asyncio.to_thread(
+            functools.partial(
+                browser_tools.mock_add_request,
+                url_pattern,
+                session_id=session_id,
+                status=status,
+                headers=headers,
+                body=body,
+            )
+        )
+    if op == "list":
+        return await asyncio.to_thread(browser_tools.mock_list_requests, session_id)
+    if op == "clear":
+        return await asyncio.to_thread(
+            functools.partial(
+                browser_tools.mock_clear_requests,
+                session_id=session_id,
+                url_pattern=url_pattern,
+            )
+        )
+    raise ValueError(f"mock op must be add, list, or clear, not '{op}'")
+
+
+@mcp.tool()
 async def browser_inject_script(
-    op: str = "add",
+    op: Literal["add", "list", "remove"] = "add",
     source: str | None = None,
     identifier: str | None = None,
     session_id: str = "default",
@@ -1815,7 +1999,7 @@ async def browser_inject_script(
 
 @mcp.tool()
 async def browser_cookies(
-    op: str = "get",
+    op: Literal["get", "set", "clear"] = "get",
     session_id: str = "default",
     domain: str | None = None,
     name: str | None = None,
@@ -1830,11 +2014,11 @@ async def browser_cookies(
 
 @mcp.tool()
 async def browser_local_storage(
-    op: str = "read",
+    op: Literal["read", "write", "delete"] = "read",
     session_id: str = "default",
     key: str | None = None,
     value: str | None = None,
-    kind: str = "local",
+    kind: Literal["local", "session"] = "local",
 ) -> dict[str, Any]:
     """Read, write, or delete localStorage or sessionStorage entries for the open page."""
     return await asyncio.to_thread(
@@ -1908,6 +2092,12 @@ _ACTIONS: dict[str, ActionSpec] = {
             browser_show,
             "session",
             "Explicitly bring one session to the foreground; this may interrupt the user.",
+        ),
+        _action(
+            "context",
+            browser_context,
+            "session",
+            "Retarget a live session's fingerprint.",
         ),
         _action("wait", browser_wait_for, "page", "Wait until an element is present, visible, or clickable."),
         _action(
@@ -2011,6 +2201,12 @@ _ACTIONS: dict[str, ActionSpec] = {
             browser_replay_request,
             "page",
             "Re-send a captured or explicit request from the page context.",
+        ),
+        _action(
+            "mock",
+            browser_mock,
+            "page",
+            "Stub third-party responses.",
         ),
         _action(
             "close",
@@ -2521,6 +2717,11 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
                 "fix": "Nothing. DOM reads and pointer actions still work; do not call show unless the user asked to watch.",
             },
             {
+                "symptom": "Chrome keeps showing 'started debugging this browser' on agent tabs; closing it brings it back.",
+                "cause": "That banner is Chrome's mandatory UI for chrome.debugger, not a defect: Cancel detaches the debugger and the next agent action re-attaches.",
+                "fix": "Relaunch Chrome once with --silent-debugger-extension-api, or drive Selenium modes (profile_mode temporary/persistent/isolated), which show no banner. Full steps live in browser_status current_chrome.debug_banner.",
+            },
+            {
                 "symptom": "The tab another agent is using keeps changing under me.",
                 "cause": "Two agents share one session_id.",
                 "fix": "Choose a distinct session_id and open or attach your own tab.",
@@ -2629,8 +2830,15 @@ _ACTION_NOTES = {
         "contenteditable": "TipTap/ProseMirror/Slate/Quill and Gmail's body are written as a real edit: the content is selected and typed in through the browser's input channel, a line at a time with a soft break (Shift+Enter - never Enter, which sends in a chat composer) between them, so paragraphs survive. The read-back is innerText.",
         "contenteditable_limits": "An editor that folds the breaks anyway is named as such in errors; the fix is a real paste - run_script with user_gesture=true and navigator.clipboard.writeText(text), then Ctrl+V through input. Telegram Web (#editable-message-text, Teact) never updates its own state from a write at all - its send button stays a microphone - so paste there always.",
         "files": "A file input is refused in fields; pass files={selector: path}, which replaces the input's selection rather than adding to it. upload_states/upload_notes appear when a widget emptied the input; they mean what upload's upload_state means.",
-        "blur": "Every control written is blurred, which is how the last field fires its change event - so focus ends on the body and a following press_keys needs target_selector to reach a field.",
+        "blur": "By default every control written is blurred (blur_after=true), which is how the last field fires its change event - so focus ends on the body and a following press_keys needs target_selector to reach a field. Pass blur_after=false to leave focus in the last control, and typing=true to emulate keystroke-by-keystroke input for masked/autocomplete fields.",
         "frame_selector": _FRAME_ANY,
+    },
+    "local_storage": {
+        "ops": "op is read (whole store without key, one value with key), write (needs key and value), or delete (needs key); kind is local (localStorage) or session (sessionStorage, cleared when the tab closes).",
+        "scope": "Reads and writes the open page's own Web Storage for its origin; a typo in kind is refused rather than written to the other store.",
+    },
+    "context": {
+        "scope": "Owned browsers only (temporary/isolated/persistent): user_agent, timezone, locale, geolocation and viewport size. On current/attach the same call is refused - one real profile means one fingerprint, so open profile_mode='isolated' (one account = one isolated session) instead.",
     },
     "upload": {
         "replaces": "The input is cleared first: this sets its selection to exactly file_paths. Two files means one call with two paths; a second call discards the first file.",
@@ -2657,7 +2865,8 @@ _ACTION_NOTES = {
 "run_script": {
         "scope": "Runs in the top document of the session's current tab; there is no frame_selector - address a frame from inside the script if needed.",
         "args": "args arrive as arguments[0..n]; only JSON-serialisable values can cross into the page.",
-        "result": "value is the JSON-serialisable return value; a promise is awaited when await_promise=true (Chrome bridge driver). Long strings are clipped at 200k characters and reported as {clipped, length, head}.",
+        "result": "value is the JSON-serialisable return value; a promise is awaited when await_promise=true (Chrome bridge driver). Long strings are clipped at 200k characters and reported as {clipped, length, head}. attempts reports how many tries the call took.",
+        "retry": "Transient post-navigation failures (Uncaught/detached context) are retried automatically (retry_on_uncaught=true, retries=2, retry_delay_ms=300); wait_ready=true additionally settles readiness first. Pass retry_on_uncaught=false for exactly one attempt.",
         "safety": "This is raw page-side JavaScript: it can navigate, mutate, or delete state. Prefer fill/click/pointer for input-shaped work and reserve scripts for state only the page holds (localStorage, virtualised rows, framework stores).",
     },
     "click_text": {
@@ -2669,6 +2878,7 @@ _ACTION_NOTES = {
     },
     "wait": {
         "state": "present|visible|clickable; timeout_seconds defaults to 10 and is respected as passed.",
+        "script": "Pass script (a JS expression, e.g. \"window.__hydrated === true\") instead of selector to poll a hydration/framework condition atomically server-side; selector and script are mutually exclusive. poll_ms sets the poll interval.",
         "frame_selector": _FRAME_ANY,
     },
     "find": {
@@ -2707,6 +2917,7 @@ _ACTION_NOTES = {
             "current": "the user's signed-in Chrome through the companion extension (default)",
             "auto": "current, falling back to a headless temporary profile",
             "temporary": "clean disposable profile",
+            "isolated": "disposable owned browser with its own fingerprint - one account = one isolated session, with per-session user_agent/timezone/locale/geolocation",
             "persistent": "durable server-owned profile, keeps logins",
             "attach": "a Chrome you started with a DevTools port",
         },
@@ -2719,8 +2930,9 @@ _ACTION_NOTES = {
         "result": "focus_requested=true confirms the explicit request was sent; warning names the user interruption risk.",
     },
     "attach_tab": {
-        "ownership": "Refused, naming the holder, when another agent is already driving that tab. Pick another tab or open your own; do not retry.",
+        "ownership": "Refused, naming the holder, when another agent is already driving that tab. Pick another tab or open your own; do not retry. A tab claimed by another session in this server is refused the same way: it is busy, so observe it read-only through its own session or open your own tab.",
         "capture": "Console and network are recorded from the claim onwards; whatever the tab did before it was claimed is unrecoverable.",
+        "badge": "The tab gets the agent-activity favicon dot while driven (gone after 5 quiet minutes); a dotted tab in the strip is agent-held - do not act on it from another session.",
     },
     "close_tabs": {
         "ids": "tab_ids are the ids from web_info(topic='browser_tabs'). There is no close-everything switch on purpose: closing a tab cannot be undone, so each one is named.",
@@ -2735,6 +2947,14 @@ _ACTION_NOTES = {
     "close_all": {
         "browser_gone": "A list of session ids left alone because their Chrome is gone; closed_all stays true, since nothing of ours was left to leak.",
         "scope": "Defaults to scope='mine': only the sessions opened with your agent_label (or, with no label, the unlabelled ones). kept_sessions names what was left running and who owns it. scope='all' closes every agent's sessions in this MCP server - that is the old behaviour, and it ends other subagents' work.",
+    },
+    "mock": {
+        "pattern": "url_pattern is a CDP-style wildcard ('*' matches anything) matched against the full request URL; the first matching stub wins and everything else reaches the network untouched.",
+        "mechanism": "On the Chrome companion the stub is answered inside the extension over the CDP Fetch domain; on Selenium browsers it is an in-page fetch/XHR patch. Either way the page sees the stubbed status/headers/body as the real response.",
+        "lifetime": "Stubs live until mock_clear drops them (one pattern or all) or the session closes. A companion reload lapses extension-side stubs; mock_list always reports what is live.",
+    },
+    "reload": {
+        "fallback": "When the installed companion predates Page.reload it refuses the method; the call then serves the reload via same-URL navigation and says so with reload_fallback=navigate plus a companion_note telling the user to press Reload at chrome://extensions. browser_status always carries the shipped allowlist size/hash (allowed_cdp_methods_size/hash) so the skew is visible before the call.",
     },
     "browser_status": {
         "roster": "sessions lists every session in this server with agent_label, current_tab_id, tab_group, last_url/last_title, created_at, last_used_at, idle_seconds and busy; sessions_open/max_sessions/sessions_free are the occupancy, and max_sessions_source says whether the cap came from the environment, the companion popup, or the default. last_url/last_title are where a session was last seen, not a fresh read - another agent's tab is never touched to answer this.",
@@ -3060,7 +3280,7 @@ def _topic_schema(topic: str) -> dict[str, Any]:
     return response
 
 
-def _capabilities(action_name: str | None = None) -> dict[str, Any]:
+def _capabilities(action_name: str | None = None, full_schemas: bool = False) -> dict[str, Any]:
     """Return the whole agent-facing contract, one action's schema, or one topic's."""
     if action_name is not None:
         selected = action_name.strip().lower()
@@ -3098,7 +3318,7 @@ def _capabilities(action_name: str | None = None) -> dict[str, Any]:
     # finds all eight taken has learned nothing it could not have learned by
     # failing. How many are free is the answer to the question it was asking.
     occupancy = browser_tools.sessions_overview()
-    return {
+    document: dict[str, Any] = {
         "server": "Web Search Neo",
         "version": __version__,
         "public_tools": ["web_info", "web_action"],
@@ -3136,10 +3356,15 @@ def _capabilities(action_name: str | None = None) -> dict[str, Any]:
                 "actions[name].required lists parameters you must always send; "
                 "also_required is a condition a list cannot express and is just as "
                 "mandatory. Optional names, types, and defaults exist only in "
-                "action_schema."
+                "action_schema; capabilities full_schemas=true embeds them all at once."
             ),
         },
     }
+    if full_schemas:
+        document["schemas"] = {
+            name: _capabilities(name)["input_schema"] for name in _ACTIONS
+        }
+    return document
 
 
 _TOPIC_HANDLERS = {
@@ -3208,9 +3433,14 @@ async def web_info(
     """
     arguments = dict(params or {})
     if topic == "capabilities":
-        if arguments:
-            raise ValueError("capabilities does not accept params")
-        return _stamp_now(_capabilities())
+        unknown = set(arguments) - {"full_schemas"}
+        if unknown:
+            raise ValueError(
+                f"capabilities accepts only params.full_schemas; unknown: {sorted(unknown)}"
+            )
+        return _stamp_now(
+            _capabilities(full_schemas=bool(arguments.get("full_schemas", False)))
+        )
     if topic == "action_schema":
         # params.topic is accepted as an alias: what is being described may be an
         # info topic, and naming one under the key "action" reads as a mistake.

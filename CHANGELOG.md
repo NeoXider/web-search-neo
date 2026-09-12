@@ -1,7 +1,60 @@
 # Changelog
 
-## Unreleased
+## 1.11.0
 
+Release focus: the eight defects a live multi-agent session surfaced, plus the
+two papercuts around it (agent-held tabs nobody can see, a debugging banner
+nobody can dismiss).
+
+- Fix the `reload` version drift. The repo already forwarded `Page.reload`
+  while installed companions still refused it with "forwards only the 24
+  methods". `browser_status` now publishes the shipped allowlist
+  (`allowed_cdp_methods_size/hash`) so the skew is visible before the call,
+  and `reload` on a stale companion serves the reload via same-URL navigation
+  with `reload_fallback=navigate` plus a note naming the fix (Reload the card
+  at chrome://extensions).
+- Make `run_script` survive its own navigation race. Transient post-navigation
+  evaluation failures (`Uncaught`/detached context) are retried automatically
+  (`retry_on_uncaught=true`, `retries=2`, `retry_delay_ms=300`, opt-in
+  `wait_ready`), genuine page errors still fail at once, every answer reports
+  `attempts`, and bridge errors now carry the exception description with
+  line/column instead of a bare `Uncaught`.
+- Add a universal `wait`: `script` (a JS expression polled atomically
+  server-side until truthy) alongside `selector`, mutually exclusive, for SPA
+  hydration and framework flags no selector expresses.
+- Stop `fill` from dropping focus silently. `blur_after=true` stays the safe
+  default (uncommitted values are lost data, a moved focus is not);
+  `blur_after=false` leaves focus in the last control and `typing=true`
+  emulates keystroke-by-keystroke input for masked/autocomplete fields.
+- Add isolated browser contexts. `profile_mode="isolated"` is a disposable
+  owned browser with its own fingerprint (one account = one isolated
+  session), with per-session `user_agent`/`timezone`/`locale`/`geolocation`
+  overrides and a live `context` action; `current`/`attach` refuse overrides
+  with the reason instead of pretending to apply them.
+- Teach `fetch_text`/`fetch_many` raw work: `mode="text"|"html"|"raw"`,
+  custom `headers`, and `save_to` for downloading bodies (e.g. JS bundles)
+  straight to a file.
+- Publish real enums in schemas: `local_storage.op/kind` (plus `cookies.op`,
+  `inject_script.op`, `wait.state`) are `Literal` so `action_schema` shows
+  `enum` without guessing, and `capabilities` accepts `full_schemas=true` to
+  embed every action schema in one call.
+- Add request stubbing with the `mock` action (`op=add|list|clear`): wildcard
+  `url_pattern` stubs answered over the CDP Fetch domain in the companion and
+  via an in-page fetch/XHR patch on Selenium drivers, until cleared or the
+  session closes. New companion methods: `Fetch.enable/disable/fulfillRequest/
+  continueRequest/failRequest` plus `Emulation.setTimezone/Locale/
+  GeolocationOverride`.
+- Mark agent-held tabs visibly. Driven tabs wear a green activity dot on the
+  favicon while an agent acts (fading after 5 quiet minutes, restored
+  favicon on teardown); `browser_status` reports `agent_active` per session,
+  and shared/claimed sessions warn with the read-only-or-open-your-own
+  guidance instead of failing silently mid-run.
+- Explain the debugging banner instead of fighting it. `browser_status` and
+  `setup_current_chrome` carry `debug_banner`: the strip is Chrome's
+  mandatory `chrome.debugger` UI, Cancel only detaches until the next action,
+  and the one supported silence is relaunching Chrome with
+  `--silent-debugger-extension-api` (per-OS steps included); Selenium modes
+  show no banner at all.
 - Add periodic cleanup of claims whose owner process has died in the bridge daemon.
   A background thread runs every 30 seconds (configurable via
   ``WEB_SEARCH_NEO_BRIDGE_CLAIM_CLEANUP_INTERVAL``), checks all active claims,
@@ -26,6 +79,8 @@
   * claim with non-existing PID is released,
   * claim with living PID stays,
   * unrecognised label format is not touched.
+- Add tests in ``tests/test_bugfix_bundle.py`` (fixes 1-8) and
+  ``tests/test_tab_activity.py`` (badge, busy warnings, banner note).
 
 ## 1.10.1
 
