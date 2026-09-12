@@ -418,6 +418,7 @@ def _lock_delta(session, moves: int | None = None) -> dict[str, float]:
         time.sleep(0.02)
 
 
+@pytest.mark.desktop_input
 def test_the_first_relative_move_carries_the_delta_and_nothing_else(local_site):
     session = _open(local_site, POINTER_FIXTURE, "relative-start")
     try:

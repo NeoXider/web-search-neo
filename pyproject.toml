@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "web-search-neo"
-version = "1.11.0"
+version = "1.11.1"
 description = "Free API-keyless web search and visible Chrome automation for AI agents over MCP."
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
@@ -30,5 +30,6 @@ testpaths = ["tests"]
 # No single test needs two minutes; anything longer is a hung browser session.
 addopts = "-ra --strict-markers --timeout=120"
 markers = [
+    "desktop_input: may capture the OS cursor; requires --run-desktop-input",
     "live: tests that call public internet services or a local model server",
 ]

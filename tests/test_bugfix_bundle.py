@@ -138,7 +138,7 @@ class _FlakyScriptDriver(_ProbeDriver):
 def test_execute_js_retries_a_post_navigation_uncaught():
     driver = _FlakyScriptDriver(failures_before_success=1)
     _register(driver, "bundle-retry")
-    result = browser_tools.execute_js("return 42;", session_id="bundle-retry")
+    result = browser_tools.execute_js("return 42;", session_id="bundle-retry", retry_on_uncaught=True)
     assert result["success"] is True
     assert result["value"] == 42
     assert result["attempts"] == 2
@@ -453,9 +453,10 @@ def test_mock_add_list_clear_on_selenium_backend():
         body='{"ok": true}',
     )
     assert added["success"] is True and added["mocks"] == 1
-    assert ("Page.addScriptToEvaluateOnNewDocument", {"source": browser_tools._MOCK_STUB_SOURCE}) in [
-        (command, params) for command, params in driver.cdp_calls
-    ]
+    sources = [params["source"] for command, params in driver.cdp_calls
+               if command == "Page.addScriptToEvaluateOnNewDocument"]
+    assert any(browser_tools._MOCK_STUB_SOURCE in source and "https://api.test/*" in source
+               for source in sources)
     listed = browser_tools.mock_list_requests(session_id="bundle-mock")
     assert listed["count"] == 1
     assert listed["mocks"][0]["pattern"] == "https://api.test/*"

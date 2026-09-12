@@ -336,6 +336,7 @@ def test_touch_emulation_enables_tap_swipe_and_multitouch(local_site):
         browser_tools.close_session("touch-input")
 
 
+@pytest.mark.desktop_input
 def test_pointer_lock_accumulates_unclamped_relative_movement(local_site):
     session = _open_pointer_fixture(local_site, "lock-input")
     try:

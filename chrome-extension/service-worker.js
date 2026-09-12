@@ -258,6 +258,9 @@ async function restoreState() {
     restorePromise = (async () => {
       const stored = (await chrome.storage.session.get(STATE_KEY))?.[STATE_KEY] || {};
       for (const tabId of stored.attachedTabs || []) attachedTabs.add(Number(tabId));
+      for (const [tabId, entries] of stored.requestMocks || []) {
+        requestMocks.set(Number(tabId), entries);
+      }
       for (const entry of stored.childSessions || []) {
         childSessions.set(`${entry.tabId}:${entry.url}`, {...entry, tabId: Number(entry.tabId)});
       }
@@ -280,6 +283,7 @@ function persistState() {
       chrome.storage.session.set({
         [STATE_KEY]: {
           attachedTabs: [...attachedTabs],
+          requestMocks: [...requestMocks.entries()],
           childSessions: [...childSessions.values()],
           capture: [...capture.entries()].map(([tabId, state]) => ({
             tabId,
@@ -456,11 +460,42 @@ export const ALLOWED_CDP_METHODS = new Set([
 // (`*` matches anything). Non-matching requests are never paused and flow
 // untouched; a handler error continues the request rather than hanging it.
 const requestMocks = new Map();
+const mockMutationQueues = new Map();
+
+async function mutateMocks(tabId, operation) {
+  const key = Number(tabId);
+  const previous = mockMutationQueues.get(key) || Promise.resolve();
+  const pending = previous.catch(() => {}).then(operation);
+  mockMutationQueues.set(key, pending);
+  try { return await pending; }
+  finally { if (mockMutationQueues.get(key) === pending) mockMutationQueues.delete(key); }
+}
+
+async function commitMocks(tabId, entries) {
+  const previous = mocksForTab(tabId);
+  // Publish before Fetch.enable can deliver an immediate paused request.
+  requestMocks.set(tabId, entries);
+  try { await rearmFetchInterception(tabId, entries); }
+  catch (error) {
+    if (previous.length) requestMocks.set(tabId, previous);
+    else requestMocks.delete(tabId);
+    throw error;
+  }
+  if (!entries.length) requestMocks.delete(tabId);
+  await persistState();
+}
 
 function mockWildcardMatch(url, pattern) {
-  const escaped = String(pattern).split("*").map(part =>
-    part.replace(/[.+?^${}()|[\]\\]/g, "\\$&")
-  ).join(".*");
+  let escaped = "";
+  const p = String(pattern);
+  for (let i = 0; i < p.length; i++) {
+    const c = p[i];
+    if (c === "\\" && i + 1 < p.length) {
+      escaped += p[++i].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    } else if (c === "*") escaped += ".*";
+    else if (c === "?") escaped += ".";
+    else escaped += c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
   try {
     return new RegExp(`^${escaped}$`).test(String(url));
   } catch (error) {
@@ -472,11 +507,11 @@ function mocksForTab(tabId) {
   return requestMocks.get(Number(tabId)) || [];
 }
 
-async function rearmFetchInterception(tabId) {
+async function rearmFetchInterception(tabId, entries) {
   const numericId = Number(tabId);
-  const mocks = mocksForTab(numericId);
+  const mocks = entries ?? mocksForTab(numericId);
   if (!mocks.length) {
-    await cdpSend({tabId: numericId, method: "Fetch.disable"}).catch(() => {});
+    await cdpSend({tabId: numericId, method: "Fetch.disable"});
     return;
   }
   await ensureDebugger(numericId);
@@ -492,14 +527,16 @@ function utf8ToBase64(text) {
 }
 
 async function handleFetchPaused(source, params) {
+  await restoreState();
   const numericId = Number(source?.tabId);
+  const sessionId = source?.sessionId;
   const requestId = params?.requestId;
   if (!requestId) return;
   const url = String(params?.request?.url || "");
   const entry = mocksForTab(numericId).find(item => mockWildcardMatch(url, item.pattern));
   try {
     if (!entry) {
-      await cdpSend({tabId: numericId, method: "Fetch.continueRequest", params: {requestId}});
+      await cdpSend({tabId: numericId, sessionId, method: "Fetch.continueRequest", params: {requestId}});
       return;
     }
     const headers = Object.entries(entry.headers || {}).map(([name, value]) => ({
@@ -511,18 +548,21 @@ async function handleFetchPaused(source, params) {
     }
     await cdpSend({
       tabId: numericId,
+      sessionId,
       method: "Fetch.fulfillRequest",
       params: {
         requestId,
         responseCode: Number(entry.status) || 200,
         responseHeaders: headers,
-        body: utf8ToBase64(entry.body),
+        ...(![204, 205, 304].includes(Number(entry.status)) && params?.request?.method !== "HEAD"
+          ? {body: utf8ToBase64(entry.body)} : {}),
       },
     });
   } catch (error) {
     console.warn(`bridge: mock handling failed for ${url}`, error);
     await cdpSend({
       tabId: numericId,
+      sessionId,
       method: "Fetch.continueRequest",
       params: {requestId},
     }).catch(() => {});
@@ -809,12 +849,14 @@ const commands = {
   // extension lapses them, and mock.list always reports what is live.
   async "mock.add"({tabId, pattern, status = 200, headers = {}, body = ""}) {
     const numericId = Number(tabId);
+    return mutateMocks(numericId, async () => {
     const wanted = String(pattern || "").trim();
     if (!wanted) throw new Error("mock.add needs a url pattern");
-    const code = Number(status) || 200;
+    const code = Number(status);
     if (!Number.isInteger(code) || code < 200 || code > 599) {
       throw new Error(`mock.add status must be an integer 200-599, not '${status}'`);
     }
+    await ensureDebugger(numericId);
     const entries = mocksForTab(numericId).filter(item => item.pattern !== wanted);
     entries.push({
       pattern: wanted,
@@ -822,14 +864,15 @@ const commands = {
       headers: {...(headers || {})},
       body: String(body ?? ""),
     });
-    requestMocks.set(numericId, entries);
-    persistState();
-    await rearmFetchInterception(numericId);
+    await commitMocks(numericId, entries);
     return {mocked: true, tabId: numericId, pattern: wanted, mocks: entries.length};
+    });
   },
 
   async "mock.list"({tabId}) {
     const numericId = Number(tabId);
+    await restoreState();
+    if (mocksForTab(numericId).length) await ensureDebugger(numericId);
     return {
       tabId: numericId,
       mocks: mocksForTab(numericId).map(item => ({
@@ -843,15 +886,16 @@ const commands = {
 
   async "mock.clear"({tabId, pattern}) {
     const numericId = Number(tabId);
+    return mutateMocks(numericId, async () => {
+    await restoreState();
+    if (mocksForTab(numericId).length) await ensureDebugger(numericId);
     const wanted = pattern === undefined || pattern === null ? "" : String(pattern);
     let entries = mocksForTab(numericId);
     const before = entries.length;
     entries = wanted ? entries.filter(item => item.pattern !== wanted) : [];
-    if (entries.length) requestMocks.set(numericId, entries);
-    else requestMocks.delete(numericId);
-    persistState();
-    await rearmFetchInterception(numericId);
+    if (before) await commitMocks(numericId, entries);
     return {cleared: before - entries.length, mocks: entries.length};
+    });
   },
 
   // Nothing outside Chrome can press "Reload" on an unpacked extension card, so
@@ -1514,6 +1558,7 @@ export async function connect() {
       browser: {
         name: "Chrome",
         extension_version: chrome.runtime.getManifest().version,
+        allowed_cdp_methods: [...ALLOWED_CDP_METHODS].sort(),
         browser_run: run,
         max_sessions: maxSessions,
       },

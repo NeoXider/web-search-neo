@@ -14,6 +14,22 @@ import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def pytest_addoption(parser):
+    parser.addoption("--run-desktop-input", action="store_true", default=False,
+                     help="Run tests that may capture the real desktop cursor")
+
+
+def pytest_collection_modifyitems(config, items):
+    if config.getoption("--run-desktop-input"):
+        return
+    skip = pytest.mark.skip(reason="Desktop cursor capture requires --run-desktop-input")
+    for item in items:
+        if "desktop_input" in item.keywords:
+            item.add_marker(skip)
+
+
 FIXTURE_ROOT = (PROJECT_ROOT / "tests" / "fixtures").resolve()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))

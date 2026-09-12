@@ -150,11 +150,12 @@ stay reachable, so local services work unchanged.
   or drive Selenium modes, which show no banner. Steps live in
   `browser_status` → `current_chrome.debug_banner`.
 - `auto` falls back to a headless temporary browser; `temporary` and `persistent` also
-  default headless. `isolated` is a disposable owned browser with its own fingerprint —
+  default headless. `isolated` is a disposable browser with separate profile storage —
   one account, one isolated session — with per-session `user_agent`/`timezone`/`locale`/
   `geolocation` overrides (owned browsers only; `current`/`attach` share one real profile
   and refuse overrides). The live `context` action retargets a session without reopening
-  it. `headless=false` explicitly permits a visible MCP-owned window.
+  it. Isolation does not guarantee an unlinkable network or hardware fingerprint.
+  `headless=false` explicitly permits a visible MCP-owned window.
   `attach` uses a Chrome you started with a DevTools port and preserves its window mode.
 - No normal action should steal focus. `show` is the sole foreground opt-in; call it only
   when the user explicitly asks to see the controlled tab. It never changes window state.
@@ -260,8 +261,9 @@ enough.
 click — clipboard writes, fullscreen, audible autoplay. It runs the same snippet as though a
 person had just clicked; use it only for those APIs, because it bypasses the WebDriver route
 that reports errors most precisely. A script racing a fresh navigation sometimes fails with
-`Uncaught`: that transient failure is retried automatically (`retries=2`, `retry_delay_ms=300`,
-`retry_on_uncaught=false` for exactly one shot), and the answer reports `attempts`.
+`Uncaught`: this may follow a completed mutation, so execution is single-shot by default.
+Only enable `retry_on_uncaught=true` for a script safe to repeat (`retries=2`,
+`retry_delay_ms=300`); the answer reports `attempts`.
 
 Web Storage has its own action: `local_storage` reads the whole store as a map, or one
 `key`, and writes or deletes one key, in `local` or `session` `kind`. Reach for it before

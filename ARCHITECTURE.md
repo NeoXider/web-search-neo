@@ -1,5 +1,33 @@
 # Architecture invariants
 
+## Module boundaries and size gates
+
+The first extraction stage keeps `browser_tools.py` and `main.py` as compatibility
+facades. Existing callers and session locks remain there; leaf modules accept a driver
+and explicit callbacks instead of importing either facade or accessing its globals.
+
+- `sessions/`: session models, activity badge lifecycle, owned-profile context overrides.
+- `actions/`: script execution, condition polling, render bootstrap source.
+- `perception/`: element collection and response budgets.
+- `cdp/`: request mock installation, navigation persistence, and teardown.
+- `contract/`: domain-neutral action notes, examples, and built-in playbook.
+- `fetch/`: bounded HTTP source/text/link extraction.
+
+`scripts/architecture_policy.py` is the executable dependency allowlist. The AST checker
+resolves absolute and relative imports; a leaf may not import `main` or `browser_tools`.
+Third-party dependencies are named explicitly. Do not bypass boundaries with dynamic
+imports, injected module globals, or wildcard re-exports.
+
+Production Python and JavaScript files have a 600-line soft limit and 800-line hard limit,
+counting physical lines including comments. Existing oversized files have exact, reviewed
+maxima in the same policy. Those are ratchets: lower them after extraction; do not raise
+them to accommodate unrelated features. New modules never inherit legacy exemptions.
+
+CI runs `python scripts/check_module_size.py` before tests; `tests/test_architecture.py`
+also exercises prohibited imports, new oversized files, and legacy growth. The remaining
+legacy files are deliberately not claimed to be fully decomposed. Continue extracting
+coherent implementations while preserving the public contract and regression coverage.
+
 Web Search Neo is a universal browser/search MCP. Its core stays domain-neutral: public APIs,
 storage, validation, guards, and documentation primitives must not encode any business-domain
 workflow, vocabulary, or host policy.

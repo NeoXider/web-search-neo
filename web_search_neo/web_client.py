@@ -187,6 +187,20 @@ def _session() -> requests.Session:
 MAX_REDIRECTS = 5
 
 
+def _origin(url: str) -> tuple[str, str | None, int | None]:
+    parsed = urlparse(url)
+    return parsed.scheme.lower(), parsed.hostname, parsed.port or (
+        443 if parsed.scheme.lower() == "https" else 80
+    )
+
+
+class _NoRedirectAuth(requests.auth.AuthBase):
+    """Suppress both Session.auth and automatic netrc authentication."""
+
+    def __call__(self, request: requests.PreparedRequest) -> requests.PreparedRequest:
+        return request
+
+
 def _follow_redirects(
     session: requests.Session,
     response: requests.Response,
@@ -205,7 +219,25 @@ def _follow_redirects(
     for _ in range(MAX_REDIRECTS):
         if not response.is_redirect or not response.headers.get("location"):
             break
-        target = validate_http_url(urljoin(response.url, response.headers["location"]))
+        try:
+            target = validate_http_url(urljoin(response.url, response.headers["location"]))
+            cross_origin = _origin(response.url) != _origin(target)
+        except Exception:
+            response.close()
+            raise
+        if cross_origin:
+            # Manual redirect requests bypass requests' normal auth stripping.
+            # Mask session defaults too, and never reintroduce credentials if a
+            # later hop returns to the original origin. An empty Cookie header
+            # also prevents the shared session jar from supplying host cookies
+            # to another port on the same host.
+            headers = requests.structures.CaseInsensitiveDict(kwargs.get("headers") or {})
+            for name in ("Authorization", "Proxy-Authorization", "Host"):
+                headers[name] = None
+            headers["Cookie"] = ""
+            kwargs["headers"] = headers
+            kwargs["auth"] = _NoRedirectAuth()
+            kwargs.pop("cookies", None)
         if response.status_code == 303 or (
             response.status_code in {301, 302} and method.upper() not in {"GET", "HEAD"}
         ):
@@ -254,19 +286,22 @@ def request(
     response = _follow_redirects(
         session, response, method=method, timeout=timeouts, **kwargs
     )
-    response.raise_for_status()
-    if max_response_bytes is not None:
-        limit = max(1024, min(int(max_response_bytes), 20_000_000))
-        chunks: list[bytes] = []
-        size = 0
-        for chunk in response.iter_content(chunk_size=65_536):
-            if not chunk:
-                continue
-            size += len(chunk)
-            if size > limit:
-                response.close()
-                raise ValueError(f"Response exceeded the {limit}-byte safety limit")
-            chunks.append(chunk)
-        response._content = b"".join(chunks)
-        response._content_consumed = True
+    try:
+        response.raise_for_status()
+        if max_response_bytes is not None:
+            limit = max(1024, min(int(max_response_bytes), 20_000_000))
+            chunks: list[bytes] = []
+            size = 0
+            for chunk in response.iter_content(chunk_size=65_536):
+                if not chunk:
+                    continue
+                size += len(chunk)
+                if size > limit:
+                    raise ValueError(f"Response exceeded the {limit}-byte safety limit")
+                chunks.append(chunk)
+            response._content = b"".join(chunks)
+            response._content_consumed = True
+    except Exception:
+        response.close()
+        raise
     return response

@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.11.1
+
+- Real Pointer Lock tests require `--run-desktop-input`; ordinary test runs must
+  not capture the desktop cursor, including when Chrome is headless.
+
+- Audit correction: raw script execution is single-shot by default; retries require
+  explicit opt-in because an exception can follow a completed mutation.
+- Fix JavaScript truthiness in condition polling and promise evaluation through CDP.
+- Keep locale, navigator language and Accept-Language aligned; preserve the other
+  viewport dimension when only one is changed. Do not repeat failed reload navigation.
+- Strip credentials on cross-origin HTTP redirects, including session defaults; close
+  failed responses. Raw and custom-header fetch remain supported.
+- Repair mock navigation persistence, relative URLs, XHR events/response types,
+  bodyless responses, cleanup, and companion child-session routing/state restoration.
+- Prevent delayed favicon loads from reviving expired/stopped activity badges.
+- Advertise live companion CDP methods so status can distinguish shipped and running
+  capabilities. Older companions report capability verification as unavailable.
+- Extract sessions/actions/perception/cdp/contract/fetch modules behind compatible
+  entry points. Enforce 600 soft / 800 hard production line limits, explicit legacy
+  ratchets, and import boundaries in CI.
+- Correct prior claims: isolated profiles separate storage but do not guarantee an
+  unlinkable fingerprint. Debug-banner guidance is a launch workaround, not automatic
+  suppression of Chrome's UI.
+
+See `docs/audit-1.11.1.md` for scope and verification.
+
 ## 1.11.0
 
 Release focus: the eight defects a live multi-agent session surfaced, plus the

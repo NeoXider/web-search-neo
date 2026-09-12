@@ -157,224 +157,7 @@ _SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _BROWSER_LOG_LIMIT = 500
 
 
-@dataclass
-class ConsoleCursor:
-    """One reader's place in the console sources.
-
-    ``seq`` counts inside ``doc`` and nowhere else: every document numbers its own
-    entries from one, so a sequence number kept across a navigation would hide the
-    new page's first entries instead of skipping the old page's. ``log_index`` is
-    a position in the session's browser-log buffer, which belongs to the session
-    rather than to any document and therefore survives navigation untouched.
-    """
-
-    seq: int = 0
-    doc: str = ""
-    log_index: int = 0
-
-
-class SessionLock:
-    """An ``RLock`` that can also say whether a second caller is inside.
-
-    Sessions are the unit of isolation between agents, and across processes the
-    bridge daemon's tab register keeps two of them off one tab. Inside one MCP
-    server there is no such register: several agents - subagents of one run, most
-    of the time - share this process, and two that both leave ``session_id`` at
-    its default land on the same :class:`BrowserSession`. The lock below then did
-    its job perfectly and made that invisible: the second caller waited, took the
-    lock, and acted on a page the first one had navigated out from under it. No
-    error, no warning, a click on whatever happened to be there.
-
-    Nothing here can tell the two agents apart - an MCP call carries no caller
-    identity - so this does not try to arbitrate. It counts, so that the overlap
-    can be reported instead of swallowed: :attr:`busy` is true while another
-    thread holds the session, and :attr:`waiting` counts the callers queued
-    behind it.
-
-    The API is the subset of ``threading.RLock`` this module actually uses -
-    the context manager plus ``acquire``/``release`` - so every ``with
-    session.lock:`` in this file keeps working untouched.
-    """
-
-    __slots__ = ("_lock", "_state", "_owner", "_depth", "_waiting")
-
-    def __init__(self) -> None:
-        self._lock = threading.RLock()
-        self._state = threading.Lock()
-        self._owner: int | None = None
-        self._depth = 0
-        self._waiting = 0
-
-    @property
-    def waiting(self) -> int:
-        """How many callers are queued for a session somebody else is using."""
-        with self._state:
-            return self._waiting
-
-    @property
-    def busy(self) -> bool:
-        """Whether a *different* thread is inside this session right now.
-
-        Reentrancy is why the owner is compared rather than the depth: a tool
-        that takes its own session's lock twice is one caller, not two.
-        """
-        with self._state:
-            return self._owner is not None and self._owner != threading.get_ident()
-
-    @property
-    def concurrent_callers(self) -> int:
-        """Callers inside or queued, counting from the point of view of others.
-
-        Zero when this thread is the only one that has anything to do with the
-        session, which is the ordinary case and the one that must stay silent.
-        """
-        with self._state:
-            mine = threading.get_ident()
-            inside = 1 if self._owner is not None and self._owner != mine else 0
-            return inside + self._waiting
-
-    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
-        mine = threading.get_ident()
-        counted = False
-        with self._state:
-            # Only a wait that is actually about to happen counts: a free lock,
-            # or one this very thread already holds, is not contention.
-            if blocking and self._owner is not None and self._owner != mine:
-                self._waiting += 1
-                counted = True
-        try:
-            acquired = self._lock.acquire(blocking, timeout)
-        finally:
-            if counted:
-                with self._state:
-                    self._waiting -= 1
-        if acquired:
-            with self._state:
-                self._owner = mine
-                self._depth += 1
-        return acquired
-
-    def release(self) -> None:
-        with self._state:
-            # Released inside the bookkeeping section, and before it, on purpose.
-            # Before, because a release by a thread that does not hold the lock
-            # raises and must leave the counters alone rather than corrupt them.
-            # Inside, because otherwise the thread this hands off to could record
-            # itself as owner and then be overwritten by our own tidying.
-            self._lock.release()
-            self._depth -= 1
-            if self._depth <= 0:
-                self._depth = 0
-                self._owner = None
-
-    def __enter__(self) -> "SessionLock":
-        self.acquire()
-        return self
-
-    def __exit__(self, *_exception: Any) -> None:
-        self.release()
-
-
-@dataclass
-class BrowserSession:
-    driver: Any
-    headless: bool
-    profile_mode: str = "temporary"
-    profile_id: str | None = None
-    debugger_address: str | None = None
-    current_tab_id: int | None = None
-    tab_group: str | None = None
-    # Which run of the user's Chrome the tab id above belongs to. Tab ids restart
-    # with the browser, so without this a session that outlived a Chrome restart
-    # would keep driving whatever tab inherited its number.
-    browser_run: str | None = None
-    owns_browser: bool = True
-    held_keys: dict[str, str] = field(default_factory=dict)
-    held_buttons: set[str] = field(default_factory=set)
-    # Touch id -> the page-space point it is holding, so one finger can be lifted
-    # without lifting the others and so a forgotten finger can still be found.
-    held_touches: dict[int, dict[str, Any]] = field(default_factory=dict)
-    # Where this session last put the mouse, in page pixels. Chrome measures
-    # movementX/movementY against exactly this point, and a session that has
-    # dispatched nothing starts where Chrome's own pointer starts, at (0, 0).
-    pointer_x: float = 0.0
-    pointer_y: float = 0.0
-    render_mode: str = "normal"
-    key_repeat: bool = True
-    render_target_fps: float | None = None
-    render_frame_selector: str | None = None
-    render_deterministic: bool = False
-    render_bootstrap_registered: bool = False
-    render_options: dict[str, Any] = field(
-        default_factory=lambda: {
-            "frame_delta_ms": 1000 / 60,
-            "freeze_time": True,
-            "gate_timers": True,
-        }
-    )
-    owns_tab: bool = False
-    pointer_locked: bool = False
-    touch_enabled: bool = False
-    fresh_keys: set[str] = field(default_factory=set)
-    console: ConsoleCursor = field(default_factory=ConsoleCursor)
-    browser_log: list[dict[str, Any]] = field(default_factory=list)
-    # game_probe reads the same two sources as the console topic, but reports
-    # what is new to *it*, so it carries its own place in both of them.
-    probe_console: ConsoleCursor = field(default_factory=ConsoleCursor)
-    probe_console_seen: list[dict[str, Any]] = field(default_factory=list)
-    network_pending: dict[str, dict[str, Any]] = field(default_factory=dict)
-    network_rows: list[dict[str, Any]] = field(default_factory=list)
-    # Capture runs from the moment the tab opens, so a long session outlives its
-    # own buffer. Both backends bound what they keep; this counts what the
-    # Selenium one threw away, as the extension counts evictions for the other.
-    network_dropped: int = 0
-    # Identifiers of scripts registered with Page.addScriptToEvaluateOnNewDocument
-    # for this session, so inject_script can list them and remove them by id -
-    # the id is the only handle CDP's removal takes, and the only one a caller gets.
-    injected_scripts: list[str] = field(default_factory=list)
-    # The extra HTTP headers Chrome adds to every request, echoed back so a caller
-    # can see what is in force, and the injected-script id that enables stealth,
-    # kept so it can be turned off without the caller tracking it.
-    extra_headers: dict[str, str] = field(default_factory=dict)
-    stealth_identifier: str | None = None
-    # Per-session fingerprint overrides (isolated/temporary/persistent only).
-    # One real Chrome profile means one fingerprint, so multi-account work gets
-    # one isolated session per account instead of two sessions on one profile.
-    user_agent_override: str | None = None
-    timezone_override: str | None = None
-    locale_override: str | None = None
-    geolocation_override: dict[str, Any] | None = None
-    lock: SessionLock = field(default_factory=SessionLock)
-    last_used: float = field(default_factory=time.monotonic)
-    # Who opened this session, in the opener's own words. Nothing in an MCP call
-    # carries caller identity, so this is the only way one agent's tab can be
-    # told from another's - and it is why `close_all` can now leave other
-    # agents' work alone. Optional on purpose: a caller that says nothing is
-    # anonymous, not refused.
-    agent_label: str | None = None
-    # The tab-strip label this session applied ("[ag-mail] "), or None when the
-    # tab is unlabelled. Read topics strip exactly this prefix back off, so what
-    # a human sees in the tab strip never leaks into titles macros compare.
-    tab_label_prefix: str | None = None
-    # The Page.addScriptToEvaluateOnNewDocument id that keeps the label alive
-    # across navigations, kept apart from injected_scripts: that list is the
-    # caller's own inject_script bookkeeping, this one is the session's.
-    tab_label_script_id: str | None = None
-    # The activity badge (a green dot on the tab's favicon while an agent is
-    # driving it), same bookkeeping shape as the label: script id plus the last
-    # server-side ping, so pings stay throttled to one a minute per session.
-    tab_activity_script_id: str | None = None
-    activity_pinged_at: float = 0.0
-    # Wall-clock, unlike `last_used`, because these two are reported to a reader
-    # and a monotonic number means nothing to one.
-    created_at: float = field(default_factory=time.time)
-    last_used_at: float = field(default_factory=time.time)
-    # The last page this session was seen on, recorded whenever a call summarises
-    # it. The status topic reports every session at once, and asking another
-    # agent's tab for its URL would mean waiting on that agent's lock - so what
-    # is reported is the last thing seen, labelled as such.
-    last_url: str | None = None
-    last_title: str | None = None
+from web_search_neo.sessions.models import ConsoleCursor, SessionLock, BrowserSession
 
 
 _sessions: dict[str, BrowserSession] = {}
@@ -403,160 +186,10 @@ def _validate_session_id(session_id: str) -> str:
 #
 # 18,000 is chosen to sit just under the ~20k the text topics already default to
 # and well inside a 32k window with room for the conversation around it.
-DEFAULT_RESPONSE_CHAR_BUDGET = 18_000
-MIN_RESPONSE_CHAR_BUDGET = 2_000
-MAX_RESPONSE_CHAR_BUDGET = 200_000
-
-
-def _response_char_budget(max_chars: object) -> int:
-    """Clamp a requested character budget; anything unreadable falls back to the default."""
-    try:
-        wanted = int(max_chars)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return DEFAULT_RESPONSE_CHAR_BUDGET
-    return max(MIN_RESPONSE_CHAR_BUDGET, min(wanted, MAX_RESPONSE_CHAR_BUDGET))
-
-
-def _measure(value: Any) -> int:
-    """Size a payload the way the transport will: as JSON, non-ASCII unescaped."""
-    try:
-        return len(json.dumps(value, ensure_ascii=False, default=str))
-    except (TypeError, ValueError):
-        return len(str(value))
-
-
-def _fit_lists_to_budget(
-    payload: dict[str, Any],
-    list_keys: tuple[str, ...],
-    budget: int,
-    finalize: Any = None,
-) -> dict[str, Any]:
-    """Trim the entry lists of a result until the whole answer fits ``budget``.
-
-    Prefixes only. Every one of these topics pages with ``offset``, so keeping
-    the first N of each list leaves ``next_offset`` meaning exactly what it
-    meant; dropping from the middle would make the paging a lie.
-
-    Entries are taken round-robin across the lists rather than filling the first
-    one to the brim, because a page whose buttons matter is not helped by a
-    budget spent entirely on its links.
-
-    ``finalize`` is called with the trimmed payload whenever it changes. It is
-    for the bookkeeping that depends on what survived - ``returned``, ``range``,
-    ``next_offset`` - which grows the answer slightly as it fills in, and would
-    otherwise push a payload that just fitted a few characters over the line it
-    was trimmed to.
-
-    Returns the report of what happened; the payload is trimmed in place.
-    """
-    lists = {key: list(payload.get(key) or []) for key in list_keys if key in payload}
-    total_entries = sum(len(items) for items in lists.values())
-    full_size = _measure(payload)
-    if full_size <= budget or not total_entries:
-        return {
-            "chars_returned": full_size,
-            "char_budget": budget,
-            "budget_truncated": False,
-        }
-    # Everything that is not an entry list has to be paid for first: the counts,
-    # the ranges and the page summary go out whatever happens, because they are
-    # what tells the caller there is more to fetch.
-    skeleton = {key: value for key, value in payload.items() if key not in lists}
-    for key in lists:
-        skeleton[key] = []
-    remaining = budget - _measure(skeleton)
-    costs = {key: [_measure(entry) + 1 for entry in items] for key, items in lists.items()}
-    taken = {key: 0 for key in lists}
-    index = 0
-    progressing = True
-    while progressing and remaining > 0:
-        progressing = False
-        for key in lists:
-            position = taken[key]
-            if position >= len(lists[key]):
-                continue
-            cost = costs[key][position]
-            if cost > remaining:
-                continue
-            remaining -= cost
-            taken[key] += 1
-            progressing = True
-        index += 1
-        if index > 100_000:  # Defensive: no page has this many controls.
-            break
-    def _publish() -> int:
-        for key, items in lists.items():
-            payload[key] = items[: taken[key]]
-        if finalize is not None:
-            finalize(payload)
-        return _measure(payload)
-
-    size = _publish()
-    # Give back what the bookkeeping took. One entry at a time from the longest
-    # list, so the balance the round-robin built is kept; bounded because each
-    # pass removes an entry and there are finitely many.
-    while size > budget and sum(taken.values()) > 0:
-        longest = max(taken, key=lambda key: taken[key])
-        taken[longest] -= 1
-        size = _publish()
-    kept = sum(taken.values())
-    return {
-        "chars_returned": _measure(payload),
-        "char_budget": budget,
-        "chars_before_budget": full_size,
-        "budget_truncated": True,
-        "entries_returned": kept,
-        "entries_before_budget": total_entries,
-        "budget_note": (
-            f"The full answer was {full_size} characters; {kept} of {total_entries} "
-            f"entries were kept to stay inside max_chars={budget}. Read the rest with "
-            "offset (see range[*].next_offset), narrow the request with the include_* "
-            "flags, or raise max_chars if your context can take it."
-        ),
-    }
-
-
-def _fit_text_to_budget(payload: dict[str, Any], text_key: str, budget: int) -> dict[str, Any]:
-    """Clip one long text field so the whole answer fits ``budget``.
-
-    Used where the bulk is a rendered blob rather than a list - the outline's
-    text form - and the caller's lever is ``limit`` rather than ``offset``, which
-    is what the note says instead of pointing at a page that does not exist.
-    """
-    full_size = _measure(payload)
-    text = payload.get(text_key)
-    if full_size <= budget or not isinstance(text, str) or not text:
-        return {"chars_returned": full_size, "char_budget": budget, "budget_truncated": False}
-    overhead = _measure({**payload, text_key: ""})
-    room = max(0, budget - overhead)
-    def _on_a_line_boundary(value: str) -> str:
-        """Half a node is worse than one node fewer."""
-        newline = value.rfind("\n")
-        return value[:newline] if newline > len(value) // 2 else value
-
-    clipped = _on_a_line_boundary(text[:room])
-    payload[text_key] = clipped
-    # A character of text is not a character of JSON - a newline is two, a quote
-    # is two, and an outline is mostly newlines - so the first cut is an estimate
-    # and this loop is what makes the promise true. It converges quickly because
-    # each pass removes the whole measured excess.
-    for _ in range(8):
-        overshoot = _measure(payload) - budget
-        if overshoot <= 0 or not clipped:
-            break
-        clipped = _on_a_line_boundary(clipped[: max(0, len(clipped) - overshoot)])
-        payload[text_key] = clipped
-    return {
-        "chars_returned": _measure(payload),
-        "char_budget": budget,
-        "chars_before_budget": full_size,
-        "budget_truncated": True,
-        "budget_note": (
-            f"The full answer was {full_size} characters and was clipped to stay inside "
-            f"max_chars={budget}. Ask for fewer nodes with limit, scope the read with "
-            "frame_selector, or raise max_chars if your context can take it."
-        ),
-    }
+from web_search_neo.perception.budget import (
+    DEFAULT_RESPONSE_CHAR_BUDGET, MIN_RESPONSE_CHAR_BUDGET, MAX_RESPONSE_CHAR_BUDGET,
+    _response_char_budget, _measure, _fit_lists_to_budget, _fit_text_to_budget,
+)
 
 
 _AGENT_LABEL_LIMIT = 64
@@ -1401,71 +1034,7 @@ def _set_viewport(driver: Any, width: int, height: int) -> None:
     )
 
 
-def _apply_context_overrides(
-    driver: Any,
-    profile_mode: str,
-    user_agent: str | None = None,
-    timezone: str | None = None,
-    locale: str | None = None,
-    geolocation: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Apply per-session fingerprint overrides; refuse where they cannot apply.
-
-    One real Chrome profile means one fingerprint: overrides are honoured for
-    owned Selenium browsers (temporary/isolated/persistent) and refused with an
-    actionable error for ``current``/``attach``, instead of pretending to apply.
-    """
-    applied: dict[str, Any] = {}
-    wanted = {
-        "user_agent": user_agent,
-        "timezone": timezone,
-        "locale": locale,
-        "geolocation": geolocation,
-    }
-    if profile_mode in {"current", "attach"} and any(
-        value not in (None, "") for value in wanted.values()
-    ):
-        raise ValueError(
-            f" Fingerprint overrides need an owned browser: profile_mode='{profile_mode}'"
-            " shares one real Chrome profile (one fingerprint). Open with"
-            " profile_mode='isolated' (one account = one isolated session) to use"
-            " user_agent/timezone/locale/geolocation."
-        )
-    send = getattr(driver, "execute_cdp_cmd", None)
-    if send is None:
-        if any(value not in (None, "") for value in wanted.values()):
-            raise ValueError("This backend has no CDP channel for fingerprint overrides")
-        return applied
-    if user_agent:
-        driver.execute_cdp_cmd(
-            "Network.setUserAgentOverride", {"userAgent": str(user_agent)}
-        )
-        applied["user_agent"] = str(user_agent)
-    if timezone:
-        driver.execute_cdp_cmd(
-            "Emulation.setTimezoneOverride", {"timezoneId": str(timezone)}
-        )
-        applied["timezone"] = str(timezone)
-    if locale:
-        driver.execute_cdp_cmd(
-            "Emulation.setLocaleOverride", {"locale": str(locale)}
-        )
-        applied["locale"] = str(locale)
-    if geolocation:
-        try:
-            lat = float(geolocation.get("latitude"))
-            lng = float(geolocation.get("longitude"))
-        except (TypeError, ValueError, AttributeError) as exc:
-            raise ValueError(
-                "geolocation needs {latitude: float, longitude: float, accuracy?: float}"
-            ) from exc
-        accuracy = float(geolocation.get("accuracy", 1.0))
-        driver.execute_cdp_cmd(
-            "Emulation.setGeolocationOverride",
-            {"latitude": lat, "longitude": lng, "accuracy": accuracy},
-        )
-        applied["geolocation"] = {"latitude": lat, "longitude": lng, "accuracy": accuracy}
-    return applied
+from web_search_neo.sessions.context import apply_overrides as _apply_context_overrides, resize_viewport
 
 
 def apply_context_overrides(
@@ -1481,17 +1050,10 @@ def apply_context_overrides(
     session = _get_session(session_id)
     with session.lock:
         driver = session.driver
-        if width is not None or height is not None:
-            if session.profile_mode in {"current", "attach"}:
-                raise ValueError(
-                    "Viewport overrides need an owned browser; profile_mode="
-                    f"'{session.profile_mode}' shares the user's window."
-                )
-            current_width = int(width) if width is not None else 1440
-            current_height = int(height) if height is not None else 900
-            _set_viewport(driver, current_width, current_height)
+        resize_viewport(driver, session.profile_mode, width, height, set_viewport=_set_viewport)
         applied = _apply_context_overrides(
-            driver, session.profile_mode, user_agent, timezone, locale, geolocation
+            driver, session.profile_mode, user_agent, timezone,
+            locale or (session.locale_override if user_agent else None), geolocation
         )
         if user_agent:
             session.user_agent_override = str(user_agent)
@@ -2104,8 +1666,9 @@ def open_page(
     topics keep reporting the page's own title.
 
     ``profile_mode="isolated"`` opens an owned disposable browser (like
-    temporary, but explicit): one account = one isolated session, each with
-    its own fingerprint. ``user_agent``/``timezone``/``locale``/``geolocation``
+    temporary, but explicit): one account = one isolated session with separate
+    cookies and storage. This does not create a unique hardware/network fingerprint.
+    ``user_agent``/``timezone``/``locale``/``geolocation``
     are per-session overrides for owned browsers only; on ``current``/``attach``
     they are refused instead of silently ignored.
     """
@@ -2144,7 +1707,7 @@ def open_page(
                 session.profile_mode,
                 user_agent,
                 timezone,
-                locale,
+                locale or (session.locale_override if user_agent else None),
                 geolocation,
             )
             if user_agent:
@@ -2264,12 +1827,18 @@ def _companion_status() -> dict[str, Any]:
     expected = expected_extension_version()
     running = str((status.get("browser") or {}).get("extension_version") or "")
     allowlist = _expected_cdp_methods()
+    live_methods = (status.get("browser") or {}).get("allowed_cdp_methods")
+    live_known = isinstance(live_methods, list) and all(isinstance(x, str) for x in live_methods)
+    missing_methods = sorted(set(allowlist["methods"]) - set(live_methods)) if live_known else None
     status.update(
         extension_id=CHROME_EXTENSION_ID,
         extension_directory=str(EXTENSION_DIR),
         expected_version=expected,
         running_version=running or None,
-        outdated=bool(running and expected and running != expected),
+        outdated=bool((running and expected and running != expected) or missing_methods),
+        live_allowed_cdp_methods=sorted(set(live_methods)) if live_known else None,
+        missing_cdp_methods=missing_methods,
+        cdp_capabilities_verified=live_known,
         allowed_cdp_methods_size=allowlist["size"],
         allowed_cdp_methods_hash=allowlist["hash"],
         allowed_cdp_methods=list(allowlist["methods"]),
@@ -2470,11 +2039,7 @@ def reload_page(
                     current = session.last_url
                 if not current:
                     raise
-                try:
-                    driver.get(current)
-                except Exception:
-                    # Bridge drivers navigate via tabs; plain drivers via get().
-                    session.driver.get(current)
+                driver.get(current)
                 fallback = True
                 expected = expected_extension_version()
                 companion_note = (
@@ -2748,419 +2313,25 @@ def _apply_tab_label(
 # icon, so a tab whose agent went quiet stops glowing on its own with no
 # server round-trip. Everything is wrapped defensively: a page that freezes
 # its DOM APIs keeps working unbadged rather than breaking the action.
-_TAB_ACTIVITY_IDLE_SECONDS = 300.0
-_TAB_ACTIVITY_PING_INTERVAL = 60.0
-_TAB_ACTIVITY_SOURCE = r"""
-(() => {
-  const KEY = "__wsnActivity";
-  const IDLE_MS = 5 * 60 * 1000;
-  if (window[KEY] && window[KEY].ping) {
-    try { window[KEY].ping(); } catch (error) {}
-    return;
-  }
-  const state = {links: [], timer: 0};
-  window[KEY] = state;
-  const robotIcon = () => "data:image/svg+xml," + encodeURIComponent(
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
-    + '<circle cx="32" cy="32" r="30" fill="#22c55e"/>'
-    + '<circle cx="22" cy="26" r="5" fill="#fff"/><circle cx="42" cy="26" r="5" fill="#fff"/>'
-    + '<rect x="20" y="40" width="24" height="5" rx="2.5" fill="#fff"/></svg>');
-  const snapshot = () => {
-    try {
-      state.links = Array.from(
-        document.querySelectorAll('link[rel~="icon"]')).map(el => el.href || "");
-    } catch (error) { state.links = []; }
-  };
-  const applyIcon = href => {
-    try {
-      const head = document.head || document.documentElement;
-      if (!head) return;
-      let link = document.querySelector('link[data-wsn-activity="1"]');
-      if (!link) {
-        link = document.createElement("link");
-        link.setAttribute("rel", "icon");
-        link.setAttribute("data-wsn-activity", "1");
-        head.appendChild(link);
-      }
-      link.href = href;
-    } catch (error) {}
-  };
-  const restore = () => {
-    try {
-      const badge = document.querySelector('link[data-wsn-activity="1"]');
-      if (badge && badge.parentNode) badge.parentNode.removeChild(badge);
-    } catch (error) {}
-    state.links = [];
-  };
-  const setBadge = () => {
-    try {
-      snapshot();
-      const first = state.links.length ? state.links[0] : "";
-      if (!first) { applyIcon(robotIcon()); return; }
-      const img = new Image();
-      img.onload = () => {
-        try {
-          const canvas = document.createElement("canvas");
-          canvas.width = 64; canvas.height = 64;
-          const ctx = canvas.getContext("2d");
-          if (!ctx) { applyIcon(robotIcon()); return; }
-          ctx.drawImage(img, 0, 0, 64, 64);
-          ctx.fillStyle = "#22c55e";
-          ctx.beginPath(); ctx.arc(50, 50, 15, 0, 7); ctx.fill();
-          ctx.fillStyle = "#ffffff";
-          ctx.font = "bold 22px sans-serif";
-          ctx.textAlign = "center"; ctx.textBaseline = "middle";
-          ctx.fillText("\u25CF", 50, 51);
-          applyIcon(canvas.toDataURL());
-        } catch (error) { applyIcon(robotIcon()); }
-      };
-      img.onerror = () => applyIcon(robotIcon());
-      img.src = first;
-    } catch (error) {}
-  };
-  state.ping = () => {
-    try {
-      if (state.timer) clearTimeout(state.timer);
-      const run = () => { setBadge(); };
-      if (document.readyState === "loading" && !document.head) {
-        document.addEventListener("DOMContentLoaded", run, {once: true});
-      } else {
-        run();
-      }
-      state.timer = setTimeout(restore, IDLE_MS);
-    } catch (error) {}
-  };
-  state.stop = () => {
-    try { if (state.timer) clearTimeout(state.timer); } catch (error) {}
-    state.timer = 0;
-    restore();
-    try { delete window[KEY]; } catch (error) {}
-  };
-  state.ping();
-})();
-"""
-_TAB_ACTIVITY_PING_SCRIPT = (
-    "(() => { const a = window.__wsnActivity;"
-    " if (a && a.ping) a.ping(); return true; })()"
-)
-_TAB_ACTIVITY_STOP_SCRIPT = (
-    "(() => { const a = window.__wsnActivity;"
-    " if (a && a.stop) a.stop(); return true; })()"
+from web_search_neo.sessions.activity import (
+    _TAB_ACTIVITY_IDLE_SECONDS, _TAB_ACTIVITY_PING_INTERVAL, _TAB_ACTIVITY_SOURCE,
+    _TAB_ACTIVITY_PING_SCRIPT, _TAB_ACTIVITY_STOP_SCRIPT,
+    _apply_tab_activity as _apply_tab_activity_impl, _remove_tab_activity, _ping_tab_activity,
 )
 
 
 def _tab_activity_enabled() -> bool:
-    """Whether activity badges may touch a tab at all.
-
-    Shares the tab-strip kill switch: an operator who disabled tab labelling
-    does not want the server drawing on tabs either.
-    """
     return _tab_labelling_enabled()
 
 
-def _apply_tab_activity(
-    session: BrowserSession, session_id: str, *, label_tab: bool = True
-) -> None:
-    """Badge one session's tab with the agent-activity dot, when it can show.
-
-    Headless tabs have no visible favicon, and ``label_tab=False`` means the
-    caller asked visuals to be left alone - both skip silently. Otherwise the
-    badge script is registered for future documents and run in the live one,
-    exactly like the tab-strip label. Caller holds the session lock.
-    """
-    if session.headless or not label_tab or not _tab_activity_enabled():
-        return
-    if session.tab_activity_script_id:
-        return
-    try:
-        result = session.driver.execute_cdp_cmd(
-            "Page.addScriptToEvaluateOnNewDocument", {"source": _TAB_ACTIVITY_SOURCE}
-        )
-    except Exception as exc:
-        logger.warning(
-            "Tab activity badge for session '%s' was skipped: %s: %s",
-            session_id,
-            type(exc).__name__,
-            exc,
-        )
-        return
-    session.tab_activity_script_id = str((result or {}).get("identifier") or "")
-    session.activity_pinged_at = time.monotonic()
-    try:
-        session.driver.execute_script(_TAB_ACTIVITY_SOURCE)
-    except Exception:
-        pass
-
-
-def _remove_tab_activity(session: BrowserSession) -> None:
-    """Stop badging one session's tab and restore its favicon.
-
-    Best-effort throughout, like the label removal: teardown paths call this
-    when the driver may already be half gone, and a badge left behind restores
-    itself after five quiet minutes anyway. Caller holds the session lock.
-    """
-    driver = session.driver
-    if not session.tab_activity_script_id:
-        return
-    try:
-        driver.execute_script(_TAB_ACTIVITY_STOP_SCRIPT)
-    except Exception:
-        pass
-    try:
-        driver.execute_cdp_cmd(
-            "Page.removeScriptToEvaluateOnNewDocument",
-            {"identifier": session.tab_activity_script_id},
-        )
-    except Exception:
-        pass
-    session.tab_activity_script_id = None
-
-
-def _ping_tab_activity(session: BrowserSession) -> None:
-    """Re-arm one session's badge when the server last pinged over a minute ago.
-
-    Called from the page summary every action already takes, so pings ride the
-    round-trips that exist rather than adding their own. The five-minute expiry
-    lives page-side: a session that stops acting stops glowing with no call.
-    Never raises; a page that refuses the ping simply keeps its last state.
-    """
-    if not session.tab_activity_script_id:
-        return
-    now = time.monotonic()
-    if now - session.activity_pinged_at < _TAB_ACTIVITY_PING_INTERVAL:
-        return
-    session.activity_pinged_at = now
-    try:
-        session.driver.execute_script(_TAB_ACTIVITY_PING_SCRIPT)
-    except Exception:
-        pass
+def _apply_tab_activity(session: BrowserSession, session_id: str, *, label_tab: bool = True) -> None:
+    _apply_tab_activity_impl(session, session_id, label_tab=label_tab, enabled=_tab_activity_enabled())
 
 
 # Shares the perception helpers so a selector, a visibility verdict and the
 # aria-hidden rule mean the same thing here as in page_outline; the two topics
 # disagreeing about what is on the page is the failure this avoids.
-_INSPECT_SCRIPT = page_perception.JS_LIBRARY + r"""
-const limit = arguments[0];
-const offset = arguments[1];
-const includeLinks = arguments[2];
-const includeForms = arguments[3];
-const includeButtons = arguments[4];
-
-// A web component keeps its controls in a shadow root and an embedded form keeps
-// them in another document, and `document.querySelectorAll` sees neither. That
-// returned an empty page for an app that plainly has buttons on it, which is the
-// first call the built-in recipes make.
-// `depth` counts frames only, and stops where every other topic stops: a walk
-// that reached deeper than the outline reported controls the outline denied, and
-// one that stopped shallower hid controls the outline had already handed out.
-let framesTooDeep = 0;
-const WSN_ELEMENT_COLLECT_LIMIT = 20000;
-const collectorTruncated = {links: false, forms: false, fields: false, buttons: false, iframes: false};
-
-function collect(selectors) {
-  const found = [];
-  const seen = new Set();
-  let truncated = false;
-  const walk = (root, depth) => {
-    if (truncated) return;
-    let matched;
-    try {
-      matched = root.querySelectorAll(selectors);
-    } catch (error) {
-      matched = [];
-    }
-    for (const el of matched) {
-      if (seen.has(el)) continue;
-      if (found.length >= WSN_ELEMENT_COLLECT_LIMIT) {
-        truncated = true;
-        break;
-      }
-      seen.add(el);
-      found.push(el);
-    }
-    if (truncated) return;
-    let all;
-    try {
-      all = root.querySelectorAll('*');
-    } catch (error) {
-      return;
-    }
-    for (const el of all) {
-      const shadow = wsnShadowRoot(el);
-      if (shadow) walk(shadow, depth);
-      if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {
-        if (depth >= WSN_MAX_FRAME_DEPTH) {
-          framesTooDeep += 1;
-          continue;
-        }
-        let doc = null;
-        try {
-          doc = el.contentDocument;
-        } catch (error) {
-          doc = null;
-        }
-        if (doc) walk(doc, depth + 1);
-      }
-    }
-  };
-  walk(document, 0);
-  return {items: found, truncated: truncated};
-}
-
-function category(name, selectors) {
-  const result = collect(selectors);
-  collectorTruncated[name] = result.truncated;
-  return order(result.items);
-}
-
-function visibility(el) {
-  const reason = wsnHiddenReason(el);
-  return {visible: !reason, hidden_reason: reason};
-}
-
-// Something nothing can reach must not push a usable control past the limit.
-function order(elements) {
-  const visible = [];
-  const hidden = [];
-  for (const el of elements) (wsnHiddenReason(el) ? hidden : visible).push(el);
-  return visible.concat(hidden);
-}
-
-function labelFor(el) {
-  if (el.labels && el.labels.length) return (el.labels[0].innerText || '').trim();
-  let parent = null;
-  try {
-    parent = el.closest ? el.closest('label') : null;
-  } catch (error) {
-    parent = null;
-  }
-  return parent ? (parent.innerText || '').trim() : '';
-}
-function fieldInfo(el) {
-  const result = Object.assign({
-    selector: wsnSelector(el), tag: el.tagName.toLowerCase(),
-    type: (el.getAttribute('type') || '').toLowerCase(),
-    id: el.id || '', name: el.getAttribute('name') || '',
-    label: labelFor(el), placeholder: el.getAttribute('placeholder') || '',
-    required: !!el.required, disabled: !!el.disabled
-  }, visibility(el));
-  if (el.tagName.toLowerCase() === 'select') {
-    result.options = Array.from(el.options).map(o => ({value: o.value, text: o.text, selected: o.selected}));
-  }
-  return result;
-}
-const output = {links: [], forms: [], fields: [], buttons: [], iframes: []};
-const counts = {links: 0, forms: 0, fields: 0, buttons: 0, iframes: 0};
-const FIELD_SELECTOR = 'input, textarea, select, [contenteditable="true"]';
-if (includeLinks) {
-  const links = category('links', 'a[href]');
-  counts.links = links.length;
-  output.links = links.slice(offset, offset + limit).map(a => Object.assign({
-    selector: wsnSelector(a),
-    text: (a.innerText || a.getAttribute('aria-label') || '').trim(),
-    href: a.href
-  }, visibility(a)));
-}
-if (includeForms) {
-  const forms = category('forms', 'form');
-  counts.forms = forms.length;
-  output.forms = forms.slice(offset, offset + limit).map((form, index) => Object.assign({
-    index: offset + index, selector: wsnSelector(form), id: form.id || '',
-    name: form.getAttribute('name') || '',
-    action: form.action, method: (form.method || 'get').toLowerCase(), enctype: form.enctype,
-    fields: Array.from(form.querySelectorAll(FIELD_SELECTOR)).slice(0, limit).map(fieldInfo)
-  }, visibility(form)));
-  const fields = category('fields', FIELD_SELECTOR);
-  counts.fields = fields.length;
-  output.fields = fields.slice(offset, offset + limit).map(fieldInfo);
-}
-if (includeButtons) {
-  const buttons = category('buttons',
-    'button, input[type="button"], input[type="submit"], input[type="reset"], ' +
-    'input[type="image"], [role="button"]'
-  );
-  counts.buttons = buttons.length;
-  output.buttons = buttons.slice(offset, offset + limit).map(button => Object.assign({
-    selector: wsnSelector(button), tag: button.tagName.toLowerCase(),
-    type: (button.getAttribute('type') || '').toLowerCase(), id: button.id || '',
-    name: button.getAttribute('name') || '',
-    text: (button.innerText || button.value || button.getAttribute('aria-label') || '').trim(),
-    disabled: !!button.disabled
-  }, visibility(button)));
-}
-const frames = category('iframes', 'iframe, frame');
-counts.iframes = frames.length;
-output.iframes = frames.slice(offset, offset + limit).map(frame => Object.assign({
-  selector: wsnSelector(frame), id: frame.id || '', name: frame.name || '',
-  src: frame.src || '', title: frame.title || '',
-  same_origin: (() => {
-    try {
-      return !!frame.contentDocument;
-    } catch (error) {
-      return false;
-    }
-  })()
-}, visibility(frame)));
-output.found = counts;
-output.returned = {};
-output.range = {};
-for (const key of Object.keys(counts)) {
-  const returned = (output[key] || []).length;
-  const start = Math.min(offset, counts[key]);
-  const end = start + returned;
-  output.returned[key] = returned;
-  output.range[key] = {
-    start: start,
-    end: end,
-    next_offset: end < counts[key] ? end : null,
-    has_more: end < counts[key]
-  };
-}
-output.offset = offset;
-output.limit = limit;
-output.collector_limit = WSN_ELEMENT_COLLECT_LIMIT;
-output.collector_truncated = collectorTruncated;
-output.truncated = Object.keys(counts).some(key => counts[key] > (output[key] || []).length);
-output.frames_too_deep = framesTooDeep;
-return output;
-"""
-
-
-_ELEMENT_LIST_KEYS = ("links", "forms", "fields", "buttons", "iframes")
-
-
-def _restate_element_ranges(payload: dict[str, Any]) -> None:
-    """Re-derive ``returned``/``range`` from what is actually in the payload.
-
-    Called only after the character budget shortened a list, so that ``has_more``
-    and ``next_offset`` describe the answer that was sent rather than the one
-    that was collected.
-    """
-    counts = payload.get("found")
-    if not isinstance(counts, dict):
-        return
-    offset = int(payload.get("offset") or 0)
-    returned: dict[str, int] = {}
-    ranges: dict[str, Any] = {}
-    for key, total in counts.items():
-        rows = payload.get(key)
-        kept = len(rows) if isinstance(rows, list) else 0
-        try:
-            available = int(total)
-        except (TypeError, ValueError):
-            available = kept
-        start = min(offset, available)
-        end = start + kept
-        returned[key] = kept
-        ranges[key] = {
-            "start": start,
-            "end": end,
-            "next_offset": end if end < available else None,
-            "has_more": end < available,
-        }
-    payload["returned"] = returned
-    payload["range"] = ranges
-    payload["truncated"] = any(value["has_more"] for value in ranges.values())
+from web_search_neo.perception.elements import _INSPECT_SCRIPT, _ELEMENT_LIST_KEYS, _restate_element_ranges
 
 
 def get_page_elements(
@@ -3217,64 +2388,23 @@ def get_page_elements(
         return {**payload, **report}
 
 
-def wait_for_condition(
-    script: str,
-    session_id: str = "default",
-    timeout_seconds: float = 10.0,
-    poll_ms: int = 150,
-    frame_selector: str | None = None,
-) -> dict[str, Any]:
-    """Poll one JS expression server-side until it is truthy or the timeout hits.
+from web_search_neo.actions.waits import js_truthy as _js_truthy
 
-    This is the atomic wait for SPA hydration and framework state that
-    ``wait`` on a selector cannot express: instead of N round-trips of
-    ``run_script`` polling from the client, the server polls inside the
-    session lock and returns ``{success, value, waited_seconds}`` once.
-    ``script`` is wrapped as ``return (<script>)``; a truthy value ends the
-    wait and is returned as ``value`` (clipped like any script result).
-    """
-    if not str(script or "").strip():
-        raise ValueError("script must not be empty")
-    timeout = max(0.1, float(timeout_seconds))
-    poll = max(0.05, min(float(poll_ms) / 1000.0, 2.0))
+
+def wait_for_condition(
+    script: str, session_id: str = "default", timeout_seconds: float = 10.0,
+    poll_ms: int = 150, frame_selector: str | None = None,
+) -> dict[str, Any]:
+    from web_search_neo.actions.waits import wait_for_condition as poll_condition
     session = _get_session(session_id)
-    started = time.monotonic()
-    deadline = started + timeout
-    last_value: Any = None
-    last_error: str | None = None
     with session.lock:
-        _enter_action_frame(session.driver, frame_selector, script)
-        try:
-            while True:
-                try:
-                    last_value = session.driver.execute_script(f"return ({script});")
-                    last_error = None
-                    if last_value:
-                        break
-                except Exception as exc:
-                    last_error = _brief_error(exc)
-                now = time.monotonic()
-                if now >= deadline:
-                    break
-                time.sleep(min(poll, deadline - now))
-            waited = round(time.monotonic() - started, 2)
-            if last_value:
-                return {
-                    **_page_summary(session.driver, session_id),
-                    "success": True,
-                    "script": script,
-                    "value": _clip_result(last_value),
-                    "waited_seconds": waited,
-                    "timeout_seconds": timeout,
-                    "frame_selector": frame_selector,
-                }
-            raise TimeoutException(
-                f"Condition was still falsy after {timeout:g}s"
-                + (f" (last error: {last_error})" if last_error else "")
-                + f" (waited {waited:g}s)"
-            )
-        finally:
-            _release_action_frame(session.driver, frame_selector, script)
+        return poll_condition(
+            session.driver, script, timeout_seconds=timeout_seconds, poll_ms=poll_ms,
+            frame_selector=frame_selector, enter_frame=_enter_action_frame,
+            release_frame=_release_action_frame,
+            page_summary=lambda: _page_summary(session.driver, session_id),
+            describe_error=_brief_error,
+        )
 
 
 def wait_for_element(
@@ -4332,134 +3462,30 @@ def _click_trusted(
     )
 
 
-_MAX_SCRIPT_RESULT_CHARS = 200_000
-
-
-def _clip_result(value: Any) -> Any:
-    """Cut undisplayable size out of a script result, marking what was lost."""
-    if isinstance(value, str) and len(value) > _MAX_SCRIPT_RESULT_CHARS:
-        return {
-            "clipped": True,
-            "length": len(value),
-            "head": value[:_MAX_SCRIPT_RESULT_CHARS],
-        }
-    return value
-
-
-_RETRYABLE_SCRIPT_ERRORS = (
-    "uncaught",
-    "cannot find context",
-    "no such context",
-    "detached",
-    "target crashed",
-    "session closed",
-    "disconnected",
-    "execution context was destroyed",
-    "cannot access before initialization",
+from web_search_neo.actions.scripts import (
+    MAX_SCRIPT_RESULT_CHARS as _MAX_SCRIPT_RESULT_CHARS,
+    RETRYABLE_SCRIPT_ERRORS as _RETRYABLE_SCRIPT_ERRORS,
+    clip_result as _clip_result, error_is_retryable as _script_error_is_retryable,
+    execute as _execute_script,
 )
 
 
-def _script_error_is_retryable(exc: Exception) -> bool:
-    text = f"{type(exc).__name__}: {exc}".lower()
-    return any(marker in text for marker in _RETRYABLE_SCRIPT_ERRORS)
-
-
 def execute_js(
-    script: str,
-    args: list[Any] | None = None,
-    session_id: str = "default",
-    await_promise: bool = False,
-    user_gesture: bool = False,
-    retry_on_uncaught: bool = True,
-    retries: int = 2,
-    retry_delay_ms: int = 300,
-    wait_ready: bool = False,
+    script: str, args: list[Any] | None = None, session_id: str = "default",
+    await_promise: bool = False, user_gesture: bool = False,
+    retry_on_uncaught: bool = False, retries: int = 2,
+    retry_delay_ms: int = 300, wait_ready: bool = False,
 ) -> dict[str, Any]:
-    """Run a JavaScript snippet in a session's page and report what it returns.
-
-    ``script`` runs in the top document of the session's current tab; ``args``
-    arrive as ``arguments[0..n]``. A JSON-serialisable value comes back as
-    itself, and a returned promise is awaited. Strings longer than 200k
-    characters are clipped in the report.
-
-    This is the escape hatch for page state the DOM reads do not expose -
-    localStorage, virtualised lists, framework state - and for mutations that
-    have no input-shaped equivalent. With the Chrome bridge driver the result
-    of ``await_promise`` is honoured because bridge evaluation awaits promises
-    anyway; a plain Selenium driver cannot await one, so that mode is refused
-    there rather than silently returning an unserialisable promise.
-
-    ``user_gesture`` runs the script as though a person had just clicked, which
-    is the only way to reach the APIs Chrome gates behind one - clipboard writes,
-    fullscreen, autoplay with sound. It goes through CDP directly, so ``args``
-    are inlined as ``arguments`` rather than passed by the WebDriver protocol.
-
-    A script racing a fresh navigation used to fail sporadically with an opaque
-    ``WebDriverException: Uncaught``: it ran in a detaching document while the
-    new one was still loading. ``retry_on_uncaught`` (default on) retries those
-    transient evaluation failures ``retries`` times with ``retry_delay_ms``
-    between attempts, and reports ``attempts`` so a caller can see the retry
-    happened. ``wait_ready`` additionally settles document readiness before the
-    first attempt (off by default: it costs a round-trip on the hot path).
-    """
+    """Run page JavaScript once; retry only when explicitly safe for this script."""
     session = _get_session(session_id)
     with session.lock:
-        driver = session.driver
-        attempts = 0
-        last_exc: Exception | None = None
-        max_attempts = 1 + max(0, int(retries)) if retry_on_uncaught else 1
-        for attempt in range(1, max_attempts + 1):
-            attempts = attempt
-            try:
-                if wait_ready and attempt == 1:
-                    try:
-                        if driver.execute_script("return document.readyState") not in (
-                            None,
-                            "complete",
-                            "interactive",
-                        ):
-                            _wait_until_ready(driver, 2.0)
-                    except Exception:
-                        pass
-                if await_promise and not hasattr(driver, "execute_cdp_cmd"):
-                    raise ValueError(
-                        "await_promise needs the Chrome bridge driver; with a plain "
-                        "Selenium driver, return the promise object and read it in a "
-                        "later call instead"
-                    )
-                if user_gesture:
-                    value = _evaluate_with_gesture(driver, script, args, await_promise)
-                else:
-                    value = driver.execute_script(script, *(args or []))
-            except ValueError:
-                raise
-            except Exception as exc:
-                last_exc = exc
-                if (
-                    retry_on_uncaught
-                    and attempt < max_attempts
-                    and _script_error_is_retryable(exc)
-                ):
-                    time.sleep(max(0.0, float(retry_delay_ms)) / 1000.0)
-                    continue
-                return {
-                    **_page_summary(driver, session_id),
-                    "success": False,
-                    "error": _brief_error(exc),
-                    "attempts": attempts,
-                }
-            return {
-                **_page_summary(driver, session_id),
-                "success": True,
-                "value": _clip_result(value),
-                "attempts": attempts,
-            }
-        return {
-            **_page_summary(driver, session_id),
-            "success": False,
-            "error": _brief_error(last_exc) if last_exc else "WebDriverException: Uncaught",
-            "attempts": attempts,
-        }
+        return _execute_script(
+            session.driver, script, args, await_promise=await_promise,
+            user_gesture=user_gesture, retry_on_uncaught=retry_on_uncaught,
+            retries=retries, retry_delay_ms=retry_delay_ms, wait_ready=wait_ready,
+            page_summary=lambda: _page_summary(session.driver, session_id),
+            wait_until_ready=_wait_until_ready, describe_error=_brief_error,
+        )
 
 
 _CLICK_TEXT_SCRIPT = page_perception.JS_LIBRARY + r"""
@@ -5729,52 +4755,9 @@ def get_network_body(
         }
 
 
-def _evaluate_with_gesture(
-    driver: Any,
-    script: str,
-    args: list[Any] | None,
-    await_promise: bool,
-) -> Any:
-    """Evaluate a script under a synthetic user gesture, returning its value.
-
-    ``Runtime.evaluate`` takes an expression, not a function body, so the script
-    is wrapped in a function that is *applied* to the arguments rather than one
-    that declares them: ``arguments`` is reserved inside a function body and
-    cannot be assigned, and applying keeps the ``arguments[0..n]`` contract the
-    WebDriver path already publishes. A page-side throw is raised here so the
-    caller's existing error handling reports it the same way either route fails.
-    """
-    expression = (
-        f"(function() {{\n{script}\n}}).apply(null, {json.dumps(args or [])})"
-    )
-    result = driver.execute_cdp_cmd(
-        "Runtime.evaluate",
-        {
-            "expression": expression,
-            "returnByValue": True,
-            "awaitPromise": bool(await_promise),
-            "userGesture": True,
-        },
-    )
-    details = result.get("exceptionDetails")
-    if details:
-        raise RuntimeError(_exception_text(details))
-    return (result.get("result") or {}).get("value")
-
-
-def _exception_text(details: dict[str, Any]) -> str:
-    """The most specific message a CDP exceptionDetails carries, line kept if present.
-
-    The nested ``exception.description`` holds the real stack-bearing message when
-    Chrome sends one; ``text`` is the flat fallback. Either way a line number, when
-    given, is worth keeping - it is the only pointer back into the injected source.
-    """
-    exception = details.get("exception") or {}
-    message = exception.get("description") or details.get("text") or "evaluation failed"
-    line = details.get("lineNumber")
-    if line is not None:
-        return f"{message} (line {line})"
-    return str(message)
+from web_search_neo.actions.scripts import (
+    evaluate_with_gesture as _evaluate_with_gesture, exception_text as _exception_text,
+)
 
 
 def inject_script(
@@ -6232,288 +5215,43 @@ def replay_request(
 # Page.addScriptToEvaluateOnNewDocument (future documents) and applied live to
 # the current one. Both paths share the Python registry below as the source of
 # truth for listing.
-_REQUEST_MOCKS: dict[str, list[dict[str, Any]]] = {}
-_MOCK_STUB_SCRIPT_IDS: dict[str, str] = {}
-_MOCK_BODY_LIMIT = 1_000_000
-
-_MOCK_STUB_SOURCE = r"""
-(() => {
-  if (window.__wsnMockState) return;
-  const state = window.__wsnMockState = {mocks: []};
-  const matchPattern = (url, pattern) => {
-    const escaped = String(pattern).split('*').map(part =>
-      part.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*');
-    try { return new RegExp('^' + escaped + '$').test(String(url)); }
-    catch (error) { return false; }
-  };
-  const findMock = url => state.mocks.find(entry => matchPattern(url, entry.pattern));
-  const stubResponse = entry => new Response(String(entry.body ?? ''), {
-    status: Number(entry.status) || 200,
-    headers: entry.headers || {},
-  });
-  window.__wsnMockSet = mocks => { state.mocks = Array.isArray(mocks) ? mocks : []; };
-  if (window.fetch) {
-    const origFetch = window.fetch.bind(window);
-    window.fetch = (input, init) => {
-      let url = '';
-      try { url = String(input && input.url !== undefined ? input.url : input); }
-      catch (error) { return origFetch(input, init); }
-      const entry = findMock(url);
-      if (!entry) return origFetch(input, init);
-      return Promise.resolve(stubResponse(entry));
-    };
-  }
-  const OrigXHR = window.XMLHttpRequest;
-  function MockXHR() {
-    const xhr = new OrigXHR();
-    let mockUrl = '';
-    const origOpen = xhr.open;
-    xhr.open = function (method, url) {
-      mockUrl = String(url || '');
-      return origOpen.apply(this, arguments);
-    };
-    const origSend = xhr.send;
-    xhr.send = function () {
-      const entry = findMock(mockUrl);
-      if (!entry) return origSend.apply(this, arguments);
-      const self = this;
-      const fire = () => {
-        Object.defineProperty(self, 'status', {value: Number(entry.status) || 200, configurable: true});
-        Object.defineProperty(self, 'responseText', {value: String(entry.body ?? ''), configurable: true});
-        Object.defineProperty(self, 'response', {value: String(entry.body ?? ''), configurable: true});
-        Object.defineProperty(self, 'readyState', {value: 4, configurable: true});
-        if (typeof self.onreadystatechange === 'function') self.onreadystatechange();
-        if (typeof self.onload === 'function') self.onload();
-      };
-      setTimeout(fire, 0);
-    };
-    return xhr;
-  }
-  MockXHR.prototype = OrigXHR.prototype;
-  window.XMLHttpRequest = MockXHR;
-})();
-"""
-
-
-def _validate_mock(
-    url_pattern: str,
-    status: int,
-    headers: dict[str, str] | None,
-    body: str,
-) -> dict[str, Any]:
-    pattern = str(url_pattern or "").strip()
-    if not pattern:
-        raise ValueError("mock needs a url_pattern (CDP wildcard, '*' matches anything)")
-    try:
-        code = int(status)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"mock status must be an integer 200-599, not '{status}'") from exc
-    if not 200 <= code <= 599:
-        raise ValueError(f"mock status must be an integer 200-599, not '{status}'")
-    clean_headers = {str(k): str(v) for k, v in (headers or {}).items()}
-    text = "" if body is None else str(body)
-    if len(text.encode("utf-8")) > _MOCK_BODY_LIMIT:
-        raise ValueError(f"mock body exceeds the {_MOCK_BODY_LIMIT}-byte limit")
-    return {"pattern": pattern, "status": code, "headers": clean_headers, "body": text}
-
-
-def _mock_push_inpage(driver: Any, session_id: str, mocks: list[dict[str, Any]]) -> None:
-    """Install (or refresh) the in-page fetch/XHR stub on a Selenium backend."""
-    if session_id not in _MOCK_STUB_SCRIPT_IDS:
-        result = driver.execute_cdp_cmd(
-            "Page.addScriptToEvaluateOnNewDocument", {"source": _MOCK_STUB_SOURCE}
-        )
-        script_id = str((result or {}).get("identifier") or "")
-        if script_id:
-            _MOCK_STUB_SCRIPT_IDS[session_id] = script_id
-    driver.execute_script(_MOCK_STUB_SOURCE)
-    driver.execute_script("window.__wsnMockSet(arguments[0]);", list(mocks))
+from web_search_neo.cdp import request_mocks
+from web_search_neo.cdp.request_mocks import (
+    _REQUEST_MOCKS, _MOCK_STUB_SCRIPT_IDS, _MOCK_BODY_LIMIT,
+    _MOCK_STUB_SOURCE, _validate_mock,
+)
 
 
 def mock_add_request(
-    url_pattern: str,
-    session_id: str = "default",
-    status: int = 200,
-    headers: dict[str, str] | None = None,
-    body: str = "",
+    url_pattern: str, session_id: str = "default", status: int = 200,
+    headers: dict[str, str] | None = None, body: str = "",
 ) -> dict[str, Any]:
-    """Stub a third-party endpoint's response directly in the page.
-
-    ``url_pattern`` is a CDP-style wildcard (``*`` matches anything), matched
-    against the full request URL; the first matching stub wins. The page's
-    fetch/XHR keeps working untouched for everything else. Listing shows what
-    is live; clearing restores the real endpoint.
-    """
-    entry = _validate_mock(url_pattern, status, headers, body or "")
     session = _get_session(session_id)
     with session.lock:
-        driver = session.driver
-        registry = _REQUEST_MOCKS.setdefault(session_id, [])
-        registry = [item for item in registry if item["pattern"] != entry["pattern"]]
-        registry.append(entry)
-        _REQUEST_MOCKS[session_id] = registry
-        if getattr(driver, "is_extension_bridge", False):
-            try:
-                answer = driver.bridge.request(
-                    "mock.add",
-                    {
-                        "tabId": driver.tab_id,
-                        "pattern": entry["pattern"],
-                        "status": entry["status"],
-                        "headers": entry["headers"],
-                        "body": entry["body"],
-                    },
-                    timeout=15.0,
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    f"mock_add needs companion {expected_extension_version()} or newer "
-                    f"(request stubbing over the Fetch domain): {type(exc).__name__}: {exc}"
-                ) from exc
-            return {
-                **_page_summary(driver, session_id),
-                "success": True,
-                "mocked": True,
-                "pattern": entry["pattern"],
-                "status": entry["status"],
-                "mocks": int((answer or {}).get("mocks", len(registry))),
-            }
-        _mock_push_inpage(driver, session_id, registry)
-        return {
-            **_page_summary(driver, session_id),
-            "success": True,
-            "mocked": True,
-            "pattern": entry["pattern"],
-            "status": entry["status"],
-            "mocks": len(registry),
-        }
+        result = request_mocks.add(session.driver, session_id, url_pattern, status, headers, body)
+        return {**_page_summary(session.driver, session_id), "success": True, **result}
 
 
 def mock_list_requests(session_id: str = "default") -> dict[str, Any]:
-    """List the live response stubs for one session."""
     session = _get_session(session_id)
     with session.lock:
-        driver = session.driver
-        if getattr(driver, "is_extension_bridge", False):
-            try:
-                answer = driver.bridge.request(
-                    "mock.list", {"tabId": driver.tab_id}, timeout=15.0
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    f"mock_list needs companion {expected_extension_version()} or newer: "
-                    f"{type(exc).__name__}: {exc}"
-                ) from exc
-            live = (answer or {}).get("mocks") or []
-            return {
-                **_page_summary(driver, session_id),
-                "success": True,
-                "mocks": live,
-                "count": len(live),
-            }
-        registry = list(_REQUEST_MOCKS.get(session_id, []))
-        return {
-            **_page_summary(driver, session_id),
-            "success": True,
-            "mocks": [
-                {
-                    "pattern": item["pattern"],
-                    "status": item["status"],
-                    "headers": item["headers"],
-                    "body_chars": len(item["body"]),
-                }
-                for item in registry
-            ],
-            "count": len(registry),
-        }
+        result = request_mocks.list_requests(session.driver, session_id)
+        return {**_page_summary(session.driver, session_id), "success": True, **result}
 
 
-def mock_clear_requests(
-    session_id: str = "default",
-    url_pattern: str | None = None,
-) -> dict[str, Any]:
-    """Drop one (or every) response stub; the real endpoint answers again."""
+def mock_clear_requests(session_id: str = "default", url_pattern: str | None = None) -> dict[str, Any]:
     session = _get_session(session_id)
     with session.lock:
-        driver = session.driver
-        if getattr(driver, "is_extension_bridge", False):
-            try:
-                answer = driver.bridge.request(
-                    "mock.clear",
-                    {"tabId": driver.tab_id, **({"pattern": url_pattern} if url_pattern else {})},
-                    timeout=15.0,
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    f"mock_clear needs companion {expected_extension_version()} or newer: "
-                    f"{type(exc).__name__}: {exc}"
-                ) from exc
-            _REQUEST_MOCKS.pop(session_id, None)
-            return {
-                **_page_summary(driver, session_id),
-                "success": True,
-                "cleared": int((answer or {}).get("cleared", 0)),
-                "mocks": int((answer or {}).get("mocks", 0)),
-            }
-        registry = _REQUEST_MOCKS.get(session_id, [])
-        if url_pattern:
-            kept = [item for item in registry if item["pattern"] != str(url_pattern)]
-            cleared = len(registry) - len(kept)
-        else:
-            kept, cleared = [], len(registry)
-        _REQUEST_MOCKS[session_id] = kept
-        try:
-            if kept:
-                driver.execute_script("window.__wsnMockSet(arguments[0]);", list(kept))
-            else:
-                try:
-                    driver.execute_script(
-                        "if (window.__wsnMockSet) window.__wsnMockSet([]);"
-                    )
-                except Exception:
-                    pass
-                script_id = _MOCK_STUB_SCRIPT_IDS.pop(session_id, None)
-                if script_id:
-                    try:
-                        driver.execute_cdp_cmd(
-                            "Page.removeScriptToEvaluateOnNewDocument",
-                            {"identifier": script_id},
-                        )
-                    except Exception:
-                        pass
-        except Exception as exc:
-            return {
-                **_page_summary(driver, session_id),
-                "success": False,
-                "error": _brief_error(exc),
-                "cleared": cleared,
-            }
-        return {
-            **_page_summary(driver, session_id),
-            "success": True,
-            "cleared": cleared,
-            "mocks": len(kept),
-        }
+        result = request_mocks.clear(session.driver, session_id, url_pattern)
+        return {**_page_summary(session.driver, session_id), "success": True, **result}
 
 
 def _clear_mock_state(session: BrowserSession, session_id: str | None) -> None:
-    """Best-effort stub teardown for a tab that outlives its session."""
     if session_id is not None:
-        _REQUEST_MOCKS.pop(session_id, None)
-        _MOCK_STUB_SCRIPT_IDS.pop(session_id, None)
-    driver = session.driver
-    try:
-        if getattr(driver, "is_extension_bridge", False):
-            driver.bridge.request("mock.clear", {"tabId": driver.tab_id}, timeout=5.0)
-        else:
-            try:
-                driver.execute_script(
-                    "if (window.__wsnMockSet) window.__wsnMockSet([]);"
-                )
-            except Exception:
-                pass
-    except Exception:
-        pass
+        try:
+            request_mocks.teardown(session.driver, session_id)
+        except Exception:
+            logger.debug("Mock teardown failed for %s", session_id, exc_info=True)
 
 
 def _session_modifiers(session: BrowserSession) -> int:
@@ -7870,505 +6608,7 @@ def game_probe(
         }
 
 
-_RENDER_BOOTSTRAP_SCRIPT = r"""
-(() => {
-const stateKey = '__webSearchNeoRenderControl';
-if (window[stateKey]) return;
-
-// Capture every timing primitive before anything is replaced, so the gate can
-// restore real timing and can schedule its own work without gating itself.
-const nativeRequest = window.requestAnimationFrame.bind(window);
-const nativeCancel = window.cancelAnimationFrame.bind(window);
-const nativeSetTimeout = window.setTimeout.bind(window);
-const nativeClearTimeout = window.clearTimeout.bind(window);
-const nativeSetInterval = window.setInterval.bind(window);
-const nativeClearInterval = window.clearInterval.bind(window);
-const nativeIdle = window.requestIdleCallback ? window.requestIdleCallback.bind(window) : null;
-const nativeCancelIdle = window.cancelIdleCallback ? window.cancelIdleCallback.bind(window) : null;
-const nativePerformanceNow = performance.now.bind(performance);
-const nativeDateNow = Date.now.bind(Date);
-const epochOffset = nativeDateNow() - nativePerformanceNow();
-
-// Yielding between frames must not be a timer. A tab nobody is looking at - and
-// agent tabs open in the background so the user can keep working - clamps
-// setTimeout to about a second, and to a minute once intensive throttling kicks
-// in, so stepping sixty frames through nativeSetTimeout took 53 seconds where a
-// visible tab took 241 ms. A MessageChannel message is still a macrotask, so page
-// work, network callbacks and microtasks run between frames exactly as before,
-// but nothing throttles it.
-const yieldChannel = typeof MessageChannel === 'function' ? new MessageChannel() : null;
-const yieldQueue = [];
-if (yieldChannel) {
-  yieldChannel.port1.onmessage = () => {
-    const task = yieldQueue.shift();
-    if (task) task();
-  };
-}
-const yieldTask = task => {
-  if (!yieldChannel) { nativeSetTimeout(task, 0); return; }
-  yieldQueue.push(task);
-  yieldChannel.port2.postMessage(0);
-};
-
-const state = {
-    mode: 'normal',
-    targetFps: null,
-    interval: 1000 / 60,
-    frameDelta: 1000 / 60,
-    freezeTime: true,
-    gateTimers: true,
-    clockInstalled: false,
-    clockPatched: false,
-    timersInstalled: false,
-    // How far ahead of the native clock the page-visible one has been carried by
-    // stepping. It never shrinks, because a clock that goes backwards is worse
-    // than one that is wrong: see restoreClock.
-    skew: 0,
-    // The last frame timestamp the page was given, which no later one may
-    // undercut: see state.stamp.
-    lastStamp: 0,
-    virtualNow: nativePerformanceNow(),
-    lastFrame: nativePerformanceNow(),
-    lastRealFlush: nativePerformanceNow(),
-    frameCount: 0,
-    nextId: -1,
-    nextTimerId: -1,
-    pending: new Map(),
-    native: new Map(),
-    nativeIds: new Map(),
-    timers: new Map(),
-    liveTimers: new Map(),
-    timer: null,
-    // How deep inside a chain of timer callbacks the gate currently is, which is
-    // what decides whether the next setTimeout gets the spec's nesting clamp.
-    timerDepth: 0,
-    nativeRequest: nativeRequest,
-    nativeCancel: nativeCancel
-};
-
-// The page-visible clock. While the gate is engaged it only moves when a frame
-// is released, so a game sees a constant delta no matter how long the agent
-// spent thinking between calls. Off the gate it is the native clock plus the
-// skew stepping has earned, so the two never disagree about which way time runs.
-state.now = () => (
-    state.gated() && state.freezeTime
-      ? state.virtualNow
-      : nativePerformanceNow() + state.skew
-);
-state.gated = () => state.mode !== 'normal';
-
-// Sixty frames of 100ms cost the wall clock a fraction of that, so the frozen
-// clock ends up seconds ahead of the native one. Handing the raw native clock
-// back would drop the page's time by exactly that much: performance.now() falls,
-// the next frame's delta is negative, physics integrates backwards, tweens snap
-// and any timestamp the page stored now sits in the future. Carrying the
-// difference forward as a fixed offset keeps the page's own clock monotonic
-// across every mode change, at the price of it running ahead of wall time -
-// which is what the page was told all along.
-state.carryClock = previousNow => {
-    state.skew = Math.max(state.skew, previousNow - nativePerformanceNow());
-};
-
-// Every frame timestamp the page is given passes through here, and none of them
-// may undercut the last one. Measuring the skew is not enough on its own: a
-// browser dates a frame from when it *began*, so the first native frame after a
-// mode change can carry a stamp from before the moment the skew was read - up to
-// a frame period earlier - and hand the page a small negative delta, which a
-// game reads no differently from a large one. The shortfall is exactly what the
-// skew was missing, so it is added there rather than papered over per frame:
-// the whole page-visible clock moves up with the stamp instead of trailing it.
-state.stamp = value => {
-    if (value < state.lastStamp) {
-      state.skew += state.lastStamp - value;
-      // now() is the same clock as these stamps, so it has to be the moved one.
-      state.patchClock();
-      return state.lastStamp;
-    }
-    state.lastStamp = value;
-    return value;
-};
-
-state.patchClock = () => {
-    if (state.clockPatched) return;
-    performance.now = () => state.now();
-    Date.now = () => Math.round(epochOffset + state.now());
-    state.clockPatched = true;
-};
-state.installClock = () => {
-    state.clockInstalled = true;
-    state.patchClock();
-};
-state.restoreClock = () => {
-    state.clockInstalled = false;
-    // Only a page that never gained a skew gets its untouched native clock back;
-    // with one, the wrapper stays in place to keep applying it.
-    if (state.skew) {
-        state.patchClock();
-        return;
-    }
-    if (!state.clockPatched) return;
-    performance.now = nativePerformanceNow;
-    Date.now = nativeDateNow;
-    state.clockPatched = false;
-};
-
-// Timer wrappers are installed once, at bootstrap, and stay pass-through while
-// the gate is off. Installing them only when step mode starts would leave every
-// timer a real game registered during load running on the wall clock, which is
-// exactly the case that matters.
-state.wrapTimer = (callback, delay, args, interval) => {
-    if (typeof callback !== 'function') return null;
-    const id = state.nextTimerId--;
-    const depth = state.timerDepth + 1;
-    // HTML clamps a timeout scheduled from inside a timer to 4ms once the chain
-    // is five deep, and that clamp is all that stands between a `setTimeout(loop,
-    // 0)` game loop and an unbounded run of ticks inside a single frame, every
-    // one of them reading the same instant off the frozen clock.
-    const floor = interval === null ? (depth > 5 ? 4 : 0) : 1;
-    const wait = Math.max(floor, Number(delay) || 0);
-    if (state.gated() && state.gateTimers) {
-      state.timers.set(id, {
-        callback: callback, args: args, interval: interval,
-        due: state.now() + wait, depth: depth
-      });
-      // A queued timer is work that only a released frame can run, so it has to
-      // be able to start the pump on its own; in step mode this does nothing and
-      // the agent stays the only source of frames.
-      state.schedule();
-      return id;
-    }
-    const fire = interval === null
-      ? (...inner) => { state.liveTimers.delete(id); callback(...inner); }
-      : callback;
-    const nativeId = interval === null
-      ? nativeSetTimeout(fire, wait, ...args)
-      : nativeSetInterval(fire, wait, ...args);
-    state.liveTimers.set(id, {
-      nativeId: nativeId, callback: callback, args: args,
-      interval: interval, realDue: nativePerformanceNow() + wait
-    });
-    return id;
-};
-
-state.dropTimer = id => {
-    if (state.timers.delete(id)) return true;
-    const live = state.liveTimers.get(id);
-    if (!live) return false;
-    if (live.interval === null) nativeClearTimeout(live.nativeId);
-    else nativeClearInterval(live.nativeId);
-    state.liveTimers.delete(id);
-    return true;
-};
-
-state.installTimers = () => {
-    if (state.timersInstalled) return;
-    window.setTimeout = (callback, delay, ...args) =>
-      state.wrapTimer(callback, delay, args, null) ?? nativeSetTimeout(callback, delay, ...args);
-    window.clearTimeout = id => { if (!state.dropTimer(id)) nativeClearTimeout(id); };
-    window.setInterval = (callback, delay, ...args) =>
-      state.wrapTimer(callback, delay, args, Math.max(1, Number(delay) || 0))
-        ?? nativeSetInterval(callback, delay, ...args);
-    window.clearInterval = id => { if (!state.dropTimer(id)) nativeClearInterval(id); };
-    if (nativeIdle) {
-      window.requestIdleCallback = (callback, options) => {
-        if (typeof callback !== 'function') return nativeIdle(callback, options);
-        return state.wrapTimer(
-          () => callback({didTimeout: false, timeRemaining: () => 8}), 0, [], null
-        );
-      };
-      window.cancelIdleCallback = id => { if (!state.dropTimer(id)) nativeCancelIdle(id); };
-    }
-    state.timersInstalled = true;
-};
-
-// Pull timers the real scheduler is already holding into the virtual queue, so
-// that gating catches everything the page set up before the gate existed.
-state.captureTimers = () => {
-    const now = state.now();
-    const real = nativePerformanceNow();
-    for (const [id, entry] of state.liveTimers) {
-      if (entry.interval === null) nativeClearTimeout(entry.nativeId);
-      else nativeClearInterval(entry.nativeId);
-      const remaining = entry.interval === null
-        ? Math.max(0, entry.realDue - real)
-        : entry.interval;
-      state.timers.set(id, {
-        callback: entry.callback, args: entry.args,
-        interval: entry.interval, due: now + remaining
-      });
-    }
-    state.liveTimers.clear();
-};
-
-// Rebase virtual deadlines onto another clock. Turning freeze_time off swaps the
-// clock underneath the queue, and a deadline read against the wrong one is
-// already in the past, so the whole queue would detonate on the next frame.
-state.rebaseTimers = (fromNow, toNow) => {
-    for (const entry of state.timers.values()) {
-      entry.due = toNow + Math.max(0, entry.due - fromNow);
-    }
-};
-
-// Give the queue back to the real scheduler, keeping ids valid for clearTimeout.
-// `referenceNow` is the clock the deadlines were written against; the caller has
-// to pass it whenever the mode is about to change.
-state.releaseTimers = referenceNow => {
-    const queued = Array.from(state.timers.entries());
-    state.timers.clear();
-    const real = nativePerformanceNow();
-    const now = referenceNow === undefined ? state.now() : referenceNow;
-    for (const [id, entry] of queued) {
-      const fire = entry.interval === null
-        ? (...inner) => { state.liveTimers.delete(id); entry.callback(...inner); }
-        : entry.callback;
-      const wait = entry.interval === null ? Math.max(0, entry.due - now) : entry.interval;
-      const nativeId = entry.interval === null
-        ? nativeSetTimeout(fire, wait, ...entry.args)
-        : nativeSetInterval(fire, wait, ...entry.args);
-      state.liveTimers.set(id, {
-        nativeId: nativeId, callback: entry.callback, args: entry.args,
-        interval: entry.interval, realDue: real + wait
-      });
-    }
-};
-// A released frame covers `frameDelta` of virtual time, and every timer whose
-// deadline falls inside that span really did come due inside it. So they run in
-// deadline order with the page-visible clock parked at each one's own deadline,
-// and an interval keeps its phase instead of being pushed to the end of the
-// frame - rescheduling from `now` stretched every period out to a whole frame,
-// which made a 5ms interval tick once per frame instead of three times, and made
-// a 16ms one indistinguishable from a 100ms one under a 100ms frame delta.
-state.runDueTimers = (now, spanStart) => {
-    if (!state.gateTimers || !state.timers.size) return 0;
-    const steer = state.gated() && state.freezeTime;
-    let cursor = spanStart === undefined ? now : Math.min(spanStart, now);
-    let count = 0;
-    while (count < 512) {
-      let dueId = null;
-      let due = null;
-      for (const [id, entry] of state.timers) {
-        if (entry.due <= now && (due === null || entry.due < due.due)) {
-          dueId = id;
-          due = entry;
-        }
-      }
-      if (due === null) break;
-      cursor = Math.max(cursor, Math.min(now, due.due));
-      if (steer) state.virtualNow = cursor;
-      if (due.interval) due.due += due.interval;
-      else state.timers.delete(dueId);
-      const outerDepth = state.timerDepth;
-      state.timerDepth = due.depth || 1;
-      try { due.callback(...due.args); }
-      catch (error) { nativeSetTimeout(() => { throw error; }, 0); }
-      finally { state.timerDepth = outerDepth; }
-      count += 1;
-    }
-    if (count >= 512) {
-      // The page wants more timer work than one frame can hold. Carrying the
-      // backlog forward would make every later frame slower still, so the
-      // stragglers give up their missed ticks the way a real browser does.
-      for (const entry of state.timers.values()) {
-        if (entry.interval && entry.due <= now) entry.due = now + entry.interval;
-      }
-    }
-    if (steer) state.virtualNow = now;
-    return count;
-};
-
-state.flush = () => {
-    const previous = state.lastFrame;
-    if (state.gated() && state.freezeTime) state.virtualNow += state.frameDelta;
-    else state.virtualNow = nativePerformanceNow() + state.skew;
-    const timestamp = state.stamp(state.now());
-    state.lastFrame = timestamp;
-    state.frameCount += 1;
-    state.runDueTimers(timestamp, previous);
-    const batch = Array.from(state.pending.entries());
-    state.pending.clear();
-    for (const [, callback] of batch) {
-      try { callback(timestamp); } catch (error) { nativeSetTimeout(() => { throw error; }, 0); }
-    }
-    state.schedule();
-    return batch.length;
-};
-
-// Keep the throttled pump running for as long as anything is waiting on a
-// frame - a queued frame callback or a gated timer. Waiting only on frame
-// callbacks deadlocks a page whose loop boots from a timer: that timer runs on
-// the frame it was itself going to ask for. With nothing queued no timer is
-// armed at all, so an idle page costs nothing and the pump restarts from
-// `request` and `wrapTimer` the moment work appears.
-state.pumpWanted = () =>
-    state.pending.size > 0 || (state.gateTimers && state.timers.size > 0);
-
-state.schedule = () => {
-    if (state.mode !== 'throttled' || state.timer !== null || !state.pumpWanted()) return;
-    const elapsed = nativePerformanceNow() - state.lastRealFlush;
-    const delay = Math.max(0, state.interval - elapsed);
-    const pump = () => {
-      state.timer = null;
-      if (state.mode !== 'throttled') return;
-      state.lastRealFlush = nativePerformanceNow();
-      state.flush();
-    };
-    // A pump that is already late is not waiting for anything, so it yields
-    // rather than arming a timer a hidden tab would clamp to a second. Zero is
-    // not a timer id any browser hands out, so it marks the pending yield
-    // without confusing the clearTimeout in setMode.
-    if (delay > 0) {
-      state.timer = nativeSetTimeout(pump, delay);
-    } else {
-      state.timer = 0;
-      yieldTask(pump);
-    }
-};
-
-// While the gate is off the callback goes to the real scheduler, but it is also
-// remembered: a callback already queued there when the gate engages would fire
-// on the next compositor frame - one the agent never asked for, landing in the
-// middle of an unrelated call - so setMode has to be able to reclaim it.
-state.request = callback => {
-    if (state.mode === 'normal') {
-      const id = state.nativeRequest(timestamp => {
-        state.native.delete(id);
-        state.nativeIds.delete(id);
-        // A frame timestamp is the same clock performance.now() reads, and a
-        // game measures its delta from the last one it was given - which may
-        // well be a stepped one. Handing over the raw native stamp after a
-        // skew has been earned is the backwards jump all over again.
-        callback(state.stamp(timestamp + state.skew));
-      });
-      state.native.set(id, callback);
-      return id;
-    }
-    const id = state.nextId--;
-    state.pending.set(id, callback);
-    state.schedule();
-    return id;
-};
-
-// Hand a callback back to the real scheduler under the id the page already holds:
-// re-registering it under a fresh id would make the page's cancelAnimationFrame
-// silently miss, and the frame it thought it cancelled still runs.
-state.adopt = (id, callback) => {
-    const nativeId = state.nativeRequest(timestamp => {
-      state.native.delete(id);
-      state.nativeIds.delete(id);
-      // The stamp this callback was waiting for was going to come off the
-      // stepped clock; see state.request for why it still has to.
-      callback(state.stamp(timestamp + state.skew));
-    });
-    state.native.set(id, callback);
-    state.nativeIds.set(id, nativeId);
-};
-
-state.cancel = id => {
-    if (state.pending.delete(id)) return;
-    const adopted = state.nativeIds.get(id);
-    state.nativeIds.delete(id);
-    state.native.delete(id);
-    state.nativeCancel(adopted === undefined ? id : adopted);
-};
-
-// Release `count` frames, yielding to the real task queue between them so that
-// network callbacks and page microtasks can run like they would in a real frame.
-// The yield is a message rather than a timer because a hidden tab clamps timers:
-// see yieldTask.
-state.step = (count, done) => {
-    let remaining = count;
-    let callbacks = 0;
-    const run = () => {
-      callbacks += state.flush();
-      remaining -= 1;
-      if (remaining > 0) yieldTask(run);
-      else done({
-        success: true, frames: count, callbacks,
-        pending_callbacks: state.pending.size,
-        pending_timers: state.timers.size,
-        frame_count: state.frameCount,
-        virtual_now: Math.round(state.now())
-      });
-    };
-    run();
-};
-
-state.setMode = (mode, targetFps, options) => {
-    const settings = options || {};
-    if (state.timer !== null) nativeClearTimeout(state.timer);
-    state.timer = null;
-    // Everything queued so far carries a deadline written against the clock that
-    // is live right now. It has to be read before that clock is swapped.
-    const previousNow = state.now();
-    const nextFreeze = settings.freeze_time !== undefined
-      ? !!settings.freeze_time : state.freezeTime;
-    const nextGate = settings.gate_timers !== undefined
-      ? !!settings.gate_timers : state.gateTimers;
-    if (mode === 'normal' || !nextGate) state.releaseTimers(previousNow);
-    state.mode = mode;
-    state.targetFps = mode === 'throttled' ? targetFps : null;
-    state.interval = 1000 / targetFps;
-    if (settings.frame_delta_ms) state.frameDelta = settings.frame_delta_ms;
-    state.freezeTime = nextFreeze;
-    state.gateTimers = nextGate;
-    if (mode === 'normal') {
-      state.carryClock(previousNow);
-      state.restoreClock();
-      const callbacks = Array.from(state.pending.entries());
-      state.pending.clear();
-      for (const [id, callback] of callbacks) state.adopt(id, callback);
-    } else {
-      // Reclaim frames the real scheduler still owes, keeping their ids valid
-      // so a later cancelAnimationFrame still finds them.
-      for (const [id, callback] of state.native) {
-        const adopted = state.nativeIds.get(id);
-        state.nativeCancel(adopted === undefined ? id : adopted);
-        state.pending.set(id, callback);
-      }
-      state.native.clear();
-      state.nativeIds.clear();
-      // Carry on from where the page's clock already is. Reading the native one
-      // here threw away every skew an earlier round of stepping had earned, so
-      // re-entering step mode dropped the clock just as leaving it did.
-      state.virtualNow = previousNow;
-      if (state.freezeTime) state.installClock();
-      else { state.carryClock(previousNow); state.restoreClock(); }
-      if (state.gateTimers) {
-        state.rebaseTimers(previousNow, state.now());
-        state.captureTimers();
-      }
-      state.schedule();
-    }
-};
-
-window[stateKey] = state;
-window.requestAnimationFrame = state.request;
-window.cancelAnimationFrame = state.cancel;
-// Wrap timers immediately so the ones a game registers while loading can be
-// reclaimed later; while the gate is off they pass straight through.
-state.installTimers();
-})();
-"""
-
-
-_RENDER_CONTROL_SCRIPT = r"""
-const mode = arguments[0];
-const targetFps = arguments[1];
-const options = arguments[2];
-const state = window.__webSearchNeoRenderControl;
-if (!state) {
-  return {error: 'Render bootstrap is unavailable in this document'};
-}
-state.setMode(mode, targetFps, options);
-return {
-  mode: state.mode,
-  target_fps: state.targetFps,
-  pending_callbacks: state.pending.size,
-  frame_delta_ms: Math.round(state.frameDelta * 1000) / 1000,
-  time_frozen: state.clockInstalled,
-  timers_gated: state.gated() && state.gateTimers
-};
-"""
+from web_search_neo.actions.render_source import _RENDER_BOOTSTRAP_SCRIPT, _RENDER_CONTROL_SCRIPT
 
 
 def _register_render_bootstrap(session: BrowserSession) -> None:
