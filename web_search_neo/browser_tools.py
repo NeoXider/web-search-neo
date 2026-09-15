@@ -33,6 +33,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as conditions
 from selenium.webdriver.support.ui import Select, WebDriverWait
 
+from web_search_neo import agent_presence
 from web_search_neo.chrome_bridge import (
     CHROME_EXTENSION_ID,
     DEFAULT_TAB_GROUP,
@@ -1589,6 +1590,7 @@ def _leave_claimed_tab(
     # script registration lapses with the debugger detach.
     _remove_tab_label(session)
     _remove_tab_activity(session)
+    _remove_agent_presence(session)
     released = session.current_tab_id
     borrowed = session.driver
     driver = create_driver(
@@ -1725,6 +1727,7 @@ def open_page(
             # when the new document's own scripts run.
             _apply_tab_label(session, session_id, label_tab=label_tab)
             _apply_tab_activity(session, session_id, label_tab=label_tab)
+            _apply_agent_presence(session, session_id)
             session.driver.get(normalized)
             _wait_until_ready(session.driver, timeout_seconds)
             # A new document drops the gate. Re-arm it, because a caller that
@@ -1947,6 +1950,7 @@ def attach_current_tab(
             _register_render_bootstrap(session)
             _apply_tab_label(session, session_id, label_tab=label_tab)
             _apply_tab_activity(session, session_id, label_tab=label_tab)
+            _apply_agent_presence(session, session_id)
             return {
                 **_page_summary(session.driver, session_id),
                 "success": True,
@@ -2326,6 +2330,153 @@ def _tab_activity_enabled() -> bool:
 
 def _apply_tab_activity(session: BrowserSession, session_id: str, *, label_tab: bool = True) -> None:
     _apply_tab_activity_impl(session, session_id, label_tab=label_tab, enabled=_tab_activity_enabled())
+
+
+def _presence_applies(session: BrowserSession) -> bool:
+    """Whether this session's tab has a human who could see the signals.
+
+    Headless has no tab strip and no screen, so both signals would be pure
+    cost there. Everything with a window qualifies - the user's own Chrome
+    first of all, but a visible temporary profile has a tab strip too, and
+    that is exactly where an unattended agent is hardest to notice.
+
+    Step and render modes are excluded for a different reason: they freeze the
+    page's clock and gate its timers, which is exactly what the badge's fade
+    and the flash's removal are made of. A signal whose timers never fire would
+    not decorate a stepped page, it would litter it - and it would spend a
+    bridge round trip on every single frame.
+    """
+    return (
+        bool(agent_presence.enabled())
+        and not session.headless
+        and session.render_mode == "normal"
+    )
+
+
+def _remove_agent_presence(session: BrowserSession) -> None:
+    """Give the favicon back and drop the installed script. Best-effort.
+
+    Called from teardown paths where the driver may already be half gone; a
+    badge left on a tab that is closing is cosmetic and never worth an error.
+    Caller holds the session lock.
+    """
+    if session.presence_script_id:
+        try:
+            session.driver.execute_cdp_cmd(
+                "Page.removeScriptToEvaluateOnNewDocument",
+                {"identifier": session.presence_script_id},
+            )
+        except Exception:
+            pass
+        session.presence_script_id = None
+    try:
+        session.driver.execute_script(agent_presence.RESTORE_SCRIPT)
+    except Exception:
+        pass
+
+
+def _apply_agent_presence(session: BrowserSession, session_id: str) -> None:
+    """Arm the presence script for every document this session will open.
+
+    Registration alone marks nothing: the script installs the machinery and
+    waits, and it is ``note_agent_activity`` after each action that lights the
+    badge. Caller holds the session lock.
+    """
+    if not _presence_applies(session):
+        _remove_agent_presence(session)
+        return
+    if session.presence_script_id:
+        return
+    try:
+        result = session.driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": agent_presence.install_source()},
+        )
+    except Exception as exc:
+        # No CDP on this backend, or a bridge that refused: the per-action ping
+        # installs the script itself when it finds none, so the signals still
+        # work, they just do not survive a navigation for free.
+        logger.debug(
+            "Agent presence for session '%s' was not pre-registered: %s: %s",
+            session_id,
+            type(exc).__name__,
+            exc,
+        )
+        return
+    session.presence_script_id = str((result or {}).get("identifier") or "")
+
+
+# How long a drawing-nothing action stays silent after the last mark. Well under
+# the five minutes the badge lives, so no throttled step can let it lapse.
+_PRESENCE_QUIET_SECONDS = 1.0
+
+
+def _hide_presence_overlays(driver: Any) -> None:
+    """Take the action flashes off the page before it is photographed.
+
+    A flash lives 250 ms, and a screenshot taken inside that window would hand
+    an agent a picture of a box its own click drew - which it would then read as
+    something the page did. Cheap enough to run before every capture, and a
+    no-op in a page that has no overlay up.
+    """
+    try:
+        driver.execute_script(agent_presence.HIDE_FLASHES_SCRIPT)
+    except Exception:
+        pass
+
+
+def note_agent_activity(
+    session_id: str,
+    action: str,
+    arguments: dict[str, Any] | None = None,
+    ok: bool = True,
+) -> bool:
+    """Mark one finished action in the tab the human is looking at.
+
+    Two things happen in the page: the favicon gets its badge (bright while the
+    agent is working, dimmer for five minutes after its last action, gone after
+    that), and the element the action touched flashes for a quarter of a second.
+
+    This is decoration, and it is called on the action path, so it swallows
+    everything. A tab that closed, a session that expired, a page that navigated
+    mid-call, a driver that is gone: none of them may turn a successful action
+    into a failed one because its badge could not be painted. The return value
+    says whether the page was actually marked, for tests and for nothing else.
+    """
+    if not agent_presence.enabled():
+        return False
+    try:
+        session = _get_session(session_id)
+    except Exception:
+        return False
+    if not _presence_applies(session):
+        return False
+    payload = agent_presence.payload_for(
+        action,
+        arguments,
+        ok=ok,
+        label=session.agent_label or session_id,
+    )
+    now = time.monotonic()
+    if not payload["flash"] and now - session.last_presence_ping < _PRESENCE_QUIET_SECONDS:
+        # A step that draws nothing only refreshes the badge's five minutes, and
+        # the badge cannot tell one second from the next. A polling loop would
+        # otherwise pay a round trip per iteration for no visible difference.
+        return False
+    session.last_presence_ping = now
+    try:
+        with session.lock:
+            driver = session.driver
+            marked = driver.execute_script(agent_presence.ping_script(), payload)
+            if marked:
+                return True
+            # Nothing installed in this document - a navigation the registration
+            # did not cover, or a backend without CDP. Install it here and mark
+            # the page in the same call rather than skipping the signal.
+            driver.execute_script(agent_presence.install_source())
+            return bool(driver.execute_script(agent_presence.ping_script(), payload))
+    except Exception:
+        return False
 
 
 # Shares the perception helpers so a selector, a visibility verdict and the
@@ -7324,6 +7475,7 @@ def screenshot(
     with session.lock:
         driver = session.driver
         is_current = bool(getattr(driver, "is_extension_bridge", False))
+        _hide_presence_overlays(driver)
 
         if selected_mode == "viewport":
             if has_size:
@@ -7786,6 +7938,10 @@ def _clear_injected_state(session: BrowserSession, session_id: str | None = None
     teardown may not raise - and only a borrowed, surviving tab ever gets here.
     """
     driver = session.driver
+    # Before the CDP check, because this one also has a page-side half: a tab
+    # handed back still wearing the agent badge would tell the user someone is
+    # working in a tab that is theirs again.
+    _remove_agent_presence(session)
     if not hasattr(driver, "execute_cdp_cmd"):
         return
     if session.extra_headers:

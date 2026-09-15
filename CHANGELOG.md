@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.12.0
+
+Release focus: visible agent presence — a human watching the browser sees
+which tab is driven and what each step touched.
+
+- Show, in the browser itself, that an agent is working there. Every action now
+  marks the page it ran in: the tab's favicon carries a green badge while an
+  agent is acting and an amber one for five minutes after its last action, and
+  the element the action touched flashes for 250 ms — red when the action was
+  refused. New module ``web_search_neo/agent_presence.py`` holds the injected
+  script and its builders; ``browser_tools.note_agent_activity`` marks one
+  action and ``_apply_agent_presence`` arms the script for future documents.
+  - Hooked in ``main._execute_actions`` rather than in each handler: a signal
+    only as complete as the last handler someone instrumented would leave the
+    tab looking idle during whichever actions were forgotten.
+  - Everything injected carries ``aria-hidden="true"``, which every reading
+    topic already skips, so an overlay can never surface in ``page_text``,
+    ``page_outline`` or ``inspect``. No ``<style>`` element is created, so a
+    strict ``style-src`` CSP cannot leave the overlay unstyled over the page.
+  - Every screenshot clears the overlays first, so a capture taken inside the
+    250 ms flash cannot hand an agent a picture of a box its own click drew.
+  - Skipped entirely in step and render modes, which freeze the page clock the
+    fade and the removal are built on and call ``step`` once per frame, and
+    throttled to one mark a second for actions that draw nothing, so a polling
+    loop cannot spend a bridge round trip per iteration.
+  - Never costs a caller an action: the whole path swallows failures, and a
+    handed-back tab has its favicon restored in ``_clear_injected_state``.
+  - Off with ``WEB_SEARCH_NEO_AGENT_PRESENCE=0``; headless sessions never show
+    either signal.
+  - Tests in ``tests/test_agent_presence.py``.
+
 ## 1.11.1
 
 - Real Pointer Lock tests require `--run-desktop-input`; ordinary test runs must

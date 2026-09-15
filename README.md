@@ -709,6 +709,18 @@ page scripts and every read topic keep seeing the unlabelled title. Headless,
 persistent, and attach sessions are never labelled. Pass `label_tab=false`, or
 set `WEB_SEARCH_NEO_LABEL_TABS=0` in the server's environment, to turn it off.
 
+The label says whose tab it is; two further signals say whether anything is
+happening in it. Every action marks the page it ran in: the tab's favicon gets
+a green badge while an agent is working there, an amber one for five minutes
+after its last action, and its own icon back afterwards — so a glance at the
+tab strip separates the tab being driven right now from the one abandoned an
+hour ago. In the page itself, the element the action touched flashes for a
+quarter of a second, in red when the action was refused, which turns a burst of
+thirty clicks into thirty visible taps instead of a page that mutates on its
+own. Both are shown in every session with a window, headless excepted, and both
+are drawn `aria-hidden`, so nothing an agent reads back can see them. Set
+`WEB_SEARCH_NEO_AGENT_PRESENCE=0` to turn them off.
+
 Sessions are pinned to the browser run they were opened in. Tab ids restart with
 Chrome, so a session that outlived a restart would address whatever tab inherited
 its number — quite possibly one of the user's. Such a session is dropped, with an

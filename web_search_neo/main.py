@@ -2503,6 +2503,35 @@ async def web_action(
     return await _execute_actions(actions, continue_on_error)
 
 
+async def _mark_agent_presence(
+    tool_name: str,
+    action_name: str,
+    arguments: dict[str, Any],
+    *,
+    ok: bool,
+) -> None:
+    """Let the human watching the tab see that this step happened.
+
+    Hooked here rather than inside each handler for one reason: there are
+    dozens of handlers and one dispatcher, and a signal that is only as
+    complete as the last action someone remembered to instrument is worse
+    than none - the tab would look idle precisely during the actions nobody
+    thought about.
+
+    Never raises and never blocks the result. A step that has no session, or
+    whose session the step itself just closed, is simply not marked.
+    """
+    session_id = _step_session(tool_name, arguments)
+    if not session_id:
+        return
+    try:
+        await asyncio.to_thread(
+            browser_tools.note_agent_activity, session_id, action_name, arguments, ok
+        )
+    except Exception:
+        pass
+
+
 async def _execute_actions(
     actions: list[dict[str, Any]],
     continue_on_error: bool = False,
@@ -2541,6 +2570,9 @@ async def _execute_actions(
             reported_failure = (
                 isinstance(data, dict) and data.get("success") is False
             )
+            await _mark_agent_presence(
+                spec.tool_name, action_name, validated, ok=not reported_failure
+            )
             results.append(
                 {
                     "index": index,
@@ -2557,6 +2589,10 @@ async def _execute_actions(
             if reported_failure and not continue_on_error:
                 break
         except Exception as exc:
+            # A refused step is worth showing too, in the failure colour: a
+            # burst where one click never landed is exactly what a watching
+            # human wants to catch.
+            await _mark_agent_presence(spec.tool_name, action_name, arguments, ok=False)
             results.append(
                 {
                     "index": index,

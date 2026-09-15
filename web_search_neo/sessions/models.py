@@ -214,6 +214,14 @@ class BrowserSession:
     # server-side ping, so pings stay throttled to one a minute per session.
     tab_activity_script_id: str | None = None
     activity_pinged_at: float = 0.0
+    # The same, for the agent-presence script that badges the favicon and
+    # flashes the last action. Separate id because the two signals are
+    # independently switchable and one may be off while the other is on.
+    presence_script_id: str | None = None
+    # When this session last marked its page. Only the steps that draw nothing
+    # consult it: they are throttled so a loop of waits cannot spend a bridge
+    # round trip per iteration on a badge that is already lit.
+    last_presence_ping: float = 0.0
     # Wall-clock, unlike `last_used`, because these two are reported to a reader
     # and a monotonic number means nothing to one.
     created_at: float = field(default_factory=time.time)
