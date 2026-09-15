@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.13.0
+
+Release focus: LMS batch download macros and page_elements filtering for large tables.
+
+- Fix `browser_get_page_elements` truncation on pages with hundreds of controls.
+  The LMS group page renders 380 links but the 18k character budget delivered only
+  26 (80 of 380 when limited to links) — the 36 lesson rows were lost. New
+  server-side filters `href_pattern` and `text_pattern` (case-insensitive substring
+  matches on `href`/`text`) run before the budget is applied, so
+  `href_pattern="/lesson/view/"` returns exactly the 36 lessons without growing
+  `max_chars` or paging. Both filter links and buttons; forms stay unfiltered.
+  Wrapper `browser_get_page_elements` in `main.py` exposes the same two parameters.
+  Fixes the “26 of 380” failure that blocked the LMS Unity course automation.
+- Add project macros for the LMS Unity course (36 lessons, `98781969`):
+  `lms-unity-list-lessons` (3 steps: open group, wait `#group-lessons`, run_script to
+  return deduplicated `lesson_url/title/note`) and `lms-unity-one-lesson` (4 steps:
+  open lesson, wait `#lesson-editor`, run_script for `/storage/` PDFs and for
+  `docs.google.com` links). Both use `{{lesson_url}}`/`{{session_id}}` placeholders
+  so one macro repeats 36 times with different variables. Verified live: list returns
+  36/36, one-lesson returns 4 storage PDFs (methodichka + presentation) for М1У1.
+- Add `scripts/lms_unity_batch.py` — one-command batch helper that reuses the same
+  browser session (`lms`, `profile_mode=current`): collects 36 lessons, extracts
+  storage PDFs per lesson (public, no auth needed for `/storage/`), downloads to
+  `data/materials_inbox/lms-unity/<M1U1>/`, and validates extraction via
+  `feedback_bot/source_parser`. Prints a summary ready for `courses/unity_36.md`
+  (`# Курс → ## Модуль → ### Урок → ####`).
+
 ## 1.12.0
 
 Release focus: visible agent presence — a human watching the browser sees

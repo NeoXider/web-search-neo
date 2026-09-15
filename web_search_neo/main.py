@@ -528,6 +528,8 @@ async def browser_get_page_elements(
     limit: int = 200,
     offset: int = 0,
     max_chars: int = browser_tools.DEFAULT_RESPONSE_CHAR_BUDGET,
+    href_pattern: str | None = None,
+    text_pattern: str | None = None,
 ) -> dict[str, Any]:
     """Get rendered links, forms, fields, and buttons with CSS selectors."""
     return await asyncio.to_thread(
@@ -539,6 +541,8 @@ async def browser_get_page_elements(
         limit,
         offset,
         max_chars,
+        href_pattern,
+        text_pattern,
     )
 
 
