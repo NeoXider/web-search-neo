@@ -21,10 +21,11 @@ from web_search_neo import msp_date_time
 from web_search_neo import msp_search
 from web_search_neo import plugins
 from web_search_neo.web_client import request
+from web_search_neo.fetch import api as fetch_api
 from web_search_neo.fetch import content as fetch_content
 
 
-__version__ = "1.11.1"
+__version__ = "1.14.0"
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 log = logging.getLogger("web_search_neo")
@@ -132,6 +133,33 @@ async def fetch_urls_text(
             }
 
     return await asyncio.gather(*(fetch_one(url) for url in urls))
+
+
+@mcp.tool()
+async def http_request(
+    url: str,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    query: dict[str, Any] | None = None,
+    body: str | None = None,
+    body_json: Any | None = None,
+    timeout_seconds: float = 20.0,
+    max_chars: int = 20_000,
+    save_to: str | None = None,
+) -> dict[str, Any]:
+    """Send any HTTP request without a browser; 4xx/5xx return status, not errors."""
+    return await asyncio.to_thread(
+        fetch_api.http_request,
+        url,
+        method,
+        headers,
+        query,
+        body,
+        body_json,
+        timeout_seconds,
+        max_chars,
+        save_to,
+    )
 
 
 @mcp.tool()
@@ -920,6 +948,16 @@ async def browser_click_text(
         wait_seconds,
         frame_selector,
     )
+
+
+@mcp.tool()
+async def browser_type_text(
+    text: str,
+    session_id: str = "default",
+    selector: str | None = None,
+) -> dict[str, Any]:
+    """Type text into the focused element or a CSS target via CDP insert-text."""
+    return await asyncio.to_thread(browser_tools.type_text, text, session_id, selector)
 
 
 @mcp.tool()
@@ -2007,6 +2045,7 @@ _ACTIONS: dict[str, ActionSpec] = {
         ),
         _action("fetch_links", fetch_page_links, "fetch", "List the links of one page without a browser."),
         _action("fetch_many", fetch_urls_text, "fetch", "Read several pages concurrently as text."),
+        _action("http_request", http_request, "fetch", "Send any HTTP request without a browser; 4xx/5xx return status."),
         _action("open", browser_open_page, "session", "Open a URL in a named browser session."),
         _action(
             "open_many", browser_open_pages, "session", "Open several URLs in independent sessions at once."
@@ -2051,6 +2090,7 @@ _ACTIONS: dict[str, ActionSpec] = {
             "page",
             "Execute a JavaScript snippet in a session's page and return its value.",
         ),
+        _action("type_text", browser_type_text, "page", "Type text into the focused control or a CSS target via CDP insert-text."),
         _action(
             "click_text",
             browser_click_text,

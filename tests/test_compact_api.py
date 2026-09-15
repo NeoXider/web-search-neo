@@ -203,14 +203,16 @@ def test_capabilities_names_required_parameters_and_where_the_rest_live():
     assert not any("include_summary" in json.dumps(entry) for entry in actions.values())
     # A ceiling, not a target: every model reads this document on every session,
     # so a rule earns its place here or it lives in a topic. Raised deliberately
-    # four times - once for request replay, once for the parallel-agent pitfall,
+    # five times - once for request replay, once for the parallel-agent pitfall,
     # once for project-local macro stores, where the failure is a macro saved
-    # into one store and looked for in the other, and for the two lines that name
-    # topic=actions and topic=skill as the places the rest of the contract lives,
-    # and once for agent ownership: close_all defaulting to the caller's own
-    # sessions and page_elements answering inside a character budget are both
-    # things a model gets wrong silently unless the contract says them.
-    assert len(json.dumps(document)) < 14_000
+    # into one store and looked for in the other, once for type_text, whose new
+    # index entry costs its summary plus required no matter how it is worded,
+    # and for the two lines that name topic=actions and topic=skill as the
+    # places the rest of the contract lives, and once for agent ownership:
+    # close_all defaulting to the caller's own sessions and page_elements
+    # answering inside a character budget are both things a model gets wrong
+    # silently unless the contract says them.
+    assert len(json.dumps(document)) < 15_000
 
     assert any(
         "ref:" in pitfall and "page_outline" in pitfall for pitfall in document["pitfalls"]
@@ -238,7 +240,7 @@ def test_capabilities_states_the_requirements_that_python_defaults_hide():
     # Unconditional actions keep the plain shape, so the key stays a signal.
     assert "also_required" not in actions["pointer"]
     assert "also_required" not in actions["open"]
-    assert len(json.dumps(document)) < 14_000
+    assert len(json.dumps(document)) < 15_000
 
 
 def test_input_and_touch_reject_exactly_what_the_document_calls_required():
@@ -536,6 +538,7 @@ def test_the_contract_names_the_three_silent_failures_it_now_reports():
     elements = asyncio.run(main.web_info("action_schema", {"action": "page_elements"}))
     assert "invisible_challenge" in elements["notes"]["invisible_challenge_pending"]
 
-    # The budgets that keep the contract readable are unchanged, not raised.
-    assert len(json.dumps(main._capabilities())) < 14_000
+    # The skill budget is unchanged; only the capabilities ceiling moved, with
+    # type_text's index entry as the reason named above.
+    assert len(json.dumps(main._capabilities())) < 15_000
     assert len(json.dumps(skill)) < 7_000

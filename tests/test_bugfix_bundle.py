@@ -218,8 +218,28 @@ def test_wait_refuses_selector_and_script_together():
         browser_tools.wait_for_element(
             "#app", session_id="bundle-wait-both", script="window.x"
         )
+    # A present-but-empty script is still a passed script: with no selector it
+    # cannot poll and must say so instead of sleeping.
     with pytest.raises(ValueError, match="must not be empty"):
-        browser_tools.wait_for_element("", session_id="bundle-wait-both")
+        browser_tools.wait_for_element("", session_id="bundle-wait-both", script="")
+
+
+def test_wait_without_selector_or_script_is_a_plain_sleep():
+    driver = _ProbeDriver()
+    _register(driver, "bundle-wait-sleep")
+    started = time.monotonic()
+    result = browser_tools.wait_for_element(
+        "", session_id="bundle-wait-sleep", timeout_seconds=0.2
+    )
+    assert result["success"] is True
+    assert result["state"] == "sleep"
+    assert result["selector"] == ""
+    assert 0.15 <= time.monotonic() - started < 5
+    # The sleep floor is honoured in the answer, not only in real time.
+    clamped = browser_tools.wait_for_element(
+        "", session_id="bundle-wait-sleep", timeout_seconds=0.0
+    )
+    assert clamped["timeout_seconds"] == 0.1
 
 
 def test_wait_with_script_routes_to_condition():

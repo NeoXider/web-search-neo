@@ -2622,6 +2622,20 @@ def wait_for_element(
             poll_ms=poll_ms,
             frame_selector=frame_selector,
         )
+    if script is None and not str(selector or "").strip():
+        timeout = max(0.1, float(timeout_seconds))
+        session = _get_session(session_id)
+        with session.lock:
+            time.sleep(timeout)
+        return {
+            **_page_summary(session.driver, session_id),
+            "success": True,
+            "selector": "",
+            "state": "sleep",
+            "tag": None,
+            "timeout_seconds": timeout,
+            "frame_selector": frame_selector,
+        }
     if not str(selector or "").strip():
         raise ValueError("selector must not be empty (or pass script= for a JS condition)")
     if state not in _ELEMENT_STATES:
@@ -4033,6 +4047,44 @@ def _commit_held_keys(
                 continue
             session.held_keys.pop(key_id, None)
             session.fresh_keys.discard(key_id)
+
+
+def type_text(
+    text: str,
+    session_id: str = "default",
+    selector: str | None = None,
+) -> dict[str, Any]:
+    """Type ``text`` into the focused control via CDP Input.insertText.
+
+    Without ``selector`` the characters land in whatever element currently has
+    focus (fill and click leave their target focused). With a selector that
+    control is located first so the call works from any page state. The bridge
+    driver routes one insert-text command per call instead of a per-key event
+    storm, which is what React controlled inputs need to see as a real edit.
+    """
+    if not isinstance(text, str) or not text:
+        raise ValueError("text must be a non-empty string")
+    session = _get_session(session_id)
+    with session.lock:
+        driver = session.driver
+        started_ms = time.time() * 1000
+        target = str(selector or "").strip()
+        element = (
+            _wait_for_locator(driver, target, "clickable", 10.0)
+            if target
+            else driver.execute_script("return document.activeElement")
+        )
+        element.send_keys(text)
+        return _note_stalled_submit(
+            session,
+            {
+                **_page_summary(driver, session_id),
+                "success": True,
+                "typed_into": target or "focused_element",
+                "inserted": len(text),
+            },
+            started_ms,
+        )
 
 
 def press_keys(

@@ -136,6 +136,7 @@ _ACTION_NOTES = {
 "run_script": {
         "scope": "Runs in the top document of the session's current tab; there is no frame_selector - address a frame from inside the script if needed.",
         "args": "args arrive as arguments[0..n]; only JSON-serialisable values can cross into the page.",
+        "body": "Your script is the body of a wrapper function: end with `return <value>;` for value to be returned - an expression statement or an IIFE without an outer return comes back as null. A promise result needs await_promise=true.",
         "result": "value is the JSON-serialisable return value; a promise is awaited when await_promise=true (Chrome bridge driver). Long strings are clipped at 200k characters and reported as {clipped, length, head}. attempts reports how many tries the call took.",
         "retry": "Single-shot by default (retry_on_uncaught=false). An exception may follow a completed mutation. Only enable retries for scripts safe to repeat; retries=2, retry_delay_ms=300. wait_ready=true additionally settles readiness first.",
         "safety": "This is raw page-side JavaScript: it can navigate, mutate, or delete state. Prefer fill/click/pointer for input-shaped work and reserve scripts for state only the page holds (localStorage, virtualised rows, framework stores).",
@@ -150,6 +151,7 @@ _ACTION_NOTES = {
     "wait": {
         "state": "present|visible|clickable; timeout_seconds defaults to 10 and is respected as passed.",
         "script": "Pass script (a JS expression, e.g. \"window.__hydrated === true\") instead of selector to poll a hydration/framework condition atomically server-side; selector and script are mutually exclusive. poll_ms sets the poll interval.",
+        "sleep": "With neither selector nor script the call is a plain sleep for timeout_seconds and returns success.",
         "frame_selector": _FRAME_ANY,
     },
     "find": {
@@ -249,6 +251,12 @@ _ACTION_NOTES = {
         "frame_selector": _FRAME_CSS,
         "speed": _HOT_PATH_SPEED,
     },
+    "type_text": {
+        "text": "Non-empty string; inserted whole in one command instead of key by key.",
+        "selector": "Optional CSS target, located and focused first. Omit it to type into whatever already has focus - fill and click leave their target there.",
+        "note": "The bridge driver sends CDP Input.insertText per call, so controlled inputs (React) see one composed edit instead of a key event storm.",
+        "speed": _HOT_PATH_SPEED,
+    },
     "press_keys": {
         "key_action": "tap|hold|release",
         "note": "The dispatcher key is 'action'; the keyboard verb is 'key_action'.",
@@ -326,5 +334,15 @@ _ACTION_NOTES = {
             "not: the companion re-reads its own folder when asked."
         ),
         "wait_seconds": "Raise it right after the user pressed Load unpacked.",
+    },
+    "http_request": {
+        "method": "GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS; anything else is refused.",
+        "headers": "Optional {name: value} map sent with the request.",
+        "query": "Optional {name: value} map sent as the URL query string.",
+        "body": "Raw str body; mutually exclusive with body_json.",
+        "body_json": "Any JSON value sent as the body; adds Content-Type: application/json unless headers set one.",
+        "timeout": "timeout_seconds bounds the call; DNS/timeout failures raise like fetch_text.",
+        "save_to": "Writes raw bytes to a file; the answer carries saved_to and size_bytes instead of body.",
+        "response": "Always {success, url, status, headers, body/size}: 4xx/5xx return success True with their status, not an error. fetch_text is GET-only and returns str; replay_request re-sends inside the page with cookies/CORS, this one never touches a browser.",
     },
 }

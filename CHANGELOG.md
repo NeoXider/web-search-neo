@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.14.0
+
+Release focus: reliable text input for React forms, plain sleeps without polling,
+and convenient REST API testing without curl.
+
+- Add `http_request` fetch action: any method, custom headers, query params,
+  raw `body` or `body_json`, returning `{status, headers, body}` so 4xx/5xx
+  are answers, not exceptions — the model's curl replacement.
+- Add `type_text` action: types via a single CDP `insert-text` call. With no
+  `selector` it types into the currently focused element, with `selector` it
+  focuses the target first; single-call insertion keeps React controlled inputs
+  in sync where keystroke-by-keystroke input drifts.
+- Allow `wait` with neither `selector` nor `script` as a plain sleep: reports
+  `state:sleep`, floors at 0.1s, no polling round trips.
+- Add contract notes for `type_text`, `wait.sleep`, and `run_script` body return
+  so `action_schema`/`capabilities` document the new behaviour.
+- Raise the `capabilities` budget 14_000→15_000 to fit the new notes; skill
+  budget stays under 7_000.
+- Tests in `tests/test_type_text.py` plus wait-sleep cases in
+  `tests/test_bugfix_bundle.py`, and `tests/test_http_request.py` for the API action.
+
 ## 1.13.0
 
 Release focus: LMS batch download macros and page_elements filtering for large tables.
@@ -19,13 +40,13 @@ Release focus: LMS batch download macros and page_elements filtering for large t
   open lesson, wait `#lesson-editor`, run_script for `/storage/` PDFs and for
   `docs.google.com` links). Both use `{{lesson_url}}`/`{{session_id}}` placeholders
   so one macro repeats 36 times with different variables. Verified live: list returns
-  36/36, one-lesson returns 4 storage PDFs (methodichka + presentation) for М1У1.
+  36/36, one-lesson returns 4 storage PDFs (methodichka + presentation) for M1U1.
 - Add `scripts/lms_unity_batch.py` — one-command batch helper that reuses the same
   browser session (`lms`, `profile_mode=current`): collects 36 lessons, extracts
   storage PDFs per lesson (public, no auth needed for `/storage/`), downloads to
   `data/materials_inbox/lms-unity/<M1U1>/`, and validates extraction via
   `feedback_bot/source_parser`. Prints a summary ready for `courses/unity_36.md`
-  (`# Курс → ## Модуль → ### Урок → ####`).
+  (`# Course -> ## Module -> ### Lesson -> ####`).
 
 ## 1.12.0
 
