@@ -31,7 +31,12 @@ global.document = {
   querySelectorAll() {return [{href: 'https://example.test/icon.png'}];},
   querySelector() {return badge;},
   createElement(tag) {
-    if (tag === 'canvas') return {getContext() {return null;}};
+    if (tag === 'canvas') return {
+      getContext() {
+        return {drawImage() {}, beginPath() {}, arc() {}, fill() {}, fillText() {}};
+      },
+      toDataURL() {return 'data:image/png;base64,badge';}
+    };
     return {setAttribute() {}};
   }
 };
@@ -42,7 +47,11 @@ image.onerror();
 if (badge !== null) throw new Error('late image revived the badge');
 if (!stop) {
   window.__wsnActivity.ping();
+  // An unreadable icon leaves the tab's own favicon alone rather than
+  // swapping in a stand-in; a readable one re-arms the badge.
   image.onerror();
+  if (badge !== null) throw new Error('an unreadable icon must not be replaced');
+  image.onload();
   if (!badge) throw new Error('new activity should re-arm the badge');
 }
 """

@@ -26,6 +26,8 @@ import typing
 from pathlib import Path
 from typing import Any, Callable
 
+from web_search_neo.mcp_compat import tool_registry
+
 from web_search_neo.msp_search import register_search_provider  # noqa: F401
 
 ENV_VAR = "WEB_SEARCH_NEO_PLUGINS"
@@ -47,7 +49,7 @@ def _ensure_legacy_tool(fn: Callable[..., Any]) -> str:
     legacy surface even though it is dispatched from the compact one.
     """
     m = _main()
-    tools = m.legacy_mcp._tool_manager._tools
+    tools = tool_registry(m.legacy_mcp)
     if fn.__name__ not in tools:
         m.legacy_mcp.add_tool(fn)
     return fn.__name__

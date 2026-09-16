@@ -162,9 +162,11 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# Agent tooling state (kept out of clones instead of .git/info/exclude)
+# Agent tooling and editor state (kept out of clones instead of .git/info/exclude)
 .kilo/
 .kilocode/
+.opencode/
+.vscode/
 .demo/
 
 # Machine-local companion secret written by bridge_auth.write_extension_token

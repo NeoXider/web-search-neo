@@ -51,7 +51,8 @@ def test_cross_origin_redirect_does_not_leak_credentials(monkeypatch, credential
         second_redirects["/away"] = first_url + "/return"
         credentials = {"aUtHoRiZaTiOn": "Bearer private", "cOoKiE": "token=private",
                        "pRoXy-AuThOrIzAtIoN": "Basic private"}
-        kwargs = {"headers": {"X-Public": "keep"}}
+        kwargs = {"headers": {"X-Public": "drop", "X-Api-Key": "private",
+                              "Accept": "application/json"}}
         if credential_source == "headers":
             kwargs["headers"].update(credentials)
         elif credential_source == "session":
@@ -70,7 +71,11 @@ def test_cross_origin_redirect_does_not_leak_credentials(monkeypatch, credential
             assert not headers.get("Authorization")
             assert not headers.get("Cookie")
             assert not headers.get("Proxy-Authorization")
-            assert headers["X-Public"] == "keep"
+            # Only the non-credential allowlist crosses origins.
+            assert "X-Public" not in headers
+            assert "X-Api-Key" not in headers
+            assert headers["Accept"] == "application/json"
+        assert requests.structures.CaseInsensitiveDict(first_received[0])["X-Api-Key"] == "private"
         assert kwargs["headers"] == original_headers
 
 

@@ -1,5 +1,15 @@
 import datetime
-import time
+
+
+def format_region(moment: datetime.datetime) -> str:
+    """``<zone name> ±HH:MM`` for an aware datetime, e.g. ``IST +05:30``."""
+    offset = moment.utcoffset() or datetime.timedelta(0)
+    total_minutes = int(offset.total_seconds() // 60)
+    sign = "-" if total_minutes < 0 else "+"
+    hours, minutes = divmod(abs(total_minutes), 60)
+    name = moment.tzname() or "UTC"
+    return f"{name} {sign}{hours:02d}:{minutes:02d}"
+
 
 def get_current_time_and_region() -> dict:
     """
@@ -13,24 +23,12 @@ def get_current_time_and_region() -> dict:
             "hour": 14,
             "minute": 23,
             "second": 47,
-            "region": "ЕКБ +5"
+            "region": "+05 +05:00"
         }
     """
-    # Current local datetime
-    now = datetime.datetime.now()
-
-    # UTC offset in hours (e.g., +5 or -3)
-    utc_offset_td = now.astimezone().utcoffset()
-    if utc_offset_td is None:
-        # Fallback to 0 if timezone info unavailable
-        utc_offset_hours = 0
-    else:
-        utc_offset_hours = int(utc_offset_td.total_seconds() // 3600)
-
-    # Time‑zone abbreviation (e.g., 'EST', 'EDT', 'ЕКБ')
-    tz_abbr = time.tzname[0]   # first entry is the abbreviation for DST if applicable
-
-    region_str = f"{tz_abbr} {utc_offset_hours:+d}"
+    # Aware local time: its offset and zone name both follow DST.
+    now = datetime.datetime.now().astimezone()
+    region_str = format_region(now)
 
     return {
         "year": now.year,

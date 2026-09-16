@@ -17,8 +17,6 @@ import json
 import logging
 import os
 from pathlib import Path
-import re
-import secrets
 import subprocess
 import sys
 import threading
@@ -30,6 +28,7 @@ from selenium.common.exceptions import NoSuchElementException, TimeoutException,
 
 from web_search_neo import bridge_auth
 from web_search_neo import bridge_daemon
+from web_search_neo import bridge_handshake
 from web_search_neo.bridge_daemon import (
     CHROME_EXTENSION_ID,
     DEFAULT_HOST,
@@ -39,6 +38,7 @@ from web_search_neo.bridge_daemon import (
     close_quietly,
 )
 from web_search_neo.key_table import MODIFIER_BITS, resolve_key
+from web_search_neo.process_probe import popen_detached
 
 
 # The tab group the agent's pages land in. It carries the project's mascot so a
@@ -89,11 +89,6 @@ DAEMON_RECHECK_SECONDS = 10.0
 # the same cadence the extension heartbeat uses, so both ends recover on their
 # own on the same clock. Set to 0 to switch the supervisor off.
 SUPERVISE_SECONDS = 60.0
-
-# A daemon of another revision refuses the hello and names the protocol it wants
-# in the close reason. That reason is the only thing it ever tells us, so it is
-# read rather than reported as an unexplained hello failure.
-_PROTOCOL_REFUSAL = re.compile(r"bridge protocol (\d+)")
 
 # Long enough for a capture of a window nothing is looking at, which measured
 # between 70 ms and half a minute depending on whether Chrome was painting it,
@@ -180,24 +175,19 @@ def spawn_bridge_daemon(port: int) -> None:
         return
     environment = dict(os.environ, WEB_SEARCH_NEO_BRIDGE_PORT=str(port))
     command = [_daemon_interpreter(environment), "-m", DAEMON_MODULE, "--bridge"]
-    detach: dict[str, Any] = {}
-    if _IS_WINDOWS:
-        # CREATE_NO_WINDOW is ignored when combined with DETACHED_PROCESS. A
-        # Windows child already outlives its parent, and the three DEVNULL
-        # handles below keep it independent of the MCP stdio transport.
-        detach["creationflags"] = CREATE_NO_WINDOW
-    else:
-        detach["start_new_session"] = True
     try:
-        subprocess.Popen(  # noqa: S603 - fixed command, no shell, no caller input
+        # CREATE_NO_WINDOW is ignored when combined with DETACHED_PROCESS; the
+        # three DEVNULL handles keep the daemon off the MCP stdio transport.
+        popen_detached(
             command,
+            windows=_IS_WINDOWS,
+            windows_flags=CREATE_NO_WINDOW,
             cwd=str(PROJECT_DIR),
             env=environment,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             close_fds=True,
-            **detach,
         )
     except OSError as exc:
         LOGGER.warning("Could not start the bridge daemon: %s: %s", type(exc).__name__, exc)
@@ -666,57 +656,27 @@ class ChromeBridge:
         )
 
     def _handshake(self, connection: Any) -> dict[str, Any]:
-        """Prove we hold the machine secret, and make the daemon prove it too."""
-        token = self._ensure_token()
-        nonce = secrets.token_hex(16)
+        """Mutual challenge-response; the raw token never goes over the wire."""
+        fields = {
+            "role": "client",
+            "version": self._expected_version(),
+            "client": {
+                "pid": os.getpid(),
+                "program": Path(sys.argv[0] or "python").name,
+                "instance": self.__dict__.setdefault("_client_instance", uuid.uuid4().hex),
+                "name": os.getenv("WEB_SEARCH_NEO_AGENT_NAME", "")[:64] or None,  # badge name
+            },
+        }
         try:
-            connection.send(
-                json.dumps(
-                    {
-                        "type": "hello",
-                        "protocol": PROTOCOL,
-                        "role": "client",
-                        "token": token,
-                        "nonce": nonce,
-                        "version": self._expected_version(),
-                        "client": {
-                            "pid": os.getpid(),
-                            "program": Path(sys.argv[0] or "python").name,
-                        },
-                    }
-                )
+            return bridge_handshake.client_handshake(
+                connection, token=self._ensure_token(), protocol=PROTOCOL, fields=fields
             )
-            acknowledgement = json.loads(connection.recv(timeout=5.0))
-        except (TypeError, ValueError) as exc:
-            close_quietly(connection, 1008, "Bridge daemon hello_ack must be JSON")
-            raise ChromeBridgeError(f"The bridge daemon answered with junk: {exc}") from exc
-        except Exception as exc:
-            # Every other failure here closes the socket, and this one has to as
-            # well: a peer that accepts the connection and then says nothing - a
-            # wedged daemon, or something else listening on the port - would
-            # otherwise leave one abandoned socket and its reader thread behind
-            # on every retry, for as long as the server runs.
-            close_quietly(connection, 1002, "The bridge daemon did not finish the hello")
-            refusal = _PROTOCOL_REFUSAL.search(str(exc))
-            if refusal:
-                # Not a wedged peer: a daemon of another revision, which rejects
-                # the hello before it would ever answer with a version. This is
-                # the one skew that is a real incompatibility, so it is the one
-                # that stops instead of retrying every half second.
-                raise _VersionConflict(self._protocol_conflict(refusal.group(1))) from exc
-            raise ChromeBridgeError(
-                f"The peer on the bridge port did not answer the hello: "
-                f"{type(exc).__name__}: {exc}"
-            ) from exc
-        if not isinstance(acknowledgement, dict) or acknowledgement.get("type") != "hello_ack":
-            close_quietly(connection, 1008, "Expected a bridge daemon hello_ack")
-            raise ChromeBridgeError("The peer on the bridge port is not a bridge daemon")
-        if not bridge_auth.verify(token, nonce, acknowledgement.get("proof")):
-            close_quietly(connection, 1008, TOKEN_MISMATCH_REASON)
-            raise ChromeBridgeError(
-                "The peer on the bridge port did not prove it knows the companion token"
-            )
-        return acknowledgement
+        except bridge_handshake.HandshakeFailure as exc:
+            if exc.refused_protocol is not None:
+                # A daemon of another revision: the one skew that is a real
+                # incompatibility, so it stops instead of retrying.
+                raise _VersionConflict(self._protocol_conflict(exc.refused_protocol)) from exc
+            raise ChromeBridgeError(str(exc)) from exc
 
     def _remember_daemon(self, acknowledgement: dict[str, Any]) -> None:
         with self._state_lock:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import atexit
 import base64
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from http.client import HTTPConnection
 import json
 import logging
@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 
 from selenium import webdriver
 from selenium.common.exceptions import (
+    InvalidSelectorException,
     NoSuchElementException,
     NoSuchFrameException,
     TimeoutException,
@@ -54,6 +55,31 @@ from web_search_neo import diagnostics
 from web_search_neo import key_table
 from web_search_neo import page_perception
 from web_search_neo.web_client import validate_http_url
+from web_search_neo.actions.render_source import _RENDER_BOOTSTRAP_SCRIPT, _RENDER_CONTROL_SCRIPT
+from web_search_neo.actions.scripts import execute as _execute_script
+from web_search_neo.actions.stealth import stealth_source
+from web_search_neo.actions.waits import (
+    clamp_wait as _clamp_wait,
+    poll_under_lock as _poll_under_lock,
+    wait_for_condition as _poll_condition,
+    wait_out_challenge as _wait_out_challenge,
+)
+from web_search_neo.cdp import request_mocks
+# Re-exported for tests that exercise the mock validator through this module.
+from web_search_neo.cdp.request_mocks import (  # noqa: F401
+    _MOCK_BODY_LIMIT, _MOCK_STUB_SOURCE, _validate_mock,
+)
+from web_search_neo.perception.elements import (
+    _ELEMENT_LIST_KEYS, _INSPECT_SCRIPT, _restate_element_ranges,
+)
+from web_search_neo.sessions.activity import (
+    _TAB_ACTIVITY_IDLE_SECONDS,
+    _TAB_ACTIVITY_SOURCE,  # noqa: F401 - re-exported for tests
+    _apply_tab_activity as _apply_tab_activity_impl, _ping_tab_activity, _remove_tab_activity,
+)
+from web_search_neo.sessions.context import (
+    apply_overrides as _apply_context_overrides, resize_viewport,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -158,7 +184,9 @@ _SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _BROWSER_LOG_LIMIT = 500
 
 
-from web_search_neo.sessions.models import ConsoleCursor, SessionLock, BrowserSession
+from web_search_neo.sessions.models import (  # noqa: F401 - SessionLock is re-exported
+    BrowserSession, ConsoleCursor, SessionLock,
+)
 
 
 _sessions: dict[str, BrowserSession] = {}
@@ -187,9 +215,9 @@ def _validate_session_id(session_id: str) -> str:
 #
 # 18,000 is chosen to sit just under the ~20k the text topics already default to
 # and well inside a 32k window with room for the conversation around it.
-from web_search_neo.perception.budget import (
-    DEFAULT_RESPONSE_CHAR_BUDGET, MIN_RESPONSE_CHAR_BUDGET, MAX_RESPONSE_CHAR_BUDGET,
-    _response_char_budget, _measure, _fit_lists_to_budget, _fit_text_to_budget,
+from web_search_neo.perception.budget import (  # noqa: F401 - MAX_* is re-exported
+    DEFAULT_RESPONSE_CHAR_BUDGET, MAX_RESPONSE_CHAR_BUDGET,
+    _response_char_budget, _fit_lists_to_budget, _fit_text_to_budget,
 )
 
 
@@ -398,7 +426,6 @@ def _driver_popen_kwargs() -> dict[str, Any]:
         "creation_flags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
         "startupinfo": startupinfo,
     }
-
 
 
 def create_driver(
@@ -653,6 +680,7 @@ def _drop_sessions_whose_tab_is_gone() -> None:
                 if _sessions.get(session_id) is not session:
                     continue
                 del _sessions[session_id]
+                request_mocks.forget(session_id)
             logger.info("Dropped session '%s': its tab is no longer open", session_id)
             # No page is left to release held input on and no tab to close, so the
             # full teardown would only collect failures. Give up the debugger
@@ -700,6 +728,7 @@ def _create_session(
                 # the right response to that - so drop it here instead of refusing
                 # the call and making the caller close a session that no longer is one.
                 del _sessions[session_id]
+                request_mocks.forget(session_id)
                 existing = None
             if existing is not None:
                 if (
@@ -940,6 +969,7 @@ def _discard_stale_session(session_id: str, session: BrowserSession) -> None:
     with _sessions_lock:
         if _sessions.get(session_id) is session:
             del _sessions[session_id]
+            request_mocks.forget(session_id)
 
 
 def _shared_session_note(session_id: str, session: BrowserSession) -> dict[str, Any]:
@@ -1033,9 +1063,6 @@ def _set_viewport(driver: Any, width: int, height: int) -> None:
             "mobile": False,
         },
     )
-
-
-from web_search_neo.sessions.context import apply_overrides as _apply_context_overrides, resize_viewport
 
 
 def apply_context_overrides(
@@ -1702,6 +1729,8 @@ def open_page(
             # After the reset, so the borrowed tab is given back with no keys
             # held and no frame gate on it, and before anything is sent to the
             # new one.
+            if session.profile_mode == "current" and not session.owns_tab:
+                _clear_mock_state(session, session_id)  # stubs stay with the borrowed tab otherwise
             released_tab = _leave_claimed_tab(session, width, height, tab_group)
             _set_viewport(session.driver, width, height)
             applied_overrides = _apply_context_overrides(
@@ -1900,6 +1929,7 @@ def close_tabs(
             for name, session in list(_sessions.items()):
                 if session.current_tab_id in gone:
                     _sessions.pop(name, None)
+                    request_mocks.forget(name)
                     dropped.append(name)
         for tab_id in gone:
             try:
@@ -2317,13 +2347,6 @@ def _apply_tab_label(
 # icon, so a tab whose agent went quiet stops glowing on its own with no
 # server round-trip. Everything is wrapped defensively: a page that freezes
 # its DOM APIs keeps working unbadged rather than breaking the action.
-from web_search_neo.sessions.activity import (
-    _TAB_ACTIVITY_IDLE_SECONDS, _TAB_ACTIVITY_PING_INTERVAL, _TAB_ACTIVITY_SOURCE,
-    _TAB_ACTIVITY_PING_SCRIPT, _TAB_ACTIVITY_STOP_SCRIPT,
-    _apply_tab_activity as _apply_tab_activity_impl, _remove_tab_activity, _ping_tab_activity,
-)
-
-
 def _tab_activity_enabled() -> bool:
     return _tab_labelling_enabled()
 
@@ -2488,9 +2511,6 @@ def note_agent_activity(
 # Shares the perception helpers so a selector, a visibility verdict and the
 # aria-hidden rule mean the same thing here as in page_outline; the two topics
 # disagreeing about what is on the page is the failure this avoids.
-from web_search_neo.perception.elements import _INSPECT_SCRIPT, _ELEMENT_LIST_KEYS, _restate_element_ranges
-
-
 def get_page_elements(
     session_id: str = "default",
     include_links: bool = True,
@@ -2575,23 +2595,17 @@ def get_page_elements(
         return {**payload, **report}
 
 
-from web_search_neo.actions.waits import js_truthy as _js_truthy
-
-
 def wait_for_condition(
     script: str, session_id: str = "default", timeout_seconds: float = 10.0,
     poll_ms: int = 150, frame_selector: str | None = None,
 ) -> dict[str, Any]:
-    from web_search_neo.actions.waits import wait_for_condition as poll_condition
-    session = _get_session(session_id)
-    with session.lock:
-        return poll_condition(
-            session.driver, script, timeout_seconds=timeout_seconds, poll_ms=poll_ms,
-            frame_selector=frame_selector, enter_frame=_enter_action_frame,
-            release_frame=_release_action_frame,
-            page_summary=lambda: _page_summary(session.driver, session_id),
-            describe_error=_brief_error,
-        )
+    session = _get_session(session_id)  # the lock is taken per poll, not for the wait
+    return _poll_condition(
+        session.driver, script, lock=session.lock, timeout_seconds=timeout_seconds,
+        poll_ms=poll_ms, frame_selector=frame_selector, enter_frame=_enter_action_frame,
+        release_frame=_release_action_frame, describe_error=_brief_error,
+        page_summary=lambda: _page_summary(session.driver, session_id),
+    )
 
 
 def wait_for_element(
@@ -2613,10 +2627,9 @@ def wait_for_element(
     hydration, framework flags): the expression is polled server-side until
     truthy. ``selector`` and ``script`` are mutually exclusive.
 
-    The wait honours ``timeout_seconds`` as passed (it defaults to 10) and
-    ``timeout_seconds`` in the result is the wait that was really made. A timeout
-    says the same number, so a wait that was cut short cannot read as one that
-    ran its course.
+    ``timeout_seconds`` (default 10) is capped at 300 s (``timeout_note`` says
+    when) and the result names the wait really made. The session lock is taken
+    per poll only, so other calls on the session are not queued behind the wait.
     """
     if script is not None and str(script).strip():
         if str(selector or "").strip():
@@ -2629,41 +2642,37 @@ def wait_for_element(
             frame_selector=frame_selector,
         )
     if script is None and not str(selector or "").strip():
-        timeout = max(0.1, float(timeout_seconds))
+        timeout, note = _clamp_wait(timeout_seconds)
         session = _get_session(session_id)
+        # A sleep reads nothing, so it must not hold the session other calls queue on.
+        time.sleep(timeout)
         with session.lock:
-            time.sleep(timeout)
+            summary = _page_summary(session.driver, session_id)
         return {
-            **_page_summary(session.driver, session_id),
-            "success": True,
-            "selector": "",
-            "state": "sleep",
-            "tag": None,
-            "timeout_seconds": timeout,
-            "frame_selector": frame_selector,
+            **summary, "success": True, "selector": "", "state": "sleep", "tag": None,
+            "timeout_seconds": timeout, "frame_selector": frame_selector,
+            **({"timeout_note": note} if note else {}),
         }
     if not str(selector or "").strip():
         raise ValueError("selector must not be empty (or pass script= for a JS condition)")
     if state not in _ELEMENT_STATES:
         raise ValueError("state must be 'present', 'visible', or 'clickable'")
-    timeout = max(0.1, float(timeout_seconds))
+    timeout, note = _clamp_wait(timeout_seconds)
     session = _get_session(session_id)
-    with session.lock:
+
+    def attempt() -> dict[str, Any]:  # one immediate check, under the lock
         _enter_action_frame(session.driver, frame_selector, selector)
         try:
-            element = _wait_for_locator(session.driver, selector, state, timeout)
-            tag = element.tag_name
+            tag = _wait_for_locator(session.driver, selector, state, 0.0).tag_name
         finally:
             _release_action_frame(session.driver, frame_selector, selector)
         return {
-            **_page_summary(session.driver, session_id),
-            "success": True,
-            "selector": selector,
-            "state": state,
-            "tag": tag,
-            "timeout_seconds": timeout,
-            "frame_selector": frame_selector,
+            **_page_summary(session.driver, session_id), "success": True,
+            "selector": selector, "state": state, "tag": tag, "timeout_seconds": timeout,
+            "frame_selector": frame_selector, **({"timeout_note": note} if note else {}),
         }
+
+    return _poll_under_lock(session.lock, attempt, timeout=timeout, poll=poll_ms / 1000.0)
 
 
 def wait_for_challenge_resolution(
@@ -2675,42 +2684,16 @@ def wait_for_challenge_resolution(
 
     An unsolved invisible widget counts as unresolved too: its token field being
     empty is the same wait, and returning "resolved" over it told the caller the
-    form was free to submit when it was not.
+    form was free to submit when it was not. The session lock is taken per poll
+    only, and ``timeout_seconds`` is capped (``timeout_note`` says when).
     """
-    timeout = max(0.1, float(timeout_seconds))
-    poll_interval = max(0.05, min(float(poll_interval_seconds), 2.0))
     session = _get_session(session_id)
-    started = time.monotonic()
-    challenge_seen = False
-    with session.lock:
-        while True:
-            challenge = _challenge_status(session.driver)
-            blocked = bool(challenge["challenge_detected"]) or bool(
-                challenge.get("invisible_challenge_pending")
-            )
-            challenge_seen = challenge_seen or blocked
-            if not blocked:
-                return {
-                    **_page_summary(session.driver, session_id),
-                    "success": True,
-                    "resolved": True,
-                    "timed_out": False,
-                    "challenge_seen": challenge_seen,
-                    "waited_seconds": round(time.monotonic() - started, 2),
-                    "session_open": True,
-                }
-            elapsed = time.monotonic() - started
-            if elapsed >= timeout:
-                return {
-                    **_page_summary(session.driver, session_id),
-                    "success": False,
-                    "resolved": False,
-                    "timed_out": True,
-                    "challenge_seen": challenge_seen,
-                    "waited_seconds": round(elapsed, 2),
-                    "session_open": True,
-                }
-            time.sleep(min(poll_interval, timeout - elapsed))
+    return _wait_out_challenge(
+        session.lock, timeout_seconds=timeout_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+        probe=lambda: _challenge_status(session.driver),
+        page_summary=lambda: _page_summary(session.driver, session_id),
+    )
 
 
 _CHECKBOX_TRUE = frozenset({"1", "true", "yes", "y", "on", "check", "checked"})
@@ -3029,7 +3012,7 @@ def _selection_rejection(state: dict[str, Any], requested: Any) -> str | None:
     values = [str(item) for item in (state.get("values") or [])]
     texts = [str(item) for item in (state.get("texts") or [])]
     wanted = _requested_values(requested)
-    unclaimed = list(zip(values, texts))
+    unclaimed = list(zip(values, texts, strict=False))  # page-reported; may differ
     for want in wanted:
         match = next(
             (
@@ -3663,14 +3646,6 @@ def _click_trusted(
     )
 
 
-from web_search_neo.actions.scripts import (
-    MAX_SCRIPT_RESULT_CHARS as _MAX_SCRIPT_RESULT_CHARS,
-    RETRYABLE_SCRIPT_ERRORS as _RETRYABLE_SCRIPT_ERRORS,
-    clip_result as _clip_result, error_is_retryable as _script_error_is_retryable,
-    execute as _execute_script,
-)
-
-
 def execute_js(
     script: str, args: list[Any] | None = None, session_id: str = "default",
     await_promise: bool = False, user_gesture: bool = False,
@@ -4035,7 +4010,7 @@ def _commit_held_keys(
     selected_action: str,
 ) -> None:
     if selected_action == "hold":
-        for key_id, key in zip(key_ids, normalized):
+        for key_id, key in zip(key_ids, normalized, strict=True):
             if _held_slot(session, key) is not None:
                 # Already down under some spelling of this key; a second entry
                 # for it would survive the release of the first one.
@@ -4133,7 +4108,7 @@ def press_keys(
         if selected_action == "tap":
             # Before anything is switched, focused or sent: a refusal has to
             # leave the keys this session holds exactly as they were.
-            for spelling, key in zip(keys, normalized):
+            for spelling, key in zip(keys, normalized, strict=True):
                 slot = _held_slot(session, key)
                 if slot is not None:
                     raise _tap_of_held_key(str(spelling), slot)
@@ -4994,11 +4969,6 @@ def get_network_body(
         }
 
 
-from web_search_neo.actions.scripts import (
-    evaluate_with_gesture as _evaluate_with_gesture, exception_text as _exception_text,
-)
-
-
 def inject_script(
     op: str = "add",
     source: str | None = None,
@@ -5172,14 +5142,15 @@ def solve_captcha(
 
     ``mode='detect'`` only looks. ``mode='wait'`` blocks until the challenge is
     gone from the page, which is what a human clicking the box actually produces.
-    ``mode='solve'`` needs a configured service and refuses without one.
-    ``mode='auto'`` - the default - solves when a service is configured and the
-    widget is one with a sitekey, and otherwise waits, so the same call works on a
-    machine with a key and on one without.
+    ``mode='solve'`` is the only way to spend money: it needs a configured
+    service and refuses without one. ``mode='auto'`` - the default - waits for a
+    human; it solves only when WEB_SEARCH_NEO_CAPTCHA_AUTO_SOLVE=1 opts the
+    machine in, because a configured key alone is not consent to be charged.
 
     Waiting returns as soon as the page stops showing the challenge, so a captcha
     the user clears in four seconds costs four seconds, not the whole timeout.
     """
+    captcha.validate_mode(mode)
     session = _get_session(session_id)
     with session.lock:
         status = _challenge_status(session.driver)
@@ -5194,40 +5165,14 @@ def solve_captcha(
 
     identity = execute_js(captcha.IDENTIFY_SCRIPT, session_id=session_id)
     found = identity.get("value") or {}
-    vendor, sitekey = found.get("vendor"), found.get("sitekey")
-    configured = captcha.solver_config()["configured"]
-
-    if mode == "solve" or (mode == "auto" and configured and vendor and sitekey):
-        if not vendor or not sitekey:
-            raise ValueError(
-                "This captcha exposes no sitekey, so no service can be asked for a "
-                "token; it has to be cleared in the page with mode='wait'."
-            )
-        solved = captcha.solve_remotely(
-            found["task"], sitekey, found["url"], timeout_seconds, max(3.0, poll_seconds)
+    if captcha.wants_paid_solve(mode, found):
+        solved = captcha.solve_and_apply(
+            found,
+            lambda script, args: execute_js(script, args=args, session_id=session_id),
+            timeout_seconds,
+            max(3.0, poll_seconds),
         )
-        applied = execute_js(
-            captcha.APPLY_TOKEN_SCRIPT,
-            args=[vendor, solved["token"]],
-            session_id=session_id,
-        )
-        return {
-            "success": bool(applied.get("success")),
-            "session_id": session_id,
-            "captcha_present": True,
-            "mode": "solve",
-            "vendor": vendor,
-            "applied": applied.get("value"),
-            "cost": solved.get("cost"),
-            "note": (
-                "The token is in the page. Submitting the form is still the "
-                "caller's move: some sites submit from the widget callback and "
-                "some wait for the button."
-            ),
-        }
-
-    if mode not in {"auto", "wait"}:
-        raise ValueError(f"captcha mode must be detect, wait, solve, or auto, not '{mode}'")
+        return {"session_id": session_id, **solved}
 
     # Waiting is what wait_challenge already does, down to holding the session
     # open and reporting the page it ends on; repeating that loop here would only
@@ -5237,13 +5182,14 @@ def solve_captcha(
         **waited,
         "captcha_present": not waited["resolved"],
         "mode": "wait",
-        "vendor": vendor,
+        "vendor": found.get("vendor"),
     }
     if not waited["resolved"]:
         outcome["error"] = (
             f"The captcha was still on the page after {waited['waited_seconds']:.0f}s. "
-            "It needs a person to click it in the browser window, or a solving "
-            "service configured through WEB_SEARCH_NEO_CAPTCHA_KEY."
+            "It needs a person to click it in the browser window, or an explicit "
+            "mode='solve' with a solving service configured through "
+            "WEB_SEARCH_NEO_CAPTCHA_KEY."
         )
     return outcome
 
@@ -5274,26 +5220,6 @@ def set_extra_headers(
     }
 
 
-# The token every automation-detection script looks at first. Setting it before
-# the page's own scripts run is the difference between hiding the flag and being
-# caught reading it late; inject_script is what makes that ordering possible.
-STEALTH_SOURCE = """
-Object.defineProperty(navigator, 'webdriver', {get: () => false, configurable: true});
-if (!window.chrome) { window.chrome = {runtime: {}}; }
-try {
-  const original = navigator.permissions && navigator.permissions.query;
-  if (original) {
-    navigator.permissions.query = (parameters) =>
-      parameters && parameters.name === 'notifications'
-        ? Promise.resolve({state: Notification.permission})
-        : original(parameters);
-  }
-} catch (error) { /* a locked-down permissions API is not worth failing over */ }
-Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5], configurable: true});
-Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en'], configurable: true});
-"""
-
-
 def stealth(
     op: str = "on",
     session_id: str = "default",
@@ -5319,7 +5245,9 @@ def stealth(
             previous = session.stealth_identifier
         if previous:
             inject_script(op="remove", identifier=previous, session_id=session_id)
-        result = inject_script(op="add", source=STEALTH_SOURCE, session_id=session_id)
+        with session.lock:
+            source = stealth_source(session.locale_override)
+        result = inject_script(op="add", source=source, session_id=session_id)
         with session.lock:
             session.stealth_identifier = result["identifier"]
         return {
@@ -5454,11 +5382,6 @@ def replay_request(
 # Page.addScriptToEvaluateOnNewDocument (future documents) and applied live to
 # the current one. Both paths share the Python registry below as the source of
 # truth for listing.
-from web_search_neo.cdp import request_mocks
-from web_search_neo.cdp.request_mocks import (
-    _REQUEST_MOCKS, _MOCK_STUB_SCRIPT_IDS, _MOCK_BODY_LIMIT,
-    _MOCK_STUB_SOURCE, _validate_mock,
-)
 
 
 def mock_add_request(
@@ -5969,7 +5892,6 @@ def scroll_page(
             "before": before,
             "after": after,
         }
-
 
 
 # CDP input is addressed in top-level page pixels, so a point inside a frame has
@@ -6847,9 +6769,6 @@ def game_probe(
         }
 
 
-from web_search_neo.actions.render_source import _RENDER_BOOTSTRAP_SCRIPT, _RENDER_CONTROL_SCRIPT
-
-
 def _register_render_bootstrap(session: BrowserSession) -> None:
     """Install the frame gate and console hook before any script in new documents."""
     if session.render_bootstrap_registered:
@@ -6948,10 +6867,14 @@ def _select_frame(
     while True:
         try:
             count = int(driver.execute_script(_FRAME_COUNT_SCRIPT, frame_selector) or 0)
-        except WebDriverException as exc:
+        except InvalidSelectorException as exc:
             raise ValueError(
                 f"frame_selector '{frame_selector}' is not a valid CSS selector: "
                 f"{type(exc).__name__}"
+            ) from exc
+        except WebDriverException as exc:
+            raise ValueError(
+                f"frame_selector '{frame_selector}' could not be looked up: {_brief_error(exc)}"
             ) from exc
         if count > 1:
             raise ValueError(
@@ -8082,6 +8005,8 @@ def _shutdown_session(
             "Session on tab %s was left alone: the Chrome it was opened in is gone",
             session.current_tab_id,
         )
+        if session_id is not None:
+            request_mocks.forget(session_id)
         return {
             "tab_closed": False,
             "browser_gone": True,
@@ -8146,6 +8071,9 @@ def _shutdown_session(
         # Let another agent have the tab even if the teardown above went badly:
         # a claim outliving the session that made it is a tab nobody can use.
         _release_claimed_tab(session.current_tab_id)
+    if session_id is not None:
+        # A closed tab took its stubs with it; the registry must not outlive it.
+        request_mocks.forget(session_id)
     return {
         "tab_closed": tab_closed,
         "browser_gone": False,

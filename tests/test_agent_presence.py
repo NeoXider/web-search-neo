@@ -12,6 +12,8 @@ identical to an idle agent.
 
 from __future__ import annotations
 
+import re
+
 import asyncio
 
 import pytest
@@ -409,3 +411,18 @@ def test_a_broken_signal_never_fails_the_action(monkeypatch):
         main._execute_actions([{"action": "close", "session_id": "presence-none"}])
     )
     assert result["success"] is True
+
+
+def test_favicon_mark_is_a_translucent_slime_over_the_page_icon():
+    source = agent_presence.install_source()
+    # The page's own icon is drawn first and the slime goes on top of it in the
+    # bottom-right quarter, partly see-through: the tab keeps its identity.
+    assert "context.drawImage(baseImage, 0, 0, 32, 32)" in source
+    assert "context.translate(12, 12)" in source
+    assert "context.scale(1.25, 1.25)" in source
+    alphas = [float(value) for value in re.findall(r"globalAlpha = active \? ([\d.]+) : ([\d.]+)", source)[0]]
+    assert all(0 < alpha < 1 for alpha in alphas)
+    # An unreadable (tainted) favicon is left alone instead of being replaced by
+    # an opaque tile, and the older activity dot defers to this script.
+    assert "#20272e" not in source
+    assert "window.__wsnPresence" in browser_tools._TAB_ACTIVITY_SOURCE

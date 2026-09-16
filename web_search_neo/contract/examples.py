@@ -1,6 +1,5 @@
 """Static contract data; no browser runtime imports."""
 
-from typing import Any
 
 _RECIPES = {
     "lookup": ["search {query}", "open {url}", "page_elements", "read the answer"],

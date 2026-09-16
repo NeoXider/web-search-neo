@@ -133,6 +133,7 @@ def test_save_to_writes_file(monkeypatch, tmp_path):
         return response
 
     monkeypatch.setattr("web_search_neo.fetch.api.request", fake)
+    monkeypatch.setenv("WEB_SEARCH_NEO_DOWNLOAD_DIR", str(tmp_path))
     result = api.http_request(URL, save_to=str(target))
 
     assert target.read_bytes() == b"binary-data"

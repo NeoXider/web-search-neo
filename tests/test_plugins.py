@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from web_search_neo import main, msp_search, plugins
+from web_search_neo.mcp_compat import registered_tool
 
 PLUGIN_SOURCE = '''
 from web_search_neo import plugins
@@ -90,7 +91,7 @@ def test_load_plugin_registers_action_and_topic(
     spec = main._ACTIONS["echo_ping"]
     assert spec.group == "plugin-test" and spec.summary == "Test echo action."
     # The schema is generated like any built-in: one optional parameter.
-    model = main.legacy_mcp._tool_manager._tools["echo_ping"].fn_metadata.arg_model
+    model = registered_tool(main.legacy_mcp, "echo_ping").fn_metadata.arg_model
     fields = list(model.model_fields)
     assert fields == ["text"] and not model.model_fields["text"].is_required()
 
@@ -131,7 +132,7 @@ def test_web_info_dispatches_plugin_topic_and_publishes_it(
     assert payload["limit"] == 7 and payload["ok"] is True
 
     # The compact surface re-published web_info with the new topic allowed.
-    model = main.mcp._tool_manager._tools["web_info"].fn_metadata.arg_model
+    model = registered_tool(main.mcp, "web_info").fn_metadata.arg_model
     annotation = model.model_fields["topic"].annotation
     allowed = set(getattr(annotation, "__args__", ())) or set(
         str(v) for v in getattr(annotation, "args", ())

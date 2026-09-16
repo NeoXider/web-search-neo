@@ -56,3 +56,28 @@ def test_forbidden_imports_including_relative_are_rejected(source):
 ])
 def test_allowed_dependencies_and_own_modules(source):
     assert not boundary_errors(source, "web_search_neo/actions/fill.py")
+
+
+# The 1.15.0 ceilings. A ratchet only ever moves down: raising one means
+# editing this table too, which is the explicit review the policy asks for.
+_RATCHET_CEILINGS = {
+    "web_search_neo/browser_tools.py": 8240,
+    "web_search_neo/main.py": 2713,
+    "web_search_neo/page_perception.py": 2632,
+    "web_search_neo/chrome_bridge.py": 2054,
+    "chrome-extension/service-worker.js": 1650,
+    "web_search_neo/bridge_daemon.py": 1169,
+    "web_search_neo/macros.py": 849,
+}
+
+
+def test_legacy_ratchets_track_the_files_and_never_rise():
+    from scripts.architecture_policy import LEGACY_MAX_LINES
+
+    root = Path(__file__).resolve().parents[1]
+    for relative, maximum in LEGACY_MAX_LINES.items():
+        assert maximum <= _RATCHET_CEILINGS[relative], f"{relative} ratchet was raised"
+        count = len((root / relative).read_text(encoding="utf-8-sig").splitlines())
+        # A file that shrank must lower its ratchet, or the freed room is
+        # silently available to the next feature.
+        assert count == maximum, f"{relative}: {count} lines, ratchet says {maximum}; lower it"

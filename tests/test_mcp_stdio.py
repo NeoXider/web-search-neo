@@ -91,4 +91,13 @@ def test_stdio_server_exposes_compact_discovery_and_action_tools(local_site):
                 assert "Local fixture" in batch["results"][0]["data"]
                 assert f"{local_site.base_url}/relative" in batch["results"][1]["data"]
 
+                # A failed batch is an MCP error, but still carries its payload.
+                failed = await session.call_tool(
+                    "web_action", {"actions": [{"action": "no_such_action"}]}
+                )
+                assert failed.isError is True
+                failed_payload = json.loads(failed.content[0].text)
+                assert failed_payload["success"] is False
+                assert "Unsupported action" in failed_payload["results"][0]["error"]
+
     asyncio.run(exercise_server())

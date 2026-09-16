@@ -615,9 +615,13 @@ either way. It carries the page summary too, `captcha_scan_incomplete` included,
 so the same caution applies to its verdict. The timeout honours `timeout_seconds`
 as passed (it defaults to 180).
 
-Automatic CAPTCHA bypass is intentionally not implemented, and there is no
-hidden flag for it. A provider-supported, legal integration is tracked in
-[TODO.md](../TODO.md).
+Nothing clears a challenge on its own. The `captcha` action can send a widget's
+sitekey to a paid, third-party solving service, but only when asked: `mode='solve'`,
+or `mode='auto'` with `WEB_SEARCH_NEO_CAPTCHA_AUTO_SOLVE=1`, and always with
+`WEB_SEARCH_NEO_CAPTCHA_KEY` set. Otherwise `auto` waits for a human like
+`mode='wait'`. A returned token is applied only if the page URL is unchanged, and the
+result reports success only when it was applied. `wait_challenge` never calls a
+service.
 
 ## When the submit fails
 

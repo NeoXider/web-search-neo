@@ -15,6 +15,14 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+VENV_COMMANDS = {".venv/Scripts/python.exe", ".venv/bin/python"}
+
+
+def _expected_interpreter(root: Path) -> str:
+    for relative in (".venv/Scripts/python.exe", ".venv/bin/python"):
+        if (root / relative).is_file():
+            return (root / relative).as_posix()
+    return "python"
 
 
 def _server_entry() -> dict:
@@ -27,9 +35,16 @@ def _server_entry() -> dict:
 def test_shipped_mcp_config_points_at_a_real_checkout():
     entry = _server_entry()
 
-    assert entry.get("command") in {"python", "python.exe"}, (
-        f"unexpected interpreter command: {entry.get('command')!r}"
+    command = str(entry.get("command"))
+    # A bare interpreter, the checkout's virtualenv (relative to cwd, as the
+    # portable form ships), or an absolute virtualenv path the generator wrote.
+    portable = command in {"python", "python.exe"} or command in VENV_COMMANDS
+    pinned = Path(command).is_absolute() and command.replace("\\", "/").endswith(
+        tuple(VENV_COMMANDS)
     )
+    assert portable or pinned, f"unexpected interpreter command: {command!r}"
+    if pinned:
+        assert Path(command).is_file(), f"the pinned interpreter is missing: {command!r}"
     assert entry.get("args") == ["main.py"], f"unexpected args: {entry.get('args')!r}"
 
     raw_cwd = entry.get("cwd", ".")
@@ -64,10 +79,27 @@ def test_make_mcp_config_pins_this_checkout_and_preserves_foreign_servers():
     # Forward slashes keep the JSON portable across platforms (INSTALL.md).
     expected_cwd = REPO_ROOT.as_posix().replace("\\", "/")
     assert entry == {
-        "command": "python",
+        "command": _expected_interpreter(REPO_ROOT),
         "args": ["main.py"],
         "cwd": expected_cwd,
     }
+
+
+def test_make_mcp_config_prefers_the_checkout_virtualenv(tmp_path):
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    try:
+        import make_mcp_config
+    finally:
+        sys.path.pop(0)
+    assert make_mcp_config.entry_for(tmp_path)["command"] == "python"
+    unix = tmp_path / ".venv" / "bin" / "python"
+    unix.parent.mkdir(parents=True)
+    unix.write_text("", encoding="utf-8")
+    assert make_mcp_config.entry_for(tmp_path)["command"] == unix.as_posix()
+    windows = tmp_path / ".venv" / "Scripts" / "python.exe"
+    windows.parent.mkdir(parents=True)
+    windows.write_text("", encoding="utf-8")
+    assert make_mcp_config.entry_for(tmp_path)["command"] == windows.as_posix()
 
 
 def test_make_mcp_config_out_rewrites_only_its_own_entry(tmp_path):

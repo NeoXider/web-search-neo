@@ -2,9 +2,10 @@
 
 This guide installs the MCP server from source and connects it to LM Studio or another stdio-compatible MCP client.
 
-It describes version 1.10.1. The Python package, the server, and the bundled Chrome
-companion carry that same version, and the bridge only accepts a companion able to complete
-the 1.3.0 handshake — see [Updating](#updating) if an older one is already installed.
+It describes version 1.15.0. The Python package, the server, and the bundled Chrome
+companion carry that same version, and the bridge only accepts a companion that speaks the
+1.15.0 handshake (bridge protocol 2) — see [Updating](#updating) if an older one is already
+installed.
 
 ## 1. Requirements
 
@@ -50,6 +51,12 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
+`python -m pip install .` also works and adds a `wsn` command equivalent to
+`python main.py`. An installed wheel carries the companion as
+`web_search_neo/chrome_extension` and mirrors it to
+`%LOCALAPPDATA%\WebSearchNeo\extension` (or `~/.local/share/web-search-neo/extension`),
+which is the folder to load in Chrome; `setup_current_chrome` reports the exact path.
+
 ## 3. Start the MCP server directly
 
 ```text
@@ -58,7 +65,10 @@ python main.py
 
 The process waits for MCP messages on stdin and writes responses to stdout, so an apparently idle terminal is expected. Stop it with `Ctrl+C`.
 
-Diagnostic logs are written to `msp_server.log`. The log file is ignored by Git. The
+Diagnostic logs are written to `%LOCALAPPDATA%\web-search-neo\logs\msp_server.log` on
+Windows, or `$XDG_STATE_HOME/web-search-neo/logs/msp_server.log` — by default
+`~/.local/state/web-search-neo/logs/msp_server.log` — elsewhere; set
+`WEB_SEARCH_NEO_LOG_FILE` to choose another file. The
 companion bridge is a separate process and logs separately, to
 `%LOCALAPPDATA%\WebSearchNeo\bridge-daemon.log` on Windows or
 `$XDG_DATA_HOME/WebSearchNeo/bridge-daemon.log` — by default
@@ -215,7 +225,7 @@ Earlier revisions tried to perform those clicks for you through Windows UI Autom
 code is gone. It depended on the interface language, on which window happened to have focus,
 and on a folder picker that the automation backend does not even enumerate.
 
-The bundled companion is version 1.14.0 and declares five permissions: `alarms`, `debugger`,
+The bundled companion is version 1.15.0 and declares five permissions: `alarms`, `debugger`,
 `storage`, `tabs`, and `tabGroups`. There are no content scripts and no `host_permissions`;
 page access comes from `debugger`, which attaches the Chrome DevTools Protocol to the tabs
 the agent drives. `alarms` exists because Chrome suspends an idle MV3 service worker after
@@ -350,7 +360,9 @@ work; it is documented because the file exists on your disk.
   server as it connects — and stored at
   `%LOCALAPPDATA%\WebSearchNeo\bridge-token` on Windows, or at
   `$XDG_DATA_HOME/WebSearchNeo/bridge-token` — by default
-  `~/.local/share/WebSearchNeo/bridge-token` — created with `0600` permissions on POSIX.
+  `~/.local/share/WebSearchNeo/bridge-token`. It is written atomically and readable only by
+  your account: `0600` on POSIX, an ACL granting only the current user on Windows. A new
+  secret is minted only when the file is missing.
 - The token is machine-local and per-user. Never copy it to another machine or into a
   repository. If it leaks: delete the file, restart the MCP server, and reload the companion.
   Stopping the daemon used to be a required step, because it kept the token it had read at
@@ -359,10 +371,11 @@ work; it is documented because the file exists on your disk.
 - A copy is written into `chrome-extension/bridge-token.js` whenever the bridge comes up and
   on every `setup_current_chrome` call. That file is in `.gitignore`; a fresh clone does not
   contain it, and the companion simply retries until it has been written.
-- The companion sends the token with a nonce; the daemon answers with
-  `HMAC-SHA256(token, nonce)`; each side stops if the other cannot prove it holds the same
-  secret. An MCP server proves itself to the daemon the same way before it may relay
-  anything, so the relay is not a way around the token.
+- The token never crosses the socket. Both sides exchange fresh nonces and prove the
+  secret with `HMAC-SHA256`; the daemon proves itself first, and the companion sends nothing
+  derived from the secret until that proof checks out. An MCP server proves itself to the
+  daemon the same way before it may relay anything, so the relay is not a way around the
+  token, and the daemon refuses commands for a tab another connected client has claimed.
 - A file-based secret does not protect against a malicious process running as the same user,
   which can read it. It closes the case where any local process that grabs the bridge port
   before the server gains DevTools access to your signed-in tabs.
@@ -485,6 +498,12 @@ re-read `chrome-extension/bridge-token.js`, which is how a rotated secret reache
 
 Two cases still need the human:
 
+- **Upgrading from 1.14.x or older to 1.15.0.** The bridge handshake changed, so an older
+  companion is refused with a close reason that says to update and reload, and never gets
+  far enough to receive `runtime.reload`. Press **Reload** once, as below. A 1.14 bridge
+  daemon that is still running refuses the new handshake too, and a 1.15 `--bridge --stop`
+  cannot talk to it: end its `python ... --bridge` process (Task Manager, or
+  `Stop-Process -Id <pid>` for the process listening on 8765) before starting 1.15 servers.
 - **Upgrading from 1.3.0 or older.** The build being replaced is the one that has to
   understand the command, and it does not. From 1.3.0 the server sees the stale companion,
   answers `self_update: "unsupported"`, and returns the Reload steps as `manual_steps`. From
@@ -528,6 +547,10 @@ Set these for the MCP server process before it starts.
 | `WEB_SEARCH_NEO_BRIDGE_CONNECT_TIMEOUT` | How long a server keeps trying to reach a daemon, including one it just started, default `12` seconds. |
 | `WEB_SEARCH_NEO_BRIDGE_START_TIMEOUT` | How long startup waits for that first attempt before it continues in the background, default `2` seconds. |
 | `WEB_SEARCH_NEO_ALLOW_PLAIN_HTTP` | Accept unencrypted `http://` to public hosts. |
+| `WEB_SEARCH_NEO_DOWNLOAD_DIR` | The only directory fetch `save_to` may write into, default `downloads/` under the server's working directory. |
+| `WEB_SEARCH_NEO_LOG_FILE` | Path of the server's `msp_server.log`, instead of the per-user state directory. |
+| `WEB_SEARCH_NEO_AGENT_NAME` | Friendly agent name the companion shows on its toolbar badge and in the popup's **Agent tabs** card. |
+| `WEB_SEARCH_NEO_CAPTCHA_KEY` | Key for a paid CAPTCHA solving service (`WEB_SEARCH_NEO_CAPTCHA_HOST`, 2captcha by default). Used only by `captcha` `mode='solve'`, or `mode='auto'` with `WEB_SEARCH_NEO_CAPTCHA_AUTO_SOLVE=1`. |
 | `WEB_SEARCH_NEO_LEGACY_TOOLS` | Advertise the former wide tool list instead of the two compact tools. |
 | `WEB_SEARCH_NEO_PLUGINS` | `os.pathsep`-separated plugin `.py` files or directories; plugins may add actions, observation topics, and search providers. |
 
@@ -538,7 +561,9 @@ the values it started with, so stop it with `--bridge --stop` after changing the
 
 `WEB_SEARCH_NEO_ALLOW_PLAIN_HTTP` accepts `1`, `true`, `yes`, or `on`. Without it, plain
 `http://` to a public host is refused for both page fetches and browser `open`, and each
-redirect hop is validated the same way. Loopback, private, and link-local addresses, plus
+redirect hop is validated the same way. Link-local and cloud-metadata addresses
+(`169.254.0.0/16`, `fe80::/10`, `metadata.google.internal`) are refused whatever the scheme,
+and a public host may not redirect to a private one. Loopback and private addresses, plus
 `localhost` and hosts ending in `.local`, `.localhost`, `.internal`, `.home.arpa`, `.lan`,
 `.home`, `.intranet`, `.private`, or `.corp`, are always allowed over plain HTTP — and so is
 any single-label host such as `http://nas/`, because a name with no dot cannot exist on the
@@ -553,7 +578,8 @@ Install a supported Python version and enable the installer's “Add Python to P
 
 ### MCP starts and immediately disconnects
 
-Run `python main.py` from the clone directory and inspect `msp_server.log`. Confirm all packages were installed into the same Python environment that the MCP client resolves through `PATH`.
+Run `python main.py` from the clone directory and inspect `msp_server.log` (its location is
+under [Start the MCP server directly](#3-start-the-mcp-server-directly)). Confirm all packages were installed into the same Python environment that the MCP client resolves through `PATH`.
 
 ### Chrome does not start
 
@@ -619,7 +645,8 @@ or when `setup_current_chrome` answered `self_update: "unsupported"` or `"timeou
 2. If it stays `OFF`, open the card's **service worker** link and read its console. `no
    companion token yet, run setup_current_chrome` means `chrome-extension/bridge-token.js`
    is missing: start the MCP server from the clone, which writes it, or send a
-   `setup_current_chrome` action. `handshake refused (1008) Companion token mismatch` means
+   `setup_current_chrome` action. `the server did not prove it knows the companion token`
+   (or a daemon-side `Companion token mismatch` close) means
    `chrome-extension/bridge-token.js` holds a different secret than the daemon does, and
    there is essentially one cause: that file belongs to a *clone*, while the secret it is
    compared against is per-user and singular. Chrome is loading one checkout and a server is
@@ -627,11 +654,13 @@ or when `setup_current_chrome` answered `self_update: "unsupported"` or `"timeou
    very directory **Load unpacked** points at, then reload the extension. Restarting the
    daemon does not help and never did after the daemon learned to re-read the token file:
    it already fetches the current secret from disk before calling anything a mismatch.
-3. Check the card's version. It must read 1.10.1; anything older than 1.3.0 cannot
-   authenticate at all, and Chrome only picks up the new manifest on reload.
+3. Check the card's version. It must read 1.15.0; anything older speaks bridge protocol 1
+   and is refused with `Expected Web Search Neo bridge protocol 2; update and reload the
+   companion`, and Chrome only picks up the new manifest on reload.
 4. `%LOCALAPPDATA%\WebSearchNeo\bridge-daemon.log` records the bridge's side: `Rejected a
-   bridge client that did not present the companion token` confirms that something did reach
-   the port but could not prove the secret.
+   bridge extension that did not prove it knows the companion token` or `A bridge peer left
+   during the challenge (token mismatch?)` confirms that something did reach the port but
+   could not prove the secret.
 
 The companion keeps retrying a refused handshake on its own — starting at about ten seconds
 and slowing to at most two minutes — so once the cause is fixed it reconnects without help.

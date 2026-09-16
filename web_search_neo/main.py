@@ -4,10 +4,7 @@ import asyncio
 from dataclasses import dataclass
 import functools
 import json
-import logging
-from logging.handlers import RotatingFileHandler
 import os
-from pathlib import Path
 import sys
 from typing import Any, Literal
 from mcp.server.fastmcp import FastMCP, Image
@@ -20,25 +17,16 @@ from web_search_neo import macros
 from web_search_neo import msp_date_time
 from web_search_neo import msp_search
 from web_search_neo import plugins
-from web_search_neo.web_client import request
+from web_search_neo.log_setup import configure_server_log
+from web_search_neo.mcp_compat import ReportingFastMCP, registered_tool
+from web_search_neo.web_client import clamp_timeout, request
 from web_search_neo.fetch import api as fetch_api
 from web_search_neo.fetch import content as fetch_content
 
 
-__version__ = "1.14.0"
+__version__ = "1.15.0"
 
-PROJECT_DIR = Path(__file__).resolve().parents[1]
-log = logging.getLogger("web_search_neo")
-log.setLevel(logging.INFO)
-if not log.handlers:
-    handler = RotatingFileHandler(
-        PROJECT_DIR / "msp_server.log",
-        maxBytes=1_000_000,
-        backupCount=2,
-        encoding="utf-8",
-    )
-    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-    log.addHandler(handler)
+log = configure_server_log()  # per-user state dir; see log_setup.py
 
 
 mcp = FastMCP(
@@ -63,8 +51,9 @@ def _fetch_url_text(
     mode: str = "text",
     headers: dict[str, str] | None = None,
     save_to: str | None = None,
+    overwrite: bool = False,
 ) -> str:
-    return fetch_content._fetch_url_text(url, max_chars, timeout_seconds, mode, headers, save_to, request_client=request)
+    return fetch_content._fetch_url_text(url, max_chars, timeout_seconds, mode, headers, save_to, overwrite, request_client=request)
 
 @mcp.tool()
 async def fetch_url_text(
@@ -74,14 +63,17 @@ async def fetch_url_text(
     mode: Literal["text", "html", "raw"] = "text",
     headers: dict[str, str] | None = None,
     save_to: str | None = None,
+    overwrite: bool = False,
 ) -> str:
     """Download an HTTP(S) page without blocking parallel MCP tool calls.
 
     mode='raw'/'html' returns the raw source (JS bundles, markup); headers
-    sends custom request headers; save_to writes the body to a file.
+    sends custom request headers; save_to writes the body to a file under
+    WEB_SEARCH_NEO_DOWNLOAD_DIR (default ./downloads) and never replaces an
+    existing file unless overwrite=true. timeout_seconds is capped at 120.
     """
     return await asyncio.to_thread(
-        _fetch_url_text, url, max_chars, timeout_seconds, mode, headers, save_to
+        _fetch_url_text, url, max_chars, timeout_seconds, mode, headers, save_to, overwrite
     )
 
 
@@ -146,8 +138,13 @@ async def http_request(
     timeout_seconds: float = 20.0,
     max_chars: int = 20_000,
     save_to: str | None = None,
+    overwrite: bool = False,
 ) -> dict[str, Any]:
-    """Send any HTTP request without a browser; 4xx/5xx return status, not errors."""
+    """Send any HTTP request without a browser; 4xx/5xx return status and body, not errors.
+
+    save_to is confined to WEB_SEARCH_NEO_DOWNLOAD_DIR (default ./downloads) and
+    needs overwrite=true to replace a file; timeout_seconds is capped at 120.
+    """
     return await asyncio.to_thread(
         fetch_api.http_request,
         url,
@@ -159,6 +156,7 @@ async def http_request(
         timeout_seconds,
         max_chars,
         save_to,
+        overwrite,
     )
 
 
@@ -172,7 +170,7 @@ async def get_search_engines_status(
     return await asyncio.to_thread(
         msp_search.get_search_engines_status,
         check_live,
-        timeout_seconds,
+        clamp_timeout(timeout_seconds),
         force_refresh,
     )
 
@@ -203,7 +201,7 @@ async def search_web(
         )
         return {**response, "challenge_mode": "fallback"}
 
-    manual_timeout = max(10.0, float(manual_timeout_seconds))
+    manual_timeout = min(300.0, max(10.0, float(manual_timeout_seconds)))
     initial = await asyncio.to_thread(
         msp_search.search_web,
         query,
@@ -498,7 +496,7 @@ async def browser_open_pages(
             }
 
     pages = await asyncio.gather(
-        *(open_one(url, session_id) for url, session_id in zip(urls, ids))
+        *(open_one(url, session_id) for url, session_id in zip(urls, ids, strict=True))
     )
     return {
         "success_count": sum(1 for page in pages if page["success"]),
@@ -1870,7 +1868,7 @@ async def browser_captcha(
     timeout_seconds: float = 180.0,
     poll_seconds: float = 3.0,
 ) -> dict[str, Any]:
-    """Detect a captcha and clear it: wait for a human, or use a configured solving service."""
+    """Detect a captcha and clear it: wait for a human by default; mode='solve' uses a configured paid service."""
     return await asyncio.to_thread(
         browser_tools.solve_captcha, mode, session_id, timeout_seconds, poll_seconds
     )
@@ -2009,7 +2007,7 @@ def get_current_time_and_region() -> dict:
 # Keep the narrow Python wrappers above for compatibility and direct testing, but expose
 # only a compact self-documenting MCP surface to models.
 legacy_mcp = mcp
-mcp = FastMCP(
+mcp = ReportingFastMCP(  # failed web_action batches come back with isError=true
     "Web Search Neo",
     instructions=(
         "Use web_info for discovery and observation. Start with topic=capabilities when "
@@ -2208,7 +2206,7 @@ _ACTIONS: dict[str, ActionSpec] = {
 
 def _argument_model(tool_name: str) -> Any:
     """Return the pydantic model FastMCP generated for one wrapper function."""
-    return legacy_mcp._tool_manager._tools[tool_name].fn_metadata.arg_model
+    return registered_tool(legacy_mcp, tool_name).fn_metadata.arg_model
 
 
 def _parameter_names(tool_name: str) -> tuple[list[str], list[str]]:
@@ -2339,7 +2337,7 @@ def _topic_schema(topic: str) -> dict[str, Any]:
             f"Unknown action schema: {topic}. Available actions: {sorted(_ACTIONS)}. "
             f"Available info topics: {sorted(_TOPIC_HANDLERS)}"
         )
-    original = legacy_mcp._tool_manager._tools[handler.__name__].parameters
+    original = registered_tool(legacy_mcp, handler.__name__).parameters
     response: dict[str, Any] = {
         "topic": topic,
         "summary": _INFO_TOPICS[topic],
@@ -2359,7 +2357,7 @@ def _capabilities(action_name: str | None = None, full_schemas: bool = False) ->
         spec = _ACTIONS.get(selected)
         if spec is None:
             return _topic_schema(selected)
-        original = legacy_mcp._tool_manager._tools[spec.tool_name].parameters
+        original = registered_tool(legacy_mcp, spec.tool_name).parameters
         input_schema = {
             **original,
             "properties": {
@@ -2690,9 +2688,6 @@ def stop_bridge_daemon() -> int:
 
 
 def main() -> None:
-    # Plugins (WEB_SEARCH_NEO_PLUGINS or entry points) may add actions,
-    # info topics, and search providers before the surface is published.
-    plugins.load_plugins()
     arguments = sys.argv[1:]
     if "--bridge" in arguments:
         if "--stop" in arguments:
@@ -2701,6 +2696,10 @@ def main() -> None:
         # config already points at. It speaks no MCP and touches no stdio: an
         # agent's browser calls reach it over the loopback bridge instead.
         raise SystemExit(bridge_daemon.run_forever(__version__))
+    # Plugins (WEB_SEARCH_NEO_PLUGINS or entry points) may add actions, info
+    # topics, and search providers before the surface is published; the bridge
+    # daemon above publishes no MCP surface and never loads them.
+    plugins.load_plugins()
     browser_tools.start_current_chrome_bridge()
     active_mcp = (
         legacy_mcp

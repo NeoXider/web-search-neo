@@ -1,6 +1,5 @@
 """Static contract data; no browser runtime imports."""
 
-from typing import Any
 
 _INFO_TOPICS = {
     "capabilities": "This contract: topics, actions, recipes, and pitfalls.",
@@ -148,8 +147,12 @@ _ACTION_NOTES = {
         "background": "hit_test_unavailable=true can occur in an unpainted background tab; the unique DOM target is still clicked and must be verified from fresh state.",
         "frame_selector": _FRAME_CSS,
     },
+    "captcha": {
+        "paid": "mode='auto' waits for a human. A paid solving service is used only with mode='solve' (or auto with WEB_SEARCH_NEO_CAPTCHA_AUTO_SOLVE=1) and always needs WEB_SEARCH_NEO_CAPTCHA_KEY.",
+        "timeout": "timeout_seconds is capped at 300; timeout_note says when the cap applied.",
+    },
     "wait": {
-        "state": "present|visible|clickable; timeout_seconds defaults to 10 and is respected as passed.",
+        "state": "present|visible|clickable; timeout_seconds defaults to 10 and is capped at 300 s (timeout_note says when).",
         "script": "Pass script (a JS expression, e.g. \"window.__hydrated === true\") instead of selector to poll a hydration/framework condition atomically server-side; selector and script are mutually exclusive. poll_ms sets the poll interval.",
         "sleep": "With neither selector nor script the call is a plain sleep for timeout_seconds and returns success.",
         "frame_selector": _FRAME_ANY,
@@ -341,8 +344,9 @@ _ACTION_NOTES = {
         "query": "Optional {name: value} map sent as the URL query string.",
         "body": "Raw str body; mutually exclusive with body_json.",
         "body_json": "Any JSON value sent as the body; adds Content-Type: application/json unless headers set one.",
-        "timeout": "timeout_seconds bounds the call; DNS/timeout failures raise like fetch_text.",
-        "save_to": "Writes raw bytes to a file; the answer carries saved_to and size_bytes instead of body.",
-        "response": "Always {success, url, status, headers, body/size}: 4xx/5xx return success True with their status, not an error. fetch_text is GET-only and returns str; replay_request re-sends inside the page with cookies/CORS, this one never touches a browser.",
+        "timeout": "timeout_seconds (capped at 120) bounds each read, the whole body gets twice that; DNS/timeout failures raise like fetch_text.",
+        "save_to": "Writes raw bytes to a path inside WEB_SEARCH_NEO_DOWNLOAD_DIR (default ./downloads; relative paths resolve there, escapes are refused); an existing file needs overwrite=true. The answer carries saved_to and size_bytes instead of body.",
+        "network": "Explicit localhost/private URLs are allowed; cloud metadata and link-local hosts are always refused, as is a redirect from a public host to a private one. A cross-origin redirect keeps only non-credential headers (Accept*, User-Agent, Content-Type...).",
+        "response": "Always {success, url, status, headers, body/size}: 4xx/5xx return success True with their status and the server's error body, not an error. fetch_text is GET-only and returns str; replay_request re-sends inside the page with cookies/CORS, this one never touches a browser.",
     },
 }

@@ -26,11 +26,12 @@ from pathlib import Path
 from typing import Any
 
 from web_search_neo import bridge_auth
+from web_search_neo.extension_path import EXTENSION_DIR
 from web_search_neo.chrome_bridge import CHROME_EXTENSION_ID, get_chrome_bridge
 
 
 EXTENSION_NAME = "Web Search Neo Companion"
-EXTENSION_DIR = (Path(__file__).resolve().parents[1] / "chrome-extension").resolve()
+_SELF_UPDATE_POLL_SECONDS = 0.25
 
 
 def prepare_bridge_token() -> dict[str, Any]:
@@ -91,6 +92,9 @@ def _reload_companion(bridge: Any, expected_version: str) -> dict[str, Any]:
         running = str((status.get("browser") or {}).get("extension_version") or "")
         if status.get("connected") and running == expected_version:
             return {"self_update": "done", "replaced_version": replaced}
+        # status() answers at once while the daemon knows the worker is gone,
+        # so without a pause this loop spins a core for the whole deadline.
+        time.sleep(min(_SELF_UPDATE_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
     return {"self_update": "timeout", "replaced_version": replaced}
 
 

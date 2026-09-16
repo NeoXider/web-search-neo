@@ -7,13 +7,13 @@ architecture review. New production files always use the ordinary hard limit.
 SOFT_LIMIT = 600
 HARD_LIMIT = 800
 LEGACY_MAX_LINES = {
-    "web_search_neo/browser_tools.py": 8308,
-    "web_search_neo/main.py": 2714,
+    "web_search_neo/browser_tools.py": 8236,
+    "web_search_neo/main.py": 2713,
     "web_search_neo/page_perception.py": 2632,
-    "web_search_neo/chrome_bridge.py": 2090,
-    "chrome-extension/service-worker.js": 1712,
-    "web_search_neo/bridge_daemon.py": 1179,
-    "web_search_neo/macros.py": 850,
+    "web_search_neo/chrome_bridge.py": 2050,
+    "chrome-extension/service-worker.js": 1650,
+    "web_search_neo/bridge_daemon.py": 1166,
+    "web_search_neo/macros.py": 849,
 }
 
 # Each new package may import its own modules, stdlib, and only these internal

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import Any
 
-from web_search_neo.web_client import request, validate_http_url
+from web_search_neo.fetch.safety import redact_url, write_download
+from web_search_neo.web_client import clamp_timeout, request, validate_http_url
 
 log = logging.getLogger("web_search_neo")
 
@@ -23,6 +23,7 @@ def http_request(
     timeout_seconds: float = 20.0,
     max_chars: int = 20_000,
     save_to: str | None = None,
+    overwrite: bool = False,
     *,
     request_client: Any | None = None,
 ) -> dict[str, Any]:
@@ -32,6 +33,8 @@ def http_request(
     ``body_json`` (serialised as JSON) are mutually exclusive. HTTP error
     statuses (4xx/5xx) are returned as a success envelope with their real
     status, while transport failures (DNS, timeout) raise like fetch_text.
+    ``save_to`` is confined to the download directory (see fetch.safety) and
+    refuses to replace an existing file unless ``overwrite`` is true.
     """
     normalized_method = "GET" if method is None else str(method).strip().upper()
     if normalized_method not in _METHODS:
@@ -55,14 +58,14 @@ def http_request(
         if not any(str(name).lower() == "content-type" for name in sent):
             extra["headers"] = {**sent, "Content-Type": "application/json"}
     normalized_url = validate_http_url(url)
-    log.info("HTTP %s %s", normalized_method, normalized_url)
+    log.info("HTTP %s %s", normalized_method, redact_url(normalized_url))
     byte_budget = min(max(1_000_000, int(max_chars) * 8), 10_000_000)
     client = request if request_client is None else request_client
     try:
         response = client(
             normalized_url,
             method=normalized_method,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=clamp_timeout(timeout_seconds),
             max_response_bytes=byte_budget,
             **extra,
         )
@@ -85,16 +88,10 @@ def http_request(
     else:
         raw_bytes = text_value.encode("utf-8")
     size_bytes = len(raw_bytes)
+    # An error body over the byte budget arrives cut short (web_client.request).
+    cut_by_transport = getattr(response, "wsn_truncated", False) is True
     if save_to:
-        path = Path(str(save_to)).expanduser()
-        try:
-            resolved = path.resolve()
-        except OSError as exc:
-            raise ValueError(f"save_to is not a writable path: {exc}") from exc
-        parent = resolved.parent
-        if not parent.is_dir():
-            raise ValueError(f"save_to directory does not exist: {parent}")
-        resolved.write_bytes(raw_bytes)
+        resolved = write_download(str(save_to), raw_bytes, overwrite=bool(overwrite))
         return {
             "success": True,
             "url": final_url,
@@ -102,6 +99,7 @@ def http_request(
             "headers": resp_headers,
             "saved_to": str(resolved),
             "size_bytes": size_bytes,
+            **({"truncated": True} if cut_by_transport else {}),
         }
     limit = max(1, int(max_chars))
     return {
@@ -110,6 +108,6 @@ def http_request(
         "status": status,
         "headers": resp_headers,
         "body": text_value[:limit],
-        "truncated": len(text_value) > limit,
+        "truncated": len(text_value) > limit or cut_by_transport,
         "size_bytes": size_bytes,
     }

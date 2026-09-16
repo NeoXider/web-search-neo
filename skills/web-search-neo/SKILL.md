@@ -140,8 +140,9 @@ stay reachable, so local services work unchanged.
   bundled build is reloaded automatically, reported as `self_update`. When it does return
   `manual_steps`, show them to the user word for word and wait: nothing can install the
   extension, or reload a build older than 1.3.1, on their behalf.
-- A tab an agent is driving wears a green activity dot on its favicon; it fades after
-  5 quiet minutes. A dotted tab is agent-held: observe it read-only
+- A tab an agent is driving wears a small slime on its favicon (green while acting, amber
+  for 5 quiet minutes after), and the companion's toolbar badge reads `AI`. Such a tab is
+  agent-held: observe it read-only
   (`page_text`/`page_outline`/`screenshot`) or open your own session — acting on it
   collides mid-run, and claiming it is refused with the holder named.
 - Chrome's "started debugging this browser" banner on driven tabs is mandatory platform
@@ -417,8 +418,8 @@ clears — the default when no solving service is configured, and the honest ans
 person clicking the box always works. `mode=solve` sends the sitekey to a configured service
 and writes the returned token into the page; it needs `WEB_SEARCH_NEO_CAPTCHA_KEY`
 (`WEB_SEARCH_NEO_CAPTCHA_HOST` picks the provider, 2captcha by default) and costs money per
-solve. `mode=auto` solves when a service is configured and the widget exposes a sitekey, and
-waits otherwise.
+solve. `mode=auto` waits for the user; it solves only if the operator also set
+`WEB_SEARCH_NEO_CAPTCHA_AUTO_SOLVE=1`. A token is applied only if the page URL is unchanged.
 
 A solved token is not a submitted form: some sites submit from the widget's own callback and
 some wait for the button, so re-read the page and submit if it did not. A captcha with no

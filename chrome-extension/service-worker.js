@@ -18,6 +18,10 @@ import {
   sameFrameUrl,
   trackPending,
 } from "./events.js";
+import {agentMessage, applyGlobalBadge, noteAgentCommand} from "./agent-badges.js";
+import {PROTOCOL_VERSION, advanceHandshake, bytesToHex, loadBridgeToken, newNonce} from "./bridge-auth.js";
+
+export {loadBridgeToken, parseBridgeToken} from "./bridge-auth.js";
 
 const DEFAULT_BRIDGE_PORT = 8765;
 const PORT_KEY = "companion_bridge_port";
@@ -57,7 +61,6 @@ function normalizePort(value) {
   if (!Number.isFinite(port) || port < 1024 || port > 65535) return null;
   return port;
 }
-const PROTOCOL_VERSION = 1;
 // The bridge only listens while the MCP server runs, which on a desktop is a
 // small slice of the day. Chrome logs every refused attempt as a runtime error
 // of ours, so a flat retry buries chrome://extensions under hundreds of
@@ -413,11 +416,10 @@ async function ensureDebugger(tabId) {
 }
 
 // Every DevTools method the server sends through "cdp.send", and nothing else.
-// The companion previously forwarded whatever arrived, so an authenticated peer
-// held the entire protocol - including domains this MCP never exposes. The list
-// is asserted against the Python call sites by tests/test_chrome_bridge.py, so
-// adding a method to the server without adding it here fails the suite instead
-// of failing a user.
+// This narrows the protocol surface, not the power: Runtime.evaluate, Input.*,
+// cookies and Fetch interception still let an authenticated peer do anything
+// the page (and its cookies) can. The token handshake is the real boundary.
+// tests/test_chrome_bridge.py asserts the list against the Python call sites.
 export const ALLOWED_CDP_METHODS = new Set([
   "DOM.setFileInputFiles",
   "Emulation.sendGamepadEvents",
@@ -1083,14 +1085,14 @@ export async function handleCommand(connection, message) {
   } catch (error) {
     payload = {error: `${error?.name || "Error"}: ${error?.message || error}`};
   }
+  noteAgentCommand(message, params, payload);
   sendResult(connection, id, payload);
 }
 
 function setBadge(online) {
-  const color = !enabled ? "#64748b" : online ? "#16a34a" : "#dc2626";
-  chrome.action.setBadgeBackgroundColor({color});
-  chrome.action.setBadgeText({text: online ? "ON" : "OFF"});
-  chrome.action.setTitle({
+  applyGlobalBadge({
+    color: !enabled ? "#64748b" : online ? "#16a34a" : "#dc2626",
+    text: online ? "ON" : "OFF",
     title: !enabled
       ? "Web Search Neo Companion — disabled"
       : online
@@ -1459,53 +1461,6 @@ async function startBrowserRun() {
   if (socket) socket.close();
 }
 
-function bytesToHex(bytes) {
-  return [...new Uint8Array(bytes)].map(byte => byte.toString(16).padStart(2, "0")).join("");
-}
-
-function hexToBytes(hex) {
-  const bytes = new Uint8Array(hex.length >> 1);
-  for (let index = 0; index < bytes.length; index += 1) {
-    bytes[index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
-  }
-  return bytes;
-}
-
-function timingSafeEqual(left, right) {
-  if (left.length !== right.length) return false;
-  let difference = 0;
-  for (let index = 0; index < left.length; index += 1) difference |= left[index] ^ right[index];
-  return difference === 0;
-}
-
-export function parseBridgeToken(source) {
-  const match = /BRIDGE_TOKEN\s*=\s*["']([0-9a-f]{64})["']/.exec(String(source ?? ""));
-  if (!match) throw new Error("bridge-token.js holds no usable token");
-  return match[1];
-}
-
-// bridge-token.js is written by the Python side and is absent in a fresh clone.
-// It is read rather than imported on purpose: the worker's module map caches a
-// failed import for the life of the worker, so a token file that appears after
-// the first attempt would never be seen without a manual reload.
-export async function loadBridgeToken() {
-  const response = await fetch(chrome.runtime.getURL("bridge-token.js"), {cache: "no-store"});
-  if (!response.ok) throw new Error(`bridge-token.js is unreadable (HTTP ${response.status})`);
-  return parseBridgeToken(await response.text());
-}
-
-async function hmacSha256(token, message) {
-  const encoder = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    "raw",
-    encoder.encode(token),
-    {name: "HMAC", hash: "SHA-256"},
-    false,
-    ["sign"],
-  );
-  return new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(message)));
-}
-
 export async function connect() {
   if (!(await loadEnabled())) {
     connecting = false;
@@ -1516,13 +1471,10 @@ export async function connect() {
   if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
   connecting = true;
   let token = null;
-  let nonce = null;
-  let expectedProof = null;
   let run = null;
+  const nonce = newNonce();
   try {
     token = await loadBridgeToken();
-    nonce = bytesToHex(crypto.getRandomValues(new Uint8Array(16)));
-    expectedProof = await hmacSha256(token, nonce);
     // Read last, and before the socket exists, because onopen cannot await.
     run = await browserRun();
     if (!enabled) {
@@ -1545,6 +1497,7 @@ export async function connect() {
 
   verified = false;
   let handshakeStarted = false;
+  const handshake = {stage: "hello"};
   socket = new WebSocket(bridgeUrl());
   connecting = false;
   const active = socket;
@@ -1553,7 +1506,7 @@ export async function connect() {
     active.send(JSON.stringify({
       type: "hello",
       protocol: PROTOCOL_VERSION,
-      token,
+      role: "extension",
       nonce,
       browser: {
         name: "Chrome",
@@ -1574,14 +1527,12 @@ export async function connect() {
     }
     if (!message) return;
     if (!verified) {
-      // Anything other than a valid ack — a command above all — means the peer
-      // is not the local server we share a secret with.
-      if (message.type !== "hello_ack") {
-        console.warn(`bridge: closing an unverified peer that sent ${message.type}`);
-        active.close();
-        return;
-      }
-      completeHandshake(active, message, expectedProof);
+      advanceHandshake(active, message, handshake, {
+        token,
+        nonce,
+        isCurrent: () => active === socket && active.readyState === WebSocket.OPEN,
+        onVerified: () => completeHandshake(active),
+      });
       return;
     }
     if (message.type !== "command") return;
@@ -1613,22 +1564,7 @@ export async function connect() {
   socket.onerror = () => active.close();
 }
 
-function completeHandshake(connection, message, expectedProof) {
-  let accepted = false;
-  try {
-    const proof = typeof message.proof === "string" ? message.proof : "";
-    accepted =
-      message.protocol === PROTOCOL_VERSION &&
-      /^[0-9a-f]{64}$/.test(proof) &&
-      timingSafeEqual(hexToBytes(proof), expectedProof);
-  } catch (error) {
-    console.warn("bridge: could not check the server proof", error);
-  }
-  if (!accepted) {
-    console.warn("bridge: the server did not prove it knows the companion token");
-    connection.close();
-    return;
-  }
+function completeHandshake(connection) {
   if (connection !== socket || connection.readyState !== WebSocket.OPEN) return;
   verified = true;
   lastFailure = null;
@@ -1681,6 +1617,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     operation = loadEnabled().then(() => setBridgePort(message.port));
   } else if (type === "companion.setMaxSessions") {
     operation = loadEnabled().then(() => setMaxSessions(message.max_sessions));
+  } else if (String(type).startsWith("companion.") && (operation = agentMessage(message))) {
+    // Agent activity list and focus requests from the popup.
   } else {
     return false;
   }

@@ -62,7 +62,7 @@ python -m pip install -r requirements.txt
 python main.py
 ```
 
-The server uses MCP over stdio. Keep stdout reserved for MCP messages; rotating diagnostic logs are written to `msp_server.log`. The companion bridge runs as [its own process](#the-bridge-daemon) and keeps a separate rotating log at `%LOCALAPPDATA%\WebSearchNeo\bridge-daemon.log`, or `$XDG_DATA_HOME/WebSearchNeo/bridge-daemon.log` — by default `~/.local/share/WebSearchNeo/bridge-daemon.log` — because two processes rotating one file collide on Windows.
+The server uses MCP over stdio. Keep stdout reserved for MCP messages; rotating diagnostic logs are written to `%LOCALAPPDATA%\web-search-neo\logs\msp_server.log` on Windows, or `$XDG_STATE_HOME/web-search-neo/logs/msp_server.log` — by default under `~/.local/state` — elsewhere; `WEB_SEARCH_NEO_LOG_FILE` overrides the path. The companion bridge runs as [its own process](#the-bridge-daemon) and keeps a separate rotating log at `%LOCALAPPDATA%\WebSearchNeo\bridge-daemon.log`, or `$XDG_DATA_HOME/WebSearchNeo/bridge-daemon.log` — by default `~/.local/share/WebSearchNeo/bridge-daemon.log` — because two processes rotating one file collide on Windows.
 
 For Linux/macOS activation and detailed setup/troubleshooting, see [INSTALL.md](INSTALL.md).
 
@@ -280,19 +280,21 @@ is no automatic substitute. If you would rather not install an extension at all,
 `profile_mode="temporary"` and `profile_mode="persistent"` drive a Selenium
 browser that needs no companion.
 
-The bundled companion is version 1.14.0. Chrome does not refresh an unpacked
+The bundled companion is version 1.15.0. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
-whenever the connected build is older than the bundled one. Upgrading *onto*
-1.3.1 is the last one that costs a click, because the build being replaced is the
-build that has to understand the command; the very first install still needs the
-three steps above, which no program can perform.
+whenever the connected build is older than the bundled one. That only works for
+a companion that can still authenticate, though: 1.15.0 changed the bridge
+handshake (protocol 2), so an older build is refused before the command can reach
+it. Upgrading *onto* 1.15.0 therefore costs one click, just as upgrading onto
+1.3.1 did; the very first install still needs the three steps above, which no
+program can perform.
 
 So press **Reload** on the companion card at `chrome://extensions` once, after the
-pull that crosses 1.3.1. Skipping it on a 1.2.0-or-older install is the loudest
-case, because that build cannot even authenticate:
+pull that crosses 1.15.0 (or 1.3.1). Skipping it leaves a build that cannot
+authenticate:
 
-- a service worker from 1.2.0 or older sends no token, so the bridge closes it with code 1008 and the reason `Companion token mismatch; reload the extension on chrome://extensions`;
+- a service worker from 1.2.0 or older sends no token, and one older than 1.15.0 still speaks bridge protocol 1, so the bridge closes it with code 1008 and a reason that says to update and reload the extension on `chrome://extensions`;
 - the badge then stays `OFF` and the worker retries on a slow ladder, from about ten seconds up to two minutes;
 - the bridge daemon records the rejection in `%LOCALAPPDATA%\WebSearchNeo\bridge-daemon.log`, not in `msp_server.log`;
 - a 1.3.0 worker also prints the close code and reason in its own service-worker console; an older one does not, so on a stale install the badge and that daemon log are the signal.
@@ -467,19 +469,23 @@ knowledge of a machine-local secret before a single command is executed:
   starts or by a server as it connects, and kept in
   `%LOCALAPPDATA%\WebSearchNeo\bridge-token` on Windows, or in
   `$XDG_DATA_HOME/WebSearchNeo/bridge-token` — by default
-  `~/.local/share/WebSearchNeo/bridge-token` — created `0600` on POSIX;
+  `~/.local/share/WebSearchNeo/bridge-token`;
 - the same secret is copied into `chrome-extension/bridge-token.js` before Chrome is
   asked to load the folder, so setup stays hands-free. That file is listed in
   `.gitignore` and is never committed or shared between machines;
-- the companion sends the token and a fresh 16-byte nonce in its `hello`. The daemon
-  compares the token in constant time and answers `hello_ack` with
-  `HMAC-SHA256(token, nonce)`;
-- the companion verifies that proof with WebCrypto and runs nothing until it matches. A
-  peer that sends anything other than a valid ack first — a command above all — is closed
-  immediately;
-- an MCP server authenticates to the daemon with the same hello, marked `role: "client"`,
-  and checks the daemon's proof before relaying anything. Being a relay is not a way
-  around the token: a local process without it is closed on both roles alike.
+- the token itself never crosses the socket (bridge protocol 2). The peer's `hello`
+  carries a `role` and a fresh nonce; the daemon answers with its own nonce and an
+  `HMAC-SHA256` proof over both, and only once the peer has verified that proof — with
+  WebCrypto in the companion — does it send its own HMAC back. The proofs carry
+  direction labels, so neither can be replayed as the other. A squatter on the port
+  learns nothing from the companion, and a peer that sends anything else first is closed;
+- an MCP server authenticates the same way with `role: "client"`; the `extension` role
+  additionally requires the companion's `Origin`. Being a relay is not a way around the
+  token: a local process without it is closed on both roles alike;
+- the token file is written atomically and restricted to the current user — `0600` on
+  POSIX, an `icacls` ACL on Windows — and a new secret is minted only when the file is
+  missing. The daemon caps connections (64 open, 16 mid-handshake) and refuses a command
+  for a tab another connected client has claimed.
 
 A newly authenticated connection replaces the previous one, so a companion whose service
 worker Chrome had suspended reclaims the bridge on reconnect instead of finding it held by
@@ -489,9 +495,8 @@ The honest limit: the secret is a file owned by the user account, so any process
 as that same user can read it and impersonate either side. This closes the "whoever binds
 the port first owns the browser" hole; it is not protection against malware already
 running as you. The real fix is Chrome Native Messaging, where Chrome launches the server
-itself and no port is listened on at all — it is tracked in [TODO.md](TODO.md). An
-authenticated peer is also unrestricted: `cdp.send` forwards any DevTools method to a tab,
-with no method allowlist.
+itself and no port is listened on at all — it is tracked in [TODO.md](TODO.md). The
+companion forwards only the DevTools methods on its `cdp.send` allowlist.
 
 The daemon did not move that boundary, but it did change how long the door stands open.
 The listener used to exist only while an agent was running — minutes a day on a normal
@@ -544,7 +549,7 @@ Detection answers "is a challenge in the way", not "does this page contain a cap
 
 A challenge with no box is the other half of this. An invisible Turnstile renders no picture and no checkbox — the whole widget is a container in the DOM and a hidden field its token would go into — so a visibility test walked straight past it while the site's own submit handler waited for a token that was never coming: the button sits on "Submitting…", no request leaves the page, and the console stays empty. Every page summary therefore also carries `invisible_challenge_pending`, and with it `invisible_challenge` naming the vendor, the state (`token_empty` when the hidden `cf-turnstile-response`, `g-recaptcha-response`, `h-captcha-response` or `smart-token` field is empty; `widget_hidden` when the widget rendered before its field existed), the evidence and what to do about it. It gates the form rather than the page, so `challenge_detected` stays false — but `captcha` with `op=detect` reports it, `mode='wait'` no longer calls it resolved, and a `click` that made no network request at all while it is pending comes back with `submit_blocked_by_challenge` and a reason.
 
-Automatic CAPTCHA bypass is intentionally not implemented. The roadmap tracks a future provider-supported, legal integration in [TODO.md](TODO.md).
+The `captcha` web action can also hand a widget's sitekey to a third-party solving service (2captcha-compatible, `WEB_SEARCH_NEO_CAPTCHA_HOST`), but only on request: `mode='solve'`, or `mode='auto'` with `WEB_SEARCH_NEO_CAPTCHA_AUTO_SOLVE=1`, and always with `WEB_SEARCH_NEO_CAPTCHA_KEY` set, because every solve costs money. By default `auto` waits for a human. The returned token is applied only if the page URL has not changed, and the result reports success only when it was. Search `challenge_mode` never calls a service.
 
 ## Current Chrome automation
 
@@ -711,8 +716,10 @@ set `WEB_SEARCH_NEO_LABEL_TABS=0` in the server's environment, to turn it off.
 
 The label says whose tab it is; two further signals say whether anything is
 happening in it. Every action marks the page it ran in: the tab's favicon gets
-a green badge while an agent is working there, an amber one for five minutes
-after its last action, and its own icon back afterwards — so a glance at the
+a small semi-transparent slime in its corner — awake and green while an agent
+is working there, sleepy and amber for five minutes after its last action — on
+top of the site's own icon, which comes back clean afterwards (a favicon the
+page cannot read cross-origin is left untouched) — so a glance at the
 tab strip separates the tab being driven right now from the one abandoned an
 hour ago. In the page itself, the element the action touched flashes for a
 quarter of a second, in red when the action was refused, which turns a burst of
@@ -1475,15 +1482,15 @@ It reports the eager tool-schema size and the median and p95 latency of both MCP
 
 - Visible or attached sessions may contain authenticated accounts. The MCP client can act with the permissions of those accounts.
 - The companion declares five permissions: `alarms`, `debugger`, `storage`, `tabs`, and `tabGroups`. It ships no content scripts and asks for no `host_permissions`, but `debugger` is the broad one: it lets the extension attach the Chrome DevTools Protocol to a tab and from there read and modify that page, its console, and its network traffic. Chrome shows a "started debugging this browser" banner whenever it is attached. `alarms` is the narrow one — it only wakes a suspended service worker to retry the bridge, and Chrome shows no extra warning for it. Install the companion only from this repository.
-- The loopback bridge is authenticated in both directions. The extension proves it holds the machine-local token before the bridge accepts a command, and the bridge proves the same by returning `HMAC-SHA256(token, nonce)` before the extension executes one; an MCP server presents the same token before it may relay anything. Until 1.3.0 the port accepted any local client that spoke the protocol, and the extension trusted whatever answered on it.
+- The loopback bridge is authenticated in both directions with an HMAC challenge-response over fresh nonces: the daemon proves it holds the machine-local token first, and the extension or MCP server answers only after checking that proof, so the token itself never crosses the socket (since 1.15.0). Until 1.3.0 the port accepted any local client that spoke the protocol, and the extension trusted whatever answered on it.
 - That secret is a file readable by the user account that owns it, so it does not defend against a malicious process already running as you: such a process can read the token and impersonate either side. It removes the race in which any local program that binds `127.0.0.1:8765` before the server inherits DevTools access to every signed-in tab. Chrome Native Messaging, which needs no listening port at all, is the actual fix and is tracked in [TODO.md](TODO.md).
 - The port is now held by a [daemon](#the-bridge-daemon) that outlives each agent call, so it is reachable for as long as Chrome keeps the companion attached rather than only while an agent runs. The authentication is unchanged and same-user processes were never excluded by it, but the window in which one could use the token is wider. Stop the daemon with `python main.py --bridge --stop`, or let its idle exit close the port fifteen minutes after the last companion and client are gone.
-- Authentication is not authorization. An authenticated peer may call `cdp.send` with any DevTools method on any tab the session drives; there is no method allowlist yet.
+- Authentication is not authorization. An authenticated peer may call `cdp.send` on any tab it holds, limited only to the companion's DevTools method allowlist; the daemon refuses commands for a tab another connected client has claimed.
 - `setup_current_chrome` opens no page, navigates nothing, and reads no browsing data. It publishes the shared secret and returns the steps. The single exception, since 1.3.1, is that it may tell an already-installed companion older than the bundled build to reload itself; *installing* the companion stays a deliberate user action in Chrome's own UI.
-- Plain `http://` to public hosts is refused unless `WEB_SEARCH_NEO_ALLOW_PLAIN_HTTP=1` is set; loopback and private-network addresses are always reachable.
+- Plain `http://` to public hosts is refused unless `WEB_SEARCH_NEO_ALLOW_PLAIN_HTTP=1` is set; loopback and private-network addresses are reachable when addressed directly, but a public host redirecting to one is refused, and link-local/cloud-metadata addresses are always blocked. Cross-origin redirects drop credential headers, and `save_to` writes only under `WEB_SEARCH_NEO_DOWNLOAD_DIR` (default `./downloads`), never over an existing file without `overwrite=true`.
 - File upload tools can upload local paths supplied to the tool. Review agent actions and scope filesystem access appropriately.
 - Browser automation may be restricted by a site's terms of service. Use it only where you are authorized.
-- Manual challenge mode hands control to you; it does not attempt to bypass CAPTCHA protections.
+- Manual challenge mode hands control to you. A paid CAPTCHA solving service is contacted only on `captcha` `mode='solve'` (or `mode='auto'` with `WEB_SEARCH_NEO_CAPTCHA_AUTO_SOLVE=1`) and only when `WEB_SEARCH_NEO_CAPTCHA_KEY` is set.
 
 ## Contributing
 

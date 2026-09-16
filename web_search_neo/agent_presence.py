@@ -26,14 +26,14 @@ from typing import Any
 # reinstall itself. Without it a long-lived tab would keep running whatever
 # version was current when it first loaded, and a fix here would only reach
 # pages opened afterwards.
-PRESENCE_VERSION = 1
+PRESENCE_VERSION = 4
 
 PRESENCE_ENV = "WEB_SEARCH_NEO_AGENT_PRESENCE"
 
 # How long a single action keeps the badge in its bright "working now" state.
-# An action lasts milliseconds, so this is really "how long the eye needs to
-# catch it" - shorter and a fast burst of steps looks like nothing happened.
-ACTIVE_MS = 2500
+# Agents pause between steps to think, so a few seconds made a busy tab flicker
+# to "recent"; this matches the companion's toolbar badge.
+ACTIVE_MS = 30_000
 # The afterglow the user asked for: the tab stays marked for five minutes after
 # the agent's last action, then gives the favicon back.
 RECENT_MS = 5 * 60 * 1000
@@ -244,61 +244,99 @@ _INSTALL_TEMPLATE = r"""
     }
   }
 
-  function drawBadge(context, color) {
-    const cx = 23;
-    const cy = 23;
-    // A ring in the page-independent direction: dark under a light favicon,
-    // light under a dark one is unknowable here, so the badge carries its own
-    // contrast with a two-tone outline instead of guessing.
+  // The mark is the project's slime, drawn into the bottom-right quarter over
+  // the page's own favicon and slightly see-through, so the tab keeps its
+  // identity and only gains a small companion. Active: awake and bright;
+  // recent: dimmer and asleep.
+  function slimeBody(context) {
     context.beginPath();
-    context.arc(cx, cy, 9.5, 0, Math.PI * 2);
-    context.fillStyle = "rgba(255,255,255,0.92)";
+    context.moveTo(1.5, 15);
+    context.bezierCurveTo(0, 9, 3, 3.5, 8, 3.5);
+    context.bezierCurveTo(13, 3.5, 16, 9, 14.5, 15);
+    context.closePath();
+  }
+
+  function drawSlime(context, phase) {
+    const active = phase === "active";
+    context.save();
+    // 16 units scaled to 20 px: at the tab strip's 16 px a smaller mark
+    // shrinks to a few pixels nobody can read.
+    context.translate(12, 12);
+    context.scale(1.25, 1.25);
+    context.globalAlpha = active ? 0.88 : 0.78;
+    // A light halo keeps the slime readable on dark favicons, the dark edge on
+    // light ones; which one the page has is unknowable here.
+    slimeBody(context);
+    context.lineWidth = 2;
+    context.strokeStyle = "rgba(255,255,255,0.9)";
+    context.stroke();
+    slimeBody(context);
+    context.lineWidth = 0.8;
+    context.strokeStyle = "rgba(10,30,18,0.8)";
+    context.stroke();
+    context.fillStyle = active ? CONFIG.activeColor : CONFIG.recentColor;
     context.fill();
     context.beginPath();
-    context.arc(cx, cy, 8, 0, Math.PI * 2);
-    context.fillStyle = "rgba(17,24,28,0.55)";
+    context.arc(8, 3.4, 1.2, 0, Math.PI * 2);
     context.fill();
     context.beginPath();
-    context.arc(cx, cy, 6.5, 0, Math.PI * 2);
-    context.fillStyle = color;
+    context.ellipse(5, 7, 1.6, 0.9, -0.6, 0, Math.PI * 2);
+    context.fillStyle = "rgba(255,255,255,0.55)";
     context.fill();
+    context.fillStyle = "#10261a";
+    context.strokeStyle = "#10261a";
+    context.lineWidth = 0.9;
+    context.lineCap = "round";
+    if (active) {
+      for (const x of [5.6, 10.4]) {
+        context.beginPath();
+        context.arc(x, 9.6, 1.5, 0, Math.PI * 2);
+        context.fillStyle = "#ffffff";
+        context.fill();
+        context.beginPath();
+        context.arc(x + 0.2, 9.8, 0.8, 0, Math.PI * 2);
+        context.fillStyle = "#10261a";
+        context.fill();
+      }
+      context.beginPath();
+      context.arc(8, 11.6, 1.6, 0.15 * Math.PI, 0.85 * Math.PI);
+      context.stroke();
+    } else {
+      for (const x of [5.6, 10.4]) {
+        context.beginPath();
+        context.arc(x, 9.4, 1.2, 0.1 * Math.PI, 0.9 * Math.PI);
+        context.stroke();
+      }
+      context.beginPath();
+      context.moveTo(7.2, 12.6);
+      context.lineTo(8.8, 12.6);
+      context.stroke();
+    }
+    context.restore();
   }
 
   function paint(phase, baseImage) {
-    let canvas;
     try {
-      canvas = document.createElement("canvas");
+      const canvas = document.createElement("canvas");
       canvas.width = 32;
       canvas.height = 32;
       const context = canvas.getContext("2d");
       if (!context) return null;
-      if (baseImage) {
-        context.drawImage(baseImage, 0, 0, 32, 32);
-      } else {
-        // No readable favicon: a neutral tile still gives the tab strip a
-        // visibly different icon, which is the whole point of the signal.
-        context.fillStyle = "#20272e";
-        context.fillRect(0, 0, 32, 32);
-      }
-      drawBadge(context, phase === "active" ? CONFIG.activeColor : CONFIG.recentColor);
+      // No favicon at all leaves the canvas transparent: Chrome's generic
+      // globe is not the page's identity, so the slime alone replaces it.
+      if (baseImage) context.drawImage(baseImage, 0, 0, 32, 32);
+      drawSlime(context, phase);
       return canvas.toDataURL("image/png");
     } catch (error) {
-      // A cross-origin favicon taints the canvas and toDataURL throws. Fall
-      // back to the badge alone rather than leaving the tab unmarked.
-      if (baseImage) return paint(phase, null);
+      // A cross-origin favicon without CORS taints the canvas and toDataURL
+      // throws. Leave the page's icon as it is rather than swap it for
+      // something else: the companion's toolbar badge still marks the tab.
       return null;
     }
   }
 
   function applyIcon(dataUrl) {
     if (!dataUrl || !document.head) return;
-    if (!state.ownLink) {
-      state.ownLink = document.createElement("link");
-      state.ownLink.setAttribute("rel", "icon");
-      state.ownLink.setAttribute("data-wsn-presence", "icon");
-    }
-    state.ownLink.setAttribute("href", dataUrl);
-    if (state.ownLink.parentNode !== document.head) document.head.appendChild(state.ownLink);
     // Chrome honours the last icon link in the document, but a page that
     // rewrites its own favicon after us would win on the next reflow. Parking
     // the page's rel attribute makes ours the only icon link there is.
@@ -310,6 +348,17 @@ _INSTALL_TEMPLATE = r"""
       link.setAttribute("rel", "wsn-parked-icon");
       state.hidden.push(link);
     }
+    if (!state.ownLink) {
+      state.ownLink = document.createElement("link");
+      state.ownLink.setAttribute("rel", "icon");
+      state.ownLink.setAttribute("data-wsn-presence", "icon");
+    }
+    // Inserted after the parking and re-inserted on every change: Chrome keeps
+    // the page's icon when ours was already in place before the page's link
+    // stopped being an icon, and re-reads the list only when a link is added.
+    if (state.ownLink.parentNode) state.ownLink.parentNode.removeChild(state.ownLink);
+    state.ownLink.setAttribute("href", dataUrl);
+    document.head.appendChild(state.ownLink);
   }
 
   function repaint(phase) {
@@ -323,7 +372,7 @@ _INSTALL_TEMPLATE = r"""
     // the same picture.
     if (state.loading[phase]) return;
     state.loading[phase] = true;
-    const href = state.baseHref || (state.baseHref = baseIconHref());
+    const declared = state.baseHref || (state.baseHref = baseIconHref());
     const finish = function (image) {
       state.loading[phase] = false;
       const dataUrl = paint(phase, image);
@@ -331,20 +380,32 @@ _INSTALL_TEMPLATE = r"""
       state.painted[phase] = dataUrl;
       if (state.phase === phase) applyIcon(dataUrl);
     };
-    if (!href) {
-      finish(null);
-      return;
-    }
-    try {
-      const image = new Image();
-      image.crossOrigin = "anonymous";
-      image.onload = function () { finish(image); };
-      image.onerror = function () { finish(null); };
-      image.src = href;
-      if (image.complete && image.naturalWidth) finish(image);
-    } catch (error) {
-      finish(null);
-    }
+    let fallback = null;
+    try { fallback = new URL("/favicon.ico", location.href).href; } catch (error) {}
+    const candidates = [declared];
+    if (fallback && fallback !== declared) candidates.push(fallback);
+    const attempt = function (index) {
+      const href = candidates[index];
+      if (!href) {
+        // Nothing readable. A page that declares an icon still has one on
+        // screen (Chrome fetches it without CORS), so it stays; only a page
+        // with no icon at all gets the slime on its own.
+        state.loading[phase] = false;
+        if (iconLinks().length || state.hidden.length) return;
+        finish(null);
+        return;
+      }
+      try {
+        const image = new Image();
+        image.crossOrigin = "anonymous";
+        image.onload = function () { finish(image); };
+        image.onerror = function () { attempt(index + 1); };
+        image.src = href;
+      } catch (error) {
+        attempt(index + 1);
+      }
+    };
+    attempt(0);
   }
 
   function restoreIcon() {

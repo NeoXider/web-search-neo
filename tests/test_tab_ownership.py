@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from web_search_neo import browser_tools
+from web_search_neo import agent_presence, browser_tools
 
 
 class _Companion:
@@ -88,6 +88,11 @@ class _Tab:
         return {"removed": True}
 
     def execute_script(self, script: str, *_args: object) -> object:
+        if script == agent_presence.RESTORE_SCRIPT:
+            # Handing a tab back gives its favicon back; that is not a change
+            # to the page, so it is recorded apart from the calls that would be.
+            self.calls.append("restore_favicon")
+            return None
         self.calls.append("execute_script")
         if script.strip() == "return document.readyState":
             return "complete"
@@ -123,8 +128,9 @@ def test_the_borrowed_tab_is_handed_back_untouched(monkeypatch, companion):
     )
 
     assert released == 42
-    # Detached, and nothing else: not closed, not navigated, not activated.
-    assert borrowed.calls == ["quit"]
+    # Detached with its favicon restored, and nothing else: not closed, not
+    # navigated, not activated.
+    assert borrowed.calls == ["restore_favicon", "quit"]
 
 
 def test_the_session_moves_to_a_tab_it_owns(monkeypatch, companion):

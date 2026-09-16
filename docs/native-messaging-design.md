@@ -8,25 +8,36 @@
 extension origin and origin-less local Python clients, holds one extension connection and
 many MCP-client connections, routes commands/results, and owns tab claims.
 
-The extension service worker opens `ws://127.0.0.1:<port>`. Its first frame is:
+The extension service worker opens `ws://127.0.0.1:<port>`. The handshake is protocol 2
+(`web_search_neo/bridge_handshake.py`, `chrome-extension/bridge-auth.js`); the raw token
+never crosses the socket:
 
 ```json
-{"type":"hello","protocol":1,"token":"<64 hex>","nonce":"<32 hex>","browser":{"name":"Chrome","extension_version":"...","browser_run":"...","max_sessions":8}}
+{"type":"hello","protocol":2,"role":"extension","nonce":"<Nc>","browser":{"name":"Chrome","extension_version":"...","browser_run":"...","max_sessions":8}}
+{"type":"challenge","protocol":2,"nonce":"<Ns>","proof":"HMAC-SHA256(token, wsn-bridge-server|Nc|Ns)"}
+{"type":"auth","proof":"HMAC-SHA256(token, wsn-bridge-client|Ns|Nc)"}
+{"type":"hello_ack","protocol":2}
 ```
 
-An MCP client sends the same hello with `role: "client"`, its version, PID, and program.
-The daemon validates the raw token and replies with `hello_ack` containing
-`HMAC-SHA256(token, nonce)`. Both peers verify that proof before accepting traffic. Commands
+An MCP client sends the same hello with `role: "client"`, its version, PID, program, and
+optional agent name. The daemon proves itself first; a peer that cannot verify that proof
+hangs up without sending anything derived from the secret. The `extension` role also needs
+the extension `Origin`, a protocol-1 hello is refused with an "update and reload" reason,
+and the daemon caps connections at 64 open and 16 mid-handshake. Commands
 are `{type:"command", id, method, params}` and extension replies are
 `{type:"result", id, result|error}`. Local clients also use control messages; the daemon
-broadcasts extension and claim state.
+broadcasts extension and claim state, refuses a command for a tab claimed by another
+connected client (`tabs.get` excepted), and attaches the sender's `agent` identity to each
+relayed command so the companion can badge the tab.
 
 `web_search_neo/bridge_auth.py` creates `%LOCALAPPDATA%\WebSearchNeo\bridge-token`, then mirrors it into
-`chrome-extension/bridge-token.js`. `setup_current_chrome()`, the daemon, and the default
-client ensure that copy exists. The worker fetches it without caching on every attempt.
-This protects against a random loopback peer, but not another process running as the same
-user. A process that binds 8765 first also sees the extension's raw token before proving
-anything.
+`chrome-extension/bridge-token.js` (or the per-user extension mirror of an installed
+wheel). Both files are written atomically and restricted to the current user (`0600`, or an
+`icacls` ACL on Windows), and a new token is minted only when the file is missing.
+`setup_current_chrome()`, the daemon, and the default client ensure that copy exists. The
+worker fetches it without caching on every attempt. This protects against a random loopback
+peer, including one that binds 8765 first, but not against another process running as the
+same user, which can read the file.
 
 The worker keeps a verified socket alive with 20-second pings. Reconnect uses persisted,
 jittered exponential backoff: 1.5--60 seconds for transport failure and 10--120 seconds for
@@ -50,16 +61,16 @@ Native mode still starts with a transport-neutral hello so version, `browser_run
 `max_sessions` reach the broker:
 
 ```json
-{"type":"hello","protocol":2,"transport":"native","browser":{"name":"Chrome","extension_version":"...","browser_run":"...","max_sessions":8}}
+{"type":"hello","protocol":3,"transport":"native","browser":{"name":"Chrome","extension_version":"...","browser_run":"...","max_sessions":8}}
 ```
 
 The broker answers with `hello_ack`, protocol, transport, broker version, PID, and instance.
 There is no token, nonce, or HMAC on this leg: Chrome has selected the registered host and
-enforced its `allowed_origins`. Protocol 1 and its authentication remain unchanged for the
-WebSocket fallback.
+enforced its `allowed_origins`. Protocol 2 and its challenge-response remain unchanged for
+the WebSocket fallback.
 
 The named pipe needs a current-user-only ACL. MCP clients should retain their existing
-client hello during rollout, including the token, so mixed versions fail closed. This is
+client challenge-response during rollout, so mixed versions fail closed. This is
 compatibility and defence against other accounts, not protection from malicious code under
 the same account.
 
@@ -127,7 +138,7 @@ Chrome's framing, manifest, registration, and lifecycle rules are documented in
 - Put WebSocket and `chrome.runtime.Port` behind one small transport adapter. Liveness must
   use adapter identity/epoch rather than `readyState === WebSocket.OPEN`; results must still
   return only through the connection that received the command.
-- Send the protocol-2 metadata hello immediately after `connectNative`; accept commands only
+- Send the protocol-3 metadata hello immediately after `connectNative`; accept commands only
   after its acknowledgement. Remove token loading, WebCrypto HMAC, WebSocket pings, port
   setting, and alarm-backed retry only from the native path. Keep the existing logic intact
   in the fallback adapter.
@@ -156,7 +167,7 @@ Chrome's framing, manifest, registration, and lifecycle rules are documented in
 - `tests/test_lifecycle_defects.py` uses an unused TCP port to prove the unavailable error.
   Add missing-host, host-exit, named-pipe-drop, and in-flight native-disconnect cases.
 - `tests/test_parallel_agent_defects.py` extracts `max_sessions` and `browser_run` from the
-  WebSocket hello. Run the same assertions through the protocol-2 native hello.
+  WebSocket hello. Run the same assertions through the protocol-3 native hello.
 - `tests/test_close_tabs.py` and `tests/test_without_chrome.py` contain host/port status
   fixtures. Update them if the compatibility schema changes. `tests/test_session_identity.py`
   may keep its transport-neutral fake if `browser` and broker status remain stable.
@@ -166,7 +177,7 @@ Chrome's framing, manifest, registration, and lifecycle rules are documented in
 1. Extract the transport-neutral broker and add framing/installer tests. Ship no behavior
    change; WebSocket remains the only transport.
 2. Ship the native host, named-pipe client, extension permission, and service-worker adapter
-   behind an opt-in setting/environment flag. Native failure falls back to protocol-1
+   behind an opt-in setting/environment flag. Native failure falls back to protocol-2
    WebSocket. Report the selected transport and exact native failure in setup/status.
 3. Make native preferred after setup installs and verifies the host. Keep WebSocket fallback
    for at least one release and cover mixed old/new extension, host, daemon, and MCP versions.
@@ -183,7 +194,7 @@ Chrome's framing, manifest, registration, and lifecycle rules are documented in
   A current-user ACL and token stop other accounts and accidents, but stronger same-user
   isolation would require a separately enforceable client identity or a different product
   boundary.
-- Keeping fallback preserves the original token theft and port-squatting risk and creates a
+- Keeping fallback preserves the port-squatting and same-user token-read risk and creates a
   downgrade path. Status must make fallback visible; automatic fallback must be narrow and
   bounded.
 - Chrome permits only 1 MiB per host-to-extension message and 64 MiB per

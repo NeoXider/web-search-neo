@@ -17,14 +17,12 @@ client owns which tab, because letting several servers share one browser also
 means they can reach for the same tab, and this process is the only one that can
 see them all.
 
-The frames exchanged with the extension are byte-for-byte what they were, because
-the extension is not being changed. A local client speaks the same authenticated
-hello and is told apart by the ``role`` field it adds.
+The extension and local clients speak the same authenticated handshake
+(:mod:`web_search_neo.bridge_handshake`) and are told apart by ``role``.
 """
 
 from __future__ import annotations
 
-import ctypes
 from dataclasses import dataclass, field
 import errno
 import json
@@ -33,20 +31,29 @@ from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import re
-import sys
 import threading
 import time
 from typing import Any
 import uuid
 
 from web_search_neo import bridge_auth
+from web_search_neo.bridge_claims import claim_is_own, js_number_tab_id
+from web_search_neo.bridge_handshake import TOKEN_MISMATCH_REASON, authenticate_peer  # noqa: F401
+from web_search_neo.process_probe import process_alive
 
 
 CHROME_EXTENSION_ID = "ndbmcjhbdjpefojkoljacjhammmcigao"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
-PROTOCOL = 1
-TOKEN_MISMATCH_REASON = "Companion token mismatch; reload the extension on chrome://extensions"
+# 2: challenge-response in both directions; the raw token never crosses the wire.
+PROTOCOL = 2
+EXTENSION_ORIGIN = f"chrome-extension://{CHROME_EXTENSION_ID}"
+# Every connection holds a server thread; peers still in the handshake are capped
+# tighter so a local flood cannot starve the companion of a slot.
+MAX_CONNECTIONS = 64
+MAX_PENDING_HANDSHAKES = 16
+# Commands on a tab another agent holds are refused, except harmless reads.
+CLAIM_EXEMPT_METHODS = frozenset({"tabs.get"})
 MAX_FRAME_BYTES = 64 * 1024 * 1024
 # The companion mints one of these per browser run and sends it in its hello.
 # Because this process now outlives Chrome, it is the only thing that tells a
@@ -178,7 +185,16 @@ class _Client:
     connection: Any
     version: str
     label: str
+    pid: int | None = None
+    program: str = ""
+    name: str = ""
+    instance: str = ""  # stable across one bridge object's reconnects
     lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def identity(self) -> dict[str, Any]:
+        """Who is asking, as relayed to the companion for its activity badge."""
+        return {"label": self.label, "name": self.name or None, "pid": self.pid,
+                "program": self.program or None, "version": self.version or None}
 
     def send(self, payload: dict[str, Any]) -> None:
         # Results, state pushes and control answers reach a client from different
@@ -267,6 +283,8 @@ class BridgeDaemon:
         self._claims: dict[int, _Claim] = {}
         self._clients: set[_Client] = set()
         self._routes: dict[str, _Route] = {}
+        self._open_connections = 0
+        self._pending_handshakes = 0
         self._started = threading.Event()
         self._stopped = threading.Event()
         self._startup_error: str | None = None
@@ -330,9 +348,7 @@ class BridgeDaemon:
             from websockets.sync.server import serve
 
             self._ensure_token()
-            extension_origin = re.compile(
-                rf"^chrome-extension://{re.escape(CHROME_EXTENSION_ID)}/?$"
-            )
+            extension_origin = re.compile(rf"^{re.escape(EXTENSION_ORIGIN)}/?$")
             with serve(
                 self._handle_connection,
                 self.host,
@@ -452,6 +468,27 @@ class BridgeDaemon:
                 return self._token or ""
             self._token = None
         return self._ensure_token()
+
+    def _handshake_token(self) -> str:
+        """The secret for one handshake, re-read from disk when this daemon owns it.
+
+        Peers no longer send their token, so a rotated secret cannot be noticed
+        from a hello; re-reading per handshake keeps rotation working without
+        killing the daemon by hand.
+        """
+        if not self._owns_token:
+            return self._ensure_token()
+        previous = self._token
+        try:
+            return self._reload_token()
+        except OSError as exc:
+            # A token file held by a concurrent writer is not a rotation.
+            LOGGER.warning("Could not re-read the bridge token: %s: %s", type(exc).__name__, exc)
+            if previous is None:
+                raise
+            with self._lock:
+                self._token = previous
+            return previous
 
     # -- state -------------------------------------------------------------
 
@@ -588,14 +625,10 @@ class BridgeDaemon:
         that has not met the companion yet record the claim against the right
         browser instead of against nothing.
         """
-        try:
-            tab_id = int(raw_tab_id)
-        except (TypeError, ValueError):
-            return {
-                "granted": False,
-                "tab_id": raw_tab_id,
-                "reason": "A tab claim needs a numeric tab id",
-            }
+        tab_id, _ = js_number_tab_id(raw_tab_id)
+        if tab_id is None:
+            return {"granted": False, "tab_id": raw_tab_id,
+                    "reason": "A tab claim needs a numeric tab id"}
         asserted = raw_run if isinstance(raw_run, str) and raw_run else None
         with self._lock:
             run = self._browser_run
@@ -624,7 +657,9 @@ class BridgeDaemon:
             held = self._claims.get(tab_id)
             # Re-claiming a tab you already hold is how a caller renews its grip
             # after a reconnect, and must never be mistaken for a conflict.
-            if held is not None and held.client is not client:
+            if held is not None and claim_is_own(held.client, client, self._clients):
+                held = None  # this process's own claim from a superseded connection
+            if held is not None:
                 held_for = held.held_seconds()
                 LOGGER.info(
                     "Refused %s the tab %s that %s has held for %.0f s",
@@ -668,19 +703,15 @@ class BridgeDaemon:
         return {"granted": True, "tab_id": tab_id, "browser_run": recorded}
 
     def _release_tab(self, client: _Client, raw_tab_id: Any) -> dict[str, Any]:
-        try:
-            tab_id = int(raw_tab_id)
-        except (TypeError, ValueError):
-            return {
-                "released": False,
-                "tab_id": raw_tab_id,
-                "reason": "A tab release needs a numeric tab id",
-            }
+        tab_id, _ = js_number_tab_id(raw_tab_id)
+        if tab_id is None:
+            return {"released": False, "tab_id": raw_tab_id,
+                    "reason": "A tab release needs a numeric tab id"}
         with self._lock:
             held = self._claims.get(tab_id)
             if held is None:
                 return {"released": False, "tab_id": tab_id, "reason": "Nobody holds that tab"}
-            if held.client is not client:
+            if not claim_is_own(held.client, client, self._clients):
                 return {
                     "released": False,
                     "tab_id": tab_id,
@@ -700,98 +731,40 @@ class BridgeDaemon:
 
     @staticmethod
     def _is_process_alive(pid: int) -> bool:
-        """Check if a process with the given PID is still alive.
-
-        On POSIX this is ``os.kill(pid, 0)``: signal 0 delivers nothing and
-        succeeds only if the process exists. ``ProcessLookupError`` means it
-        has exited; ``PermissionError`` means it is alive but not ours.
-
-        Windows needs a different call, and the difference is not cosmetic.
-        There ``signal.CTRL_C_EVENT`` **is** 0, so ``os.kill(pid, 0)`` does not
-        probe anything — it tries to deliver a Ctrl+C to a process group. For a
-        PID that is gone it raises a bare ``OSError`` (WinError 87), which is
-        neither of the two exceptions above: it escaped this function, killed
-        the reaper thread on its first dead claim, and claims then sat forever.
-        That is exactly what happened on 09.09.2026 — four tabs held for 6258
-        seconds by a process that had been gone for over an hour. So on Windows
-        we ask the kernel directly instead of signalling anyone.
-
-        Returns
-        -------
-            ``True`` if the process exists, ``False`` if it has terminated.
-        """
-        if sys.platform == "win32":
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            STILL_ACTIVE = 259
-            ERROR_INVALID_PARAMETER = 87
-            kernel32 = ctypes.windll.kernel32
-            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-            if not handle:
-                # "Invalid parameter" is how Windows says "no such process".
-                # Anything else (access denied, for one) means it is alive and
-                # merely out of reach, and a live tab must not be stolen.
-                return kernel32.GetLastError() != ERROR_INVALID_PARAMETER
-            try:
-                code = ctypes.c_ulong()
-                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                    return True
-                return code.value == STILL_ACTIVE
-            finally:
-                kernel32.CloseHandle(handle)
-        try:
-            os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            # Process is alive but we can't signal it; treat as alive.
-            return True
-        except OSError:
-            # Never guess "dead" from an error we did not plan for: releasing a
-            # claim out from under a live agent is worse than holding it.
-            return True
+        """See :func:`web_search_neo.process_probe.process_alive`."""
+        return process_alive(pid)
 
     def _cleanup_dead_claims(self) -> None:
         """Release claims whose owner process no longer exists.
 
-        Scans every ``PROCESS_CHECK_INTERVAL`` seconds.  For each claim the
-        PID is extracted from the client ``label`` (format ``program#pid``).
-        If the PID is not a positive integer or the process has exited the
-        claim is freed and ``_broadcast_state()`` is called so remaining
-        clients see the tab is free.
+        Runs every ``PROCESS_CHECK_INTERVAL`` seconds. The PID comes from the
+        client ``label`` (``program#pid``); an unparsable or non-positive one is
+        left alone, and so is a claim whose client is still connected - its
+        socket is proof enough of life. Probing and broadcasting happen outside
+        the lock, so a slow peer or a slow kernel call never holds the register.
         """
         with self._lock:
-            dead: list[tuple[int, str, int]] = []
+            candidates: list[tuple[int, Any, str, int]] = []
             for tab_id, claim in self._claims.items():
-                # Label format: "program#pid" or "client#pid"
+                if claim.client in self._clients:
+                    continue
                 label = claim.client.label
-                pid_str = label.rsplit("#", 1)[-1] if "#" in label else None
-                if pid_str is None:
-                    # Unrecognised format – leave untouched.
-                    continue
-                try:
-                    pid = int(pid_str)
-                except ValueError:
-                    # Not a number – leave untouched (prefer keeping a claim
-                    # rather than stealing a tab from a live agent).
-                    continue
-                if pid <= 0:
-                    continue
-                if not self._is_process_alive(pid):
-                    # Запоминаем владельца сразу: в сообщении ниже раньше стояли
-                    # `claim` и `pid` из последнего витка первого цикла, и лог
-                    # называл чужую вкладку чужим процессом.
-                    dead.append((tab_id, label, pid))
-            for tab_id, label, pid in dead:
-                self._claims.pop(tab_id, None)
-                LOGGER.info(
-                    "Released tab %s – owner process %s (pid %d) is gone",
-                    tab_id,
-                    label,
-                    pid,
-                )
-            if dead:
-                self._broadcast_state()
+                pid_text = label.rsplit("#", 1)[-1] if "#" in label else ""
+                if pid_text.isdigit() and int(pid_text) > 0:
+                    candidates.append((tab_id, claim, label, int(pid_text)))
+        dead = [item for item in candidates if not self._is_process_alive(item[3])]
+        released: list[tuple[int, str, int]] = []
+        with self._lock:
+            for tab_id, claim, label, pid in dead:
+                # Only the very claim that was probed: the tab may have been
+                # released and claimed afresh by a live agent meanwhile.
+                if self._claims.get(tab_id) is claim:
+                    self._claims.pop(tab_id, None)
+                    released.append((tab_id, label, pid))
+        for tab_id, label, pid in released:
+            LOGGER.info("Released tab %s - owner process %s (pid %d) is gone", tab_id, label, pid)
+        if released:
+            self._broadcast_state()
 
     def _broadcast_state(self) -> None:
         state = self.status()
@@ -803,63 +776,41 @@ class BridgeDaemon:
     # -- connections -------------------------------------------------------
 
     def _handle_connection(self, websocket: Any) -> None:
-        handshake = self._authenticate(websocket)
-        if handshake is None:
+        with self._lock:
+            refused = (
+                self._open_connections >= MAX_CONNECTIONS
+                or self._pending_handshakes >= MAX_PENDING_HANDSHAKES
+            )
+            if not refused:
+                self._open_connections += 1
+                self._pending_handshakes += 1
+        if refused:
+            LOGGER.warning("Refused a bridge connection: too many open or pending sockets")
+            close_quietly(websocket, 1013, "Too many bridge connections; try again later")
             return
-        hello, token = handshake
-        if (hello.get("role") or "extension") == "client":
-            self._serve_client(websocket, hello, token)
-        else:
-            self._serve_extension(websocket, hello, token)
-
-    def _authenticate(self, websocket: Any) -> tuple[dict[str, Any], str] | None:
-        """Run the shared hello, or close the socket and say why in the close frame."""
         try:
-            first = json.loads(websocket.recv(timeout=5.0))
-        except (TypeError, ValueError):
-            first = None
-        except Exception as exc:
-            LOGGER.warning("A bridge peer never sent a hello: %s: %s", type(exc).__name__, exc)
-            return None
-        if not isinstance(first, dict):
-            # Without this the AttributeError below lands in the catch-all and
-            # the peer only ever sees a bare 1000, with no hint of what broke.
-            LOGGER.warning("Rejected a bridge client whose first frame was not a JSON object")
-            close_quietly(websocket, 1008, "Companion hello must be a JSON object")
-            return None
-        if first.get("type") != "hello" or first.get("protocol") != PROTOCOL:
-            # The number is in the reason on purpose: this close is the only thing
-            # a peer of another revision ever receives, so a bare "wrong hello"
-            # left it unable to report what it could not agree with.
-            close_quietly(
-                websocket, 1008, f"Expected Web Search Neo bridge protocol {PROTOCOL}"
-            )
-            return None
-        token = self._ensure_token()
-        nonce = first.get("nonce")
-        presented = first.get("token")
-        if not bridge_auth.token_matches(token, presented):
-            # The secret on disk may have been rotated under a daemon that is
-            # still holding the retired one; re-read before calling this a
-            # rejection, so rotation does not need the process killed by hand.
-            token = self._reload_token()
-        if not bridge_auth.token_matches(token, presented):
-            LOGGER.warning(
-                "Rejected a bridge client that did not present the companion token "
-                "(claimed browser: %r)",
-                dict(first.get("browser") or {}),
-            )
-            close_quietly(websocket, 1008, TOKEN_MISMATCH_REASON)
-            return None
-        if not isinstance(nonce, str) or not 1 <= len(nonce) <= 256:
-            LOGGER.warning("Rejected a bridge client whose hello carried no usable nonce")
-            close_quietly(websocket, 1008, "Companion hello must carry a nonce")
-            return None
-        role = first.get("role")
-        if role not in (None, "extension", "client"):
-            close_quietly(websocket, 1008, "Unknown bridge role")
-            return None
-        return first, token
+            try:
+                handshake = authenticate_peer(
+                    websocket,
+                    protocol=PROTOCOL,
+                    token_source=self._handshake_token,
+                    extension_origin=EXTENSION_ORIGIN,
+                )
+            finally:
+                with self._lock:
+                    self._pending_handshakes -= 1
+            if handshake is None:
+                return
+            hello, token = handshake
+            if hello.get("role") == "client":
+                self._serve_client(websocket, hello, token)
+            else:
+                # authenticate_peer lets only role "extension" through here, and
+                # only with the companion's Origin; a roleless hello is refused.
+                self._serve_extension(websocket, hello, token)
+        finally:
+            with self._lock:
+                self._open_connections -= 1
 
     def _serve_extension(self, websocket: Any, hello: dict[str, Any], token: str) -> None:
         try:
@@ -884,11 +835,7 @@ class BridgeDaemon:
                 ).start()
             websocket.send(
                 json.dumps(
-                    {
-                        "type": "hello_ack",
-                        "protocol": PROTOCOL,
-                        "proof": bridge_auth.sign(token, str(hello.get("nonce"))),
-                    }
+                    {"type": "hello_ack", "protocol": PROTOCOL}
                 )
             )
             self._broadcast_state()
@@ -942,10 +889,14 @@ class BridgeDaemon:
         route.client.send_quietly(answer)
 
     def _serve_client(self, websocket: Any, hello: dict[str, Any], token: str) -> None:
-        details = hello.get("client") or {}
-        label = f"{details.get('program') or 'client'}#{details.get('pid') or '?'}"
+        details = hello.get("client") if isinstance(hello.get("client"), dict) else {}
+        pid = details.get("pid") if isinstance(details.get("pid"), int) else None
+        program = str(details.get("program") or "")[:64]
+        label = f"{program or 'client'}#{pid or '?'}"
         client = _Client(
-            connection=websocket, version=str(hello.get("version") or ""), label=label
+            connection=websocket, version=str(hello.get("version") or "")[:64], label=label,
+            pid=pid, program=program, name=str(details.get("name") or "")[:64],
+            instance=str(details.get("instance") or "")[:64],
         )
         try:
             # The acknowledgement goes out before this client joins the register,
@@ -960,7 +911,6 @@ class BridgeDaemon:
                     "type": "hello_ack",
                     "protocol": PROTOCOL,
                     "role": "client",
-                    "proof": bridge_auth.sign(token, str(hello.get("nonce"))),
                     "version": self.version,
                     "pid": os.getpid(),
                     "instance": self.instance,
@@ -998,12 +948,9 @@ class BridgeDaemon:
                 "Bridge client %s detached: %s: %s", label, type(exc).__name__, exc
             )
         finally:
-            # Every exit from the loop above lands here - a clean goodbye, a
-            # dropped socket, an exception inside a handler - and a tab whose
-            # owner is gone has to come back to the pool on all of them. A claim
-            # that outlives its client cannot be undone by anyone: the process
-            # that would release it no longer exists, and the tab would stay
-            # unusable until the daemon itself is restarted.
+            # Every exit from the loop lands here (goodbye, dropped socket,
+            # handler exception); a claim that outlived its client could never
+            # be released, so the tab comes back to the pool on all of them.
             with self._lock:
                 self._clients.discard(client)
                 stale = [key for key, route in self._routes.items() if route.client is client]
@@ -1031,6 +978,11 @@ class BridgeDaemon:
                 {"type": "result", "id": client_id, "error": "Bridge command needs a method"}
             )
             return
+        params = message.get("params") or {}
+        holder, refusal = self._claim_check(client, method, params)
+        if refusal is not None:
+            client.send_quietly({"type": "result", "id": client_id, "error": refusal})
+            return
         with self._lock:
             extension = self._extension
         if extension is None:
@@ -1054,7 +1006,9 @@ class BridgeDaemon:
                 "type": "command",
                 "id": relay_id,
                 "method": method,
-                "params": message.get("params") or {},
+                "params": params,
+                # Who asked, so the companion can badge the tab with its agent.
+                "agent": {**client.identity(), "claim_holder": holder},
             },
             ensure_ascii=False,
         )
@@ -1071,6 +1025,39 @@ class BridgeDaemon:
                     "error": f"Chrome companion extension disconnected: {exc}",
                 }
             )
+
+    def _claim_check(
+        self, client: _Client, method: str, params: Any
+    ) -> tuple[str | None, str | None]:
+        """``(holder label, refusal)`` for the tab a command targets.
+
+        A command on a tab that a different, still connected client holds is
+        refused, except for harmless reads (``CLAIM_EXEMPT_METHODS``). The tab id
+        is read as the companion's ``Number()`` reads it and rewritten to that
+        int; a claim of this client's own superseded connection moves to it.
+        """
+        if not isinstance(params, dict):
+            return None, None
+        tab_id, bad = js_number_tab_id(params.get("tabId"))
+        if bad is not None or tab_id is None:
+            return None, bad
+        params["tabId"] = tab_id
+        with self._lock:
+            held = self._claims.get(tab_id)
+            if held is None:
+                return None, None
+            foreign = not claim_is_own(held.client, client, self._clients)
+            if not foreign:
+                held.client = client
+            owner, seconds = held.client.label, held.held_seconds()
+        if not foreign or method in CLAIM_EXEMPT_METHODS:
+            return owner, None
+        LOGGER.info("Refused %s's %s on tab %s, held by %s", client.label, method, tab_id, owner)
+        return owner, (
+            f"Chrome tab {tab_id} is claimed by another agent on this machine ({owner}, "
+            f"for {seconds:.0f}s), so {method} was not sent to it. Use a different tab, "
+            "or stop that agent first."
+        )
 
     def _answer_control(self, client: _Client, message: dict[str, Any]) -> None:
         method = message.get("method")

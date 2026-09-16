@@ -19,6 +19,7 @@ from websockets.sync.client import connect
 from web_search_neo import bridge_auth
 from web_search_neo import bridge_daemon
 from web_search_neo import browser_tools
+from web_search_neo import process_probe
 from web_search_neo import chrome_bridge
 from web_search_neo import main
 from web_search_neo.bridge_daemon import BridgeDaemon
@@ -43,6 +44,7 @@ _WORKER_STUBS = """
 import * as fs from "node:fs";
 
 const sockets = [];
+const TOKEN = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
 let tokenSource = null;
 let fetchCalls = 0;
 const noop = () => {};
@@ -113,6 +115,20 @@ globalThis.__hmac = async (token, message) => {
     {name: "HMAC", hash: "SHA-256"}, false, ["sign"]);
   const signed = await crypto.subtle.sign("HMAC", key, encoder.encode(message));
   return [...new Uint8Array(signed)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+};
+
+// The daemon's half of the protocol-2 handshake, driven against a FakeSocket:
+// a challenge signed with `token`, then - once the worker answered it - the ack.
+globalThis.__handshake = async (socket, token, serverNonce = "5e".repeat(16)) => {
+  const hello = JSON.parse(socket.sent[0]);
+  socket.onmessage({data: JSON.stringify({
+    type: "challenge", protocol: hello.protocol, nonce: serverNonce,
+    proof: await globalThis.__hmac(token, "wsn-bridge-server|" + hello.nonce + "|" + serverNonce),
+  })});
+  await globalThis.__waitFor(() => socket.sent.length > 1 || socket.readyState !== 1, "the auth frame");
+  const auth = socket.sent.length > 1 ? JSON.parse(socket.sent[1]) : null;
+  if (auth) socket.onmessage({data: JSON.stringify({type: "hello_ack", protocol: hello.protocol})});
+  return {hello, auth, serverNonce};
 };
 
 globalThis.fetch = async () => {
@@ -281,7 +297,11 @@ def test_windows_daemon_bypasses_a_venv_redirector_without_a_console(
     options = captured["kwargs"]
     assert options["env"]["__PYVENV_LAUNCHER__"] == venv_pythonw
     assert options["env"]["WEB_SEARCH_NEO_BRIDGE_PORT"] == "18765"
-    assert options["creationflags"] == chrome_bridge.CREATE_NO_WINDOW
+    # Breaking away from the MCP client's kill-on-close job keeps the daemon
+    # alive after this server exits.
+    assert options["creationflags"] == (
+        chrome_bridge.CREATE_NO_WINDOW | process_probe.CREATE_BREAKAWAY_FROM_JOB
+    )
     assert "start_new_session" not in options
     assert options["stdin"] is subprocess.DEVNULL
     assert options["stdout"] is subprocess.DEVNULL
@@ -306,8 +326,27 @@ def test_windows_daemon_uses_the_base_console_interpreter_as_a_safe_fallback(
     chrome_bridge.spawn_bridge_daemon(18766)
 
     assert captured["command"][0] == str(base)
-    assert captured["kwargs"]["creationflags"] == chrome_bridge.CREATE_NO_WINDOW
+    assert captured["kwargs"]["creationflags"] & chrome_bridge.CREATE_NO_WINDOW
     assert captured["kwargs"]["env"]["__PYVENV_LAUNCHER__"] == venv_python
+
+
+def test_windows_daemon_starts_plainly_when_the_job_forbids_breakaway(monkeypatch) -> None:
+    calls = []
+
+    def fake_popen(command, **kwargs):
+        calls.append(kwargs["creationflags"])
+        if kwargs["creationflags"] & process_probe.CREATE_BREAKAWAY_FROM_JOB:
+            raise PermissionError(5, "Access is denied")
+        return object()
+
+    monkeypatch.setattr(process_probe.subprocess, "Popen", fake_popen)
+
+    process_probe.popen_detached(["daemon"], windows=True, windows_flags=chrome_bridge.CREATE_NO_WINDOW)
+
+    assert calls == [
+        chrome_bridge.CREATE_NO_WINDOW | process_probe.CREATE_BREAKAWAY_FROM_JOB,
+        chrome_bridge.CREATE_NO_WINDOW,
+    ]
 
 
 def test_daemon_entry_is_the_packaged_main_module() -> None:
@@ -338,22 +377,50 @@ def _companion_socket(port: int):
 
 
 def _hello(
-    token: str | None,
     nonce: str = "0f" * 16,
-    role: str | None = None,
+    role: str | None = "extension",
     run: str | None = None,
+    protocol: int | None = None,
 ) -> str:
-    message: dict = {"type": "hello", "protocol": 1, "browser": {"name": "Test Chrome"}}
+    message: dict = {
+        "type": "hello",
+        "protocol": bridge_daemon.PROTOCOL if protocol is None else protocol,
+        "browser": {"name": "Test Chrome"},
+        "nonce": nonce,
+    }
     if role is not None:
         message["role"] = role
     # Left out entirely by default, because that is what a companion older than
     # 1.3.2 sends and the daemon has to keep serving it.
     if run is not None:
         message["browser"]["browser_run"] = run
-    if token is not None:
-        message["token"] = token
-        message["nonce"] = nonce
     return json.dumps(message)
+
+
+def _handshake(
+    websocket,
+    token: str | None = TEST_TOKEN,
+    nonce: str = "0f" * 16,
+    role: str | None = "extension",
+    run: str | None = None,
+) -> dict:
+    """The peer half of protocol 2 over a raw socket; returns the hello_ack.
+
+    The daemon's proof is checked with ``TEST_TOKEN`` whatever ``token`` the
+    peer then signs with, so a test can present a wrong secret.
+    """
+    websocket.send(_hello(nonce, role=role, run=run))
+    challenge = json.loads(websocket.recv(timeout=5.0))
+    assert challenge["type"] == "challenge", challenge
+    assert "token" not in challenge
+    server_nonce = challenge["nonce"]
+    auth: dict = {"type": "auth"}
+    if token is not None:
+        auth["proof"] = bridge_auth.sign(
+            token, bridge_auth.client_proof_message(server_nonce, nonce)
+        )
+    websocket.send(json.dumps(auth))
+    return json.loads(websocket.recv(timeout=5.0))
 
 
 @contextlib.contextmanager
@@ -385,11 +452,21 @@ class _FakeCompanion:
 
     def __init__(self, port: int, nonce: str = "0f" * 16, run: str | None = None) -> None:
         self.socket = _companion_socket(port)
-        self.socket.send(_hello(TEST_TOKEN, nonce, run=run))
-        acknowledgement = json.loads(self.socket.recv(timeout=5.0))
+        websocket = self.socket
+        websocket.send(_hello(nonce, run=run))
+        challenge = json.loads(websocket.recv(timeout=5.0))
+        # The challenge proves the daemon knows the same secret, not just the port.
+        assert bridge_auth.verify(
+            TEST_TOKEN,
+            bridge_auth.server_proof_message(nonce, challenge["nonce"]),
+            challenge["proof"],
+        )
+        proof = bridge_auth.sign(
+            TEST_TOKEN, bridge_auth.client_proof_message(challenge["nonce"], nonce)
+        )
+        websocket.send(json.dumps({"type": "auth", "proof": proof}))
+        acknowledgement = json.loads(websocket.recv(timeout=5.0))
         assert acknowledgement["type"] == "hello_ack"
-        # The ack proves the daemon knows the same secret, not just the port.
-        assert bridge_auth.verify(TEST_TOKEN, nonce, acknowledgement["proof"])
 
     def take_command(self, timeout: float = 5.0) -> dict:
         return json.loads(self.socket.recv(timeout=timeout))
@@ -425,14 +502,13 @@ def test_bridge_round_trip_accepts_extension_protocol() -> None:
             companion.close()
 
 
-@pytest.mark.parametrize("role", [None, "client"])
-@pytest.mark.parametrize("token", [None, OTHER_TOKEN, "", "not-a-token"])
+@pytest.mark.parametrize("role", ["extension", "client"])
+@pytest.mark.parametrize("token", [None, OTHER_TOKEN, "not-a-token"])
 def test_bridge_rejects_a_client_without_the_shared_token(token, role) -> None:
     with _running_daemon() as daemon:
         with _companion_socket(daemon.port) as websocket:
-            websocket.send(_hello(token, role=role))
             with pytest.raises(ConnectionClosed) as rejection:
-                websocket.recv(timeout=5.0)
+                _handshake(websocket, token, role=role)
         closed = rejection.value.rcvd
         assert closed.code == 1008
         assert "token mismatch" in closed.reason
@@ -441,13 +517,99 @@ def test_bridge_rejects_a_client_without_the_shared_token(token, role) -> None:
         assert daemon.client_count == 0
 
 
+def test_a_hello_without_a_role_is_not_taken_for_the_extension() -> None:
+    with _running_daemon() as daemon:
+        with _companion_socket(daemon.port) as websocket:
+            websocket.send(_hello(role=None))
+            with pytest.raises(ConnectionClosed) as rejection:
+                websocket.recv(timeout=5.0)
+        assert rejection.value.rcvd.code == 1008
+        assert "role" in rejection.value.rcvd.reason
+        assert daemon.connected is False
+
+
+def test_the_extension_role_requires_the_companion_origin() -> None:
+    with _running_daemon() as daemon:
+        with connect(f"ws://127.0.0.1:{daemon.port}") as websocket:
+            websocket.send(_hello(role="extension"))
+            with pytest.raises(ConnectionClosed) as rejection:
+                websocket.recv(timeout=5.0)
+        assert rejection.value.rcvd.code == 1008
+        assert "origin" in rejection.value.rcvd.reason
+        assert daemon.connected is False
+
+
+def test_an_old_protocol_companion_is_told_to_update() -> None:
+    with _running_daemon() as daemon:
+        with _companion_socket(daemon.port) as websocket:
+            websocket.send(
+                json.dumps({"type": "hello", "protocol": 1, "token": TEST_TOKEN, "nonce": "0f" * 16})
+            )
+            with pytest.raises(ConnectionClosed) as rejection:
+                websocket.recv(timeout=5.0)
+        reason = rejection.value.rcvd.reason
+        assert f"bridge protocol {bridge_daemon.PROTOCOL}" in reason
+        assert "reload the companion" in reason
+
+
+def test_the_daemon_proves_itself_before_the_peer_answers() -> None:
+    """A squatter on the port must learn nothing: the peer checks the daemon first."""
+    with _running_daemon() as daemon:
+        with _companion_socket(daemon.port) as websocket:
+            websocket.send(_hello("1c" * 16))
+            challenge = json.loads(websocket.recv(timeout=5.0))
+        assert challenge["type"] == "challenge"
+        assert TEST_TOKEN not in json.dumps(challenge)
+        assert bridge_auth.verify(
+            TEST_TOKEN,
+            bridge_auth.server_proof_message("1c" * 16, challenge["nonce"]),
+            challenge["proof"],
+        )
+        # The direction label keeps the daemon's proof from passing as a peer's.
+        assert not bridge_auth.verify(
+            TEST_TOKEN,
+            bridge_auth.client_proof_message(challenge["nonce"], "1c" * 16),
+            challenge["proof"],
+        )
+
+
+def test_the_client_never_puts_the_token_on_the_wire_and_checks_the_daemon() -> None:
+    """ChromeBridge must hang up on a peer that cannot prove the secret."""
+
+    class _Squatter:
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+            self.closed: list[tuple[int, str]] = []
+            self.replies = [json.dumps({"type": "challenge", "nonce": "9" * 32, "proof": "0" * 64})]
+
+        def send(self, text: str) -> None:
+            self.sent.append(text)
+
+        def recv(self, timeout: float | None = None):
+            return self.replies.pop(0)
+
+        def close(self, code: int = 1000, reason: str = "") -> None:
+            self.closed.append((code, reason))
+
+    client = ChromeBridge(port=_free_port(), token=TEST_TOKEN, spawn=False, start_timeout=0.1)
+    try:
+        squatter = _Squatter()
+        with pytest.raises(ChromeBridgeError, match="did not prove"):
+            client._handshake(squatter)
+        assert len(squatter.sent) == 1, "nothing but the hello may reach an unproven peer"
+        assert TEST_TOKEN not in squatter.sent[0]
+        assert json.loads(squatter.sent[0])["role"] == "client"
+        assert squatter.closed and "token mismatch" in squatter.closed[0][1].lower()
+    finally:
+        client.shutdown()
+
+
 def test_a_daemon_that_outlived_a_rotated_secret_accepts_the_new_one(tmp_path, monkeypatch) -> None:
     """Rotating the token must not require hunting down the running daemon.
 
     The documented way to retire a secret is to delete the file and let the next
-    start mint another. A daemon caches what it read at startup, so before it
-    learned to re-read, it would refuse every peer for as long as it ran and the
-    only cure was killing it by hand.
+    start mint another. A daemon that cached what it read at startup would
+    refuse every peer for as long as it ran.
     """
     token_file = tmp_path / "bridge-token"
     monkeypatch.setattr(bridge_auth, "token_path", lambda: token_file)
@@ -460,20 +622,29 @@ def test_a_daemon_that_outlived_a_rotated_secret_accepts_the_new_one(tmp_path, m
     assert daemon.startup_error is None, daemon.startup_error
     try:
         with _companion_socket(daemon.port) as websocket:
-            websocket.send(_hello(TEST_TOKEN))
-            assert json.loads(websocket.recv(timeout=5.0))["type"] == "hello_ack"
+            assert _handshake(websocket, TEST_TOKEN)["type"] == "hello_ack"
 
         token_file.write_text(OTHER_TOKEN, encoding="utf-8")
 
         with _companion_socket(daemon.port) as websocket:
-            websocket.send(_hello(OTHER_TOKEN))
+            websocket.send(_hello())
+            challenge = json.loads(websocket.recv(timeout=5.0))
+            # Signed with the new secret already, so a new-secret peer accepts it.
+            assert bridge_auth.verify(
+                OTHER_TOKEN,
+                bridge_auth.server_proof_message("0f" * 16, challenge["nonce"]),
+                challenge["proof"],
+            )
+            proof = bridge_auth.sign(
+                OTHER_TOKEN, bridge_auth.client_proof_message(challenge["nonce"], "0f" * 16)
+            )
+            websocket.send(json.dumps({"type": "auth", "proof": proof}))
             assert json.loads(websocket.recv(timeout=5.0))["type"] == "hello_ack"
 
         # Adopting the newer secret must retire the old one, not widen the door.
         with _companion_socket(daemon.port) as websocket:
-            websocket.send(_hello(TEST_TOKEN))
             with pytest.raises(ConnectionClosed) as rejection:
-                websocket.recv(timeout=5.0)
+                _handshake(websocket, TEST_TOKEN)
         assert rejection.value.rcvd.code == 1008
     finally:
         daemon.shutdown()
@@ -482,7 +653,9 @@ def test_a_daemon_that_outlived_a_rotated_secret_accepts_the_new_one(tmp_path, m
 def test_bridge_rejects_a_hello_without_a_nonce() -> None:
     with _running_daemon() as daemon:
         with _companion_socket(daemon.port) as websocket:
-            websocket.send(json.dumps({"type": "hello", "protocol": 1, "token": TEST_TOKEN}))
+            websocket.send(
+                json.dumps({"type": "hello", "protocol": bridge_daemon.PROTOCOL, "role": "extension"})
+            )
             with pytest.raises(ConnectionClosed) as rejection:
                 websocket.recv(timeout=5.0)
         assert rejection.value.rcvd.code == 1008
@@ -494,8 +667,7 @@ def test_a_newer_authenticated_companion_replaces_the_previous_one() -> None:
     answers: list = []
     with _running_daemon() as daemon:
         first = _companion_socket(daemon.port)
-        first.send(_hello(TEST_TOKEN))
-        assert json.loads(first.recv(timeout=5.0))["type"] == "hello_ack"
+        assert _handshake(first)["type"] == "hello_ack"
         assert daemon.connected
 
         second = _FakeCompanion(daemon.port, nonce="abcd" * 8)
@@ -582,15 +754,10 @@ def test_a_command_answers_only_the_socket_it_arrived_on() -> None:
         await worker.connect();
         const first = globalThis.__sockets[0];
         first.onopen();
-        const hello = JSON.parse(first.sent[0]);
-        first.onmessage({{data: JSON.stringify({{
-          type: "hello_ack",
-          protocol: hello.protocol,
-          proof: await globalThis.__hmac(token, hello.nonce),
-        }})}});
+        await globalThis.__handshake(first, token);
 
         first.onmessage({{data: JSON.stringify({{type: "command", id: "fast", method: "tabs.list"}})}});
-        await globalThis.__waitFor(() => first.sent.length > 1, "the answer to the fast command");
+        await globalThis.__waitFor(() => first.sent.length > 2, "the answer to the fast command");
 
         let release = null;
         chrome.tabs.query = () => new Promise(resolve => {{ release = resolve; }});
@@ -605,8 +772,8 @@ def test_a_command_answers_only_the_socket_it_arrived_on() -> None:
         await globalThis.__sleep(60);
 
         return {{
-          fast: JSON.parse(first.sent[1]),
-          first_after: first.sent.slice(2).map(item => JSON.parse(item)),
+          fast: JSON.parse(first.sent[2]),
+          first_after: first.sent.slice(3).map(item => JSON.parse(item)),
           second_frames: second.sent.map(item => JSON.parse(item).type),
         }};
         """
@@ -686,12 +853,7 @@ def test_popup_can_disable_reenable_and_release_the_companion() -> None:
         await globalThis.__waitFor(() => globalThis.__sockets.length === 1, "enable to connect");
         const socket = globalThis.__sockets[0];
         socket.onopen();
-        const hello = JSON.parse(socket.sent[0]);
-        socket.onmessage({data: JSON.stringify({
-          type: "hello_ack",
-          protocol: hello.protocol,
-          proof: await globalThis.__hmac(hello.token, hello.nonce),
-        })});
+        await globalThis.__handshake(socket, TOKEN);
         const connected = await globalThis.__message({type: "companion.status"});
         const disabled = await globalThis.__message({
           type: "companion.setEnabled", enabled: false,
@@ -901,12 +1063,7 @@ def test_a_verified_handshake_puts_the_retry_back_on_its_floor() -> None:
         await worker.connect();
         const accepted = globalThis.__sockets[globalThis.__sockets.length - 1];
         accepted.onopen();
-        const hello = JSON.parse(accepted.sent[0]);
-        accepted.onmessage({data: JSON.stringify({
-          type: "hello_ack",
-          protocol: hello.protocol,
-          proof: await globalThis.__hmac(hello.token, hello.nonce),
-        })});
+        await globalThis.__handshake(accepted, TOKEN);
         globalThis.__resetSchedule();
         accepted.onclose({code: 1006, reason: "server stopped"});
 
@@ -1071,12 +1228,7 @@ def test_the_reload_command_answers_before_it_takes_the_worker_down() -> None:
         await worker.connect();
         const socket = globalThis.__sockets[globalThis.__sockets.length - 1];
         socket.onopen();
-        const hello = JSON.parse(socket.sent[0]);
-        socket.onmessage({data: JSON.stringify({
-          type: "hello_ack",
-          protocol: hello.protocol,
-          proof: await globalThis.__hmac(hello.token, hello.nonce),
-        })});
+        await globalThis.__handshake(socket, TOKEN);
         // A wait left over from an earlier outage; the worker that comes back
         // would otherwise honour it instead of connecting.
         globalThis.__seedSession({bridge_backoff: {transport: 9, auth: 9, nextAttemptAt: Date.now() + 60000}});
@@ -1084,8 +1236,8 @@ def test_the_reload_command_answers_before_it_takes_the_worker_down() -> None:
         socket.onmessage({data: JSON.stringify({
           type: "command", id: "reload-1", method: "runtime.reload",
         })});
-        await globalThis.__waitFor(() => socket.sent.length > 1, "the answer to the reload request");
-        const answer = JSON.parse(socket.sent[1]);
+        await globalThis.__waitFor(() => socket.sent.length > 2, "the answer to the reload request");
+        const answer = JSON.parse(socket.sent[2]);
         const before = globalThis.__reloads();
         const stored = globalThis.__session().bridge_backoff;
         await globalThis.__sleep(500);
@@ -1549,8 +1701,7 @@ def test_a_tab_claim_dies_with_the_client_that_made_it() -> None:
             # A raw socket, so the drop is abrupt: no release, no goodbye, exactly
             # what an MCP server that is killed mid-session leaves behind.
             doomed = connect(f"ws://127.0.0.1:{daemon.port}")
-            doomed.send(_hello(TEST_TOKEN, nonce="2b" * 16, role="client"))
-            assert _next_frame(doomed, "hello_ack")["type"] == "hello_ack"
+            assert _handshake(doomed, nonce="2b" * 16, role="client")["type"] == "hello_ack"
             doomed.send(
                 json.dumps({"type": "control", "id": "c1", "method": "claim_tab", "tab_id": 41})
             )
@@ -1939,12 +2090,7 @@ const openSocket = async () => {
   await worker.connect();
   const socket = globalThis.__sockets[globalThis.__sockets.length - 1];
   socket.onopen();
-  const hello = JSON.parse(socket.sent[0]);
-  socket.onmessage({data: JSON.stringify({
-    type: "hello_ack",
-    protocol: hello.protocol,
-    proof: await globalThis.__hmac(hello.token, hello.nonce),
-  })});
+  await globalThis.__handshake(socket, TOKEN);
   return socket;
 };
 const ask = async (socket, method, params) => {
@@ -3657,6 +3803,8 @@ def test_the_popup_and_its_script_describe_the_same_page() -> None:
     used_classes = {
         name for group in re.findall(r'class="([^"]+)"', markup) for name in group.split()
     }
+    # Rows the script builds at run time (the agent tab list) count as used.
+    used_classes |= set(re.findall(r'className = "([a-z-]+)"', script))
     styled = set(re.findall(r"\.([a-z-]+)\s*[{,]", styles))
     assert not styled - used_classes, (
         f"popup.css styles class(es) {sorted(styled - used_classes)} that no element uses."

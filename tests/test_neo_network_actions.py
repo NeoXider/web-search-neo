@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from web_search_neo import browser_tools
@@ -18,6 +20,13 @@ class _CannedDriver:
 
     def execute_cdp_cmd(self, command, params):
         self.cdp_calls.append((command, params))
+        if command == "Runtime.evaluate" and command not in self.cdp:
+            # Promise-returning scripts are evaluated through CDP, not
+            # execute_script; record them the same way so tests read one list.
+            expression = params["expression"]
+            head, _, arguments = expression.rpartition(".apply(null, ")
+            self.scripts.append((head, json.loads(arguments[:-1])))
+            return {"result": {"value": self.script_result}}
         response = self.cdp.get(command)
         return response(command, params) if callable(response) else (response or {})
 

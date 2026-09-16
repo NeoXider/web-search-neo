@@ -23,6 +23,9 @@ const saveMaxSessionsButton = document.querySelector("#save-max-sessions");
 const resetMaxSessionsButton = document.querySelector("#reset-max-sessions");
 const maxSessionsDefaultNode = document.querySelector("#max-sessions-default");
 const nextAttemptNode = document.querySelector("#next-attempt");
+const agentListNode = document.querySelector("#agent-tab-list");
+const agentEmptyNode = document.querySelector("#agent-tabs-empty");
+const agentCountNode = document.querySelector("#agent-tabs-count");
 
 const GITHUB_URL = "https://github.com/NeoXider/web-search-neo";
 const RELEASES_API = "https://api.github.com/repos/NeoXider/web-search-neo/releases?per_page=1";
@@ -208,6 +211,59 @@ async function refresh() {
   }
 }
 
+// "Agent tabs": every tab an agent acted on in the last five minutes, as the
+// service worker tracks it (chrome-extension/agent-badges.js). A row focuses
+// its tab. Text only goes through textContent: tab titles are page-controlled.
+function agentRow(row) {
+  const item = document.createElement("li");
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "agent-row";
+  button.dataset.phase = row.phase === "active" ? "active" : "recent";
+  button.title = row.url || row.title || "";
+  const claim = row.claim ? ` · claimed by ${row.claim}` : "";
+  const meta = `${row.agent} · ${row.status_text}${claim}`;
+  button.setAttribute("aria-label", `Focus ${row.title}: ${meta}`);
+  const dot = document.createElement("span");
+  dot.className = "agent-dot";
+  dot.setAttribute("aria-hidden", "true");
+  const title = document.createElement("span");
+  title.className = "agent-title";
+  title.textContent = String(row.title ?? "");
+  const details = document.createElement("span");
+  details.className = "agent-meta";
+  details.textContent = meta;
+  button.append(dot, title, details);
+  button.addEventListener("click", () => focusAgentTab(row.tab_id));
+  item.append(button);
+  return item;
+}
+
+function renderAgentTabs(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  agentCountNode.textContent = String(list.length);
+  agentEmptyNode.hidden = list.length > 0;
+  if (typeof document.createElement !== "function" || !agentListNode.replaceChildren) return;
+  agentListNode.replaceChildren(...list.map(agentRow));
+}
+
+async function refreshAgentTabs() {
+  try {
+    renderAgentTabs((await send("companion.agentTabs"))?.tabs);
+  } catch (error) {
+    // An older worker, or one restarting: the status line already reports it.
+  }
+}
+
+async function focusAgentTab(tabId) {
+  try {
+    await send("companion.focusAgentTab", {tab_id: tabId});
+  } catch (error) {
+    messageNode.textContent = error.message;
+    refreshAgentTabs();
+  }
+}
+
 enabledInput.addEventListener("change", async () => {
   enabledInput.disabled = true;
   messageNode.textContent = enabledInput.checked ? "Enabling..." : "Disabling...";
@@ -306,7 +362,7 @@ openGitHubButton.addEventListener("click", () => {
 // Test and preview hook: the same render pipeline the popup uses, reachable
 // without Chrome. Production popups never read this property.
 if (typeof window !== "undefined") {
-  window.__wsn = {render, deriveState, countdown, compareVersions};
+  window.__wsn = {render, deriveState, countdown, compareVersions, renderAgentTabs};
 }
 
 /* Read-only preview driver: deterministic fake state, no browser APIs.
@@ -317,9 +373,23 @@ let previewTabs = 2;
 let previewCap = 8;
 let previewCeiling = 64;
 let previewPort = 8765;
-let previewVersion = "1.14.0";
+let previewVersion = "1.15.0";
 let previewUpdate = null;
 let previewEnabled = true;
+let previewAgents = 3;
+
+// Sample rows in the exact shape the worker's companion.agentTabs returns.
+function previewAgentTabs() {
+  const rows = [
+    {tab_id: 101, title: "Pull request #42 - review", agent: "claude#4120", phase: "active",
+     status_text: "active now", claim: "main.py#4120", url: "https://example.com/pr/42"},
+    {tab_id: 102, title: "chrome://extensions", agent: "codex#5230", phase: "recent",
+     status_text: "2 min ago", claim: null, url: "chrome://extensions"},
+    {tab_id: 103, title: "Quarterly report.pdf", agent: "main.py#6008", phase: "recent",
+     status_text: "4 min ago", claim: "main.py#6008", url: "file:///report.pdf"},
+  ];
+  return {tabs: previewEnabled ? rows.slice(0, previewAgents) : [], now: Date.now()};
+}
 
 function baseState() {
   return {
@@ -366,6 +436,8 @@ function previewSend(type, extra = {}) {
     });
   }
   if (type === "companion.reconnect") return Promise.resolve(currentPreviewStatus());
+  if (type === "companion.agentTabs") return Promise.resolve(previewAgentTabs());
+  if (type === "companion.focusAgentTab") return Promise.resolve({focused: extra.tab_id});
   if (type === "companion.releaseTabs") {
     const detached = previewTabs;
     previewTabs = 0;
@@ -408,9 +480,11 @@ function startPreview() {
   previewCap = Number.parseInt(params.get("cap"), 10) || 8;
   previewCeiling = Number.parseInt(params.get("ceiling"), 10) || 64;
   previewPort = Number.parseInt(params.get("port"), 10) || 8765;
-  previewVersion = params.get("ver") || "1.14.0";
-  refresh().then(checkRelease);
-  setInterval(refresh, 1000);
+  previewVersion = params.get("ver") || "1.15.0";
+  const agents = Number.parseInt(params.get("agents"), 10);
+  previewAgents = Number.isFinite(agents) ? Math.max(0, agents) : 3;
+  refresh().then(checkRelease).then(refreshAgentTabs);
+  setInterval(() => refresh().then(refreshAgentTabs), 1000);
 }
 
 if (PREVIEW) {
@@ -418,6 +492,6 @@ if (PREVIEW) {
 } else {
   // A real action popup without a preview query renders only the live
   // service-worker state; nothing here is simulated.
-  refresh().then(checkRelease);
-  setInterval(refresh, 1000); // the documented one-second live refresh
+  refresh().then(checkRelease).then(refreshAgentTabs);
+  setInterval(() => refresh().then(refreshAgentTabs), 1000); // the documented one-second live refresh
 }

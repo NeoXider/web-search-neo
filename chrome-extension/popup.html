@@ -46,6 +46,15 @@
         </div>
       </section>
 
+      <section id="agent-tabs" class="card agent-tabs" aria-labelledby="agent-tabs-title">
+        <h2 id="agent-tabs-title" class="section-title">
+          Agent tabs
+          <span id="agent-tabs-count" class="chip" title="Tabs an agent used in the last 5 minutes">0</span>
+        </h2>
+        <ul id="agent-tab-list" class="agent-list" aria-live="polite"></ul>
+        <p id="agent-tabs-empty" class="hint">No agent activity in the last 5 minutes.</p>
+      </section>
+
       <section id="release-chip" class="release-row" title="Latest GitHub release vs this build">
         <span id="release-status">Checking</span>
         <button id="check-release" type="button" class="icon-btn"

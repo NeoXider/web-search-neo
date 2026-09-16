@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "web-search-neo"
-version = "1.14.0"
+version = "1.15.0"
 description = "Free API-keyless web search and visible Chrome automation for AI agents over MCP."
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
 license = { text = "MIT" }
 dependencies = [
-    "mcp>=1.29,<1.30",
+    "mcp>=1.29,<2",
     "pydantic-settings>=2.14,<2.15",
     "ddgs>=9.14,<10",
     "requests>=2.32,<3",
@@ -24,6 +24,33 @@ wsn = "web_search_neo.main:main"
 
 [project.urls]
 Homepage = "https://github.com/NeoXider/web-search-neo"
+
+# The flat layout also holds `skills/`, so packages are listed explicitly.
+# tests/test_fetch_hardening.py fails when this list drifts from the source tree.
+# `web_search_neo.chrome_extension` is the repository's chrome-extension/
+# folder, shipped so an installed wheel still carries the unpacked extension.
+[tool.setuptools]
+packages = [
+    "web_search_neo",
+    "web_search_neo.actions",
+    "web_search_neo.cdp",
+    "web_search_neo.contract",
+    "web_search_neo.fetch",
+    "web_search_neo.perception",
+    "web_search_neo.sessions",
+    "web_search_neo.chrome_extension",
+]
+include-package-data = false
+
+[tool.setuptools.package-dir]
+"web_search_neo.chrome_extension" = "chrome-extension"
+
+[tool.setuptools.package-data]
+"web_search_neo.chrome_extension" = ["*.js", "*.json", "*.html", "*.css", "icons/*.png"]
+
+[tool.setuptools.exclude-package-data]
+# The machine-local companion secret must never be baked into a wheel.
+"web_search_neo.chrome_extension" = ["bridge-token.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

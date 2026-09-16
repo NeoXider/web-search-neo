@@ -18,10 +18,11 @@ import json
 import os
 from pathlib import Path
 import re
-import threading
 import time
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
+
+from web_search_neo.sessions import file_lock
 
 # Deliberately the same shape as a session id: a macro name ends up in a file
 # name, so anything that could walk out of the macro directory is refused here
@@ -35,7 +36,6 @@ _PLACEHOLDER = re.compile(r"\{\{\s*([A-Za-z0-9_]+)\s*\}\}")
 MAX_STEPS = 10000
 
 _GUARDED_LEDGER_NAME = ".guarded-macro-ledger.json"
-_GUARDED_LEDGER_LOCK = threading.Lock()
 
 # Where a project keeps its own macros. A project is recognised by a store it
 # already has, and failing that by a repository root: both are directories the
@@ -541,10 +541,9 @@ def _load_guarded_ledger(project_root: str | os.PathLike[str] | None = None) -> 
 def _write_guarded_ledger(
     data: dict[str, Any], project_root: str | os.PathLike[str] | None = None
 ) -> None:
-    path = _guarded_ledger_path(project_root)
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(path)
+    file_lock.atomic_write_text(
+        _guarded_ledger_path(project_root), json.dumps(data, ensure_ascii=False, indent=2)
+    )
 
 
 def reserve_checkpoint(
@@ -553,7 +552,7 @@ def reserve_checkpoint(
     project_root: str | os.PathLike[str] | None = None,
 ) -> str:
     """Reserve a unique target/resource/token tuple after all assertions pass."""
-    with _GUARDED_LEDGER_LOCK:
+    with file_lock.exclusive(_guarded_ledger_path(project_root)):
         ledger = _load_guarded_ledger(project_root)
         # Every refusal below is permanent by design - that is what a one-time
         # guard is - and each one used to end the sentence there. It left a
@@ -605,7 +604,7 @@ def consume_checkpoint(
     checkpoint: str, project_root: str | os.PathLike[str] | None = None
 ) -> dict[str, Any]:
     """Mark a terminal submit attempted before dispatch, making retries fail closed."""
-    with _GUARDED_LEDGER_LOCK:
+    with file_lock.exclusive(_guarded_ledger_path(project_root)):
         ledger = _load_guarded_ledger(project_root)
         match = next(
             (item for item in ledger["tokens"].values() if item.get("checkpoint") == checkpoint),

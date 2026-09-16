@@ -56,6 +56,9 @@ _TAB_ACTIVITY_SOURCE = r"""
   };
   const setBadge = generation => {
     if (state.stopped || generation !== state.generation) return;
+    // The presence script owns the favicon when it is installed; painting a
+    // second badge over its icon made the tab flicker between the two.
+    if (window.__wsnPresence) { restore(); return; }
     try {
       snapshot();
       const first = state.links.length ? state.links[0] : "";
@@ -66,7 +69,7 @@ _TAB_ACTIVITY_SOURCE = r"""
           const canvas = document.createElement("canvas");
           canvas.width = 64; canvas.height = 64;
           const ctx = canvas.getContext("2d");
-          if (!ctx) { applyIcon(robotIcon(), generation); return; }
+          if (!ctx) return;
           ctx.drawImage(img, 0, 0, 64, 64);
           ctx.fillStyle = "#22c55e";
           ctx.beginPath(); ctx.arc(50, 50, 15, 0, 7); ctx.fill();
@@ -75,9 +78,9 @@ _TAB_ACTIVITY_SOURCE = r"""
           ctx.textAlign = "center"; ctx.textBaseline = "middle";
           ctx.fillText("\u25CF", 50, 51);
           applyIcon(canvas.toDataURL(), generation);
-        } catch (error) { applyIcon(robotIcon(), generation); }
+        } catch (error) {}
       };
-      img.onerror = () => applyIcon(robotIcon(), generation);
+      img.onerror = () => {};
       img.src = first;
     } catch (error) {}
   };

@@ -10,7 +10,9 @@ that will host the server and it rewrites ``mcp_servers.json`` for *this* clone.
 
 Other entries in an existing mcp_servers.json are preserved; the
 ``web-search-neo`` entry is replaced. The output uses forward slashes so it stays
-valid JSON on Windows (see INSTALL.md).
+valid JSON on Windows (see INSTALL.md). When the checkout has a virtualenv
+(``.venv/Scripts/python.exe`` or ``.venv/bin/python``) its interpreter is used
+instead of a bare ``python``.
 """
 
 from __future__ import annotations
@@ -27,10 +29,26 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+VENV_INTERPRETERS = (Path(".venv") / "Scripts" / "python.exe", Path(".venv") / "bin" / "python")
+
+
+def interpreter_for(root: Path) -> str:
+    """The checkout's own virtualenv interpreter when there is one, else ``python``.
+
+    A bare ``python`` is whatever the MCP client finds first on PATH, which is
+    rarely the environment the dependencies were installed into.
+    """
+    for relative in VENV_INTERPRETERS:
+        candidate = root / relative
+        if candidate.is_file():
+            return candidate.as_posix()
+    return "python"
+
+
 def entry_for(root: Path) -> dict:
     """The MCP-server entry pinned to ``root``."""
     return {
-        "command": "python",
+        "command": interpreter_for(root),
         "args": ["main.py"],
         "cwd": root.as_posix(),
     }

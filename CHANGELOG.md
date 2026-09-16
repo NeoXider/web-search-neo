@@ -1,5 +1,122 @@
 # Changelog
 
+## 1.15.0
+
+Release focus: a bridge handshake that never sends the secret, a fetch layer
+that cannot be pointed at cloud metadata, paid CAPTCHA solving that only runs
+when asked for, and an installable wheel.
+
+Fixed:
+
+- Tests were red on `main`: four stale tests are updated to the current behaviour.
+
+Agent presence:
+
+- The tab favicon keeps the site's own icon and gets a small semi-transparent
+  slime in its bottom-right corner — awake and green while an agent acts, sleepy
+  and amber for five minutes after (`web_search_neo/agent_presence.py`,
+  `PRESENCE_VERSION = 4`, so live pages reinstall it). The "working now" phase
+  lasts 30 s, matching the toolbar badge, and the slime is drawn at 20 px of
+  the 32 px icon so it stays readable at tab-strip size. Our icon link is
+  re-inserted after the page's icons are parked, because Chrome otherwise kept
+  showing the page's own icon. A favicon the page cannot read back
+  (cross-origin, canvas tainted) is left alone instead of replaced.
+  The older green-dot badge in `web_search_neo/sessions/activity.py` stands down
+  when the presence script is installed and no longer swaps in a robot icon.
+- The companion shows a per-tab toolbar badge — green `AI` while an agent acts,
+  amber for up to five minutes — whose tooltip names the agent, and the popup
+  gets an **Agent tabs** card listing tabs with agent activity in the last five
+  minutes (agent, active now / N s or N min ago, claim holder); a click focuses
+  the tab.
+  New `chrome-extension/agent-activity.js` and `agent-badges.js`. The daemon
+  attaches the requesting client's `agent` identity to every relayed command;
+  `WEB_SEARCH_NEO_AGENT_NAME` gives the agent a friendly name.
+  `scripts/companion-widget-preview.html` accepts `agents=N` for the card.
+
+Bridge security:
+
+- Bridge protocol 2: a mutual HMAC challenge-response in which the raw token
+  never crosses the socket and the daemon proves itself first
+  (`web_search_neo/bridge_handshake.py`, `chrome-extension/bridge-auth.js`).
+  Protocol-1 companions are refused with a close reason that says to update
+  and reload the extension.
+- Token files are written atomically, locked down before the secret is written,
+  and on Windows restricted by ACL to the current user (`icacls`). A new token
+  is minted only when the file is missing, never because a read failed.
+- The daemon enforces tab claims: a command for a tab claimed by another
+  connected client is refused (`tabs.get` stays allowed). `hello` must name a
+  `role`, and the `extension` role requires the extension `Origin`. Connections
+  are capped at 64 open and 16 still in the handshake. The claim reaper no
+  longer broadcasts under the lock and skips claims of connected clients.
+  Tab ids are read the way JavaScript `Number()` reads them (so `42.0` cannot
+  slip past a claim), and a reconnecting server keeps its own claims.
+- An existing token file is re-locked to the current user on every load, not
+  only when it is first written.
+- The bridge daemon is started with `CREATE_BREAKAWAY_FROM_JOB` on Windows when
+  the parent's job allows it, so an MCP client that runs servers in a
+  kill-on-close job object does not take the shared daemon down with it.
+- Upgrade note: a 1.14 companion cannot reload itself into protocol 2 through a
+  1.15 daemon. Press Reload once on `chrome://extensions` after updating, and
+  end a still-running 1.14 daemon (its `--bridge` python process): a 1.15
+  `--bridge --stop` speaks protocol 2 and cannot talk to it.
+
+HTTP and fetch:
+
+- `http_request` returns the body of 4xx/5xx responses.
+- SSRF guard: link-local and cloud-metadata destinations are always blocked,
+  hostnames are resolved before the check, and a redirect from a public host to
+  a private one is refused. Direct loopback/private URLs remain allowed.
+- A cross-origin redirect keeps only non-credential headers.
+- `save_to` is confined to `WEB_SEARCH_NEO_DOWNLOAD_DIR` (default `./downloads`)
+  and refuses to replace an existing file unless `overwrite=true`.
+- Bodies are read under a total deadline, timeouts are capped at 120 s, and
+  sensitive query values (`token`, `key`, `sig`, `session`, …) are redacted in
+  logs (`web_search_neo/fetch/safety.py`, `web_client.py`).
+
+CAPTCHA:
+
+- Paid solving is opt-in only. `mode='auto'` now waits for a human; a service
+  is used with `mode='solve'`, or with `auto` when
+  `WEB_SEARCH_NEO_CAPTCHA_AUTO_SOLVE=1`, and always needs
+  `WEB_SEARCH_NEO_CAPTCHA_KEY`. A token is applied only if the page URL has not
+  changed, success is reported only when it was actually applied, the widget's
+  `data-callback` is invoked, and reCAPTCHA Enterprise uses its own task type.
+
+Waits and sessions:
+
+- A plain sleep and challenge waits no longer hold the session lock. Wait,
+  captcha and challenge timeouts are capped at 300 s and report `timeout_note`
+  when clamped.
+- Fix a busy spin in the `chrome_bootstrap` reload poll. The macro one-time-submit
+  ledger uses a cross-process file lock. Request mocks are cleared on every
+  teardown path. Frame selection reports real errors. Stealth `languages` follow
+  the session locale.
+
+Packaging and server:
+
+- `pip install .` works: packages are listed explicitly, the extension ships as
+  `web_search_neo/chrome_extension`, and an installed copy is mirrored to
+  `%LOCALAPPDATA%\WebSearchNeo\extension` (or `~/.local/share/web-search-neo/extension`)
+  where the bridge token can be written (`web_search_neo/extension_path.py`).
+  The `wsn` entry point works, and CI builds and installs the wheel.
+- `msp_server.log` moved to a per-user state directory:
+  `%LOCALAPPDATA%\web-search-neo\logs\msp_server.log` on Windows,
+  `$XDG_STATE_HOME/web-search-neo/logs/msp_server.log` (default
+  `~/.local/state/...`) elsewhere; `WEB_SEARCH_NEO_LOG_FILE` overrides it, and an
+  unwritable location disables the log instead of stopping the server.
+- `mcp` pin loosened to `>=1.29,<2`; FastMCP internals are isolated in
+  `web_search_neo/mcp_compat.py`. A failed `web_action` batch returns MCP
+  `isError=true` with the JSON payload. `make_mcp_config.py` prefers the project
+  `.venv` python. Plugins are not loaded in `--bridge` mode.
+- `msp_date_time` prints correct `±HH:MM` offsets and DST zone names.
+
+Cleanup:
+
+- Removed the deprecated `driver.py`, `docs/audit-1.11.1.md` and tracked
+  `.vscode` settings; `.opencode/` and `.vscode/` are ignored. Unused and
+  mid-file imports cleaned up. Legacy module size ratchets were lowered and a
+  test now forbids raising them. The cover image is compressed.
+
 ## 1.14.0
 
 Release focus: reliable text input for React forms, plain sleeps without polling,
@@ -103,7 +220,7 @@ which tab is driven and what each step touched.
   unlinkable fingerprint. Debug-banner guidance is a launch workaround, not automatic
   suppression of Chrome's UI.
 
-See `docs/audit-1.11.1.md` for scope and verification.
+The audit write-up for this release lives in commit `c254609`.
 
 ## 1.11.0
 

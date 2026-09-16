@@ -228,3 +228,9 @@ def teardown(driver: Any, session_id: str) -> None:
     finally:
         _REQUEST_MOCKS.pop(session_id, None)
         _MOCK_STUB_SCRIPT_IDS.pop(session_id, None)
+
+
+def forget(session_id: str) -> None:
+    """Drop the registry for a session whose tab or browser is already gone."""
+    _REQUEST_MOCKS.pop(session_id, None)
+    _MOCK_STUB_SCRIPT_IDS.pop(session_id, None)

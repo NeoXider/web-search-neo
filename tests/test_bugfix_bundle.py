@@ -413,14 +413,15 @@ def test_fetch_custom_headers_forwarded(monkeypatch):
 
 def test_fetch_save_to_writes_file(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "request", lambda *a, **k: _FakeFetchResponse())
+    monkeypatch.setenv("WEB_SEARCH_NEO_DOWNLOAD_DIR", str(tmp_path))
     target = tmp_path / "bundle.js"
     message = main._fetch_url_text(
         "https://example.test/bundle.js", save_to=str(target)
     )
     assert "Saved" in message and target.read_bytes() == _FakeFetchResponse.content
-    with pytest.raises(ValueError, match="directory does not exist"):
+    with pytest.raises(ValueError, match="inside the download directory"):
         main._fetch_url_text(
-            "https://example.test/x", save_to=str(tmp_path / "nope" / "f.js")
+            "https://example.test/x", save_to=str(tmp_path.parent / "elsewhere.js")
         )
 
 
