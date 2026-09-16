@@ -2369,6 +2369,12 @@ def _remove_agent_presence(session: BrowserSession) -> None:
         except Exception:
             pass
         session.presence_script_id = None
+    if not session.last_presence_ping:
+        # Nothing was ever painted in this tab, so there is nothing to undo -
+        # and a tab being handed back to its owner must come back untouched,
+        # which includes not having a script run in it on the way out.
+        return
+    session.last_presence_ping = 0.0
     try:
         session.driver.execute_script(agent_presence.RESTORE_SCRIPT)
     except Exception:

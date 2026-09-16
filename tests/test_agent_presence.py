@@ -317,10 +317,12 @@ def test_a_screenshot_clears_the_overlays_first(monkeypatch):
 
 def test_remove_restores_the_favicon_and_drops_the_registration(monkeypatch):
     _presence_env(monkeypatch)
-    driver = _PresenceDriver()
+    driver = _PresenceDriver(installed=True)
     session = _register(driver)
     with session.lock:
         browser_tools._apply_agent_presence(session, "presence-case")
+    browser_tools.note_agent_activity("presence-case", "click", {})
+    with session.lock:
         browser_tools._remove_agent_presence(session)
     assert session.presence_script_id is None
     assert (
@@ -328,6 +330,19 @@ def test_remove_restores_the_favicon_and_drops_the_registration(monkeypatch):
         {"identifier": "presence-1"},
     ) in driver.cdp_calls
     assert any("restore" in script for script, _args in driver.scripts)
+
+
+def test_a_tab_that_was_never_marked_is_handed_back_untouched(monkeypatch):
+    # _leave_claimed_tab gives the user's tab back. A session that armed the
+    # script but never painted anything has nothing to undo, and running a
+    # script in that tab on the way out is itself touching it.
+    _presence_env(monkeypatch)
+    driver = _PresenceDriver()
+    session = _register(driver)
+    with session.lock:
+        browser_tools._apply_agent_presence(session, "presence-case")
+        browser_tools._remove_agent_presence(session)
+    assert driver.scripts == []
 
 
 def test_a_handed_back_tab_is_cleaned(monkeypatch):
