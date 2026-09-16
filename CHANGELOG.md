@@ -23,6 +23,8 @@ Agent presence:
   (cross-origin, canvas tainted) is left alone instead of replaced.
   The older green-dot badge in `web_search_neo/sessions/activity.py` stands down
   when the presence script is installed and no longer swaps in a robot icon.
+  A borrowed tab that was never marked is handed back without running the
+  restore script in it.
 - The companion shows a per-tab toolbar badge — green `AI` while an agent acts,
   amber for up to five minutes — whose tooltip names the agent, and the popup
   gets an **Agent tabs** card listing tabs with agent activity in the last five

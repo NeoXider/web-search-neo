@@ -69,9 +69,7 @@ from web_search_neo.cdp import request_mocks
 from web_search_neo.cdp.request_mocks import (  # noqa: F401
     _MOCK_BODY_LIMIT, _MOCK_STUB_SOURCE, _validate_mock,
 )
-from web_search_neo.perception.elements import (
-    _ELEMENT_LIST_KEYS, _INSPECT_SCRIPT, _restate_element_ranges,
-)
+from web_search_neo.perception.elements import _ELEMENT_LIST_KEYS, _INSPECT_SCRIPT, _restate_element_ranges
 from web_search_neo.sessions.activity import (
     _TAB_ACTIVITY_IDLE_SECONDS,
     _TAB_ACTIVITY_SOURCE,  # noqa: F401 - re-exported for tests
@@ -184,9 +182,7 @@ _SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _BROWSER_LOG_LIMIT = 500
 
 
-from web_search_neo.sessions.models import (  # noqa: F401 - SessionLock is re-exported
-    BrowserSession, ConsoleCursor, SessionLock,
-)
+from web_search_neo.sessions.models import BrowserSession, ConsoleCursor, SessionLock  # noqa: F401
 
 
 _sessions: dict[str, BrowserSession] = {}
@@ -2393,10 +2389,7 @@ def _remove_agent_presence(session: BrowserSession) -> None:
             pass
         session.presence_script_id = None
     if not session.last_presence_ping:
-        # Nothing was ever painted in this tab, so there is nothing to undo -
-        # and a tab being handed back to its owner must come back untouched,
-        # which includes not having a script run in it on the way out.
-        return
+        return  # never painted: a handed-back tab must come back untouched
     session.last_presence_ping = 0.0
     try:
         session.driver.execute_script(agent_presence.RESTORE_SCRIPT)

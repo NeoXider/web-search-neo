@@ -128,9 +128,9 @@ def test_the_borrowed_tab_is_handed_back_untouched(monkeypatch, companion):
     )
 
     assert released == 42
-    # Detached with its favicon restored, and nothing else: not closed, not
-    # navigated, not activated.
-    assert borrowed.calls == ["restore_favicon", "quit"]
+    # Detached, and nothing else: not closed, not navigated, not activated,
+    # and no favicon restore in a tab that was never marked.
+    assert borrowed.calls == ["quit"]
 
 
 def test_the_session_moves_to_a_tab_it_owns(monkeypatch, companion):
