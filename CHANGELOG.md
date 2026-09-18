@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.16.0
+
+Release focus: a visible virtual pointer, and the paperwork that says who opens
+whose Chrome.
+
+Ghost cursor:
+
+- Every coordinate-bearing action now glides a ghost cursor across the tab it
+  ran in, with the agent's name riding next to it, and every press lands a
+  fading ring where it happened — red when the press was refused
+  (`web_search_neo/agent_presence.py`, `PRESENCE_VERSION = 5`, so live pages
+  reinstall it). Pointer input was and stays synthetic CDP events: the
+  operating system's mouse never moves, agents in different tabs cannot disturb
+  each other or the user, and the cursor is one drawing per tab, purely for the
+  watcher. The cursor and the rings hide before every screenshot and the cursor
+  is shown again right after, so an agent never photographs its own arrow; a
+  handed-back tab is cleaned as before. `WEB_SEARCH_NEO_AGENT_PRESENCE=0` turns
+  all three signals off together.
+- Tests in `tests/test_agent_presence.py`.
+
+Docs:
+
+- README and the bundled skill now say who opens and closes Chrome: `open` with
+  `temporary`/`isolated`/`persistent` starts an MCP-owned browser that `close`
+  quits again; `attach` only detaches from a Chrome the user started; `current`
+  never launches or quits the user's Chrome. New "Starting fresh after a
+  reboot" recipe in INSTALL.md: with the logon launcher in place the bridge is
+  already listening and opening Chrome reconnects the companion by itself.
+
 ## 1.15.0
 
 Release focus: a bridge handshake that never sends the secret, a fetch layer

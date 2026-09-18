@@ -129,6 +129,10 @@ stay reachable, so local services work unchanged.
   group and reports the tab it gave back as `left_claimed_tab`. `close` removes a tab the
   agent opened and leaves a claimed tab open; `close_all` follows the same rule for every
   session you own, and reports the other agents' sessions it left running.
+  The MCP never launches or quits the user's own Chrome process. To open and close a
+  browser yourself, use an owned profile: `temporary`, `isolated`, or `persistent`
+  starts its own Chrome and `close` quits it; `attach` only detaches from a Chrome
+  the user started.
 - Another agent may be driving the same Chrome: `attach_tab` on a tab it already holds is
   refused with who holds it. Pick a different tab or open your own; do not retry.
 - Tabs open in the background and nothing steals the user's focus, so they keep working
@@ -141,10 +145,14 @@ stay reachable, so local services work unchanged.
   `manual_steps`, show them to the user word for word and wait: nothing can install the
   extension, or reload a build older than 1.3.1, on their behalf.
 - A tab an agent is driving wears a small slime on its favicon (green while acting, amber
-  for 5 quiet minutes after), and the companion's toolbar badge reads `AI`. Such a tab is
+  for 5 quiet minutes after), a ghost cursor glides between the agent's pointer points
+  with its name tag and lands a fading ring on every press (red when refused), and the
+  companion's toolbar badge reads `AI`. Such a tab is
   agent-held: observe it read-only
   (`page_text`/`page_outline`/`screenshot`) or open your own session — acting on it
-  collides mid-run, and claiming it is refused with the holder named.
+  collides mid-run, and claiming it is refused with the holder named. Pointer input is
+  synthetic CDP events: no OS mouse moves, tabs cannot disturb each other, and the
+  cursor is hidden from every screenshot the agent reads back.
 - Chrome's "started debugging this browser" banner on driven tabs is mandatory platform
   UI and cannot be dismissed while the tab is driven; its Cancel only detaches until the
   next action. Silence it by relaunching Chrome once with `--silent-debugger-extension-api`,

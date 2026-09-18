@@ -280,7 +280,7 @@ is no automatic substitute. If you would rather not install an extension at all,
 `profile_mode="temporary"` and `profile_mode="persistent"` drive a Selenium
 browser that needs no companion.
 
-The bundled companion is version 1.15.0. Chrome does not refresh an unpacked
+The bundled companion is version 1.16.0. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. That only works for
@@ -403,6 +403,14 @@ through pythonw (no console window), and running
 Windows Startup folder so the bridge is up on every logon. Delete the generated
 startup file to undo. The launcher sets `WEB_SEARCH_NEO_BRIDGE_IDLE_SECONDS=0`,
 so a logon-started bridge does not idle-exit before the next browser session.
+
+After a reboot nothing needs clicking: the bridge is already listening (logon
+launcher), and opening Chrome reconnects the companion by itself — its badge
+turns `ON` within seconds on the same backoff it uses after any outage. If it
+reads `OFF`, the daemon is not up yet or the token the loaded copy reads is
+stale; run the MCP once (it starts a daemon on demand) and press **Reconnect**
+in the popup, or **Reload** the card first when the copy Chrome loads is not
+the folder `setup_current_chrome` reports.
 
 `--bridge` exits quietly if another daemon already owns the port, because that one
 serves just as well. It prints nothing while it runs either: the daemon logs to
@@ -639,6 +647,17 @@ back to a separate headless Selenium session, so it does not raise another windo
 | `persistent` | MCP owns a durable profile under `%LOCALAPPDATA%\WebSearchNeo\profiles\<profile_id>`, headless by default. | Repeated automation with a separate signed-in profile. |
 | `attach` | MCP connects to a Chrome process that you started with a DevTools port and does not close it on detach. | Watching the agent work in an already authorized managed Chrome window. |
 
+#### Who opens and closes Chrome
+
+`open` with `temporary`, `isolated`, or `persistent` starts an MCP-owned Chrome
+through Selenium Manager, and `close` / `close_all` quits that process again —
+the MCP genuinely opens and closes its own browser. `attach` connects to a
+Chrome you started yourself (for example with
+`scripts\start_managed_chrome.ps1`) and only detaches from it. `current` drives
+the Chrome you already have open: the MCP never launches it and never quits it,
+it only opens tabs the agent asked for and closes those same tabs back, while a
+tab claimed with `attach_tab` is always handed back open.
+
 #### Working in the same Chrome as the user
 
 In `current` mode the agent takes no focus. Its tabs open in the background, in
@@ -714,7 +733,7 @@ page scripts and every read topic keep seeing the unlabelled title. Headless,
 persistent, and attach sessions are never labelled. Pass `label_tab=false`, or
 set `WEB_SEARCH_NEO_LABEL_TABS=0` in the server's environment, to turn it off.
 
-The label says whose tab it is; two further signals say whether anything is
+The label says whose tab it is; three further signals say whether anything is
 happening in it. Every action marks the page it ran in: the tab's favicon gets
 a small semi-transparent slime in its corner — awake and green while an agent
 is working there, sleepy and amber for five minutes after its last action — on
@@ -724,8 +743,14 @@ tab strip separates the tab being driven right now from the one abandoned an
 hour ago. In the page itself, the element the action touched flashes for a
 quarter of a second, in red when the action was refused, which turns a burst of
 thirty clicks into thirty visible taps instead of a page that mutates on its
-own. Both are shown in every session with a window, headless excepted, and both
-are drawn `aria-hidden`, so nothing an agent reads back can see them. Set
+own. And a ghost cursor follows the agent's virtual pointer from action to
+action, gliding between points with the agent's name riding next to it, landing
+a fading ring on every press — red when the press was refused. All pointer
+input here is synthetic CDP events, so the operating system's mouse never moves
+and agents in different tabs cannot disturb each other or the user; the cursor
+is one drawing per tab, purely for the watcher. All three are shown in every
+session with a window, headless excepted, and all are drawn `aria-hidden` and
+hidden before every screenshot, so nothing an agent reads back can see them. Set
 `WEB_SEARCH_NEO_AGENT_PRESENCE=0` to turn them off.
 
 Sessions are pinned to the browser run they were opened in. Tab ids restart with

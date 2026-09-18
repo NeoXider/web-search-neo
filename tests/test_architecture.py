@@ -58,7 +58,7 @@ def test_allowed_dependencies_and_own_modules(source):
     assert not boundary_errors(source, "web_search_neo/actions/fill.py")
 
 
-# The 1.15.0 ceilings. A ratchet only ever moves down: raising one means
+# The 1.16.0 ceilings. A ratchet only ever moves down: raising one means
 # editing this table too, which is the explicit review the policy asks for.
 _RATCHET_CEILINGS = {
     "web_search_neo/browser_tools.py": 8240,

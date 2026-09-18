@@ -1,13 +1,15 @@
 """Show a human, in the browser itself, that an agent is driving this tab.
 
-Two signals, both aimed at the person watching rather than at the caller:
+Three signals, all aimed at the person watching rather than at the caller:
 
 * a badge painted onto the tab's favicon while an agent is working in it, and
   for a few minutes after it stopped - the tab strip is where someone looks
   first, and the ``[session] `` title prefix in ``browser_tools`` only says
   *whose* tab it is, never *whether anything is happening in it right now*;
 * a short flash over the element the last action touched, so a burst of thirty
-  clicks reads as thirty visible taps instead of a page that mutates on its own.
+  clicks reads as thirty visible taps instead of a page that mutates on its own;
+* a ghost cursor that follows the agent's virtual pointer - synthetic CDP input
+  moves no OS mouse - with a name tag and a fading ring on every press.
 
 Everything here is pure data: the JavaScript source and the small builders that
 bake values into it. The session plumbing - when to install the script, which
@@ -19,6 +21,7 @@ lets the payloads be unit-tested without a browser.
 from __future__ import annotations
 
 import json
+import math
 import os
 from typing import Any
 
@@ -26,7 +29,7 @@ from typing import Any
 # reinstall itself. Without it a long-lived tab would keep running whatever
 # version was current when it first loaded, and a fix here would only reach
 # pages opened afterwards.
-PRESENCE_VERSION = 4
+PRESENCE_VERSION = 5
 
 PRESENCE_ENV = "WEB_SEARCH_NEO_AGENT_PRESENCE"
 
@@ -44,9 +47,24 @@ FLASH_MS = 250
 # Enough concurrent flashes to see a burst, few enough that a runaway loop
 # cannot fill the DOM with overlays.
 MAX_FLASHES = 6
+# Glide, ring life and name-tag life for the ghost cursor. A ring outlives the
+# flash so a press is seen after the fact, but dies before a burst smears.
+CURSOR_GLIDE_MS = 90
+# A press ring lives long enough to be seen after the fact and dies fast
+# enough that a burst stays a sequence rather than a smear.
+RIPPLE_MS = 700
+MAX_RIPPLES = 8
+CURSOR_CHIP_MS = 1500
 
 _ACTIVE_COLOR = "#2fbf5c"
 _RECENT_COLOR = "#e2a03f"
+
+# Actions after which the session's virtual pointer is meaningful. DOM clicks
+# move no pointer - nor would the OS cursor - so the cursor stays put there.
+_CURSOR_ACTIONS = frozenset({"pointer", "input", "pointer_lock"})
+# The sub-actions that press a button down: those land a ripple, the rest only
+# glide the cursor.
+_TAP_POINTER_ACTIONS = frozenset({"click", "double_click", "press"})
 
 # The actions that are not worth a flash: they either have no place on the page
 # or fire so often that the overlay would never be off. The favicon badge still
@@ -100,7 +118,31 @@ def _config() -> dict[str, Any]:
         "maxFlashes": MAX_FLASHES,
         "activeColor": _ACTIVE_COLOR,
         "recentColor": _RECENT_COLOR,
+        "glideMs": CURSOR_GLIDE_MS,
+        "rippleMs": RIPPLE_MS,
+        "maxRipples": MAX_RIPPLES,
+        "chipMs": CURSOR_CHIP_MS,
     }
+
+
+def _sub_action_name(value: object) -> str:
+    return str(value or "").strip().lower()
+
+
+def _cursor_hint(action: str, source: dict[str, Any]) -> tuple[bool, bool]:
+    """Whether the action moved the virtual pointer, and pressed a button."""
+    name = _sub_action_name(source.get("action"))
+    if action == "pointer":
+        return True, name in _TAP_POINTER_ACTIONS
+    if action == "pointer_lock":
+        # Only acquiring clicks; the rest never visits the pointer.
+        owns = name == "acquire"
+        return owns, owns
+    if action == "input":
+        items = source.get("pointer_actions")
+        subs = [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+        return bool(subs), any(_sub_action_name(item.get("action")) in _TAP_POINTER_ACTIONS for item in subs)
+    return False, False
 
 
 def payload_for(
@@ -109,20 +151,25 @@ def payload_for(
     *,
     ok: bool = True,
     label: str | None = None,
+    pointer: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
-    """Describe one finished action in the terms the page-side flash needs.
+    """Describe one finished action in the terms the page-side script needs.
 
     Only a hint is passed, never a resolved element: the action has already
     happened by the time this runs, and re-resolving the selector in the page
     is both cheaper than shipping a rect back and correct in the common case
     where the click moved something.
+
+    ``pointer`` is the session's virtual pointer after the action ran. It lands
+    in the payload as ``cursor`` only for actions that actually moved it.
     """
+    name = str(action or "").strip().lower()
     source = dict(arguments or {})
     payload: dict[str, Any] = {
-        "action": str(action or "").strip().lower(),
+        "action": name,
         "label": label or None,
         "ok": bool(ok),
-        "flash": str(action or "").strip().lower() not in QUIET_ACTIONS,
+        "flash": name not in QUIET_ACTIONS,
     }
     for key in _SELECTOR_KEYS:
         value = source.get(key)
@@ -138,6 +185,12 @@ def payload_for(
     if isinstance(x, (int, float)) and isinstance(y, (int, float)):
         payload["x"] = float(x)
         payload["y"] = float(y)
+    if pointer is not None:
+        moves, tap = _cursor_hint(name, source)
+        px, py = pointer
+        finite = isinstance(px, (int, float)) and isinstance(py, (int, float)) and math.isfinite(px) and math.isfinite(py)
+        if moves and finite:
+            payload["cursor"] = {"x": float(px), "y": float(py), "tap": tap}
     return payload
 
 
@@ -168,14 +221,19 @@ RESTORE_SCRIPT = (
     " return true; })()"
 )
 
-# A flash lasts 250 ms and a screenshot can be taken inside that window, which
-# would hand an agent a picture of a green box its own click drew and let it
-# reason about the box as if the page had put it there. Every capture clears the
-# overlays first. The favicon badge is untouched: it is not in the picture.
+# A flash lasts 250 ms and a screenshot inside that window would hand the agent
+# a picture of a box its own click drew. Every capture hides the overlays first
+# - flashes and rings are removed, the cursor is shown again right after - and
+# the favicon badge is untouched: it is not in the picture.
 HIDE_FLASHES_SCRIPT = (
     "(() => { const presence = window.__wsnPresence;"
     " if (presence && typeof presence.hideFlashes === 'function') presence.hideFlashes();"
     " return true; })()"
+)
+
+SHOW_EPHEMERAL_SCRIPT = (
+    "(() => { const presence = window.__wsnPresence;"
+    " if (presence && presence.showEphemeral) presence.showEphemeral(); return true; })()"
 )
 
 
@@ -213,6 +271,8 @@ _INSTALL_TEMPLATE = r"""
     painted: {},
     loading: {},
     flashes: [],
+    cursor: null,
+    ripples: [],
   };
   window[KEY] = state;
 
@@ -488,6 +548,11 @@ _INSTALL_TEMPLATE = r"""
   }
 
   function targetRect(payload) {
+    // Cursor pixels are main-frame viewport pixels; x/y arguments may be frame-local.
+    const point = payload.cursor;
+    if (point && isFinite(point.x) && isFinite(point.y)) {
+      return {left: point.x - 14, top: point.y - 14, width: 28, height: 28};
+    }
     let node = null;
     if (payload.selector) {
       try {
@@ -605,6 +670,78 @@ _INSTALL_TEMPLATE = r"""
     setTimeout(remove, CONFIG.flashMs + 120);
   }
 
+  // ---------------------------------------------------------- ghost cursor
+
+  // CDP input never moves the OS mouse: one arrow per document follows the
+  // virtual pointer, with the agent's name tag, and presses land fading rings.
+  function shadowed(host) {
+    try {
+      if (host.attachShadow) return host.attachShadow({mode: "open"});
+    } catch (error) {}
+    return host;
+  }
+
+  function cursorEntry() {
+    if (state.cursor) return state.cursor;
+    const parent = document.body || document.documentElement;
+    if (!parent || !document.createElement) return null;
+    const host = document.createElement("div");
+    host.setAttribute("aria-hidden", "true");
+    host.setAttribute("data-wsn-presence", "cursor");
+    host.style.cssText = "all:initial;position:fixed;left:0;top:0;width:0;height:0;z-index:2147483646;pointer-events:none;display:none;transition:left " + CONFIG.glideMs + "ms linear,top " + CONFIG.glideMs + "ms linear;";
+    const root = shadowed(host);
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("width", "22"); svg.setAttribute("height", "22");
+    svg.setAttribute("viewBox", "0 0 22 22");
+    svg.style.cssText = "position:absolute;left:-4px;top:-4px;display:block;overflow:visible;";
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", "M6 3 L6 15.5 L9.6 12.3 L11.6 17.6 L13.8 16.6 L11.8 11.4 L15.8 11.4 Z");
+    path.setAttribute("fill", CONFIG.activeColor);
+    path.setAttribute("stroke", "#ffffff"); path.setAttribute("stroke-width", "1.6"); path.setAttribute("stroke-linejoin", "round");
+    svg.appendChild(path); root.appendChild(svg);
+    const chip = document.createElement("div");
+    chip.style.cssText = "position:absolute;left:20px;top:18px;white-space:nowrap;padding:1px 6px;border-radius:3px;color:#ffffff;background:" + CONFIG.activeColor + ";font:600 11px/1.5 ui-sans-serif,system-ui,Segoe UI,sans-serif;opacity:0;transition:opacity 300ms ease-out;";
+    root.appendChild(chip); parent.appendChild(host);
+    return (state.cursor = {host: host, chip: chip, timer: null, visible: false});
+  }
+
+  function moveCursor(point, payload) {
+    if (!point || !isFinite(point.x) || !isFinite(point.y)) return;
+    const entry = cursorEntry();
+    if (!entry) return;
+    const off = point.x < 0 || point.y < 0 || point.x > window.innerWidth || point.y > window.innerHeight;
+    entry.visible = !off;
+    entry.host.style.display = off ? "none" : "block";
+    if (off) return;
+    entry.host.style.left = Math.round(point.x) + "px";
+    entry.host.style.top = Math.round(point.y) + "px";
+    if (!payload) return;
+    entry.chip.textContent = chipText(payload);
+    entry.chip.style.opacity = "1";
+    if (entry.timer) { try { clearTimeout(entry.timer); } catch (error) {} }
+    entry.timer = setTimeout(function () { entry.timer = null; entry.chip.style.opacity = "0"; }, CONFIG.chipMs);
+  }
+
+  function ripple(point, ok) {
+    const parent = document.body || document.documentElement;
+    if (!parent || !document.createElement || !point) return;
+    if (!isFinite(point.x) || !isFinite(point.y)) return;
+    if (point.x < 0 || point.y < 0 || point.x > window.innerWidth || point.y > window.innerHeight) return;
+    const color = ok === false ? "#e2584d" : CONFIG.activeColor;
+    const host = document.createElement("div");
+    host.setAttribute("aria-hidden", "true");
+    host.setAttribute("data-wsn-presence", "ripple");
+    host.style.cssText = "all:initial;position:fixed;left:" + Math.round(point.x) + "px;top:" + Math.round(point.y) + "px;width:0;height:0;z-index:2147483646;pointer-events:none;";
+    const ring = document.createElement("div");
+    ring.style.cssText = "position:absolute;left:-9px;top:-9px;width:18px;height:18px;box-sizing:border-box;border-radius:50%;border:3px solid " + color + ";box-shadow:0 0 8px " + color + ";opacity:0.95;pointer-events:none;transform:scale(1);transition:transform " + CONFIG.rippleMs + "ms ease-out,opacity " + CONFIG.rippleMs + "ms ease-out;";
+    shadowed(host).appendChild(ring);
+    parent.appendChild(host);
+    state.ripples.push(host);
+    while (state.ripples.length > CONFIG.maxRipples) dropFlash(state.ripples.shift());
+    requestAnimationFrame(function () { requestAnimationFrame(function () { ring.style.transform = "scale(2.8)"; ring.style.opacity = "0"; }); });
+    setTimeout(function () { const i = state.ripples.indexOf(host); if (i !== -1) state.ripples.splice(i, 1); dropFlash(host); }, CONFIG.rippleMs + 120);
+  }
+
   // ------------------------------------------------------------------ entry
 
   state.note = function (payload) {
@@ -622,11 +759,21 @@ _INSTALL_TEMPLATE = r"""
     if (data.flash !== false) {
       try { flash(data); } catch (error) {}
     }
+    if (data.cursor) {
+      try { moveCursor(data.cursor, data); if (data.cursor.tap) ripple(data.cursor, data.ok); } catch (error) {}
+    }
     return true;
   };
 
   state.hideFlashes = function () {
     clearFlashes();
+    for (const host of state.ripples.splice(0)) dropFlash(host);
+    if (state.cursor) state.cursor.host.style.display = "none";
+    return true;
+  };
+
+  state.showEphemeral = function () {
+    if (state.cursor && state.cursor.visible) state.cursor.host.style.display = "block";
     return true;
   };
 
@@ -639,6 +786,12 @@ _INSTALL_TEMPLATE = r"""
     state.recentUntil = 0;
     restoreIcon();
     clearFlashes();
+    for (const host of state.ripples.splice(0)) dropFlash(host);
+    if (state.cursor) {
+      if (state.cursor.timer) { try { clearTimeout(state.cursor.timer); } catch (error) {} }
+      dropFlash(state.cursor.host);
+      state.cursor = null;
+    }
     try { delete window[KEY]; } catch (error) { window[KEY] = undefined; }
   };
 

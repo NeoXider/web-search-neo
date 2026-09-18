@@ -2433,16 +2433,18 @@ def _apply_agent_presence(session: BrowserSession, session_id: str) -> None:
 _PRESENCE_QUIET_SECONDS = 1.0
 
 
-def _hide_presence_overlays(driver: Any) -> None:
+def _hide_presence_overlays(driver: Any, hide: bool = True) -> None:
     """Take the action flashes off the page before it is photographed.
 
     A flash lives 250 ms, and a screenshot taken inside that window would hand
     an agent a picture of a box its own click drew - which it would then read as
     something the page did. Cheap enough to run before every capture, and a
-    no-op in a page that has no overlay up.
+    no-op in a page that has no overlay up. The ghost cursor and press rings go
+    with them; pass ``hide=False`` after the capture to bring the cursor back.
     """
+    script = agent_presence.HIDE_FLASHES_SCRIPT if hide else agent_presence.SHOW_EPHEMERAL_SCRIPT
     try:
-        driver.execute_script(agent_presence.HIDE_FLASHES_SCRIPT)
+        driver.execute_script(script)
     except Exception:
         pass
 
@@ -2478,6 +2480,7 @@ def note_agent_activity(
         arguments,
         ok=ok,
         label=session.agent_label or session_id,
+        pointer=(session.pointer_x, session.pointer_y),
     )
     now = time.monotonic()
     if not payload["flash"] and now - session.last_presence_ping < _PRESENCE_QUIET_SECONDS:
@@ -7480,72 +7483,74 @@ def screenshot(
         driver = session.driver
         is_current = bool(getattr(driver, "is_extension_bridge", False))
         _hide_presence_overlays(driver)
+        try:
+            if selected_mode == "viewport":
+                if has_size:
+                    if is_current:
+                        raise ValueError(
+                            "An explicit viewport size cannot be applied in profile_mode='current': "
+                            "Web Search Neo preserves the user's Chrome window. Omit width/height "
+                            "for its actual viewport, or use mode='region' for an exact-size crop."
+                        )
+                    bounded_width, bounded_height = _bounded_size(int(width), int(height))
+                    _set_viewport(driver, bounded_width, bounded_height)
+                return driver.get_screenshot_as_png()
 
-        if selected_mode == "viewport":
+            if selected_mode == "region":
+                region_width = int(width)
+                region_height = int(height)
+                if not 1 <= region_width <= _MAX_SCREENSHOT_WIDTH:
+                    raise ValueError(
+                        f"region width must be 1-{_MAX_SCREENSHOT_WIDTH} CSS pixels"
+                    )
+                if not 1 <= region_height <= _MAX_SCREENSHOT_HEIGHT:
+                    raise ValueError(
+                        f"region height must be 1-{_MAX_SCREENSHOT_HEIGHT} CSS pixels"
+                    )
+                region_x = float(x)
+                region_y = float(y)
+                if region_x < 0 or region_y < 0:
+                    raise ValueError("region x and y must be non-negative page coordinates")
+                return _capture_png(
+                    driver,
+                    {
+                        "x": region_x,
+                        "y": region_y,
+                        "width": float(region_width),
+                        "height": float(region_height),
+                    },
+                )
+
+            # The old full_page call accepted width/height as the layout viewport used
+            # before measuring the document, so keep that behaviour for Selenium. It
+            # was silently ignored in current Chrome; saying so is safer than returning
+            # an image whose requested dimensions mean nothing.
             if has_size:
                 if is_current:
                     raise ValueError(
-                        "An explicit viewport size cannot be applied in profile_mode='current': "
-                        "Web Search Neo preserves the user's Chrome window. Omit width/height "
-                        "for its actual viewport, or use mode='region' for an exact-size crop."
+                        "width/height cannot change full-page layout in profile_mode='current'; "
+                        "omit them to capture the current layout"
                     )
                 bounded_width, bounded_height = _bounded_size(int(width), int(height))
                 _set_viewport(driver, bounded_width, bounded_height)
-            return driver.get_screenshot_as_png()
-
-        if selected_mode == "region":
-            region_width = int(width)
-            region_height = int(height)
-            if not 1 <= region_width <= _MAX_SCREENSHOT_WIDTH:
+            metrics = driver.execute_cdp_cmd("Page.getLayoutMetrics", {})
+            size = metrics.get("cssContentSize") or metrics.get("contentSize") or {}
+            page_width = float(size.get("width") or 0)
+            page_height = float(size.get("height") or 0)
+            if page_width <= 0 or page_height <= 0:
+                raise RuntimeError("Chrome returned no document size for the full-page screenshot")
+            if page_width > _MAX_SCREENSHOT_WIDTH or page_height > _MAX_SCREENSHOT_HEIGHT:
                 raise ValueError(
-                    f"region width must be 1-{_MAX_SCREENSHOT_WIDTH} CSS pixels"
+                    f"The full page is {page_width:g}x{page_height:g} CSS pixels, above the "
+                    f"safe {_MAX_SCREENSHOT_WIDTH}x{_MAX_SCREENSHOT_HEIGHT} screenshot limit. "
+                    "Use mode='region' to capture it in explicit pieces; no partial image was returned."
                 )
-            if not 1 <= region_height <= _MAX_SCREENSHOT_HEIGHT:
-                raise ValueError(
-                    f"region height must be 1-{_MAX_SCREENSHOT_HEIGHT} CSS pixels"
-                )
-            region_x = float(x)
-            region_y = float(y)
-            if region_x < 0 or region_y < 0:
-                raise ValueError("region x and y must be non-negative page coordinates")
             return _capture_png(
                 driver,
-                {
-                    "x": region_x,
-                    "y": region_y,
-                    "width": float(region_width),
-                    "height": float(region_height),
-                },
+                {"x": 0, "y": 0, "width": page_width, "height": page_height},
             )
-
-        # The old full_page call accepted width/height as the layout viewport used
-        # before measuring the document, so keep that behaviour for Selenium. It
-        # was silently ignored in current Chrome; saying so is safer than returning
-        # an image whose requested dimensions mean nothing.
-        if has_size:
-            if is_current:
-                raise ValueError(
-                    "width/height cannot change full-page layout in profile_mode='current'; "
-                    "omit them to capture the current layout"
-                )
-            bounded_width, bounded_height = _bounded_size(int(width), int(height))
-            _set_viewport(driver, bounded_width, bounded_height)
-        metrics = driver.execute_cdp_cmd("Page.getLayoutMetrics", {})
-        size = metrics.get("cssContentSize") or metrics.get("contentSize") or {}
-        page_width = float(size.get("width") or 0)
-        page_height = float(size.get("height") or 0)
-        if page_width <= 0 or page_height <= 0:
-            raise RuntimeError("Chrome returned no document size for the full-page screenshot")
-        if page_width > _MAX_SCREENSHOT_WIDTH or page_height > _MAX_SCREENSHOT_HEIGHT:
-            raise ValueError(
-                f"The full page is {page_width:g}x{page_height:g} CSS pixels, above the "
-                f"safe {_MAX_SCREENSHOT_WIDTH}x{_MAX_SCREENSHOT_HEIGHT} screenshot limit. "
-                "Use mode='region' to capture it in explicit pieces; no partial image was returned."
-            )
-        return _capture_png(
-            driver,
-            {"x": 0, "y": 0, "width": page_width, "height": page_height},
-        )
+        finally:
+            _hide_presence_overlays(driver, False)
 
 
 def show_session(session_id: str = "default") -> dict[str, Any]:

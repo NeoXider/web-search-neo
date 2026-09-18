@@ -1,9 +1,11 @@
-"""Agent presence: the favicon badge and the last-action flash.
+"""Agent presence: the favicon badge, the last-action flash, and the ghost cursor.
 
-Two signals aimed at the person watching the browser rather than at the caller.
-Every action a session runs pings the page: the tab's favicon gets a badge
-while the agent is working and for five minutes after it stops, and the element
-the action touched flashes for a quarter of a second.
+Three signals aimed at the person watching the browser rather than at the
+caller. Every action a session runs pings the page: the tab's favicon gets a
+badge while the agent is working and for five minutes after it stops, the
+element the action touched flashes for a quarter of a second, and a ghost
+cursor follows the agent's virtual pointer - synthetic CDP input that never
+moves the operating system's mouse - with a fading ring on every press.
 
 Neither may ever cost a caller an action, so the whole path swallows failures -
 which is exactly why it needs tests: a signal that silently stops working looks
@@ -426,3 +428,122 @@ def test_favicon_mark_is_a_translucent_slime_over_the_page_icon():
     # an opaque tile, and the older activity dot defers to this script.
     assert "#20272e" not in source
     assert "window.__wsnPresence" in browser_tools._TAB_ACTIVITY_SOURCE
+
+
+# --- the ghost cursor ----------------------------------------------------------
+
+
+def test_cursor_payload_follows_coordinate_actions():
+    payload = agent_presence.payload_for(
+        "pointer", {"action": "move", "x": 10, "y": 20}, pointer=(110.0, 48.0)
+    )
+    assert payload["cursor"] == {"x": 110.0, "y": 48.0, "tap": False}
+    acquire = agent_presence.payload_for(
+        "pointer_lock", {"action": "acquire"}, pointer=(5.0, 6.0)
+    )
+    assert acquire["cursor"] == {"x": 5.0, "y": 6.0, "tap": True}
+
+
+def test_cursor_payload_marks_presses_but_not_key_batches():
+    click = agent_presence.payload_for(
+        "pointer", {"action": "click", "x": 1, "y": 2}, pointer=(5.0, 6.0)
+    )
+    assert click["cursor"]["tap"] is True
+    batch = agent_presence.payload_for(
+        "input",
+        {"pointer_actions": [
+            {"action": "hover", "x": 1, "y": 1},
+            {"action": "press", "x": 2, "y": 2},
+        ]},
+        pointer=(2.0, 2.0),
+    )
+    assert batch["cursor"] == {"x": 2.0, "y": 2.0, "tap": True}
+    keys = agent_presence.payload_for(
+        "input", {"key_actions": [{"key": "a", "action": "tap"}]}, pointer=(2.0, 2.0)
+    )
+    assert "cursor" not in keys
+
+
+def test_cursor_payload_ignores_reads_and_dom_clicks():
+    # A synthetic DOM click moves no pointer - nor would the OS cursor - so the
+    # cursor stays where the last coordinate action left it.
+    assert "cursor" not in agent_presence.payload_for(
+        "click", {"selector": "#go"}, pointer=(1.0, 2.0)
+    )
+    assert "cursor" not in agent_presence.payload_for(
+        "press_keys", {"keys": ["a"]}, pointer=(1.0, 2.0)
+    )
+    assert "cursor" not in agent_presence.payload_for(
+        "pointer_lock", {"action": "status"}, pointer=(1.0, 2.0)
+    )
+    assert "cursor" not in agent_presence.payload_for("pointer", {"action": "move"})
+
+
+def test_cursor_payload_refuses_non_finite_positions():
+    assert "cursor" not in agent_presence.payload_for(
+        "pointer", {"action": "move"}, pointer=(float("inf"), 1.0)
+    )
+    assert "cursor" not in agent_presence.payload_for(
+        "pointer", {"action": "move"}, pointer=(float("nan"), 1.0)
+    )
+
+
+def test_the_installer_draws_a_ghost_cursor_and_press_rings():
+    source = agent_presence.install_source()
+    assert 'setAttribute("data-wsn-presence", "cursor")' in source
+    assert 'setAttribute("data-wsn-presence", "ripple")' in source
+    # An inline SVG arrow: no external image a page CSP could refuse.
+    assert "createElementNS" in source
+    assert "moveCursor" in source
+    assert "showEphemeral" in source
+
+
+def test_the_installer_carries_the_cursor_timings():
+    source = agent_presence.install_source()
+    assert f'"glideMs": {agent_presence.CURSOR_GLIDE_MS}' in source
+    assert f'"rippleMs": {agent_presence.RIPPLE_MS}' in source
+    assert f'"chipMs": {agent_presence.CURSOR_CHIP_MS}' in source
+    assert agent_presence.RIPPLE_MS <= 1000
+
+
+def test_note_moves_the_cursor_after_a_pointer_action(monkeypatch):
+    _presence_env(monkeypatch)
+    driver = _PresenceDriver(installed=True)
+    session = _register(driver, "presence-cursor")
+    session.pointer_x, session.pointer_y = 111.0, 47.0
+    assert browser_tools.note_agent_activity(
+        "presence-cursor", "pointer", {"action": "click", "x": 1, "y": 2}
+    )
+    assert driver.scripts[0][1][0]["cursor"] == {"x": 111.0, "y": 47.0, "tap": True}
+
+
+def test_note_leaves_the_cursor_alone_for_dom_clicks(monkeypatch):
+    _presence_env(monkeypatch)
+    driver = _PresenceDriver(installed=True)
+    session = _register(driver, "presence-cursor-dom")
+    session.pointer_x, session.pointer_y = 111.0, 47.0
+    assert browser_tools.note_agent_activity(
+        "presence-cursor-dom", "click", {"selector": "#go"}
+    )
+    assert "cursor" not in driver.scripts[0][1][0]
+
+
+def test_a_screenshot_brings_the_cursor_back(monkeypatch):
+    # The capture hides the cursor so the agent never photographs its own
+    # arrow, then shows it again: hiding without showing would strand the tab
+    # cursorless until the next pointer action.
+    _presence_env(monkeypatch)
+
+    class _ShotDriver(_PresenceDriver):
+        def get_screenshot_as_png(self):
+            return b"png-bytes"
+
+    driver = _ShotDriver(installed=True)
+    _register(driver, "presence-shot-cursor")
+    assert browser_tools.screenshot("presence-shot-cursor") == b"png-bytes"
+    kinds = [script for script, _args in driver.scripts]
+    assert any("hideFlashes" in script for script in kinds)
+    assert any("showEphemeral" in script for script in kinds)
+    assert max(
+        index for index, script in enumerate(kinds) if "showEphemeral" in script
+    ) > max(index for index, script in enumerate(kinds) if "hideFlashes" in script)
