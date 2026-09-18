@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.16.3
+
+Patch release: the windowless MCP entry survives venv launcher redirectors.
+
+- `make_mcp_config.py` on Windows now points the command at the venv's base
+  `pythonw.exe` with `__PYVENV_LAUNCHER__` naming the venv, instead of the
+  venv's own `pythonw.exe`. Some venv implementations (uv's included) ship the
+  launcher as a shim that starts the real interpreter as a child process - a
+  windowless shim with a visible console child, which is exactly the window
+  1.16.2 set out to remove. The base interpreter starts as one windowless
+  process with the venv's packages, the same hand-off the bridge daemon
+  already uses.
+
 ## 1.16.2
 
 Patch release: nothing the agent runs may pop a console onto your screen.

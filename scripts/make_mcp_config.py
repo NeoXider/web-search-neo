@@ -33,6 +33,49 @@ def repo_root() -> Path:
 VENV_INTERPRETERS = (Path(".venv") / "Scripts" / "python.exe", Path(".venv") / "bin" / "python")
 
 
+def _venv_home(root: Path) -> Path | None:
+    """The base interpreter directory of ``root/.venv``, from its pyvenv.cfg."""
+    try:
+        text = (root / ".venv" / "pyvenv.cfg").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == "home":
+            home = Path(value.strip())
+            if home.is_dir():
+                return home
+    return None
+
+
+def _windowless_venv_entry(root: Path) -> dict | None:
+    """An MCP entry that bypasses the venv launcher redirector, if there is one.
+
+    Some venv implementations (uv's included) ship ``pythonw.exe`` as a small
+    launcher that starts the real interpreter as a *child* process. A GUI-less
+    MCP client then gets two processes: a windowless shim and a visible console
+    child, which is exactly the window this setting exists to avoid. Pointing
+    the command at the base ``pythonw.exe`` directly - with
+    ``__PYVENV_LAUNCHER__`` naming the venv, the same hand-off the bridge
+    daemon uses - starts one windowless process instead.
+    """
+    venv_pythonw = root / ".venv" / "Scripts" / "pythonw.exe"
+    if not venv_pythonw.is_file():
+        return None
+    home = _venv_home(root)
+    if home is None:
+        return None
+    base_pythonw = home / "pythonw.exe"
+    if not base_pythonw.is_file() or base_pythonw.resolve() == venv_pythonw.resolve():
+        return None
+    return {
+        "command": base_pythonw.as_posix(),
+        "args": ["main.py"],
+        "cwd": root.as_posix(),
+        "env": {"__PYVENV_LAUNCHER__": venv_pythonw.as_posix()},
+    }
+
+
 def interpreter_for(root: Path) -> str:
     """The checkout's own virtualenv interpreter when there is one, else ``python``.
 
@@ -63,6 +106,10 @@ def interpreter_for(root: Path) -> str:
 
 def entry_for(root: Path) -> dict:
     """The MCP-server entry pinned to ``root``."""
+    if os.name == "nt":
+        bypass = _windowless_venv_entry(root)
+        if bypass is not None:
+            return bypass
     return {
         "command": interpreter_for(root),
         "args": ["main.py"],

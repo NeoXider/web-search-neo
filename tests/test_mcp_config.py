@@ -31,6 +31,35 @@ def _expected_interpreter(root: Path) -> str:
     return "python"
 
 
+def _import_generator():
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    try:
+        import make_mcp_config
+
+        return make_mcp_config
+    finally:
+        sys.path.pop(0)
+
+
+def _expected_entry(root: Path) -> dict:
+    """What the generator should emit for ``root``, bypass included.
+
+    The bypass computation itself lives in the generator and is unit-tested
+    below; here it is reused so this pins the selection and the entry shape
+    (including the hand-off env) rather than reimplementing them.
+    """
+    make_mcp_config = _import_generator()
+    if os.name == "nt":
+        bypass = make_mcp_config._windowless_venv_entry(root)
+        if bypass is not None:
+            return bypass
+    return {
+        "command": _expected_interpreter(root),
+        "args": ["main.py"],
+        "cwd": root.as_posix(),
+    }
+
+
 def _server_entry() -> dict:
     config = json.loads((REPO_ROOT / "mcp_servers.json").read_text(encoding="utf-8"))
     entry = config["mcpServers"]["web-search-neo"]
@@ -84,11 +113,9 @@ def test_make_mcp_config_pins_this_checkout_and_preserves_foreign_servers():
 
     # Forward slashes keep the JSON portable across platforms (INSTALL.md).
     expected_cwd = REPO_ROOT.as_posix().replace("\\", "/")
-    assert entry == {
-        "command": _expected_interpreter(REPO_ROOT),
-        "args": ["main.py"],
-        "cwd": expected_cwd,
-    }
+    assert entry["cwd"] == expected_cwd
+    assert entry["args"] == ["main.py"]
+    assert entry == _expected_entry(REPO_ROOT)
 
 
 def test_make_mcp_config_prefers_the_checkout_virtualenv(tmp_path):
@@ -151,3 +178,33 @@ def test_make_mcp_config_out_rewrites_only_its_own_entry(tmp_path):
     # ...while web-search-neo is pinned to this checkout.
     assert servers["web-search-neo"]["cwd"] == REPO_ROOT.as_posix().replace("\\", "/")
     assert servers["web-search-neo"]["args"] == ["main.py"]
+
+
+def test_make_mcp_config_bypasses_a_launcher_redirector(tmp_path):
+    # A venv pythonw.exe that is a launcher shim starts the real interpreter
+    # as a child - a visible console under a windowed client. Pointing at the
+    # base interpreter with __PYVENV_LAUNCHER__ starts one windowless process.
+    make_mcp_config = _import_generator()
+    scripts = tmp_path / ".venv" / "Scripts"
+    scripts.mkdir(parents=True)
+    venv_pythonw = scripts / "pythonw.exe"
+    venv_pythonw.write_text("", encoding="utf-8")
+    base = tmp_path / "base-python"
+    base.mkdir()
+    base_pythonw = base / "pythonw.exe"
+    base_pythonw.write_text("", encoding="utf-8")
+    (tmp_path / ".venv" / "pyvenv.cfg").write_text(
+        f"home = {base}\nuv = 0.11.16\n", encoding="utf-8"
+    )
+    if os.name != "nt":
+        assert make_mcp_config.entry_for(tmp_path)["command"] == "python"
+        return
+    assert make_mcp_config.entry_for(tmp_path) == {
+        "command": base_pythonw.as_posix(),
+        "args": ["main.py"],
+        "cwd": tmp_path.as_posix(),
+        "env": {"__PYVENV_LAUNCHER__": venv_pythonw.as_posix()},
+    }
+    # No base interpreter, no bypass: the venv launcher is the entry again.
+    base_pythonw.unlink()
+    assert make_mcp_config.entry_for(tmp_path)["command"] == venv_pythonw.as_posix()
