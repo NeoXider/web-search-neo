@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.16.1
+
+Patch release: the in-page signals gain a switch in the extension popup.
+
+- **Agent presence** in the popup turns the favicon badge, the action flash and
+  the ghost cursor off for the user's own Chrome, without touching the bridge
+  connection. On by default. The companion answers the server's paint requests
+  with success-shaped stand-ins (`Page.addScriptToEvaluateOnNewDocument` gets a
+  placeholder identifier, presence `Runtime.evaluate` gets `true`), so actions
+  are unaffected; flipping the switch mid-session restores already-painted tabs
+  at once, and enabling needs nothing - the next action ping reinstalls the
+  script through the usual fallback. `WEB_SEARCH_NEO_AGENT_PRESENCE=0` still
+  turns the signals off everywhere and wins over the popup. Selenium-driven
+  sessions never pass through the companion and keep obeying the environment
+  variable only.
+
 ## 1.16.0
 
 Release focus: a visible virtual pointer, and the paperwork that says who opens

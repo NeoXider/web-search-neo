@@ -280,7 +280,7 @@ is no automatic substitute. If you would rather not install an extension at all,
 `profile_mode="temporary"` and `profile_mode="persistent"` drive a Selenium
 browser that needs no companion.
 
-The bundled companion is version 1.16.0. Chrome does not refresh an unpacked
+The bundled companion is version 1.16.1. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. That only works for
@@ -750,8 +750,13 @@ input here is synthetic CDP events, so the operating system's mouse never moves
 and agents in different tabs cannot disturb each other or the user; the cursor
 is one drawing per tab, purely for the watcher. All three are shown in every
 session with a window, headless excepted, and all are drawn `aria-hidden` and
-hidden before every screenshot, so nothing an agent reads back can see them. Set
-`WEB_SEARCH_NEO_AGENT_PRESENCE=0` to turn them off.
+hidden before every screenshot, so nothing an agent reads back can see them. They
+are on by default; the popup's **Agent presence** switch turns them off for this
+Chrome without touching the bridge connection — the companion answers the
+server's paint requests with success-shaped stand-ins, so actions are unaffected,
+and flipping the switch mid-session takes already-painted tabs down at once. Set
+`WEB_SEARCH_NEO_AGENT_PRESENCE=0` to turn them off everywhere instead: the server
+environment wins over the popup.
 
 Sessions are pinned to the browser run they were opened in. Tab ids restart with
 Chrome, so a session that outlived a restart would address whatever tab inherited

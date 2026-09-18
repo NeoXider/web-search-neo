@@ -892,6 +892,8 @@ def test_popup_controls_have_unique_ids() -> None:
     assert {
         "max-sessions", "save-max-sessions", "reset-max-sessions", "max-sessions-default",
     } <= set(ids)
+    # The presence switch lives next to the master switch, not buried in Settings.
+    assert {"presence"} <= set(ids)
 
 
 @requires_node
@@ -900,7 +902,7 @@ def test_popup_checks_the_release_version_and_opens_github() -> None:
     module = f"""
 const callbacks = {{}};
 const ids = [
-  "enabled", "reconnect", "release-tabs", "status", "tabs", "bridge", "version",
+  "enabled", "presence", "reconnect", "release-tabs", "status", "tabs", "bridge", "version",
   "release-status", "message", "check-release", "open-github",
   "port", "save-port", "reset-port", "port-default", "next-attempt",
   "max-sessions", "save-max-sessions", "reset-max-sessions", "max-sessions-default",
@@ -923,6 +925,7 @@ const sent = [];
 // default, or the popup would appear to lose every change on its next refresh.
 let heldPort = 8765;
 let heldMaxSessions = 8;
+let heldPresence = true;
 globalThis.chrome = {{
   runtime: {{sendMessage: async message => {{
     sent.push(message);
@@ -930,6 +933,7 @@ globalThis.chrome = {{
     if (message.max_sessions !== undefined) {{
       heldMaxSessions = Number(message.max_sessions) || heldMaxSessions;
     }}
+    if (message.presence !== undefined) heldPresence = message.presence !== false;
     return {{
       enabled: true, connected: true, connecting: false, controlled_tabs: 2,
       bridge_url: `ws://127.0.0.1:${{heldPort}}`,
@@ -938,6 +942,7 @@ globalThis.chrome = {{
       max_sessions: heldMaxSessions,
       default_max_sessions: 8,
       max_sessions_ceiling: 64,
+      presence: heldPresence,
       version: "1.3.4",
     }};
   }}}},
@@ -959,6 +964,9 @@ await new Promise(resolve => setTimeout(resolve, 20));
 nodes.get("max-sessions").value = "12";
 await callbacks["save-max-sessions:click"]();
 await new Promise(resolve => setTimeout(resolve, 20));
+nodes.get("presence").checked = false;
+await callbacks["presence:change"]();
+await new Promise(resolve => setTimeout(resolve, 20));
 process.stdout.write(JSON.stringify({{
   release: nodes.get("release-status").textContent,
   releaseState: nodes.get("release-status").dataset.state,
@@ -977,6 +985,8 @@ process.stdout.write(JSON.stringify({{
   meterFill: nodes.get("meter-fill").style.width,
   maxSessionsDefault: nodes.get("max-sessions-default").textContent,
   maxSessionsMessages: sent.filter(item => item.type === "companion.setMaxSessions"),
+  presenceChecked: nodes.get("presence").checked,
+  presenceMessages: sent.filter(item => item.type === "companion.setPresence"),
 }}));
 """
     completed = subprocess.run(
@@ -1015,6 +1025,12 @@ process.stdout.write(JSON.stringify({{
     assert outcome["maxSessionsValue"] == "12"
     assert outcome["maxSessionsCeiling"] == "64"
     assert outcome["meterFill"] == "18.8%"
+    # The presence switch is asked of the worker like the other settings, then
+    # re-rendered from whatever the worker says it now holds.
+    assert outcome["presenceMessages"] == [
+        {"type": "companion.setPresence", "presence": False}
+    ]
+    assert outcome["presenceChecked"] is False
 
 
 @requires_node
@@ -3716,6 +3732,100 @@ def test_the_refusal_guards_the_command_and_not_the_extensions_own_calls() -> No
     helper = source.index("async function cdpSend(")
     assert "ALLOWED_CDP_METHODS" not in source[helper : helper + 400]
     assert "Target.attachToTarget" not in _allowed_cdp_methods()
+
+
+@requires_node
+def test_presence_switch_stubs_the_in_page_signals() -> None:
+    """The popup switch governs the user's own Chrome, no server involved.
+
+    With agent presence off, the install, the pings and any other
+    __wsnPresence-carrying evaluate never reach the debugger: the worker
+    answers in the shape each call expects, because the server treats presence
+    as decoration and swallows the stand-in. Real work on the same commands
+    still goes through.
+    """
+    outcome = _node_worker_eval(
+        _WORKER_READY
+        + _VERIFIED_SOCKET
+        + """
+        const socket = await openSocket();
+        const calls = [];
+        chrome.debugger.sendCommand = async (...args) => { calls.push(args); return {}; };
+        const INSTALL = "(() => { window.__wsnPresence = {version: 5}; })()";
+        const PING = "const presence = window.__wsnPresence; presence.note({}); return true;";
+        const initial = await globalThis.__message({type: "companion.status"});
+        const installOn = await ask(socket, "cdp.send",
+          {tabId: 7, method: "Page.addScriptToEvaluateOnNewDocument", params: {source: INSTALL}});
+        const plainOn = await ask(socket, "cdp.send",
+          {tabId: 7, method: "Runtime.evaluate", params: {expression: "1+1"}});
+        const throughOn = calls.length;
+        const off = await globalThis.__message({type: "companion.setPresence", presence: false});
+        const sweep = calls.slice(throughOn);
+        const storedOff = globalThis.__local().companion_presence;
+        calls.length = 0;
+        const installOff = await ask(socket, "cdp.send",
+          {tabId: 7, method: "Page.addScriptToEvaluateOnNewDocument", params: {source: INSTALL}});
+        const pingOff = await ask(socket, "cdp.send",
+          {tabId: 7, method: "Runtime.evaluate", params: {expression: PING}});
+        const plainOff = await ask(socket, "cdp.send",
+          {tabId: 7, method: "Runtime.evaluate", params: {expression: "1+1"}});
+        const evaluatedOff = calls
+          .filter(args => args[1] === "Runtime.evaluate")
+          .map(args => args[2].expression);
+        const on = await globalThis.__message({type: "companion.setPresence", presence: true});
+        return {initialPresence: initial.presence, installOn, plainOn, throughOn,
+          offPresence: off.presence, storedOff,
+          sweep: sweep.map(args => [args[1], args[2].expression]),
+          installOff, pingOff, plainOff, evaluatedOff,
+          onPresence: on.presence, stored: globalThis.__local().companion_presence};
+        """
+    )
+    assert outcome["initialPresence"] is True, "presence is on unless turned off"
+    assert answer_error(outcome["installOn"]) is None
+    assert answer_error(outcome["plainOn"]) is None
+    assert outcome["throughOn"] > 0, "with presence on, setup reaches the debugger"
+    assert outcome["offPresence"] is False
+    assert outcome["storedOff"] is False
+    # Flipping the switch mid-session takes already-painted tabs down now:
+    # one restore evaluate per attached tab, nothing else.
+    assert len(outcome["sweep"]) == 1
+    assert outcome["sweep"][0][0] == "Runtime.evaluate"
+    assert "__wsnPresence" in outcome["sweep"][0][1]
+    assert "restore" in outcome["sweep"][0][1]
+    assert answer_error(outcome["installOff"]) is None
+    assert outcome["installOff"]["result"] == {"identifier": "wsn-presence-off"}
+    assert answer_error(outcome["pingOff"]) is None
+    assert outcome["pingOff"]["result"] == {"result": {"type": "boolean", "value": True}}
+    assert answer_error(outcome["plainOff"]) is None
+    assert outcome["evaluatedOff"] == ["1+1"], "only real work reached the debugger"
+    assert outcome["onPresence"] is True
+    assert outcome["stored"] is True
+
+
+@requires_node
+def test_presence_stays_off_across_a_worker_restart() -> None:
+    outcome = _node_worker_eval(
+        """
+        await globalThis.__sleep(50);
+        const status = await globalThis.__message({type: "companion.status"});
+        return {presence: status.presence};
+        """,
+        prelude=(
+            "globalThis.__seedLocal({companion_presence: false});\n"
+            f"globalThis.__setToken('export const BRIDGE_TOKEN = \"{TEST_TOKEN}\";');"
+        ),
+    )
+    assert outcome == {"presence": False}
+
+
+def test_the_presence_guard_sits_beside_the_method_allowlist() -> None:
+    source = (EXTENSION_DIR / "service-worker.js").read_text(encoding="utf-8")
+    command = source.index('async "cdp.send"(params)')
+    assert "presenceStandIn" in source[command : command + 1400]
+    # cdpSend stays the extension's own unguarded path: resolveFrame evaluates
+    # page scripts that must never be mistaken for presence signals.
+    helper = source.index("async function cdpSend(")
+    assert "presenceStandIn" not in source[helper : helper + 400]
 
 
 @requires_node

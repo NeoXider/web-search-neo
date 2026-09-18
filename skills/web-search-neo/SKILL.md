@@ -152,7 +152,9 @@ stay reachable, so local services work unchanged.
   (`page_text`/`page_outline`/`screenshot`) or open your own session — acting on it
   collides mid-run, and claiming it is refused with the holder named. Pointer input is
   synthetic CDP events: no OS mouse moves, tabs cannot disturb each other, and the
-  cursor is hidden from every screenshot the agent reads back.
+  cursor is hidden from every screenshot the agent reads back. The signals are on by
+  default; the user can turn them off for their Chrome in the popup (**Agent presence**),
+  or everywhere with `WEB_SEARCH_NEO_AGENT_PRESENCE=0` in the server environment.
 - Chrome's "started debugging this browser" banner on driven tabs is mandatory platform
   UI and cannot be dismissed while the tab is driven; its Cancel only detaches until the
   next action. Silence it by relaunching Chrome once with `--silent-debugger-extension-api`,

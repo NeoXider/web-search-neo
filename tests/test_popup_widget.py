@@ -323,7 +323,7 @@ const snap = () => Object.fromEntries(["panel", "status", "next-attempt", "tabs"
       state: node.dataset ? node.dataset.state : undefined,
       width: node.style ? node.style.width : undefined,
     }}];
-  }}));
+  }}).concat([["presence", nodes.get("presence").checked]]));
 
 const results = {{initial: snap()}};
 for (const [name, payload] of Object.entries(SCENARIOS)) {{
@@ -359,6 +359,12 @@ return results;
             "state": "connected", "failure_kind": None, "controlled_tabs": 7,
             "max_sessions": 32, "max_sessions_ceiling": 64, "next_attempt_at": 0,
         },
+        "presence_off": {
+            "enabled": True, "connected": True, "connecting": False,
+            "state": "connected", "failure_kind": None, "controlled_tabs": 2,
+            "max_sessions": 8, "max_sessions_ceiling": 64, "next_attempt_at": 0,
+            "presence": False,
+        },
     }
     initial_status = {
         "enabled": True,
@@ -374,6 +380,7 @@ return results;
         "default_bridge_port": 8765,
         "next_attempt_at": 0,
         "version": main.__version__,
+        "presence": True,
     }
     prelude = (
         "globalThis.window = globalThis;\n"
@@ -427,6 +434,11 @@ def test_the_widget_renders_each_real_state_from_the_worker() -> None:
     assert capacity["tabs"]["text"] == "7"
     assert capacity["max_sessions_value"]["text"] == "32"
     assert capacity["meter_fill"]["width"] == "50.0%"
+
+    # The switch is on unless the worker says otherwise; an older worker that
+    # sends no flag leaves it on too.
+    assert result["initial"]["presence"] is True
+    assert result["presence_off"]["presence"] is False
 
 
 @requires_node

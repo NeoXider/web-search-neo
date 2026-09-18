@@ -11,7 +11,7 @@ LEGACY_MAX_LINES = {
     "web_search_neo/main.py": 2713,
     "web_search_neo/page_perception.py": 2632,
     "web_search_neo/chrome_bridge.py": 2050,
-    "chrome-extension/service-worker.js": 1650,
+    "chrome-extension/service-worker.js": 1720,
     "web_search_neo/bridge_daemon.py": 1166,
     "web_search_neo/macros.py": 849,
 }

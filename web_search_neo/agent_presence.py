@@ -98,7 +98,7 @@ _TEXT_KEYS = ("text",)
 def enabled() -> bool:
     """Whether the presence signals may be shown at all.
 
-    ``WEB_SEARCH_NEO_AGENT_PRESENCE=0`` (or false/no/off) turns both off
+    ``WEB_SEARCH_NEO_AGENT_PRESENCE=0`` (or false/no/off) turns every signal off
     everywhere, for the user who wants their tab strip left alone.
     """
     return str(os.environ.get(PRESENCE_ENV, "")).strip().lower() not in {

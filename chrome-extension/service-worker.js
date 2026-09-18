@@ -35,6 +35,17 @@ const MAX_SESSIONS_KEY = "companion_max_sessions";
 const DEFAULT_MAX_SESSIONS = 8;
 const MAX_SESSIONS_CEILING = 64;
 let maxSessions = DEFAULT_MAX_SESSIONS;
+// The in-page signals - favicon badge, action flash, ghost cursor - are painted
+// by the server through the debugger, so this is the one place that can refuse
+// them on the user's behalf: with the switch off the worker answers
+// success-shaped stand-ins and the page is never touched. On by default;
+// WEB_SEARCH_NEO_AGENT_PRESENCE=0 on the server still wins everywhere.
+const PRESENCE_KEY = "companion_presence";
+let presenceEnabled = true;
+// Mirror of agent_presence.RESTORE_SCRIPT: what takes an already-painted tab
+// back when the switch is flipped mid-session. Kept as a copy because the
+// worker cannot import the server's Python.
+const PRESENCE_RESTORE = '(() => { const presence = window.__wsnPresence; if (presence && presence.restore) presence.restore(); return true; })()';
 // The port used to live only in this line, so a server moved off 8765 meant
 // editing an installed extension and reloading it by hand - a source edit as
 // configuration, in the one file a user has no reason to open. It is a setting
@@ -456,6 +467,30 @@ export const ALLOWED_CDP_METHODS = new Set([
   "Storage.setCookies",
 ]);
 
+// The marker every in-page signal carries. Only the server's own presence
+// installer, pings and teardown contain it; page scripts are never inspected,
+// only the commands the server sends through cdp.send below.
+const PRESENCE_MARKER = "__wsnPresence";
+// Answered while the switch is off instead of the registration the server
+// asked for. Truthy, so the server treats the script as armed and keeps
+// pinging through the stub below rather than retrying the install.
+const PRESENCE_OFF_IDENTIFIER = "wsn-presence-off";
+
+// A stand-in answer for one presence-shaped command, or undefined when the
+// command is real work and must reach the debugger. The server treats presence
+// as decoration and swallows these the way it swallows a closed tab.
+function presenceStandIn(method, params) {
+  // A cdp.send envelope carries {tabId, sessionId?, method, params}: the
+  // script text lives one level down, not beside the method name.
+  const inner = params?.params && typeof params.params === "object" ? params.params : {};
+  const source = method === "Page.addScriptToEvaluateOnNewDocument" ? String(inner.source || "")
+    : method === "Runtime.evaluate" ? String(inner.expression || "")
+    : "";
+  if (!source || !source.includes(PRESENCE_MARKER)) return undefined;
+  if (method === "Page.addScriptToEvaluateOnNewDocument") return {identifier: PRESENCE_OFF_IDENTIFIER};
+  return {result: {type: "boolean", value: true}};
+}
+
 // Third-party response stubs, answered inside the extension over the CDP Fetch
 // domain (Fetch.enable + Fetch.fulfillRequest), so the page never sees the
 // real endpoint. One entry per tab; patterns are CDP urlPattern wildcards
@@ -720,6 +755,10 @@ const commands = {
         `Refused DevTools method '${method}': the companion forwards only the ` +
         `${ALLOWED_CDP_METHODS.size} methods Web Search Neo uses.`
       );
+    }
+    if (!presenceEnabled) {
+      const standIn = presenceStandIn(method, params);
+      if (standIn !== undefined) return standIn;
     }
     return cdpSend({...params, tabId: Number(params.tabId)});
   },
@@ -1151,6 +1190,33 @@ async function setMaxSessions(value) {
   return reconnectNow();
 }
 
+async function loadPresence() {
+  try {
+    const stored = (await chrome.storage.local.get(PRESENCE_KEY))?.[PRESENCE_KEY];
+    presenceEnabled = stored !== false;
+  } catch (error) {
+    console.warn("bridge: could not read the presence setting", error);
+    presenceEnabled = true;
+  }
+  return presenceEnabled;
+}
+
+async function setPresence(value) {
+  const wanted = Boolean(value);
+  if (wanted === presenceEnabled) return connectionStatus();
+  presenceEnabled = wanted;
+  await chrome.storage.local.set({[PRESENCE_KEY]: wanted});
+  if (!wanted) {
+    // Live sessions still believe their tabs are marked, so take the paint
+    // down now rather than on teardown or navigation. Enabling needs no sweep:
+    // the next action ping reinstalls the script through the usual fallback.
+    for (const tabId of [...attachedTabs]) {
+      await sendSafe(tabId, "Runtime.evaluate", {expression: PRESENCE_RESTORE, returnByValue: true});
+    }
+  }
+  return connectionStatus();
+}
+
 async function loadEnabled() {
   if (!enabledPromise) {
     enabledPromise = Promise.resolve(chrome.storage.local.get(ENABLED_KEY))
@@ -1179,6 +1245,7 @@ function connectionStatus() {
     max_sessions: maxSessions,
     default_max_sessions: DEFAULT_MAX_SESSIONS,
     max_sessions_ceiling: MAX_SESSIONS_CEILING,
+    presence: presenceEnabled,
     controlled_tabs: attachedTabs.size,
     next_attempt_at: enabled ? backoff.nextAttemptAt || 0 : 0,
     version: chrome.runtime.getManifest().version,
@@ -1617,6 +1684,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     operation = loadEnabled().then(() => setBridgePort(message.port));
   } else if (type === "companion.setMaxSessions") {
     operation = loadEnabled().then(() => setMaxSessions(message.max_sessions));
+  } else if (type === "companion.setPresence") {
+    operation = loadEnabled().then(() => setPresence(message.presence));
   } else if (String(type).startsWith("companion.") && (operation = agentMessage(message))) {
     // Agent activity list and focus requests from the popup.
   } else {
@@ -1641,6 +1710,7 @@ if (alarmsAvailable) {
 restoreState();
 loadBridgePort()
   .then(loadMaxSessions)
+  .then(loadPresence)
   .then(loadEnabled)
   .then(active => {
     setBadge(false);

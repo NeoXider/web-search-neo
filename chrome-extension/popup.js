@@ -1,5 +1,6 @@
 const panelNode = document.querySelector("#panel");
 const enabledInput = document.querySelector("#enabled");
+const presenceInput = document.querySelector("#presence");
 const reconnectButton = document.querySelector("#reconnect");
 const releaseButton = document.querySelector("#release-tabs");
 const statusNode = document.querySelector("#status");
@@ -97,6 +98,9 @@ function render(state) {
   panelNode.dataset.state = view;
   enabledInput.checked = Boolean(state.enabled);
   enabledInput.disabled = false;
+  // An older worker sends no presence flag; the switch has always meant on.
+  presenceInput.checked = state.presence !== false;
+  presenceInput.disabled = false;
   reconnectButton.disabled = !state.enabled;
   releaseButton.disabled = !state.controlled_tabs;
   tabsNode.textContent = String(state.controlled_tabs ?? 0);
@@ -279,6 +283,21 @@ enabledInput.addEventListener("change", async () => {
   }
 });
 
+presenceInput.addEventListener("change", async () => {
+  presenceInput.disabled = true;
+  messageNode.textContent = presenceInput.checked ? "Showing presence..." : "Hiding presence...";
+  try {
+    const state = await send("companion.setPresence", {presence: presenceInput.checked});
+    render(state);
+    messageNode.textContent = state.presence !== false
+      ? "Agent presence shown in driven tabs."
+      : "Agent presence hidden; tabs stay clean.";
+  } catch (error) {
+    messageNode.textContent = error.message;
+    await refresh();
+  }
+});
+
 reconnectButton.addEventListener("click", async () => {
   messageNode.textContent = "Reconnecting...";
   try {
@@ -373,9 +392,10 @@ let previewTabs = 2;
 let previewCap = 8;
 let previewCeiling = 64;
 let previewPort = 8765;
-let previewVersion = "1.16.0";
+let previewVersion = "1.16.1";
 let previewUpdate = null;
 let previewEnabled = true;
+let previewPresence = true;
 let previewAgents = 3;
 
 // Sample rows in the exact shape the worker's companion.agentTabs returns.
@@ -403,6 +423,7 @@ function baseState() {
     max_sessions: previewCap,
     default_max_sessions: 8,
     max_sessions_ceiling: previewCeiling,
+    presence: previewPresence,
     next_attempt_at: 0,
     version: previewVersion,
     failure_kind: null,
@@ -434,6 +455,10 @@ function previewSend(type, extra = {}) {
       ...currentPreviewStatus(),
       detached_tabs: previewEnabled ? 0 : previewTabs,
     });
+  }
+  if (type === "companion.setPresence") {
+    previewPresence = extra.presence !== false;
+    return Promise.resolve(currentPreviewStatus());
   }
   if (type === "companion.reconnect") return Promise.resolve(currentPreviewStatus());
   if (type === "companion.agentTabs") return Promise.resolve(previewAgentTabs());
@@ -480,7 +505,7 @@ function startPreview() {
   previewCap = Number.parseInt(params.get("cap"), 10) || 8;
   previewCeiling = Number.parseInt(params.get("ceiling"), 10) || 64;
   previewPort = Number.parseInt(params.get("port"), 10) || 8765;
-  previewVersion = params.get("ver") || "1.16.0";
+  previewVersion = params.get("ver") || "1.16.1";
   const agents = Number.parseInt(params.get("agents"), 10);
   previewAgents = Number.isFinite(agents) ? Math.max(0, agents) : 3;
   refresh().then(checkRelease).then(refreshAgentTabs);
