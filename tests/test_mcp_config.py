@@ -10,15 +10,21 @@ machine where the tests run, otherwise regeneration was forgotten after a move.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-VENV_COMMANDS = {".venv/Scripts/python.exe", ".venv/bin/python"}
+VENV_COMMANDS = {".venv/Scripts/pythonw.exe", ".venv/Scripts/python.exe", ".venv/bin/python"}
 
 
 def _expected_interpreter(root: Path) -> str:
+    if os.name == "nt":
+        for relative in (".venv/Scripts/pythonw.exe", ".venv/Scripts/python.exe"):
+            if (root / relative).is_file():
+                return (root / relative).as_posix()
+        return "pythonw"
     for relative in (".venv/Scripts/python.exe", ".venv/bin/python"):
         if (root / relative).is_file():
             return (root / relative).as_posix()
@@ -91,15 +97,36 @@ def test_make_mcp_config_prefers_the_checkout_virtualenv(tmp_path):
         import make_mcp_config
     finally:
         sys.path.pop(0)
-    assert make_mcp_config.entry_for(tmp_path)["command"] == "python"
+    assert make_mcp_config.entry_for(tmp_path)["command"] == (
+        "pythonw" if os.name == "nt" else "python"
+    )
     unix = tmp_path / ".venv" / "bin" / "python"
     unix.parent.mkdir(parents=True)
     unix.write_text("", encoding="utf-8")
-    assert make_mcp_config.entry_for(tmp_path)["command"] == unix.as_posix()
+    if os.name != "nt":
+        assert make_mcp_config.entry_for(tmp_path)["command"] == unix.as_posix()
     windows = tmp_path / ".venv" / "Scripts" / "python.exe"
     windows.parent.mkdir(parents=True)
     windows.write_text("", encoding="utf-8")
     assert make_mcp_config.entry_for(tmp_path)["command"] == windows.as_posix()
+
+
+def test_make_mcp_config_prefers_windowless_python_on_windows(tmp_path):
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    try:
+        import make_mcp_config
+    finally:
+        sys.path.pop(0)
+    windowless = tmp_path / ".venv" / "Scripts" / "pythonw.exe"
+    windowless.parent.mkdir(parents=True)
+    windowless.write_text("", encoding="utf-8")
+    if os.name == "nt":
+        # A console interpreter under a windowed MCP client owns a visible
+        # console for the whole session; pythonw runs the same stdio soundless.
+        assert make_mcp_config.entry_for(tmp_path)["command"] == windowless.as_posix()
+    else:
+        # POSIX has no console window to avoid; resolution is unchanged there.
+        assert make_mcp_config.entry_for(tmp_path)["command"] == "python"
 
 
 def test_make_mcp_config_out_rewrites_only_its_own_entry(tmp_path):

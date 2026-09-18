@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.16.2
+
+Patch release: nothing the agent runs may pop a console onto your screen.
+
+- The generated MCP configuration points at `pythonw` on Windows: a console
+  interpreter under a windowed MCP client owns a visible console for the whole
+  session, while `pythonw` runs the same stdio pipes with no console at all.
+- `scripts/bridge_autostart.bat` no longer falls back to a console interpreter;
+  autostart either runs windowless through `pythonw` or logs why it did not.
+- The test suite spawns node and python with `CREATE_NO_WINDOW` on Windows, so
+  agent-driven test runs stop flashing consoles too.
+
 ## 1.16.1
 
 Patch release: the in-page signals gain a switch in the extension popup.

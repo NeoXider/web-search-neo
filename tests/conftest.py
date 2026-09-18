@@ -5,6 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -14,6 +15,24 @@ import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+if os.name == "nt":
+    _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    _ORIGINAL_POPEN = subprocess.Popen
+
+    class _WindowlessPopen(subprocess.Popen):
+        # A subclass rather than a wrapper function: annotations like
+        # ``subprocess.Popen[bytes]`` and isinstance checks keep working, and
+        # the flag changes no behaviour, only the window.
+        def __init__(self, *args, **kwargs):
+            # A console-subsystem child of a detached run (an MCP client, an
+            # agent harness, CI) gets its own visible console window: node.exe
+            # behind every popup/worker test, python behind every CLI test.
+            kwargs["creationflags"] = kwargs.get("creationflags", 0) | _CREATE_NO_WINDOW
+            super().__init__(*args, **kwargs)
+
+    subprocess.Popen = _WindowlessPopen  # type: ignore[assignment]
 
 
 def pytest_addoption(parser):

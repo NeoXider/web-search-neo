@@ -280,7 +280,7 @@ is no automatic substitute. If you would rather not install an extension at all,
 `profile_mode="temporary"` and `profile_mode="persistent"` drive a Selenium
 browser that needs no companion.
 
-The bundled companion is version 1.16.1. Chrome does not refresh an unpacked
+The bundled companion is version 1.16.2. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. That only works for
@@ -403,6 +403,15 @@ through pythonw (no console window), and running
 Windows Startup folder so the bridge is up on every logon. Delete the generated
 startup file to undo. The launcher sets `WEB_SEARCH_NEO_BRIDGE_IDLE_SECONDS=0`,
 so a logon-started bridge does not idle-exit before the next browser session.
+
+Quiet on Windows: nothing the agent runs may pop a console onto your screen. The
+generated MCP configuration points at `pythonw` (no console, same stdio pipes),
+the daemon starts with `CREATE_NO_WINDOW`, chromedriver is launched hidden, and
+the test suite spawns node and python windowless too. If a console window still
+appears, its title names the owner: `node.exe` is a dev/test harness, `python.exe`
+is an MCP server started with a console interpreter (regenerate the config with
+`python scripts/make_mcp_config.py`), and anything else belongs to whoever
+started it — not to this project.
 
 After a reboot nothing needs clicking: the bridge is already listening (logon
 launcher), and opening Chrome reconnects the companion by itself — its badge

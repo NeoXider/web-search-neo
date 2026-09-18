@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -37,7 +38,22 @@ def interpreter_for(root: Path) -> str:
 
     A bare ``python`` is whatever the MCP client finds first on PATH, which is
     rarely the environment the dependencies were installed into.
+
+    On Windows the windowless interpreter is preferred: a console python under
+    a windowed MCP client gets its own visible console for the whole session,
+    while pythonw runs the same stdio pipes with no console at all. The venv
+    console interpreter stays ahead of a bare PATH pythonw, which would be
+    windowless but run the wrong environment.
     """
+    if os.name == "nt":
+        for relative in (
+            Path(".venv") / "Scripts" / "pythonw.exe",
+            Path(".venv") / "Scripts" / "python.exe",
+        ):
+            candidate = root / relative
+            if candidate.is_file():
+                return candidate.as_posix()
+        return "pythonw"
     for relative in VENV_INTERPRETERS:
         candidate = root / relative
         if candidate.is_file():
