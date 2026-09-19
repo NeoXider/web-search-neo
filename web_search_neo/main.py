@@ -17,6 +17,7 @@ from web_search_neo import macros
 from web_search_neo import msp_date_time
 from web_search_neo import msp_search
 from web_search_neo import plugins
+from web_search_neo import shim_bypass
 from web_search_neo.log_setup import configure_server_log
 from web_search_neo.mcp_compat import ReportingFastMCP, registered_tool
 from web_search_neo.web_client import clamp_timeout, request
@@ -2684,6 +2685,7 @@ def stop_bridge_daemon() -> int:
 
 
 def main() -> None:
+    shim_bypass.ensure_direct()
     arguments = sys.argv[1:]
     if "--bridge" in arguments:
         if "--stop" in arguments:
