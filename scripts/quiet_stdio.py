@@ -39,7 +39,14 @@ def _pump(source, destination, close_on_eof: bool) -> None:
     """Forward bytes until EOF or a broken pipe; never raise."""
     try:
         while True:
-            chunk = source.read(65536)
+            # read1() returns whatever is available in one raw read. Plain
+            # read(n) with n above the buffer size blocks until exactly n
+            # bytes arrive, which stalls long-running servers that send
+            # small messages (an MCP initialize request never arrives).
+            if hasattr(source, "read1"):
+                chunk = source.read1(65536)
+            else:
+                chunk = source.read(65536)
             if not chunk:
                 break
             destination.write(chunk)
@@ -82,7 +89,13 @@ def main(argv: list[str]) -> int:
     ]
     for pump in pumps:
         pump.start()
-    return child.wait()
+    code = child.wait()
+    # The output pumps are daemons; without an explicit join the interpreter can
+    # exit before their final flush reaches the client on slow machines.
+    for pump in pumps[1:]:
+        pump.join(timeout=10)
+    pumps[0].join(timeout=10)
+    return code
 
 
 if __name__ == "__main__":

@@ -418,10 +418,10 @@ def test_a_broken_signal_never_fails_the_action(monkeypatch):
 def test_favicon_mark_is_a_translucent_slime_over_the_page_icon():
     source = agent_presence.install_source()
     # The page's own icon is drawn first and the slime goes on top of it in the
-    # bottom-right quarter, partly see-through: the tab keeps its identity.
+    # bottom-right corner, partly see-through: the tab keeps its identity.
     assert "context.drawImage(baseImage, 0, 0, 32, 32)" in source
-    assert "context.translate(12, 12)" in source
-    assert "context.scale(1.25, 1.25)" in source
+    assert "context.translate(20, 20)" in source
+    assert "context.scale(0.75, 0.75)" in source
     alphas = [float(value) for value in re.findall(r"globalAlpha = active \? ([\d.]+) : ([\d.]+)", source)[0]]
     assert all(0 < alpha < 1 for alpha in alphas)
     # An unreadable (tainted) favicon is left alone instead of being replaced by

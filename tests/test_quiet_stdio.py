@@ -62,6 +62,38 @@ def test_stdio_round_trip_and_exit_code():
     assert completed.stderr == b"on-stderr"
 
 
+def test_long_running_child_streams_small_messages():
+    """A child that stays alive must stream small output without waiting for 64KB."""
+    import threading
+
+    inner = (
+        "import sys, time;"
+        "sys.stdout.write('early');"
+        "sys.stdout.flush();"
+        "time.sleep(30)"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, str(PROXY), sys.executable, "-c", inner],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    result: dict = {}
+
+    def read_first() -> None:
+        result["data"] = proc.stdout.read(5)
+
+    try:
+        reader = threading.Thread(target=read_first, daemon=True)
+        reader.start()
+        reader.join(timeout=10)
+        assert not reader.is_alive(), "long-running child did not stream small output"
+        assert result.get("data") == b"early"
+    finally:
+        proc.kill()
+        proc.wait()
+
+
 def test_missing_command_reports_not_found():
     completed = subprocess.run(
         [sys.executable, str(PROXY), "wsn-no-such-binary-xyz"],

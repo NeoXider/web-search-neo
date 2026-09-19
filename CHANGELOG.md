@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.18.0
+
+The favicon badge stops replacing the site's icon - it is a small corner mark now.
+
+- The presence slime shrinks from a 20 px tile covering the bottom-right quarter of the tab icon to a 12 px mark in the corner (`web_search_neo/agent_presence.py`, `PRESENCE_VERSION = 6`, so live pages reinstall it). The site's own favicon stays fully visible; at tab-strip size the mark reads as a small dot - awake and green while an agent acts, sleepy amber for five minutes after. A page with no icon of its own now gets only that corner dot instead of a full-size slime standing in for the missing icon.
+- Console MCP servers can run windowless under any client: `scripts/quiet_stdio.py` starts the server with `CREATE_NO_WINDOW` and proxies stdin/stdout/stderr byte-for-byte, so opencode-style clients no longer pop a console per session. The proxy joins its output pumps before exiting, so the final flush is never lost on slow machines (the exit code stays the server's). Its pumps use `read1()` instead of `read(n)`: with n above the buffer size, `BufferedReader.read` blocks until exactly n bytes arrive, which stalled long-running servers - an MCP initialize request from a live client sat in the pipe forever and every reconnect attempt timed out. Small messages now stream through immediately.
+- On Windows the token files' ACLs are now cleaned of leftover explicit entries: newer `icacls` builds (Windows Server 2022 images included) keep `SYSTEM`, `Administrators` and owner-rights entries after `/inheritance:r /grant:r`; every ACE that is not the current account is removed, so bridge tokens really are readable by one user only.
+
 ## 1.17.0
 
 Feature release: per-call CDP timeouts for promise-waiting scripts.

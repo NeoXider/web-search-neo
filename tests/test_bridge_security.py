@@ -423,10 +423,15 @@ def test_icacls_runs_hidden_on_an_existing_file(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(bridge_auth.subprocess, "run", fake_run)
     bridge_auth.load_or_create_token()
-    assert len(seen) == 1
-    args, kwargs = seen[0]
-    assert args[:3] == ["icacls", str(target), "/inheritance:r"]
-    assert kwargs["creationflags"] == bridge_auth._CREATE_NO_WINDOW
+    # One grant call plus one verification listing (no foreign entries to strip).
+    assert [args[:3] for args, _ in seen] == [
+        ["icacls", str(target), "/inheritance:r"],
+        ["icacls", str(target)],
+    ]
+    assert all(
+        kwargs["creationflags"] == bridge_auth._CREATE_NO_WINDOW
+        for _, kwargs in seen
+    )
 
 
 def test_an_acl_failure_is_logged_not_fatal(tmp_path, monkeypatch, caplog) -> None:

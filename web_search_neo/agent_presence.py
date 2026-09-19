@@ -29,7 +29,7 @@ from typing import Any
 # reinstall itself. Without it a long-lived tab would keep running whatever
 # version was current when it first loaded, and a fix here would only reach
 # pages opened afterwards.
-PRESENCE_VERSION = 5
+PRESENCE_VERSION = 6
 
 PRESENCE_ENV = "WEB_SEARCH_NEO_AGENT_PRESENCE"
 
@@ -304,7 +304,7 @@ _INSTALL_TEMPLATE = r"""
     }
   }
 
-  // The mark is the project's slime, drawn into the bottom-right quarter over
+  // The mark is the project's slime, drawn into the bottom-right corner over
   // the page's own favicon and slightly see-through, so the tab keeps its
   // identity and only gains a small companion. Active: awake and bright;
   // recent: dimmer and asleep.
@@ -319,10 +319,10 @@ _INSTALL_TEMPLATE = r"""
   function drawSlime(context, phase) {
     const active = phase === "active";
     context.save();
-    // 16 units scaled to 20 px: at the tab strip's 16 px a smaller mark
-    // shrinks to a few pixels nobody can read.
-    context.translate(12, 12);
-    context.scale(1.25, 1.25);
+    // 16 units scaled to 12 px in the corner: the site's own icon keeps its
+    // identity and only gains a small mark; at strip size it reads as a dot.
+    context.translate(20, 20);
+    context.scale(0.75, 0.75);
     context.globalAlpha = active ? 0.88 : 0.78;
     // A light halo keeps the slime readable on dark favicons, the dark edge on
     // light ones; which one the page has is unknowable here.
@@ -382,8 +382,8 @@ _INSTALL_TEMPLATE = r"""
       canvas.height = 32;
       const context = canvas.getContext("2d");
       if (!context) return null;
-      // No favicon at all leaves the canvas transparent: Chrome's generic
-      // globe is not the page's identity, so the slime alone replaces it.
+      // No favicon at all leaves the canvas transparent: only the corner mark
+      // shows, so an iconless tab gains a dot instead of a replacement.
       if (baseImage) context.drawImage(baseImage, 0, 0, 32, 32);
       drawSlime(context, phase);
       return canvas.toDataURL("image/png");
@@ -449,7 +449,7 @@ _INSTALL_TEMPLATE = r"""
       if (!href) {
         // Nothing readable. A page that declares an icon still has one on
         // screen (Chrome fetches it without CORS), so it stays; only a page
-        // with no icon at all gets the slime on its own.
+        // with no icon at all gets the corner mark on its own.
         state.loading[phase] = false;
         if (iconLinks().length || state.hidden.length) return;
         finish(null);

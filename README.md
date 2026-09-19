@@ -280,7 +280,7 @@ is no automatic substitute. If you would rather not install an extension at all,
 `profile_mode="temporary"` and `profile_mode="persistent"` drive a Selenium
 browser that needs no companion.
 
-The bundled companion is version 1.17.0. Chrome does not refresh an unpacked
+The bundled companion is version 1.18.0. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. That only works for
@@ -408,7 +408,8 @@ Quiet on Windows: nothing the agent runs may pop a console onto your screen. The
 generated MCP configuration points at `pythonw` (no console, same stdio pipes) -
 and past any venv launcher shim straight at the base interpreter, since a shim
 starts the real one as a visible child - the daemon starts with
-`CREATE_NO_WINDOW`, chromedriver is launched hidden, and the test suite spawns
+`CREATE_NO_WINDOW`, chromedriver is launched hidden, console MCP servers can
+run behind `scripts/quiet_stdio.py`, and the test suite spawns
 node and python windowless too. If a console window still
 appears, its title names the owner: `node.exe` is a dev/test harness, `python.exe`
 is an MCP server started with a console interpreter (regenerate the config with
