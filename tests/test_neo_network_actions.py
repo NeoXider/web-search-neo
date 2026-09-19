@@ -18,7 +18,7 @@ class _CannedDriver:
         self.cdp_calls = []
         self.scripts = []
 
-    def execute_cdp_cmd(self, command, params):
+    def execute_cdp_cmd(self, command, params, timeout=None):
         self.cdp_calls.append((command, params))
         if command == "Runtime.evaluate" and command not in self.cdp:
             # Promise-returning scripts are evaluated through CDP, not

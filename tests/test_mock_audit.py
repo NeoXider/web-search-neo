@@ -21,7 +21,7 @@ def test_mock_validation_rejects_fractional_and_header_injection():
 
 def test_mock_failure_does_not_publish_registry():
     class Driver:
-        def execute_cdp_cmd(self, method, params):
+        def execute_cdp_cmd(self, method, params, timeout=None):
             raise RuntimeError('installation refused')
 
     with pytest.raises(RuntimeError, match='refused'):

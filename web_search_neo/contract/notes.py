@@ -138,6 +138,7 @@ _ACTION_NOTES = {
         "body": "Your script is the body of a wrapper function: end with `return <value>;` for value to be returned - an expression statement or an IIFE without an outer return comes back as null. A promise result needs await_promise=true.",
         "result": "value is the JSON-serialisable return value; a promise is awaited when await_promise=true (Chrome bridge driver). Long strings are clipped at 200k characters and reported as {clipped, length, head}. attempts reports how many tries the call took.",
         "retry": "Single-shot by default (retry_on_uncaught=false). An exception may follow a completed mutation. Only enable retries for scripts safe to repeat; retries=2, retry_delay_ms=300. wait_ready=true additionally settles readiness first.",
+        "timeout": "await_promise=true waits on the promise at the CDP layer with the ~15 s script timeout by default - a promise that outlives it (waiting on a human solving a captcha, a long network round-trip) fails as 'cdp.send timed out'. Pass timeout_seconds to extend the wait; it is capped at 600.",
         "safety": "This is raw page-side JavaScript: it can navigate, mutate, or delete state. Prefer fill/click/pointer for input-shaped work and reserve scripts for state only the page holds (localStorage, virtualised rows, framework stores).",
     },
     "click_text": {

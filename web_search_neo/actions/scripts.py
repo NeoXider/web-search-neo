@@ -37,14 +37,20 @@ def exception_text(details: dict[str, Any]) -> str:
 
 def evaluate_with_gesture(
     driver: Any, script: str, args: list[Any] | None, await_promise: bool,
-    user_gesture: bool = True,
+    user_gesture: bool = True, timeout_seconds: float | None = None,
 ) -> Any:
     """CDP evaluation with independent promise and user-gesture controls."""
     expression = f"(function() {{\n{script}\n}}).apply(null, {json.dumps(args or [])})"
-    result = driver.execute_cdp_cmd("Runtime.evaluate", {
+    params = {
         "expression": expression, "returnByValue": True,
         "awaitPromise": bool(await_promise), "userGesture": bool(user_gesture),
-    })
+    }
+    if timeout_seconds is None:
+        # No explicit override: let each backend apply its own default (plain
+        # Selenium drivers do not accept a per-call CDP timeout at all).
+        result = driver.execute_cdp_cmd("Runtime.evaluate", params)
+    else:
+        result = driver.execute_cdp_cmd("Runtime.evaluate", params, timeout=timeout_seconds)
     if result.get("exceptionDetails"):
         raise RuntimeError(exception_text(result["exceptionDetails"]))
     return (result.get("result") or {}).get("value")
@@ -55,6 +61,7 @@ def execute(
     await_promise: bool = False, user_gesture: bool = False,
     retry_on_uncaught: bool = False, retries: int = 2,
     retry_delay_ms: int = 300, wait_ready: bool = False,
+    timeout_seconds: float | None = None,
     page_summary: Callable[[], dict[str, Any]],
     wait_until_ready: Callable[[Any, float], Any],
     describe_error: Callable[[Exception], str],
@@ -79,7 +86,8 @@ def execute(
                 raise ValueError("await_promise/user_gesture requires a CDP-capable browser backend")
             if user_gesture or await_promise:
                 value = evaluate_with_gesture(
-                    driver, script, args, await_promise, user_gesture=user_gesture
+                    driver, script, args, await_promise, user_gesture=user_gesture,
+                    timeout_seconds=timeout_seconds,
                 )
             else:
                 value = driver.execute_script(script, *(args or []))

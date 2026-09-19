@@ -45,7 +45,7 @@ def test_promise_uses_cdp_without_granting_user_gesture(monkeypatch):
     class Driver:
         params = None
 
-        def execute_cdp_cmd(self, command, params):
+        def execute_cdp_cmd(self, command, params, timeout=None):
             assert command == "Runtime.evaluate"
             self.params = params
             return {"result": {"value": 42}}
@@ -100,7 +100,7 @@ def test_locale_updates_languages_and_retains_user_agent(monkeypatch):
         def execute_script(self, *_):
             return "Existing/1.0"
 
-        def execute_cdp_cmd(self, method, params):
+        def execute_cdp_cmd(self, method, params, timeout=None):
             self.calls.append((method, params))
 
     driver = Driver()

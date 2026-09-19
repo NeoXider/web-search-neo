@@ -24,7 +24,7 @@ from web_search_neo.fetch import api as fetch_api
 from web_search_neo.fetch import content as fetch_content
 
 
-__version__ = "1.16.3"
+__version__ = "1.17.0"
 
 log = configure_server_log()  # per-user state dir; see log_setup.py
 
@@ -880,15 +880,14 @@ async def browser_run_script(
     user_gesture: bool = False,
     retry_on_uncaught: bool = False,
     retries: int = 2,
-    retry_delay_ms: int = 300,
-    wait_ready: bool = False,
+    retry_delay_ms: int = 300, wait_ready: bool = False, timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Execute a JavaScript snippet in a session's page and return its value.
 
     Use for state the DOM reads do not expose (localStorage, virtualised lists,
     framework state) and for mutations without an input-shaped equivalent.
     Runs once by default. Enable retry_on_uncaught only for scripts safe to repeat:
-    a thrown exception may follow an already completed mutation.
+    a thrown exception may follow an already completed mutation. With await_promise=true pass timeout_seconds (capped at 600) when the promise may outlive the ~15 s default - e.g. while a human solves a captcha or a long network round-trip completes.
     """
     return await asyncio.to_thread(
         functools.partial(
@@ -900,8 +899,7 @@ async def browser_run_script(
             user_gesture=user_gesture,
             retry_on_uncaught=retry_on_uncaught,
             retries=retries,
-            retry_delay_ms=retry_delay_ms,
-            wait_ready=wait_ready,
+            retry_delay_ms=retry_delay_ms, wait_ready=wait_ready, timeout_seconds=timeout_seconds,
         )
     )
 
@@ -910,8 +908,7 @@ async def browser_run_script(
 async def browser_execute_js(
     script: str,
     args: list[Any] | None = None,
-    session_id: str = "default",
-    await_promise: bool = False,
+    session_id: str = "default", await_promise: bool = False, timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Run a JavaScript snippet and report what it returns (info-topic form)."""
     return await asyncio.to_thread(
@@ -919,8 +916,7 @@ async def browser_execute_js(
             browser_tools.execute_js,
             script,
             args=args,
-            session_id=session_id,
-            await_promise=await_promise,
+            session_id=session_id, await_promise=await_promise, timeout_seconds=timeout_seconds,
         )
     )
 

@@ -37,7 +37,7 @@ class _FakeCaptureDriver:
         self.calls.append(("viewport", {}))
         return b"viewport-png"
 
-    def execute_cdp_cmd(self, command, params):
+    def execute_cdp_cmd(self, command, params, timeout=None):
         self.calls.append((command, params))
         if command == "Page.getLayoutMetrics":
             return {
@@ -77,7 +77,7 @@ class _FakeScrollDriver:
             }
         raise AssertionError("unexpected script")
 
-    def execute_cdp_cmd(self, command, params):
+    def execute_cdp_cmd(self, command, params, timeout=None):
         self.calls.append((command, params))
         if command == "Input.dispatchMouseEvent" and params["type"] == "mouseWheel":
             self.scroll_y = max(0, min(2400, self.scroll_y + float(params["deltaY"])))
@@ -92,7 +92,7 @@ class _FakeShowDriver:
         self.calls.append(("activate_tab", {}))
         return {"activated": True}
 
-    def execute_cdp_cmd(self, command, params):
+    def execute_cdp_cmd(self, command, params, timeout=None):
         self.calls.append((command, params))
         return {}
 

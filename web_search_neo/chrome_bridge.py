@@ -1632,16 +1632,18 @@ class ChromeBridgeDriver:
             raise TimeoutException(str(exc)) from exc
         return result.get("value")
 
-    def execute_cdp_cmd(self, command: str, params: dict[str, Any]) -> Any:
+    def execute_cdp_cmd(self, command: str, params: dict[str, Any], timeout=None) -> Any:
         # A screenshot of a tab that is not on screen is the one command whose
         # cost is set by the window manager rather than by the page. Measured on
         # this Chrome: about 70 ms while the browser window is being composited,
         # but tens of seconds - 25 s, 33 s, and once no answer at all - whenever
         # another window covers it, which is the normal state of affairs while
         # the user works elsewhere. The script timeout is far too short for that
-        # and turns a slow picture into a failed call.
-        timeout = SCREENSHOT_TIMEOUT if command == "Page.captureScreenshot" else (
-            self._script_timeout
+        # and turns a slow picture into a failed call. An explicit caller timeout
+        # overrides both: an awaited promise may wait on real user action (a human
+        # solving a captcha), which 15 s of default patience would fail early.
+        timeout = min(max(float(timeout), 1.0), 600.0) if timeout is not None else (
+            SCREENSHOT_TIMEOUT if command == "Page.captureScreenshot" else self._script_timeout
         )
         try:
             return self.bridge.request(

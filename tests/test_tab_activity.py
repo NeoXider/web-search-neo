@@ -33,7 +33,7 @@ class _ProbeDriver:
         self.cdp_calls: list[tuple[str, dict]] = []
         self.scripts: list[str] = []
 
-    def execute_cdp_cmd(self, command, params):
+    def execute_cdp_cmd(self, command, params, timeout=None):
         self.cdp_calls.append((command, params))
         if command == "Page.addScriptToEvaluateOnNewDocument":
             return {"identifier": "activity-script-1"}

@@ -24,7 +24,7 @@ class _ReloadDriver:
         self.refreshed = 0
         self.ready_probes = 0
 
-    def execute_cdp_cmd(self, command, params):
+    def execute_cdp_cmd(self, command, params, timeout=None):
         self.cdp_calls.append((command, params))
         return {}
 

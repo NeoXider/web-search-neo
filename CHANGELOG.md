@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.17.0
+
+Feature release: per-call CDP timeouts for promise-waiting scripts.
+
+- `browser_execute_js` and `browser_run_script` accept an optional `timeout_seconds` (capped at 600) that extends the CDP-layer wait when `await_promise=true`. A promise that outlives the ~15 s script default - waiting on a human solving a captcha, a long network round-trip - no longer dies as a bare `cdp.send timed out`; it now waits as long as you ask.
+- The timeout is threaded through every layer (MCP tool -> browser_tools -> scripts -> chrome_bridge) and clamped to [1, 600] at the bridge; plain Selenium backends keep their own defaults when no override is given.
+
 ## 1.16.3
 
 Patch release: the windowless MCP entry survives venv launcher redirectors.

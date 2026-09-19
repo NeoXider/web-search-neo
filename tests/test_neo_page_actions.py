@@ -15,7 +15,7 @@ class _CannedDriver:
         self.calls = []
         self.scripts = []
 
-    def execute_cdp_cmd(self, command, params):
+    def execute_cdp_cmd(self, command, params, timeout=None):
         self.calls.append((command, params))
         response = self.responses.get(command)
         if callable(response):

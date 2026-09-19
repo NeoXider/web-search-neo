@@ -38,7 +38,7 @@ class _ProbeDriver:
         self.cdp_calls: list[tuple[str, dict]] = []
         self.scripts: list[tuple[str, list]] = []
 
-    def execute_cdp_cmd(self, command, params):
+    def execute_cdp_cmd(self, command, params, timeout=None):
         self.cdp_calls.append((command, params))
         if command == "Page.addScriptToEvaluateOnNewDocument":
             return {"identifier": "stub-script-1"}
@@ -75,7 +75,7 @@ class _StaleCompanionDriver(_ProbeDriver):
     def get(self, url):
         self.navigated.append(url)
 
-    def execute_cdp_cmd(self, command, params):
+    def execute_cdp_cmd(self, command, params, timeout=None):
         self.cdp_calls.append((command, params))
         if command == "Page.reload":
             raise Exception(

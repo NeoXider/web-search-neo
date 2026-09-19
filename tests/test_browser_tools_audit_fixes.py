@@ -31,7 +31,7 @@ class _Driver:
         self.cdp_calls: list[tuple[str, dict]] = []
         self.switch_to = type("SwitchTo", (), {"default_content": staticmethod(lambda: None)})()
 
-    def execute_cdp_cmd(self, command, params):
+    def execute_cdp_cmd(self, command, params, timeout=None):
         self.cdp_calls.append((command, params))
         if command == "Page.addScriptToEvaluateOnNewDocument":
             return {"identifier": f"id-{len(self.cdp_calls)}"}

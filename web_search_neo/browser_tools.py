@@ -3646,16 +3646,16 @@ def execute_js(
     script: str, args: list[Any] | None = None, session_id: str = "default",
     await_promise: bool = False, user_gesture: bool = False,
     retry_on_uncaught: bool = False, retries: int = 2,
-    retry_delay_ms: int = 300, wait_ready: bool = False,
+    retry_delay_ms: int = 300, wait_ready: bool = False, timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
-    """Run page JavaScript once; retry only when explicitly safe for this script."""
+    """Run page JS once; retry only when explicitly safe. timeout_seconds extends the CDP await."""
     session = _get_session(session_id)
     with session.lock:
         return _execute_script(
             session.driver, script, args, await_promise=await_promise,
             user_gesture=user_gesture, retry_on_uncaught=retry_on_uncaught,
             retries=retries, retry_delay_ms=retry_delay_ms, wait_ready=wait_ready,
-            page_summary=lambda: _page_summary(session.driver, session_id),
+            timeout_seconds=timeout_seconds, page_summary=lambda: _page_summary(session.driver, session_id),
             wait_until_ready=_wait_until_ready, describe_error=_brief_error,
         )
 
