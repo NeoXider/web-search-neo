@@ -106,6 +106,8 @@ def test_selenium_promise_timeout_is_scoped_and_restored(monkeypatch, fail):
     _summary_free(monkeypatch)
     driver = object.__new__(ChromiumDriver)
     driver.session_id = "timeout-fixture"
+    # Selenium 4.49 checks the negotiated browser before dispatching CDP.
+    driver.caps = {"browserName": "chrome"}
     driver.error_handler = ErrorHandler()
     config = ClientConfig(remote_server_addr="http://127.0.0.1:4444", timeout=11)
     executor = RemoteConnection(client_config=config)
@@ -126,7 +128,7 @@ def test_selenium_promise_timeout_is_scoped_and_restored(monkeypatch, fail):
             await_promise=True, timeout_seconds=65,
         )
         assert config.timeout == 11
-        assert len(calls) == 1  # A failure must never replay a script.
+        assert len(calls) == 1, result  # A failure must never replay a script.
         assert calls[0][0] == "executeCdpCommand"
         assert calls[0][1]["cmd"] == "Runtime.evaluate"
         assert calls[0][1]["params"]["awaitPromise"] is True

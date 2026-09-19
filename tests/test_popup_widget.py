@@ -193,14 +193,15 @@ def test_the_shortcut_opens_the_panel_and_nothing_else() -> None:
 # --- versions ----------------------------------------------------------------
 
 
-def test_every_user_facing_version_reads_1_9_0() -> None:
+def test_every_user_facing_release_version_matches() -> None:
     expected = main.__version__
     assert MANIFEST["version"] == expected
     pyproject = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     declared = re.search(r'^\s*version\s*=\s*"([^"]+)"', pyproject, re.M)
     assert declared and declared.group(1) == expected
     changelog = (PROJECT_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-    assert changelog.splitlines()[2].startswith(f"## {expected}")
+    latest_release = re.search(r"^## (\d+\.\d+\.\d+)\s*$", changelog, re.M)
+    assert latest_release and latest_release.group(1) == expected
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
     install = (PROJECT_ROOT / "INSTALL.md").read_text(encoding="utf-8")
     for name, text in (("README", readme), ("INSTALL", install)):
