@@ -18,7 +18,23 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 if os.name == "nt":
+    import _winapi
+
     _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    _CONSOLE_FLAGS = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x10) | getattr(subprocess, "DETACHED_PROCESS", 0x8)
+    _ORIGINAL_CREATE_PROCESS = _winapi.CreateProcess
+
+    def _windowless_create_process(application, command, process_attrs, thread_attrs,
+                                  inherit_handles, creation_flags, environment,
+                                  directory, startup_info, /):
+        # multiprocessing's Windows spawn bypasses Popen entirely. Cover the
+        # native boundary, removing flags which make CREATE_NO_WINDOW ignored.
+        flags = (creation_flags & ~_CONSOLE_FLAGS) | _CREATE_NO_WINDOW
+        return _ORIGINAL_CREATE_PROCESS(application, command, process_attrs,
+                                        thread_attrs, inherit_handles, flags,
+                                        environment, directory, startup_info)
+
+    _winapi.CreateProcess = _windowless_create_process
     _ORIGINAL_POPEN = subprocess.Popen
 
     class _WindowlessPopen(subprocess.Popen):

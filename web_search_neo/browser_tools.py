@@ -35,6 +35,7 @@ from selenium.webdriver.support import expected_conditions as conditions
 from selenium.webdriver.support.ui import Select, WebDriverWait
 
 from web_search_neo import agent_presence
+from web_search_neo.presence_targets import remember_click_target as _remember_presence_click_target
 from web_search_neo.chrome_bridge import (
     CHROME_EXTENSION_ID,
     DEFAULT_TAB_GROUP,
@@ -405,22 +406,11 @@ def _latest_cached_chromedriver() -> Path | None:
 
 
 def _driver_popen_kwargs() -> dict[str, Any]:
-    """Popen kwargs that keep chromedriver from allocating a visible console.
-
-    Selenium's own Windows startup info allocates a new hidden console for the
-    driver; under default-terminal adoption a freshly allocated console can
-    still surface as a stray tab. Creating no console at all is stricter, so on
-    Windows pass CREATE_NO_WINDOW plus a hidden show-window state and override
-    the startup info Selenium would otherwise supply through ``popen_kw``.
-    """
+    """Use Selenium's creation-flags hook; it owns the startupinfo argument."""
     if os.name != "nt":
         return {}
-    startupinfo = subprocess.STARTUPINFO()
-    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    startupinfo.wShowWindow = subprocess.SW_HIDE
     return {
         "creation_flags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
-        "startupinfo": startupinfo,
     }
 
 
@@ -491,16 +481,14 @@ def create_driver(
         if mode == "attach"
         else _latest_cached_chromedriver()
     )
-    service = (
-        Service(executable_path=str(cached_driver), popen_kw=_driver_popen_kwargs())
-        if cached_driver else None
-    )
+    service = Service(executable_path=str(cached_driver) if cached_driver else None,
+                      popen_kw=_driver_popen_kwargs())
     try:
         driver = webdriver.Chrome(service=service, options=options)
     except Exception as exc:
-        if service is not None:
+        if cached_driver is not None:
             try:
-                driver = webdriver.Chrome(options=options)
+                driver = webdriver.Chrome(service=Service(popen_kw=_driver_popen_kwargs()), options=options)
             except Exception as retry_exc:
                 _browser_available = False
                 # Report the retry, not the stale cached-driver attempt: the
@@ -2352,19 +2340,7 @@ def _apply_tab_activity(session: BrowserSession, session_id: str, *, label_tab: 
 
 
 def _presence_applies(session: BrowserSession) -> bool:
-    """Whether this session's tab has a human who could see the signals.
-
-    Headless has no tab strip and no screen, so both signals would be pure
-    cost there. Everything with a window qualifies - the user's own Chrome
-    first of all, but a visible temporary profile has a tab strip too, and
-    that is exactly where an unattended agent is hardest to notice.
-
-    Step and render modes are excluded for a different reason: they freeze the
-    page's clock and gate its timers, which is exactly what the badge's fade
-    and the flash's removal are made of. A signal whose timers never fire would
-    not decorate a stepped page, it would litter it - and it would spend a
-    bridge round trip on every single frame.
-    """
+    """Visible normal-mode sessions qualify; frozen/headless pages skip overlays."""
     return (
         bool(agent_presence.enabled())
         and not session.headless
@@ -2455,18 +2431,7 @@ def note_agent_activity(
     arguments: dict[str, Any] | None = None,
     ok: bool = True,
 ) -> bool:
-    """Mark one finished action in the tab the human is looking at.
-
-    Two things happen in the page: the favicon gets its badge (bright while the
-    agent is working, dimmer for five minutes after its last action, gone after
-    that), and the element the action touched flashes for a quarter of a second.
-
-    This is decoration, and it is called on the action path, so it swallows
-    everything. A tab that closed, a session that expired, a page that navigated
-    mid-call, a driver that is gone: none of them may turn a successful action
-    into a failed one because its badge could not be painted. The return value
-    says whether the page was actually marked, for tests and for nothing else.
-    """
+    """Decorate a completed action without failing the action if the page is gone."""
     if not agent_presence.enabled():
         return False
     try:
@@ -2482,6 +2447,11 @@ def note_agent_activity(
         label=session.agent_label or session_id,
         pointer=(session.pointer_x, session.pointer_y),
     )
+    if action == "click" and "cursor" not in payload and ok and session.presence_click_point:
+        x, y = session.presence_click_point
+        payload["cursor"] = {"x": x, "y": y, "tap": True}
+    if action == "click":
+        session.presence_click_point = None
     now = time.monotonic()
     if not payload["flash"] and now - session.last_presence_ping < _PRESENCE_QUIET_SECONDS:
         # A step that draws nothing only refreshes the badge's five minutes, and
@@ -3589,6 +3559,12 @@ def click(
             if trusted:
                 _click_trusted(session, element, frame_selector)
             else:
+                _remember_presence_click_target(
+                    session, element, enabled=_presence_applies(session),
+                    frame_selector=frame_selector,
+                    map_frame=lambda: _pointer_context(session.driver, frame_selector)[0],
+                    restore_frame=lambda: _enter_action_frame(session.driver, frame_selector, selector),
+                )
                 element.click()
         finally:
             # The click may have happened inside a frame; everything after it -

@@ -1204,8 +1204,8 @@ async function loadPresence() {
 async function setPresence(value) {
   const wanted = Boolean(value);
   if (wanted === presenceEnabled) return connectionStatus();
-  presenceEnabled = wanted;
   await chrome.storage.local.set({[PRESENCE_KEY]: wanted});
+  presenceEnabled = wanted;
   if (!wanted) {
     // Live sessions still believe their tabs are marked, so take the paint
     // down now rather than on teardown or navigation. Enabling needs no sweep:

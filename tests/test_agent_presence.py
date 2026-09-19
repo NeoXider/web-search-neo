@@ -547,3 +547,47 @@ def test_a_screenshot_brings_the_cursor_back(monkeypatch):
     assert max(
         index for index, script in enumerate(kinds) if "showEphemeral" in script
     ) > max(index for index, script in enumerate(kinds) if "hideFlashes" in script)
+
+
+@pytest.mark.parametrize("action,arguments", [
+    ("pointer", {"pointer_action": "click"}),
+    ("pointer_lock", {"operation": "acquire"}),
+    ("click", {"x": 110, "y": 48}),
+    ("click", {"selector": "#go", "trusted": True}),
+    ("click", {"text": "Continue"}),
+    ("click_text", {"text": "Continue"}),
+])
+def test_cursor_accepts_the_published_action_schema(action, arguments):
+    payload = agent_presence.payload_for(action, arguments, pointer=(110.0, 48.0))
+    assert payload["cursor"] == {"x": 110.0, "y": 48.0, "tap": True}
+
+
+def test_dom_click_carries_the_target_without_using_stale_pointer_coordinates():
+    payload = agent_presence.payload_for("click", {"selector": "#go"}, pointer=(0, 0))
+    assert payload["cursorTarget"] is True
+    assert payload["cursorTap"] is True
+    assert "cursor" not in payload
+
+
+def test_dom_click_keeps_pre_action_target_when_the_element_disappears():
+    driver = _PresenceDriver(installed=True)
+    session = _register(driver, "presence-removed-target")
+    session.presence_click_point = (240, 135)
+    assert browser_tools.note_agent_activity("presence-removed-target", "click", {"selector": "#removed"})
+    assert driver.scripts[-1][1][0]["cursor"] == {"x": 240, "y": 135, "tap": True}
+    assert session.presence_click_point is None
+
+
+def test_dom_click_target_is_captured_separately_from_relative_input_origin():
+    class Driver(_PresenceDriver):
+        def execute_script(self, script, *args):
+            return {"x": 240, "y": 135, "top": True}
+    session = _register(Driver(), "presence-target-memory")
+    browser_tools._remember_presence_click_target(session, object())
+    assert session.presence_click_point == (240, 135)
+    assert (session.pointer_x, session.pointer_y) == (0, 0)
+
+
+def test_frame_selector_never_resolves_against_unrelated_main_document():
+    payload = agent_presence.payload_for("click", {"selector": "#go", "frame_selector": "#frame"})
+    assert "cursorTarget" not in payload

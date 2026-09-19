@@ -44,3 +44,19 @@ def test_spawn_transparency():
         check=True,
     )
     assert completed.stdout.strip() == "quiet-ok"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows native process boundary")
+def test_direct_native_spawns_cannot_request_a_console(monkeypatch):
+    import _winapi
+    import conftest
+
+    calls = []
+    monkeypatch.setattr(conftest, "_ORIGINAL_CREATE_PROCESS", lambda *args: calls.append(args) or (1, 2, 3, 4))
+    assert _winapi.CreateProcess is conftest._windowless_create_process
+    for flags in (0, 0x10, 0x8, 0x18 | 0x200):
+        result = _winapi.CreateProcess("python.exe", "fixture", None, None, False,
+                                      flags, {"fixture": "1"}, "fixture-dir", None)
+        assert result == (1, 2, 3, 4)
+        assert calls[-1][5] == (flags & ~0x18) | 0x08000000
+        assert calls[-1][6:8] == ({"fixture": "1"}, "fixture-dir")

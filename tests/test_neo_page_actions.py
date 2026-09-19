@@ -95,6 +95,69 @@ def test_gesture_script_reports_a_page_side_throw(monkeypatch):
     assert "boom is not defined" in result["error"]
 
 
+@pytest.mark.parametrize("fail", [False, True])
+def test_selenium_promise_timeout_is_scoped_and_restored(monkeypatch, fail):
+    """Use Selenium's actual CDP method, without starting a browser or socket."""
+    from selenium.webdriver.chromium.webdriver import ChromiumDriver
+    from selenium.webdriver.remote.client_config import ClientConfig
+    from selenium.webdriver.remote.errorhandler import ErrorHandler
+    from selenium.webdriver.remote.remote_connection import RemoteConnection
+
+    _summary_free(monkeypatch)
+    driver = object.__new__(ChromiumDriver)
+    driver.session_id = "timeout-fixture"
+    driver.error_handler = ErrorHandler()
+    config = ClientConfig(remote_server_addr="http://127.0.0.1:4444", timeout=11)
+    executor = RemoteConnection(client_config=config)
+    driver.command_executor = executor
+    calls = []
+
+    def execute(command, params):
+        calls.append((command, params, config.timeout))
+        if fail:
+            raise RuntimeError("Transport failed")
+        return {"value": {"result": {"value": 42}}}
+
+    monkeypatch.setattr(executor, "execute", execute)
+    _register_session(driver, "selenium-timeout")
+    try:
+        result = browser_tools.execute_js(
+            "return Promise.resolve(42)", session_id="selenium-timeout",
+            await_promise=True, timeout_seconds=65,
+        )
+        assert config.timeout == 11
+        assert len(calls) == 1  # A failure must never replay a script.
+        assert calls[0][0] == "executeCdpCommand"
+        assert calls[0][1]["cmd"] == "Runtime.evaluate"
+        assert calls[0][1]["params"]["awaitPromise"] is True
+        assert calls[0][2] == 65
+        assert result["success"] is not fail
+        if fail:
+            assert "Transport failed" in result["error"]
+        else:
+            assert result["value"] == 42
+    finally:
+        browser_tools._sessions.pop("selenium-timeout", None)
+        executor.close()
+
+
+def test_bridge_promise_timeout_stays_a_per_call_argument(monkeypatch):
+    _summary_free(monkeypatch)
+
+    class BridgeDriver(_CannedDriver):
+        def execute_cdp_cmd(self, command, params, timeout=None):
+            self.timeout = timeout
+            return super().execute_cdp_cmd(command, params)
+
+    driver = BridgeDriver({"Runtime.evaluate": {"result": {"value": 42}}})
+    _register_session(driver)
+    result = browser_tools.execute_js(
+        "return Promise.resolve(42)", await_promise=True, timeout_seconds=65,
+    )
+    assert result["value"] == 42
+    assert driver.timeout == 65
+
+
 def test_without_a_gesture_the_webdriver_route_is_used(monkeypatch):
     _summary_free(monkeypatch)
     driver = _CannedDriver({"execute_script": 7})

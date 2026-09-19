@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Keep ChromeDriver windowless for cached, uncached, and retry launches. Avoid passing Selenium a duplicate startup-info argument that previously forced an unprotected fallback. Test processes now also cover the native Windows multiprocessing spawn path.
+
+- Show the virtual cursor for ordinary selector clicks as well as coordinate input. Capture the target before it disappears, map iframe targets into the main viewport, restore a cursor removed by page updates, and recognize the public pointer-action names for click rings.
+- Keep the windowless stdio proxy responsive to small requests and let it exit when its child finishes even if the client still holds stdin open. Preserve module execution and inherited streams when bypassing Windows interpreter launchers.
+- Honor per-call script timeouts with the Selenium transport as well as the Chrome bridge, restoring the original timeout after success or failure.
+- Save the companion presence preference before changing its active state, so failed storage writes can be retried.
+
 ## 1.18.0
 
 The favicon badge stops replacing the site's icon - it is a small corner mark now.

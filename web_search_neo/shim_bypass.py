@@ -119,8 +119,16 @@ def ensure_direct(argv: list[str] | None = None) -> None:
     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startupinfo.wShowWindow = subprocess.SW_HIDE
     child = subprocess.Popen(
-        [str(base), *arguments],
+        # sys.argv[1:] contains application options, not the entry point. A
+        # bare interpreter exits on MCP input (or treats --bridge as its own
+        # option). The module target also works for installed `wsn` launchers.
+        [str(base), "-m", "web_search_neo.main", *arguments],
         env=environment,
+        # Explicit redirection preserves the MCP pipes under pythonw even
+        # when Windows standard handles are not inheritable by default.
+        stdin=sys.stdin,
+        stdout=sys.stdout,
+        stderr=sys.stderr,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
         startupinfo=startupinfo,
     )

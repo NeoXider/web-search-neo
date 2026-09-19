@@ -76,9 +76,15 @@ def main(argv: list[str]) -> int:
     except OSError as exc:
         print(f"quiet_stdio: cannot start {argv[1]!r}: {exc}", file=sys.stderr)
         return 127
+    # A server can exit while its client still owns an open stdin pipe. Reading
+    # the buffered sys.stdin in a daemon then holds its lock during interpreter
+    # shutdown. Read its raw stream instead, and never wait for client EOF after
+    # the server has already finished.
+    stdin = sys.stdin.buffer
+    input_source = getattr(stdin, "raw", stdin)
     pumps = [
         threading.Thread(
-            target=_pump, args=(sys.stdin.buffer, child.stdin, True), daemon=True
+            target=_pump, args=(input_source, child.stdin, True), daemon=True
         ),
         threading.Thread(
             target=_pump, args=(child.stdout, sys.stdout.buffer, False), daemon=True
@@ -94,7 +100,6 @@ def main(argv: list[str]) -> int:
     # exit before their final flush reaches the client on slow machines.
     for pump in pumps[1:]:
         pump.join(timeout=10)
-    pumps[0].join(timeout=10)
     return code
 
 

@@ -76,7 +76,8 @@ def test_ensure_direct_is_a_noop_for_one_shot_commands(monkeypatch, tmp_path):
     shim_bypass.ensure_direct(["--bridge", "--stop"])
 
 
-def test_ensure_direct_replaces_a_shim_child(monkeypatch, tmp_path):
+@pytest.mark.parametrize("arguments", [[], ["--bridge"]])
+def test_ensure_direct_replaces_a_shim_child(monkeypatch, tmp_path, arguments):
     if sys.platform != "win32":
         pytest.skip("Windows-only console behaviour")
     base = tmp_path / "base"
@@ -100,12 +101,15 @@ def test_ensure_direct_replaces_a_shim_child(monkeypatch, tmp_path):
 
     monkeypatch.setattr(shim_bypass.subprocess, "Popen", fake_popen)
     with pytest.raises(SystemExit) as ended:
-        shim_bypass.ensure_direct([])
+        shim_bypass.ensure_direct(arguments)
     assert ended.value.code == 42
     assert seen["cmd"][0] == str(base / "pythonw.exe")
-    assert seen["cmd"][1:] == []
+    assert seen["cmd"][1:] == ["-m", "web_search_neo.main", *arguments]
     assert seen["env"]["__PYVENV_LAUNCHER__"] == str(exe.resolve())
     assert seen["env"][shim_bypass._BYPASSED_VAR] == "1"
+    assert seen["stdin"] is sys.stdin
+    assert seen["stdout"] is sys.stdout
+    assert seen["stderr"] is sys.stderr
     assert seen.get("creationflags", 0) & 0x08000000
     assert seen["startupinfo"].wShowWindow == subprocess.SW_HIDE
 

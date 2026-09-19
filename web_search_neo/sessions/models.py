@@ -222,6 +222,9 @@ class BrowserSession:
     # consult it: they are throttled so a loop of waits cannot spend a bridge
     # round trip per iteration on a badge that is already lit.
     last_presence_ping: float = 0.0
+    # Visual click location survives a target removing itself or navigating.
+    # Separate from the actual CDP pointer used by relative input.
+    presence_click_point: tuple[float, float] | None = None
     # Wall-clock, unlike `last_used`, because these two are reported to a reader
     # and a monotonic number means nothing to one.
     created_at: float = field(default_factory=time.time)

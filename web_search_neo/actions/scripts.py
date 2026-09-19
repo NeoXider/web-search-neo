@@ -50,7 +50,20 @@ def evaluate_with_gesture(
         # Selenium drivers do not accept a per-call CDP timeout at all).
         result = driver.execute_cdp_cmd("Runtime.evaluate", params)
     else:
-        result = driver.execute_cdp_cmd("Runtime.evaluate", params, timeout=timeout_seconds)
+        client_config = getattr(getattr(driver, "command_executor", None), "client_config", None)
+        if client_config is not None:
+            # Selenium's CDP method has no per-call timeout keyword. Its HTTP
+            # client config is per driver; the caller holds the session lock,
+            # so temporarily extending it cannot affect another session.
+            previous_timeout = client_config.timeout
+            try:
+                client_config.timeout = timeout_seconds
+                result = driver.execute_cdp_cmd("Runtime.evaluate", params)
+            finally:
+                client_config.timeout = previous_timeout
+        else:
+            # The companion bridge implements a native per-call deadline.
+            result = driver.execute_cdp_cmd("Runtime.evaluate", params, timeout=timeout_seconds)
     if result.get("exceptionDetails"):
         raise RuntimeError(exception_text(result["exceptionDetails"]))
     return (result.get("result") or {}).get("value")

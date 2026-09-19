@@ -3803,6 +3803,39 @@ def test_presence_switch_stubs_the_in_page_signals() -> None:
 
 
 @requires_node
+def test_presence_storage_failure_preserves_state_and_allows_retry() -> None:
+    outcome = _node_worker_eval(
+        _WORKER_READY
+        + _VERIFIED_SOCKET
+        + """
+        const socket = await openSocket();
+        await ask(socket, "cdp.send", {
+          tabId: 7, method: "Runtime.evaluate", params: {expression: "1+1"}
+        });
+        const calls = [];
+        chrome.debugger.sendCommand = async (...args) => { calls.push(args); return {}; };
+        const originalSet = chrome.storage.local.set;
+        chrome.storage.local.set = async () => { throw new Error("Storage unavailable"); };
+        const failed = await globalThis.__message({type: "companion.setPresence", presence: false});
+        const afterFailure = await globalThis.__message({type: "companion.status"});
+        const failureCalls = calls.length;
+        chrome.storage.local.set = originalSet;
+        const retried = await globalThis.__message({type: "companion.setPresence", presence: false});
+        return {failed, afterFailure: afterFailure.presence, failureCalls,
+          retried: retried.presence, stored: globalThis.__local().companion_presence,
+          restored: calls.filter(args => args[1] === "Runtime.evaluate"
+            && args[2].expression.includes("presence.restore")).length};
+        """
+    )
+    assert "Storage unavailable" in outcome["failed"]["error"]
+    assert outcome["afterFailure"] is True
+    assert outcome["failureCalls"] == 0
+    assert outcome["retried"] is False
+    assert outcome["stored"] is False
+    assert outcome["restored"] == 1
+
+
+@requires_node
 def test_presence_stays_off_across_a_worker_restart() -> None:
     outcome = _node_worker_eval(
         """

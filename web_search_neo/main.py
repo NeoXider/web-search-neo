@@ -2550,13 +2550,11 @@ async def _mark_agent_presence(
     ok: bool,
 ) -> None:
     """Let the human watching the tab see that this step happened.
-
     Hooked here rather than inside each handler for one reason: there are
     dozens of handlers and one dispatcher, and a signal that is only as
     complete as the last action someone remembered to instrument is worse
     than none - the tab would look idle precisely during the actions nobody
     thought about.
-
     Never raises and never blocks the result. A step that has no session, or
     whose session the step itself just closed, is simply not marked.
     """

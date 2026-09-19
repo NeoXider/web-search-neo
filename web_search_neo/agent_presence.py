@@ -11,11 +11,8 @@ Three signals, all aimed at the person watching rather than at the caller:
 * a ghost cursor that follows the agent's virtual pointer - synthetic CDP input
   moves no OS mouse - with a name tag and a fading ring on every press.
 
-Everything here is pure data: the JavaScript source and the small builders that
-bake values into it. The session plumbing - when to install the script, which
-sessions are eligible, how to reach the driver - lives in ``browser_tools``,
-which imports this module. Keeping the direction of that import one-way is what
-lets the payloads be unit-tested without a browser.
+This module holds the script and payload builders. Session plumbing lives in
+``browser_tools`` so payloads can be tested independently of a browser.
 """
 
 from __future__ import annotations
@@ -29,7 +26,7 @@ from typing import Any
 # reinstall itself. Without it a long-lived tab would keep running whatever
 # version was current when it first loaded, and a fix here would only reach
 # pages opened afterwards.
-PRESENCE_VERSION = 6
+PRESENCE_VERSION = 7
 
 PRESENCE_ENV = "WEB_SEARCH_NEO_AGENT_PRESENCE"
 
@@ -59,11 +56,7 @@ CURSOR_CHIP_MS = 1500
 _ACTIVE_COLOR = "#2fbf5c"
 _RECENT_COLOR = "#e2a03f"
 
-# Actions after which the session's virtual pointer is meaningful. DOM clicks
-# move no pointer - nor would the OS cursor - so the cursor stays put there.
-_CURSOR_ACTIONS = frozenset({"pointer", "input", "pointer_lock"})
-# The sub-actions that press a button down: those land a ripple, the rest only
-# glide the cursor.
+# Coordinate presses and selector clicks both have a human-visible indicator.
 _TAP_POINTER_ACTIONS = frozenset({"click", "double_click", "press"})
 
 # The actions that are not worth a flash: they either have no place on the page
@@ -131,9 +124,11 @@ def _sub_action_name(value: object) -> str:
 
 def _cursor_hint(action: str, source: dict[str, Any]) -> tuple[bool, bool]:
     """Whether the action moved the virtual pointer, and pressed a button."""
-    name = _sub_action_name(source.get("action"))
+    name = _sub_action_name(source.get("pointer_action") or source.get("operation") or source.get("action"))
     if action == "pointer":
         return True, name in _TAP_POINTER_ACTIONS
+    if action == "click_text" or (action == "click" and (source.get("trusted") or source.get("text") is not None or source.get("x") is not None)):
+        return True, True
     if action == "pointer_lock":
         # Only acquiring clicks; the rest never visits the pointer.
         owns = name == "acquire"
@@ -153,16 +148,7 @@ def payload_for(
     label: str | None = None,
     pointer: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
-    """Describe one finished action in the terms the page-side script needs.
-
-    Only a hint is passed, never a resolved element: the action has already
-    happened by the time this runs, and re-resolving the selector in the page
-    is both cheaper than shipping a rect back and correct in the common case
-    where the click moved something.
-
-    ``pointer`` is the session's virtual pointer after the action ran. It lands
-    in the payload as ``cursor`` only for actions that actually moved it.
-    """
+    """Build a page-side indicator; pointer coordinates use the main viewport."""
     name = str(action or "").strip().lower()
     source = dict(arguments or {})
     payload: dict[str, Any] = {
@@ -171,6 +157,9 @@ def payload_for(
         "ok": bool(ok),
         "flash": name not in QUIET_ACTIONS,
     }
+    if name in {"click", "click_text"} and not source.get("frame_selector"):
+        payload["cursorTarget"] = True
+        payload["cursorTap"] = True
     for key in _SELECTOR_KEYS:
         value = source.get(key)
         if isinstance(value, str) and value.strip():
@@ -682,8 +671,14 @@ _INSTALL_TEMPLATE = r"""
   }
 
   function cursorEntry() {
-    if (state.cursor) return state.cursor;
-    const parent = document.body || document.documentElement;
+    if (state.cursor) {
+      if (!state.cursor.host.isConnected) {
+        const parent = document.documentElement || document.body;
+        if (parent) parent.appendChild(state.cursor.host);
+      }
+      return state.cursor;
+    }
+    const parent = document.documentElement || document.body;
     if (!parent || !document.createElement) return null;
     const host = document.createElement("div");
     host.setAttribute("aria-hidden", "true");
@@ -759,8 +754,13 @@ _INSTALL_TEMPLATE = r"""
     if (data.flash !== false) {
       try { flash(data); } catch (error) {}
     }
-    if (data.cursor) {
-      try { moveCursor(data.cursor, data); if (data.cursor.tap) ripple(data.cursor, data.ok); } catch (error) {}
+    let point = data.cursor;
+    if (!point && data.cursorTarget) {
+      const rect = targetRect(data);
+      if (rect) point = {x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, tap: data.cursorTap};
+    }
+    if (point) {
+      try { moveCursor(point, data); if (point.tap) ripple(point, data.ok); } catch (error) {}
     }
     return true;
   };

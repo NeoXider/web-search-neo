@@ -105,6 +105,47 @@ def test_missing_command_reports_not_found():
     assert "cannot start" in completed.stderr
 
 
+def test_server_exit_does_not_wait_for_client_stdin_eof():
+    """An MCP server crash must reach a client that still holds stdin open."""
+    proc = subprocess.Popen(
+        [sys.executable, str(PROXY), sys.executable, "-c",
+         "import sys; print('finished', flush=True); sys.exit(7)"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        assert proc.wait(timeout=10) == 7
+        assert proc.stdout.read().strip() == b"finished"
+        assert proc.stderr.read() == b""
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            stream.close()
+
+
+def test_small_input_is_forwarded_before_client_closes_stdin():
+    """A live initialize request must not wait for a full buffer or EOF."""
+    proc = subprocess.Popen(
+        [sys.executable, str(PROXY), sys.executable, "-c",
+         "import sys; line=sys.stdin.buffer.readline(); "
+         "sys.stdout.buffer.write(line); sys.stdout.buffer.flush()"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        proc.stdin.write(b'{"jsonrpc":"2.0","id":1}\n')
+        proc.stdin.flush()
+        assert proc.wait(timeout=10) == 0
+        assert proc.stdout.read() == b'{"jsonrpc":"2.0","id":1}\n'
+        assert proc.stderr.read() == b""
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            stream.close()
+
+
 def test_bare_proxy_reports_usage():
     completed = subprocess.run(
         [sys.executable, str(PROXY)], capture_output=True, text=True, check=False
