@@ -9,6 +9,12 @@
 - Honor per-call script timeouts with the Selenium transport as well as the Chrome bridge, restoring the original timeout after success or failure.
 - Save the companion presence preference before changing its active state, so failed storage writes can be retried.
 
+## 1.18.1
+
+- Capture current-Chrome viewports through a bounded single-frame screencast without activating tabs, restoring windows or changing page geometry. Stop owned captures and remove listeners after success, timeout or detach; refuse overlapping captures.
+- Remove foreground recovery advice from screenshot errors. Full-page and region captures retain the surface path and may still time out; use viewport or DOM inspection instead.
+- Add interactive element filtering before pagination, and concrete schema recovery guidance for browser agents.
+
 ## 1.18.0
 
 The favicon badge stops replacing the site's icon - it is a small corner mark now.

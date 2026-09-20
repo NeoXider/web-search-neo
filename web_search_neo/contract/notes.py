@@ -305,7 +305,7 @@ _ACTION_NOTES = {
         "viewport": "omit width/height to preserve the actual viewport. An explicit pair resizes Selenium sessions exactly and is refused in current Chrome.",
         "region": "requires x/y/width/height in page CSS pixels, captures without resizing, and works in current Chrome and Selenium",
         "full_page": "captures the whole current layout up to 3840x10000; an oversize page errors instead of returning an unlabelled partial image",
-        "background": "A current-Chrome screenshot can wait or fail while its window is obscured because Chrome is not painting pixels. DOM/actions still work; do not use pixels to prove labels or selected values.",
+        "background": "Current-Chrome viewport captures use one fresh compositor video frame without activating a tab or changing the window. Full-page/region surface captures may still stall in an obscured window; try viewport or DOM/text. Never call show as automatic recovery. DOM/actions still work; use read-back for labels and selected values.",
     },
     "pointer_lock": {
         "operation": "acquire|release|status",

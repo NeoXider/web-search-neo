@@ -1662,12 +1662,11 @@ class ChromeBridgeDriver:
             # Same exception type, because callers above catch it by type; what
             # changes is that the message names the cause and a way out.
             raise TimeoutError(
-                f"Chrome did not return a screenshot within {timeout:.0f}s. This is what "
-                "an obscured browser window looks like: Chrome stops painting a window "
-                "nothing can see, and a capture then waits for a frame that is not being "
-                "produced. The page itself is fine - reading the DOM, clicking and typing "
-                "do not need the window. Ask for the screenshot again, or bring the tab to "
-                "the front first if a picture is what matters."
+                f"Chrome did not return a screenshot within {timeout:.0f}s. "
+                "The surface capture stalled; this does not prove the page is broken. "
+                "Try a viewport screenshot (background frame capture), or inspect "
+                "page_elements/page_text. Never call show, activate or restore a window "
+                "unless the user explicitly asks to see it."
             ) from exc
 
     def find_element(self, by: str, value: str) -> ChromeBridgeElement:
@@ -1740,7 +1739,7 @@ class ChromeBridgeDriver:
         self._modifier_mask = modifiers
 
     def get_screenshot_as_png(self) -> bytes:
-        capture = self.execute_cdp_cmd("Page.captureScreenshot", {"format": "png"})
+        capture = self.bridge.request("capture.viewport", {"tabId": self.tab_id}, timeout=12.0)
         return base64.b64decode(capture["data"])
 
     def get_log(self, log_type: str) -> list[dict[str, Any]]:

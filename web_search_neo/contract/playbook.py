@@ -410,8 +410,8 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
             },
             {
                 "symptom": "A screenshot times out in current Chrome.",
-                "cause": "Chrome is not painting an obscured background window.",
-                "fix": "Nothing. DOM reads and pointer actions still work; do not call show unless the user asked to watch.",
+                "cause": "The selected capture path received no frame; a surface capture may stall in an obscured window.",
+                "fix": "Use mode='viewport' for background frame capture, or inspect DOM/text. Do not call show, activate or restore unless the user asked to watch.",
             },
             {
                 "symptom": "Chrome keeps showing 'started debugging this browser' on agent tabs; closing it brings it back.",

@@ -280,7 +280,7 @@ is no automatic substitute. If you would rather not install an extension at all,
 `profile_mode="temporary"` and `profile_mode="persistent"` drive a Selenium
 browser that needs no companion.
 
-The bundled companion is version 1.18.0. Chrome does not refresh an unpacked
+The bundled companion is version 1.18.1. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. That only works for
@@ -691,10 +691,14 @@ visible while it is not, and stops believing it the moment the debugger detaches
 
 Two consequences worth knowing. A targeted keyboard action can change DOM focus
 inside the controlled background page, but it does not take OS focus or change the
-active user tab. A screenshot of a tab in a window that another window covers can take tens of
-seconds — Chrome has no fresh pixels to hand over — so `screenshot` waits up to
-45 s there and, if it gives up, says that the window is obscured and that reading
-and typing are unaffected.
+active user tab. In Companion 1.18.1, viewport screenshots capture one fresh PNG
+video frame with an 8-second frame deadline, then stop the owned recording. This
+does not activate tabs, restore windows, resize the viewport, or alter emulation.
+An existing recording or overlapping capture is refused. Full-page and region
+screenshots still use Chrome's surface path (up to 45 seconds), which can stall
+in an obscured window; use viewport capture or DOM/text instead. A timeout never
+authorizes `show` or an automatic foreground retry. Reload the Companion and
+reconnect the MCP server after updating to pick up both halves of this change.
 
 Several agents can drive one Chrome at once, so tab ownership lives in the bridge
 daemon rather than in any one server process: every tab an agent opens or claims

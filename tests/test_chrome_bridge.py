@@ -3209,11 +3209,28 @@ def test_a_screenshot_waits_longer_than_a_script_and_says_why_when_it_cannot() -
     driver = ChromeBridgeDriver(bridge=bridge, tab_group="AI")
     driver.set_script_timeout(15.0)
     with pytest.raises(TimeoutError) as failure:
-        driver.get_screenshot_as_png()
+        driver.execute_cdp_cmd("Page.captureScreenshot", {"format": "png"})
     waited = dict(bridge.calls)["Page.captureScreenshot"]["timeout"]
     assert waited == chrome_bridge.SCREENSHOT_TIMEOUT > 15.0
     # The agent can act on this; "cdp.send timed out" only tells it to give up.
-    assert "obscured" in str(failure.value) and "front" in str(failure.value)
+    assert "Never call show" in str(failure.value)
+    assert "page_elements/page_text" in str(failure.value)
+
+
+def test_viewport_capture_uses_background_frame_without_activating_tab() -> None:
+    import base64
+    class FrameBridge(_FakeBridge):
+        def request(self, method, params=None, timeout=20.0):
+            if method == 'capture.viewport':
+                self.calls.append((method, params))
+                assert timeout == 12.0
+                return {'data': base64.b64encode(b'png-proof').decode()}
+            return super().request(method, params, timeout)
+    bridge = FrameBridge()
+    driver = ChromeBridgeDriver(bridge=bridge)
+    assert driver.get_screenshot_as_png() == b'png-proof'
+    assert ('capture.viewport', {'tabId': 41}) in bridge.calls
+    assert not any(method in {'tabs.activate', 'Page.bringToFront'} for method, _ in bridge.calls)
 
 
 def test_a_background_driver_can_still_be_told_to_show_the_tab() -> None:

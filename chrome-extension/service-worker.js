@@ -19,6 +19,7 @@ import {
   trackPending,
 } from "./events.js";
 import {agentMessage, applyGlobalBadge, noteAgentCommand} from "./agent-badges.js";
+import {createBackgroundCapture} from "./background-capture.js";
 import {PROTOCOL_VERSION, advanceHandshake, bytesToHex, loadBridgeToken, newNonce} from "./bridge-auth.js";
 
 export {loadBridgeToken, parseBridgeToken} from "./bridge-auth.js";
@@ -203,16 +204,9 @@ async function waitForTab(tabId, timeoutMs = 20000) {
 // own group - agent tabs then cluster in one place the user can ignore or close
 // as a unit - then any other window, and only then the focused one.
 //
-// A minimized window is out of the running entirely, our own group's included.
-// Chrome never composites one, and a tab that is never painted cannot be
-// photographed: every screenshot from it spends the whole capture budget and
-// comes back as the obscured-window error, not once but for the life of the
-// session, with nothing to connect that failure to a window the user minimized
-// an hour ago. Passing our own group by costs a second group of the same name in
-// whichever window is used instead; a duplicated heading is untidy, a screenshot
-// feature that never works is broken. Restoring the window would settle it and is
-// not on the table: raising a window is the interruption this mode exists to
-// avoid.
+// Prefer a non-minimized window for new tabs without restoring any window.
+// Viewport capture uses the background video path; legacy surface captures may
+// still stall when the window is not presented on screen.
 //
 // Returning null means "let Chrome choose", which happens only when the browser
 // has no normal window at all - it can outlive its last one - and Chrome then
@@ -662,7 +656,12 @@ async function resolveFrame(tabId, selector) {
   return {sameOrigin: false, sessionId: attached.sessionId, url: info.src};
 }
 
+const captureBackground = createBackgroundCapture(chrome.debugger);
 const commands = {
+  async "capture.viewport"({tabId}) {
+    await ensureDebugger(Number(tabId));
+    return captureBackground(Number(tabId));
+  },
   async "tabs.list"() {
     const [tabs, groups] = await Promise.all([chrome.tabs.query({}), groupMap()]);
     return tabs
