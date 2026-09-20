@@ -10,6 +10,7 @@ from typing import Any, Literal
 from mcp.server.fastmcp import FastMCP, Image
 from pydantic import ValidationError
 
+from web_search_neo.contract.notes import _SERVER_INSTRUCTIONS, _ARGUMENT_RECOVERY
 from web_search_neo import bridge_daemon
 from web_search_neo import browser_tools
 from web_search_neo import chrome_bridge
@@ -557,19 +558,17 @@ async def browser_get_page_elements(
     max_chars: int = browser_tools.DEFAULT_RESPONSE_CHAR_BUDGET,
     href_pattern: str | None = None,
     text_pattern: str | None = None,
+    category: Literal["all", "interactive", "links", "forms", "fields", "buttons", "iframes"] = "all",
+    visible_only: bool = False,
+    enabled_only: bool = False,
+    role: str | None = None,
 ) -> dict[str, Any]:
     """Get rendered links, forms, fields, and buttons with CSS selectors."""
     return await asyncio.to_thread(
         browser_tools.get_page_elements,
-        session_id,
-        include_links,
-        include_forms,
-        include_buttons,
-        limit,
-        offset,
-        max_chars,
-        href_pattern,
-        text_pattern,
+        session_id, include_links, include_forms, include_buttons,
+        limit, offset, max_chars, href_pattern, text_pattern,
+        category, visible_only, enabled_only, role,
     )
 
 
@@ -2006,13 +2005,7 @@ def get_current_time_and_region() -> dict:
 legacy_mcp = mcp
 mcp = ReportingFastMCP(  # failed web_action batches come back with isError=true
     "Web Search Neo",
-    instructions=(
-        "Use web_info for discovery and observation. Start with topic=capabilities when "
-        "the compact contract is not already known. Use web_action for one or many "
-        "ordered mutations. Reuse session_id across browser actions. In step render "
-        "mode an input action applies all mixed keyboard and pointer changes before "
-        "advancing exactly one frame."
-    ),
+    instructions=_SERVER_INSTRUCTIONS,
 )
 
 
@@ -2253,6 +2246,7 @@ def _validate_arguments(tool_name: str, label: str, arguments: dict[str, Any]) -
     typo would surface as an internal ``TypeError``.
     """
     model = _argument_model(tool_name)
+    recovery = _ARGUMENT_RECOVERY.get(tool_name, "")
     allowed = list(model.model_fields)
     unknown = [key for key in arguments if key not in allowed]
     if unknown:
@@ -2260,7 +2254,7 @@ def _validate_arguments(tool_name: str, label: str, arguments: dict[str, Any]) -
             f"{label}: unknown parameter(s) {sorted(unknown)}. "
             f"Allowed: {allowed}. "
             "Call web_info(topic='action_schema', params={'action': '<action or topic>'}) "
-            "for the full schema."
+            "for the full schema." + recovery
         )
     try:
         validated = model.model_validate(arguments)
@@ -2271,7 +2265,7 @@ def _validate_arguments(tool_name: str, label: str, arguments: dict[str, Any]) -
         )
         required, optional = _parameter_names(tool_name)
         raise ValueError(
-            f"{label}: {problems}. Required: {required}. Optional: {optional}."
+            f"{label}: {problems}. Required: {required}. Optional: {optional}." + recovery
         ) from None
     return validated.model_dump(exclude_unset=True)
 
@@ -2536,7 +2530,10 @@ async def web_action(
     actions: list[dict[str, Any]],
     continue_on_error: bool = False,
 ) -> dict[str, Any]:
-    """Execute 1-32 ordered search, fetch, browser, form, input, render, or close actions."""
+    """Execute 1-32 ordered actions. Read web_info action_schema before unfamiliar
+    actions or after validation errors. fill uses fields={CSS_selector: value}.
+    Use a unique session_id per task/agent; never close another agent's tabs.
+    """
     if not actions or len(actions) > 32:
         raise ValueError("Provide 1-32 actions")
     return await _execute_actions(actions, continue_on_error)

@@ -91,6 +91,7 @@ _ACTION_NOTES = {
         ),
     },
     "fill": {
+        "arguments": "fields is a map from fresh CSS selectors to values, e.g. fields={'#email': 'a@example.test'}, not a list or separate selector/value parameters.",
         "results": "filled took your value, field_values answers for every selector you sent including the failures, errors maps selector to the driver's own message, success=false if errors is non-empty.",
         "field_values": "null means nothing could be read back - the selector matched nothing, or the control is gone. A refused control reports what it still holds, so you can see the write did not land.",
         "checkbox": "1|yes|y|on|check|checked or 0|no|n|off|uncheck|unchecked|''; anything else is refused, and field_values reports a JSON boolean.",
@@ -165,12 +166,13 @@ _ACTION_NOTES = {
         "limits": "visible_only=true by default; limit is clamped to 25.",
     },
     "page_elements": {
+        "filters": "category='interactive' returns one deduplicated interactive list (links, buttons, inputs, editable controls and ARIA widgets). Other categories: all (legacy default), links, forms, fields, buttons, iframes. Combine visible_only=true, enabled_only=true, role='button', text_pattern='Save', href_pattern='/settings'. Filters run before offset/limit and the character budget; found and next_offset describe matching rows.",
         "selector": "CSS in the top document, '#host >>> #leaf' inside an open shadow root or same-origin frame, and '' when nothing addresses the element uniquely.",
         "scope": "Always the whole page: this topic takes no frame_selector, and it is the only read topic reporting challenge_detected/captcha_widgets.",
         "duplicates": "For repeated labels, compare each returned link href or stable value/attribute. Never choose by array index or nth-child alone.",
         "captcha_scan_incomplete": "true means the captcha walk stopped early, so an empty captcha_widgets is not proof there is none. Every page summary carries this key.",
         "invisible_challenge_pending": "true means a captcha with no box - an invisible Turnstile and the like - is on the page with an empty token field. It blocks the form, not the page, so challenge_detected stays false; invisible_challenge names the vendor and the evidence. Clear it with the captcha action before submitting. Every page summary carries this key too.",
-        "contenteditable": "Only [contenteditable=\"true\"] is listed; a bare contenteditable attribute is a field to page_outline and invisible here.",
+        "contenteditable": "The legacy fields list includes [contenteditable=\"true\"]; category='interactive' also includes bare contenteditable and plaintext-only editors.",
         "pagination": "The whole existing DOM is counted before each category is sliced. Use offset plus limit, then follow range.<category>.next_offset until null; reread after scrolling a lazy/infinite page.",
         "limits": "limit is clamped to 1000 per top-level category and offset to 0-20000. collector_truncated.<category>=true means the 20000-item safety cap was hit and found is only the collected prefix. include_forms=false also omits fields.",
     },
@@ -181,6 +183,7 @@ _ACTION_NOTES = {
         "id": "The default output='text' carries no ids. Pass output='json' and hand that row's id to network_body as request_id.",
     },
     "execute_js": {
+        "arguments": "params.script is a JavaScript function body, not code or an expression: use script='return document.title;' to read a result. Do not omit return.",
         "scope": "Top document of the session's current tab only; reach into a frame from inside the script when you must.",
         "result": "value is the JSON-serialisable return value, promise-awaited on the Chrome bridge driver; strings over 200k characters come back as {clipped, length, head}.",
         "prefer_actions": "Use fill/click/pointer for anything a user gesture should do; a script cannot simulate a trusted interaction.",
@@ -351,3 +354,23 @@ _ACTION_NOTES = {
         "response": "Always {success, url, status, headers, body/size}: 4xx/5xx return success True with their status and the server's error body, not an error. fetch_text is GET-only and returns str; replay_request re-sends inside the page with cookies/CORS, this one never touches a browser.",
     },
 }
+
+
+_SERVER_INSTRUCTIONS = (
+        "Use web_info for discovery and observation. Start with topic=capabilities when "
+        "the compact contract is not already known. Use web_action for one or many "
+        "ordered mutations. Read action_schema before an unfamiliar action or topic; "
+        "after validation failure fix the call from that schema, never guess aliases. "
+        "execute_js takes script (a function body with explicit return), not code; "
+        "fill takes fields={CSS_selector: value}. Give each task/agent a unique session_id "
+        "and agent_label on open; reuse only that task's session. Never close or take over "
+        "another agent's tab. After a zero-match click inspect fresh page_elements/find "
+        "and frame context before retrying; React portals alone do not explain missing text. In step render "
+        "mode an input action applies all mixed keyboard and pointer changes before "
+        "advancing exactly one frame."
+    )
+
+_ARGUMENT_RECOVERY = {
+        "browser_execute_js": " Use params={'script': 'return document.title;', 'session_id': '<your-session>'}. script is a function body; an expression without return yields no value. Do not use code.",
+        "browser_fill_fields": " Use fields={'<CSS selector from fresh page_elements>': '<value>'}, not selector/value or a list. Read field_values and errors before continuing.",
+    }

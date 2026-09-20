@@ -40,6 +40,7 @@ _RECIPES = {
 }
 
 _PITFALLS = [
+    "For a noisy page use page_elements category='interactive', visible_only=true, enabled_only=true; narrow with role and text_pattern. Filters run before pagination. Follow range.interactive.next_offset for the next matching controls.",
     "web_action success=true is not task success: check failure_count and every results[i].success.",
     "Never guess optional names: call action_schema. timeout_ms does not exist; the exact action may use timeout_seconds or wait_seconds.",
     "page_elements takes no selector filter: read its category lists and filter the returned objects yourself.",

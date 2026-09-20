@@ -2487,6 +2487,10 @@ def get_page_elements(
     max_chars: int = DEFAULT_RESPONSE_CHAR_BUDGET,
     href_pattern: str | None = None,
     text_pattern: str | None = None,
+    category: str = "all",
+    visible_only: bool = False,
+    enabled_only: bool = False,
+    role: str | None = None,
 ) -> dict[str, Any]:
     """Return stable selectors and metadata for rendered page controls.
 
@@ -2503,10 +2507,12 @@ def get_page_elements(
     still points at the next page.
 
     ``href_pattern`` and ``text_pattern`` filter links and buttons server-side
-    before the character budget is applied, so a page with 380 links can return
+    before pagination and the character budget, so a page with 380 links can return
     only the 36 lesson rows (``href_pattern="/lesson/view/"``) without truncation.
     Both are case-insensitive substring matches.
     """
+    if category not in {"all", "interactive", "links", "forms", "fields", "buttons", "iframes"}:
+        raise ValueError("Unknown page_elements category")
     limit = max(1, min(int(limit), 1000))
     offset = max(0, min(int(offset), 20_000))
     budget = _response_char_budget(max_chars)
@@ -2525,31 +2531,10 @@ def get_page_elements(
             bool(include_links),
             bool(include_forms),
             bool(include_buttons),
+            {"category": category, "visible_only": visible_only, "enabled_only": enabled_only,
+             "role": role, "href_pattern": href_pattern, "text_pattern": text_pattern},
         )
         payload = {**_page_summary(session.driver, session_id), **(elements or {})}
-        # Server-side substring filters before the character budget: a table with
-        # 380 anchors can be narrowed to 36 lesson rows without growing max_chars.
-        href_pat = str(href_pattern).strip().lower() if isinstance(href_pattern, str) and href_pattern.strip() else None
-        text_pat = str(text_pattern).strip().lower() if isinstance(text_pattern, str) and text_pattern.strip() else None
-        if href_pat or text_pat:
-            def _matches(entry: dict[str, Any]) -> bool:
-                href = str(entry.get("href") or "").lower()
-                text = str(entry.get("text") or "").lower()
-                if href_pat and href_pat not in href:
-                    return False
-                if text_pat and text_pat not in text:
-                    return False
-                return True
-
-            if href_pat or text_pat:
-                for key in ("links", "buttons"):
-                    items = payload.get(key)
-                    if isinstance(items, list):
-                        filtered = [it for it in items if isinstance(it, dict) and _matches(it)]
-                        # Keep the script's range bookkeeping honest: filtered
-                        # is the new truth, not a budget cut, so reset offsets.
-                        payload[key] = filtered
-                # Forms/fields are not filtered by href/text; they stay as-is.
         # The per-list bookkeeping the script filled in was about the row limit;
         # after a budget cut it would over-report what was sent, and
         # `next_offset` would skip whatever the budget dropped. Restating it is

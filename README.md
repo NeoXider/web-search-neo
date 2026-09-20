@@ -1539,3 +1539,21 @@ It reports the eager tool-schema size and the median and p95 latency of both MCP
 Issues and focused pull requests are welcome. A new search engine only needs a `SearchProvider` implementation plus `register_search_provider(provider)`; status, cooldown, cache, and fallback routing update automatically.
 
 See [TODO.md](TODO.md) for the current roadmap.
+
+### Focused interactive controls
+
+On a noisy page, ask for one deduplicated list of controls instead of all categories:
+
+```json
+{"topic":"page_elements","params":{"session_id":"my-task","category":"interactive","visible_only":true,"enabled_only":true,"limit":30,"max_chars":8000}}
+```
+
+Narrow further with `role: "button"`, `text_pattern: "Save"` (case-insensitive
+accessible name, rendered text, label or placeholder), or `href_pattern`. Other
+categories are `links`, `buttons`, `fields`, `forms`, `iframes`; `all` preserves
+the legacy default output. Interactive includes native controls, editable areas,
+ARIA widgets and focusable elements, without duplicate rows for the same element.
+Filters run before pagination and the response budget. Continue with
+`range.interactive.next_offset`; `found.interactive` counts matching controls
+within the collector limit. Visible means rendered, not necessarily in the viewport;
+scroll and verify before acting on a control outside the viewport.

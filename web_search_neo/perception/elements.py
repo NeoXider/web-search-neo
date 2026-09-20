@@ -10,6 +10,23 @@ const offset = arguments[1];
 const includeLinks = arguments[2];
 const includeForms = arguments[3];
 const includeButtons = arguments[4];
+const filters = arguments[5] || {};
+const selectedCategory = filters.category || 'all';
+const enabledCategory = name => selectedCategory === 'all' ? name !== 'interactive' : selectedCategory === name;
+const lower = value => String(value || '').toLocaleLowerCase();
+function matches(el, name) {
+  if (filters.visible_only && wsnHiddenReason(el)) return false;
+  if (filters.enabled_only && (el.disabled || el.getAttribute('aria-disabled') === 'true' || el.closest('[inert]'))) return false;
+  const role = wsnRole(el);
+  if (filters.role && lower(role) !== lower(filters.role)) return false;
+  if (filters.text_pattern) {
+    const text = [wsnName(el, role), el.innerText, el.getAttribute('placeholder'), labelFor(el)].join(' ');
+    if (!lower(text).includes(lower(filters.text_pattern))) return false;
+  }
+  if (filters.href_pattern && ['links', 'buttons', 'interactive'].includes(name)
+      && !lower(el.href).includes(lower(filters.href_pattern))) return false;
+  return true;
+}
 
 // A web component keeps its controls in a shadow root and an embedded form keeps
 // them in another document, and `document.querySelectorAll` sees neither. That
@@ -75,7 +92,7 @@ function collect(selectors) {
 function category(name, selectors) {
   const result = collect(selectors);
   collectorTruncated[name] = result.truncated;
-  return order(result.items);
+  return order(result.items.filter(el => matches(el, name)));
 }
 
 function visibility(el) {
@@ -117,7 +134,7 @@ function fieldInfo(el) {
 const output = {links: [], forms: [], fields: [], buttons: [], iframes: []};
 const counts = {links: 0, forms: 0, fields: 0, buttons: 0, iframes: 0};
 const FIELD_SELECTOR = 'input, textarea, select, [contenteditable="true"]';
-if (includeLinks) {
+if (includeLinks && enabledCategory('links')) {
   const links = category('links', 'a[href]');
   counts.links = links.length;
   output.links = links.slice(offset, offset + limit).map(a => Object.assign({
@@ -126,20 +143,20 @@ if (includeLinks) {
     href: a.href
   }, visibility(a)));
 }
-if (includeForms) {
+if (includeForms && (enabledCategory('forms') || enabledCategory('fields'))) {
   const forms = category('forms', 'form');
-  counts.forms = forms.length;
-  output.forms = forms.slice(offset, offset + limit).map((form, index) => Object.assign({
+  counts.forms = enabledCategory('forms') ? forms.length : 0;
+  output.forms = (enabledCategory('forms') ? forms : []).slice(offset, offset + limit).map((form, index) => Object.assign({
     index: offset + index, selector: wsnSelector(form), id: form.id || '',
     name: form.getAttribute('name') || '',
     action: form.action, method: (form.method || 'get').toLowerCase(), enctype: form.enctype,
     fields: Array.from(form.querySelectorAll(FIELD_SELECTOR)).slice(0, limit).map(fieldInfo)
   }, visibility(form)));
   const fields = category('fields', FIELD_SELECTOR);
-  counts.fields = fields.length;
-  output.fields = fields.slice(offset, offset + limit).map(fieldInfo);
+  counts.fields = enabledCategory('fields') ? fields.length : 0;
+  output.fields = (enabledCategory('fields') ? fields : []).slice(offset, offset + limit).map(fieldInfo);
 }
-if (includeButtons) {
+if (includeButtons && enabledCategory('buttons')) {
   const buttons = category('buttons',
     'button, input[type="button"], input[type="submit"], input[type="reset"], ' +
     'input[type="image"], [role="button"]'
@@ -153,7 +170,17 @@ if (includeButtons) {
     disabled: !!button.disabled
   }, visibility(button)));
 }
-const frames = category('iframes', 'iframe, frame');
+if (selectedCategory === 'interactive') {
+  const controls = category('interactive', 'a[href], button, input:not([type="hidden"]), textarea, select, summary, [contenteditable]:not([contenteditable="false"]), [role="button"], [role="link"], [role="textbox"], [role="searchbox"], [role="combobox"], [role="checkbox"], [role="radio"], [role="switch"], [role="tab"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [role="option"], [role="slider"], [role="spinbutton"], [tabindex]:not([tabindex="-1"])');
+  counts.interactive = controls.length;
+  output.interactive = controls.slice(offset, offset + limit).map(el => Object.assign({
+    selector: wsnSelector(el), tag: el.tagName.toLowerCase(), role: wsnRole(el),
+    name: wsnName(el, wsnRole(el)), text: (el.innerText || '').trim().slice(0, 300),
+    type: el.getAttribute('type') || '', href: el.href || '',
+    disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true'
+  }, visibility(el)));
+}
+const frames = enabledCategory('iframes') ? category('iframes', 'iframe, frame') : [];
 counts.iframes = frames.length;
 output.iframes = frames.slice(offset, offset + limit).map(frame => Object.assign({
   selector: wsnSelector(frame), id: frame.id || '', name: frame.name || '',
@@ -191,7 +218,7 @@ return output;
 """
 
 
-_ELEMENT_LIST_KEYS = ("links", "forms", "fields", "buttons", "iframes")
+_ELEMENT_LIST_KEYS = ("links", "forms", "fields", "buttons", "iframes", "interactive")
 
 
 def _restate_element_ranges(payload: dict[str, Any]) -> None:
