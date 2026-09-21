@@ -392,7 +392,7 @@ let previewTabs = 2;
 let previewCap = 8;
 let previewCeiling = 64;
 let previewPort = 8765;
-let previewVersion = "1.18.0";
+let previewVersion = "1.18.2";
 let previewUpdate = null;
 let previewEnabled = true;
 let previewPresence = true;
@@ -505,7 +505,7 @@ function startPreview() {
   previewCap = Number.parseInt(params.get("cap"), 10) || 8;
   previewCeiling = Number.parseInt(params.get("ceiling"), 10) || 64;
   previewPort = Number.parseInt(params.get("port"), 10) || 8765;
-  previewVersion = params.get("ver") || "1.18.0";
+  previewVersion = params.get("ver") || "1.18.2";
   const agents = Number.parseInt(params.get("agents"), 10);
   previewAgents = Number.isFinite(agents) ? Math.max(0, agents) : 3;
   refresh().then(checkRelease).then(refreshAgentTabs);

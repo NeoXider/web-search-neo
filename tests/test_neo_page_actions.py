@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from web_search_neo import browser_tools
@@ -174,6 +176,106 @@ def test_script_on_an_unknown_session_raises():
         browser_tools.execute_js("return 1;")
 
 
+# --- execute_js result contract ------------------------------------------------
+#
+# value is always plain JSON and value_json always its string form, so a caller
+# never has to guess between an object and content parts, and a DOM node never
+# reaches the MCP layer as a live handle.
+
+
+def test_execute_js_object_value_has_matching_value_json(monkeypatch):
+    _summary_free(monkeypatch)
+    payload = {"user": {"name": "Ada", "tags": ["a", "b"]}}
+    driver = _CannedDriver({"execute_script": payload})
+    _register_session(driver, "js-obj")
+    result = browser_tools.execute_js("return state;", session_id="js-obj")
+    assert result["success"] is True
+    assert result["value"] == payload
+    assert json.loads(result["value_json"]) == payload
+
+
+def test_execute_js_dom_element_becomes_a_descriptor(monkeypatch):
+    _summary_free(monkeypatch)
+
+    class _LiveElement:
+        tag_name = "IFRAME"
+
+    driver = _CannedDriver({"execute_script": _LiveElement()})
+    _register_session(driver, "js-el")
+    result = browser_tools.execute_js("return frame;", session_id="js-el")
+    assert result["success"] is True
+    assert result["value"]["element"] == "iframe"
+    assert "query their properties" in result["value"]["note"]
+    assert json.loads(result["value_json"])["element"] == "iframe"
+
+
+def test_execute_js_nested_unserialisable_is_sanitised(monkeypatch):
+    _summary_free(monkeypatch)
+    driver = _CannedDriver({"execute_script": {"items": [object(), 1]}})
+    _register_session(driver, "js-nested")
+    result = browser_tools.execute_js("return mixed;", session_id="js-nested")
+    assert result["success"] is True
+    assert result["value"]["items"][1] == 1
+    assert "unserialisable" in result["value"]["items"][0]
+    json.loads(result["value_json"])  # Must not raise.
+
+
+# --- execute_js frame_selector -------------------------------------------------
+
+
+class _FrameSwitch:
+    def __init__(self):
+        self.calls: list = []
+
+    def default_content(self):
+        self.calls.append("top")
+
+    def frame(self, element):
+        self.calls.append(("frame", element))
+
+
+def _frame_driver(count):
+    driver = _CannedDriver({"execute_script": count})
+    driver.switch_to = _FrameSwitch()
+    driver.find_calls = []
+
+    def find_element(by, selector):
+        found = {"by": by, "selector": selector}
+        driver.find_calls.append(found)
+        return found
+
+    driver.find_element = find_element
+    return driver
+
+
+def test_execute_js_frame_selector_runs_inside_and_returns_on_top(monkeypatch):
+    _summary_free(monkeypatch)
+    driver = _frame_driver(1)
+    _register_session(driver, "js-frame")
+    result = browser_tools.execute_js(
+        "return location.href;", session_id="js-frame", frame_selector="#fr"
+    )
+    assert result["success"] is True
+    assert driver.find_calls == [{"by": "css selector", "selector": "#fr"}]
+    # Entered the frame, ran the script there, handed back at the top document.
+    assert driver.switch_to.calls[0] == "top"
+    assert driver.switch_to.calls[1][0] == "frame"
+    assert driver.switch_to.calls[-1] == "top"
+
+
+def test_execute_js_ambiguous_frame_refuses_before_running(monkeypatch):
+    _summary_free(monkeypatch)
+    driver = _frame_driver(2)
+    _register_session(driver, "js-amb")
+    with pytest.raises(ValueError, match="matches 2"):
+        browser_tools.execute_js(
+            "return 42;", session_id="js-amb", frame_selector="iframe"
+        )
+    # Only the frame count probe ran; the script itself never did.
+    assert driver.find_calls == []
+    assert all("return 42" not in script for script, _args in driver.scripts)
+
+
 # --- inject_script ----------------------------------------------------------
 
 
@@ -280,6 +382,32 @@ def test_cookies_get_is_capped_but_still_counts_everything():
     asked = browser_tools.cookies(op="get", limit=10)
     assert len(asked["cookies"]) == 10
     assert browser_tools.cookies(op="get", limit=500)["truncated"] is False
+
+
+def test_cookies_offset_pages_through_the_tail():
+    many = [dict(COOKIE_SAMPLE[0], name=f"c{index}") for index in range(250)]
+    driver = _CannedDriver({"Storage.getCookies": {"cookies": many}})
+    _register_session(driver, "cookies-pages")
+
+    first = browser_tools.cookies(op="get", session_id="cookies-pages", limit=100)
+    assert first["count"] == 250
+    assert first["offset"] == 0
+    assert first["returned"] == 100
+    assert first["truncated"] is True
+    assert first["cookies"][0]["name"] == "c0"
+
+    # The tail past the old hard window is reachable now.
+    tail = browser_tools.cookies(op="get", session_id="cookies-pages", limit=100, offset=200)
+    assert tail["offset"] == 200
+    assert tail["returned"] == 50
+    assert tail["truncated"] is False
+    assert tail["cookies"][0]["name"] == "c200"
+    assert tail["cookies"][-1]["name"] == "c249"
+
+    beyond = browser_tools.cookies(op="get", session_id="cookies-pages", offset=9999)
+    assert beyond["returned"] == 0
+    assert beyond["cookies"] == []
+    assert beyond["truncated"] is False
 
 
 def test_cookies_unknown_op_raises():

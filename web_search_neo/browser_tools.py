@@ -40,6 +40,7 @@ from web_search_neo.chrome_bridge import (
     CHROME_EXTENSION_ID,
     DEFAULT_TAB_GROUP,
     ChromeBridgeDriver,
+    ChromeBridgeElement,
     ChromeBridgeError,
     ChromeBridgeUnavailable,
     close_current_chrome_tabs,
@@ -678,6 +679,89 @@ def _drop_sessions_whose_tab_is_gone() -> None:
             session.lock.release()
 
 
+DEFAULT_SESSION_IDLE_TTL = 1800.0
+
+
+def _idle_ttl_seconds() -> float:
+    """How long an untouched session may hold its slot, in seconds.
+
+    Orphaned sessions - an agent that died mid-task, a subagent nobody
+    reaped - used to squat on the session cap until somebody closed them by
+    hand, and the cap error could not even say how long they had been idle.
+    Zero or negative disables the sweep; garbage falls back to the default.
+    """
+    try:
+        return max(0.0, float(os.getenv("WEB_SEARCH_NEO_SESSION_IDLE_TTL", "") or DEFAULT_SESSION_IDLE_TTL))
+    except ValueError:
+        return DEFAULT_SESSION_IDLE_TTL
+
+
+def _format_idle(seconds: float) -> str:
+    """Short human age for the cap error: 45s, 12m, 2h5m."""
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total}s"
+    if total < 3600:
+        return f"{total // 60}m"
+    return f"{total // 3600}h{(total % 3600) // 60}m"
+
+
+def _drop_idle_sessions() -> list[str]:
+    """Forget sessions idle past the TTL, busiest-first never.
+
+    Runs at the session cap next to the closed-tab sweep: a slot held by a
+    session nobody touched for half an hour is not work in progress. Sessions
+    mid-action are skipped rather than waited for - a thread is on them, so
+    they are neither idle nor safe to pull the browser out from under. What is
+    forgotten is torn down like a close: the tab closes only if we opened it,
+    a borrowed tab goes back to the user detached.
+    """
+    ttl = _idle_ttl_seconds()
+    if ttl <= 0:
+        return []
+    cutoff = time.monotonic() - ttl
+    with _sessions_lock:
+        candidates = [
+            (session_id, session)
+            for session_id, session in _sessions.items()
+            if session.last_used < cutoff
+        ]
+    dropped: list[str] = []
+    for session_id, session in candidates:
+        if not session.lock.acquire(blocking=False):
+            continue
+        try:
+            with _sessions_lock:
+                if _sessions.get(session_id) is not session:
+                    continue
+                del _sessions[session_id]
+                request_mocks.forget(session_id)
+            logger.info(
+                "Dropped idle session '%s' after %s without use",
+                session_id, _format_idle(time.monotonic() - session.last_used),
+            )
+            try:
+                if session.owns_tab and hasattr(session.driver, "close_tab"):
+                    session.driver.close_tab()
+            except Exception:
+                pass
+            try:
+                if session.owns_browser:
+                    session.driver.quit()
+                else:
+                    session.driver.service.stop()
+            except Exception:
+                pass
+            _release_claimed_tab(session.current_tab_id)
+            dropped.append(session_id)
+        finally:
+            try:
+                session.lock.release()
+            except Exception:
+                pass
+    return dropped
+
+
 def _create_session(
     session_id: str,
     width: int,
@@ -753,15 +837,25 @@ def _create_session(
                         for name, item in _sessions.items()
                         if item.agent_label
                     }
+                    now = time.monotonic()
+                    idle = {
+                        name: _format_idle(now - item.last_used)
+                        for name, item in sorted(
+                            _sessions.items(), key=lambda kv: kv[1].last_used
+                        )
+                    }
                     raise RuntimeError(
                         f"Maximum of {cap} browser sessions reached; close one first. "
                         f"Open: {sorted(_sessions)}."
                         + (f" Owners: {owners}." if owners else "")
+                        + f" Idle for: {idle}."
                         + (f" Least recently used: '{stalest}'." if stalest else "")
                         + " The cap counts every session in this MCP server, so parallel "
                         "agents share it; raise it with WEB_SEARCH_NEO_MAX_SESSIONS in the "
                         "server's environment, or in the companion extension's popup under "
-                        "Settings, if they all genuinely need a page at once."
+                        "Settings, if they all genuinely need a page at once. Sessions idle "
+                        "past WEB_SEARCH_NEO_SESSION_IDLE_TTL (default 30m) are reaped "
+                        "automatically when the cap is hit."
                         + (
                             " The current cap comes from the companion popup."
                             if cap_source == "companion"
@@ -809,6 +903,7 @@ def _create_session(
                 break
         swept = True
         _drop_sessions_whose_tab_is_gone()
+        _drop_idle_sessions()
     session: BrowserSession | None = None
     driver: Any = None
     claim: dict[str, Any] = {}
@@ -954,6 +1049,60 @@ def _discard_stale_session(session_id: str, session: BrowserSession) -> None:
         if _sessions.get(session_id) is session:
             del _sessions[session_id]
             request_mocks.forget(session_id)
+
+
+# The text Chrome (and the companion bridge repeating it) uses when a call
+# addresses a tab that is no longer there: closed by hand, discarded, or
+# replaced under the session by a navigation the debugger did not follow.
+_STALE_TAB_MARKERS = (
+    "no tab with given id",
+    "no such window",
+    "no such target",
+    "target closed",
+    "web view not found",
+    "no webview",
+)
+
+
+def _is_stale_tab_error(exc: BaseException) -> bool:
+    """Whether this failure reads like an address to a dead tab."""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in text for marker in _STALE_TAB_MARKERS)
+
+
+def translate_stale_tab_error(
+    session_id: str | None, exc: BaseException
+) -> BaseException:
+    """Turn a dead-tab failure into a session-lost error the caller can act on.
+
+    ``No tab with given id`` names a Chrome target, not the caller's problem:
+    the session's tab is gone, so the session is dropped and the error says to
+    open the page again under the same id. Anything else passes through
+    untouched - a different session, a tab that is still alive (a transient
+    addressing failure keeps its original text), a link that never answered
+    (nothing proven about the tab), and every non-tab error.
+    """
+    if not session_id or not _is_stale_tab_error(exc):
+        return exc
+    try:
+        _validate_session_id(session_id)
+    except Exception:
+        return exc
+    with _sessions_lock:
+        session = _sessions.get(session_id)
+    if session is None or session.profile_mode != "current":
+        return exc
+    # One probe, and only on this failure path: the happy path pays nothing.
+    if _tab_still_exists(session) is not False:
+        return exc
+    _discard_stale_session(session_id, session)
+    return ValueError(
+        f"Browser session '{session_id}' lost its tab - it was closed or "
+        "discarded, so the tab id no longer names a page. The session has been "
+        "dropped rather than driving whatever inherited its id. Open the page "
+        f'again: web_action [{{"action":"open","url":...,"session_id":"{session_id}"}}]. '
+        f"Original error: {type(exc).__name__}: {exc}"
+    )
 
 
 def _shared_session_note(session_id: str, session: BrowserSession) -> dict[str, Any]:
@@ -3435,6 +3584,11 @@ def _wait_after_action(driver: webdriver.Chrome, wait_seconds: float) -> None:
         pass
 
 
+# The cheapest observable-change signal for click(): the full page summary runs
+# after the click anyway, so only the before-state needs a read of its own.
+_PRE_CLICK_STATE_SCRIPT = "return {url: String(location.href), title: String(document.title)};"
+
+
 def click(
     selector: str | None = None,
     session_id: str = "default",
@@ -3465,6 +3619,12 @@ def click(
 
     ``frame_selector`` names the frame a CSS selector or coordinate pair is
     looked up in, exactly as it does for ``find`` and ``page_text``.
+
+    The answer carries the page before/after the click: ``page_changed`` is true
+    when the URL or title moved, and ``no_observable_change`` says the click
+    reported success while both stayed put - a menu, dialog, or in-place update
+    does that legitimately, so confirm the effect with page_text/page_elements
+    rather than clicking again.
     """
     if text is not None:
         if selector_must_be_unique:
@@ -3507,6 +3667,13 @@ def click(
     session = _get_session(session_id)
     with session.lock:
         started_ms = time.time() * 1000
+        # The URL/title before the click, read cheaply: a click that reports
+        # success while the page sits still is the oldest automation lie there
+        # is, and the summary below already reads the after-state.
+        try:
+            pre_click = session.driver.execute_script(_PRE_CLICK_STATE_SCRIPT) or {}
+        except Exception:
+            pre_click = {}
         _enter_action_frame(session.driver, frame_selector, selector)
         try:
             if selector_must_be_unique:
@@ -3556,18 +3723,30 @@ def click(
             # the settle, the page summary - is about the page as a whole.
             _release_action_frame(session.driver, frame_selector, selector)
         _wait_after_action(session.driver, wait_seconds)
-        return _note_stalled_submit(
-            session,
-            {
-                **_page_summary(session.driver, session_id),
-                "success": True,
-                "clicked": selector,
-                "frame_selector": frame_selector,
-                "trusted": trusted,
-                "selector_must_be_unique": selector_must_be_unique,
-            },
-            started_ms,
-        )
+        post = {
+            **_page_summary(session.driver, session_id),
+            "success": True,
+            "clicked": selector,
+            "frame_selector": frame_selector,
+            "trusted": trusted,
+            "selector_must_be_unique": selector_must_be_unique,
+        }
+        if pre_click:
+            changed = (post.get("url") != pre_click.get("url")) or (
+                post.get("title") != pre_click.get("title")
+            )
+            post["page_changed"] = changed
+            if not changed:
+                post["no_observable_change"] = True
+                post["change_note"] = (
+                    "URL and title are unchanged after the click. That is "
+                    "normal for a menu, dialog, checkbox, or in-place update - "
+                    "confirm the effect with page_text/page_elements instead "
+                    "of clicking again."
+                )
+        else:
+            post["page_changed"] = None
+        return _note_stalled_submit(session, post, started_ms)
 
 
 _ELEMENT_CENTER_SCRIPT = """
@@ -3608,17 +3787,42 @@ def execute_js(
     await_promise: bool = False, user_gesture: bool = False,
     retry_on_uncaught: bool = False, retries: int = 2,
     retry_delay_ms: int = 300, wait_ready: bool = False, timeout_seconds: float | None = None,
+    frame_selector: str | None = None,
 ) -> dict[str, Any]:
     """Run page JS once; retry only when explicitly safe. timeout_seconds extends the CDP await."""
     session = _get_session(session_id)
     with session.lock:
-        return _execute_script(
-            session.driver, script, args, await_promise=await_promise,
-            user_gesture=user_gesture, retry_on_uncaught=retry_on_uncaught,
-            retries=retries, retry_delay_ms=retry_delay_ms, wait_ready=wait_ready,
-            timeout_seconds=timeout_seconds, page_summary=lambda: _page_summary(session.driver, session_id),
-            wait_until_ready=_wait_until_ready, describe_error=_brief_error,
-        )
+        # A top-document script cannot see inside a cross-origin frame - the
+        # browser refuses, not us - which used to make results on framed pages
+        # silently partial. frame_selector enters one frame first (the bridge
+        # attaches to it, Selenium switches target), and the driver is handed
+        # back at the top document whatever happens, so the page summary below
+        # always reads the page, not the frame.
+        if frame_selector:
+            _select_frame(session.driver, frame_selector)
+
+        def _top_summary() -> dict[str, Any]:
+            if frame_selector:
+                try:
+                    session.driver.switch_to.default_content()
+                except Exception:
+                    pass
+            return _page_summary(session.driver, session_id)
+
+        try:
+            return _execute_script(
+                session.driver, script, args, await_promise=await_promise,
+                user_gesture=user_gesture, retry_on_uncaught=retry_on_uncaught,
+                retries=retries, retry_delay_ms=retry_delay_ms, wait_ready=wait_ready,
+                timeout_seconds=timeout_seconds, page_summary=_top_summary,
+                wait_until_ready=_wait_until_ready, describe_error=_brief_error,
+            )
+        finally:
+            if frame_selector:
+                try:
+                    session.driver.switch_to.default_content()
+                except Exception:
+                    pass
 
 
 _CLICK_TEXT_SCRIPT = page_perception.JS_LIBRARY + r"""
@@ -4012,7 +4216,29 @@ def type_text(
             if target
             else driver.execute_script("return document.activeElement")
         )
-        element.send_keys(text)
+        # The companion bridge serialises document.activeElement to a plain
+        # dict (CDP returnByValue has no element handle to hand back), so the
+        # focused control arrives without send_keys and the call used to die
+        # with AttributeError. Typing is still possible: focus what is focused
+        # and send the text through the input pipeline both drivers share.
+        send_keys = getattr(element, "send_keys", None)
+        if send_keys is None:
+            cdp = getattr(driver, "execute_cdp_cmd", None)
+            if cdp is None:
+                raise ValueError(
+                    "The focused control cannot receive text: the driver returned "
+                    f"{type(element).__name__} instead of a typable element. "
+                    "Pass a selector for the field to type into."
+                )
+            try:
+                driver.execute_script(
+                    "(document.activeElement || document.body).focus();"
+                )
+            except Exception:
+                pass
+            cdp("Input.insertText", {"text": text})
+        else:
+            send_keys(text)
         return _note_stalled_submit(
             session,
             {
@@ -4404,6 +4630,58 @@ def _resolve_piercing(driver: Any, locator: str) -> Any:
     )
 
 
+# An ambiguous CSS match used to mean "the first one wins" in silence: a fill
+# aimed at "the e-mail field" landed in whichever input came first. A trailing
+# ``[N]`` picks the Nth match in document order instead (0-based, so ``[0]`` is
+# the first): ``"input.qty[1]"`` is the second ``input.qty``. Only a bare
+# ``[digits]`` suffix counts - ``input[value="[0]"]`` ends in `"]`, and
+# ``div:nth-child(2)`` ends in `)`, so neither is mistaken for one - and the
+# form applies to plain CSS only, never to ref handles or ``>>>`` paths.
+_OCCURRENCE_RE = re.compile(r"^(?P<css>.+?)\[(?P<index>\d+)\]$")
+
+
+def _split_occurrence(locator: str) -> tuple[str, int | None]:
+    """Split ``css[N]`` into its selector and 0-based match index, if any."""
+    if page_perception.resolve_locator_expression(locator) is not None:
+        return locator, None
+    match = _OCCURRENCE_RE.match(locator.strip())
+    if match is None or not match.group("css").strip():
+        return locator, None
+    return match.group("css").strip(), int(match.group("index"))
+
+
+def _css_match_count(driver: Any, css: str) -> int:
+    """How many elements ``css`` matches right now, on either backend."""
+    try:
+        return int(
+            driver.execute_script(
+                "return document.querySelectorAll(arguments[0]).length;", css
+            )
+            or 0
+        )
+    except Exception:
+        return 0
+
+
+def _nth_element(driver: Any, css: str, index: int) -> Any:
+    """The Nth match of ``css``, or a ValueError naming how many matched."""
+    if getattr(driver, "is_extension_bridge", False):
+        if _css_match_count(driver, css) <= index:
+            raise ValueError(
+                f"Selector '{css}[{index}]' matches "
+                f"{_css_match_count(driver, css)} element(s), so there is no "
+                f"match {index}. Omit [N] for the first match, or lower N."
+            )
+        return ChromeBridgeElement(driver, css, index)
+    found = driver.find_elements(By.CSS_SELECTOR, css)
+    if len(found) <= index:
+        raise ValueError(
+            f"Selector '{css}[{index}]' matches {len(found)} element(s), so "
+            f"there is no match {index}. Omit [N] for the first match, or lower N."
+        )
+    return found[index]
+
+
 def _resolve_element(driver: Any, locator: str) -> Any:
     """Find one element from a CSS selector, a ``ref:<epoch>:N``, or a piercing path.
 
@@ -4414,10 +4692,17 @@ def _resolve_element(driver: Any, locator: str) -> Any:
     that frame and **left there**, because an element handed over from another
     browsing context is refused as stale; whoever acts on the element calls
     ``_leave_element_frame`` afterwards.
+
+    A plain-CSS locator may carry an occurrence suffix - ``input.qty[1]`` is
+    the second match in document order (0-based) - resolved through
+    ``_nth_element`` so an ambiguous match is chosen explicitly, never silently.
     """
     expression = page_perception.resolve_locator_expression(locator)
     if expression is None:
-        return driver.find_element(By.CSS_SELECTOR, locator)
+        css, occurrence = _split_occurrence(locator)
+        if occurrence is None:
+            return driver.find_element(By.CSS_SELECTOR, locator)
+        return _nth_element(driver, css, occurrence)
     if getattr(driver, "is_extension_bridge", False):
         raise ValueError(
             f"Locator '{locator}' needs a live element handle, which the companion "
@@ -4455,10 +4740,31 @@ def _wait_for_locator(driver: Any, locator: str, state: str, timeout: float) -> 
     """
     waited = f"waited {timeout:g}s"
     if page_perception.resolve_locator_expression(locator) is None:
-        return WebDriverWait(driver, timeout).until(
-            _ELEMENT_STATES[state]((By.CSS_SELECTOR, locator)),
-            f"Selector '{locator}' was still not {state} after {timeout:g}s",
-        )
+        css, occurrence = _split_occurrence(locator)
+        if occurrence is None:
+            return WebDriverWait(driver, timeout).until(
+                _ELEMENT_STATES[state]((By.CSS_SELECTOR, locator)),
+                f"Selector '{locator}' was still not {state} after {timeout:g}s",
+            )
+        # expected_conditions only address the first match, so an occurrence
+        # is polled by hand: the Nth control may render after the first ones.
+        deadline = time.monotonic() + timeout
+        failure = f"Selector '{css}[{occurrence}]' matched nothing yet"
+        while True:
+            try:
+                element = _nth_element(driver, css, occurrence)
+                if _element_reached_state(element, state):
+                    return element
+                failure = (
+                    f"Selector '{css}[{occurrence}]' never became {state}"
+                )
+            except ValueError as exc:
+                failure = str(exc)
+            except WebDriverException as exc:
+                failure = f"{type(exc).__name__}: {exc}"
+            if time.monotonic() >= deadline:
+                raise TimeoutException(f"{failure} ({waited})")
+            time.sleep(0.1)
     if getattr(driver, "is_extension_bridge", False):
         _resolve_element(driver, locator)  # raises the bridge-specific explanation
     deadline = time.monotonic() + timeout
@@ -4990,6 +5296,7 @@ def cookies(
     name: str | None = None,
     set_cookies: list[dict[str, Any]] | None = None,
     limit: int = 100,
+    offset: int = 0,
 ) -> dict[str, Any]:
     """Read, write, or clear cookies as full objects - flags included, so defenses read too.
 
@@ -5000,9 +5307,11 @@ def cookies(
     ``name``/``domain`` given.
 
     A real profile holds thousands of cookies, so ``get`` reports ``count`` for
-    everything that matched and returns at most ``limit`` of them. Filter by
-    ``domain`` rather than raising the limit: the answer to "what is this site
-    setting" is never the other four thousand cookies.
+    everything that matched and returns at most ``limit`` of them starting at
+    ``offset`` - ``count``/``returned``/``truncated`` tell whether another page
+    with a larger offset is needed. Filter by ``domain`` rather than raising the
+    limit: the answer to "what is this site setting" is never the other four
+    thousand cookies.
     """
     session = _get_session(session_id)
     with session.lock:
@@ -5015,12 +5324,16 @@ def cookies(
             if name:
                 found = [c for c in found if c.get("name") == name]
             kept = max(1, min(int(limit), 1000))
+            start = max(0, int(offset))
+            window = found[start:start + kept]
             return {
                 "success": True,
                 "session_id": session_id,
                 "count": len(found),
-                "truncated": len(found) > kept,
-                "cookies": found[:kept],
+                "offset": start,
+                "returned": len(window),
+                "truncated": len(found) > start + kept,
+                "cookies": window,
             }
         if op == "set":
             if not set_cookies:

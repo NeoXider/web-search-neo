@@ -22,6 +22,37 @@ def clip_result(value: Any) -> Any:
     return value
 
 
+def json_safe(value: Any, _depth: int = 0) -> Any:
+    """Replace live handles with descriptors so the result always serialises.
+
+    A script that returns a DOM node hands Selenium a WebElement, and the MCP
+    layer then had to guess how to carry it - the answer came back as an
+    object one call and as content parts the next, and a naive String() of an
+    object value read "[object Object]". Sanitising here fixes one contract:
+    ``value`` is always plain JSON, ``value_json`` always its string form.
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if _depth > 20:
+        return "[max depth]"
+    if isinstance(value, dict):
+        return {str(key): json_safe(item, _depth + 1) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item, _depth + 1) for item in value]
+    tag = getattr(value, "tag_name", None)
+    if tag is not None:
+        return {
+            "element": str(tag).lower(),
+            "note": "DOM elements are not serialisable; query their properties instead",
+        }
+    return {"unserialisable": f"{type(value).__name__}: {value!r}"[:2000]}
+
+
+def value_json(value: Any) -> str:
+    """The sanitised value as one JSON string, for callers that want text."""
+    return json.dumps(json_safe(value), ensure_ascii=False, default=str)
+
+
 def error_is_retryable(exc: Exception) -> bool:
     text = f"{type(exc).__name__}: {exc}".lower()
     return any(marker in text for marker in RETRYABLE_SCRIPT_ERRORS)
@@ -112,6 +143,8 @@ def execute(
                 continue
             return {**page_summary(), "success": False,
                     "error": describe_error(exc), "attempts": attempt}
+        safe = clip_result(json_safe(value))
         return {**page_summary(), "success": True,
-                "value": clip_result(value), "attempts": attempt}
+                "value": safe, "value_json": value_json(safe),
+                "attempts": attempt}
     raise AssertionError("at least one script attempt must run")

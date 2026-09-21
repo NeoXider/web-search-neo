@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import time
+from unittest.mock import Mock
 
 import pytest
 import requests
 
 from web_search_neo import main
+from web_search_neo.fetch import content as fetch_content
 from web_search_neo.web_client import request, validate_http_url
 
 
@@ -64,3 +66,137 @@ def test_request_raises_for_http_error(local_site):
     # Retried status codes surface as RetryError; non-retried 4xx/5xx as HTTPError.
     with pytest.raises(requests.RequestException):
         request(f"{local_site.base_url}/error", timeout_seconds=1)
+
+
+# --- Bug #4: fetch_text on JS-rendered SPA pages ------------------------------
+# A static fetch cannot run JS, so an SPA arrives as its shell (title, empty
+# mount node, bundled scripts). The fetch must say so explicitly instead of
+# silently returning title-only content as if it were the page.
+
+
+def _fake_html_response(html: str, url: str = "https://example.test/app",
+                        content_type: str = "text/html; charset=utf-8") -> Mock:
+    return Mock(status_code=200, url=url, headers={"Content-Type": content_type},
+                text=html, content=html.encode("utf-8"))
+
+
+def _fetch_html(html: str, **kwargs) -> str:
+    client = Mock(return_value=_fake_html_response(html))
+    return fetch_content._fetch_url_text("https://example.test/app", request_client=client, **kwargs)
+
+
+VITE_SHELL = (
+    "<html><head><title>TokenForge</title>"
+    '<script type="module" src="/src/main.tsx"></script></head>'
+    '<body><div id="root"></div></body></html>'
+)
+CRA_SHELL = (
+    "<html><head><title>TokenForge sign up</title></head><body>"
+    '<div id="root"></div><noscript>You need JavaScript.</noscript>'
+    '<script src="/static/js/main.ab12cd34.js"></script></body></html>'
+)
+NEXT_SHELL = (
+    "<html><head><title>octocat - GitHub</title></head><body>"
+    '<div id="__next"></div>'
+    '<script src="/_next/static/chunks/pages/profile-abc123.js"></script></body></html>'
+)
+VUE_SHELL = (
+    "<html><head><title>App</title></head><body>"
+    '<div id="app"></div><script src="/assets/index-xyz.js"></script></body></html>'
+)
+
+
+@pytest.mark.parametrize(
+    ("html", "text"),
+    [
+        (VITE_SHELL, "TokenForge"),
+        (CRA_SHELL, "TokenForge sign up"),
+        (NEXT_SHELL, "octocat - GitHub"),
+        (VUE_SHELL, "App"),
+        # A shell without even a title is still a shell.
+        ('<html><body><div id="root"></div>'
+         '<script src="/assets/index-xyz.js"></script></body></html>', ""),
+    ],
+)
+def test_spa_shell_detection_flags_mount_and_bundle_markers(html, text):
+    assert fetch_content.is_spa_shell(html, text) is True
+
+
+@pytest.mark.parametrize(
+    ("html", "text"),
+    [
+        # Long bundled page: real content, not a shell.
+        ('<html><head><title>Guide</title></head><body><div id="root">'
+         + "<p>Real paragraph. </p>" * 60 +
+         '</div><script src="/static/js/main.ab12.js"></script></body></html>',
+         "Guide\n" + "Real paragraph. \n" * 60),
+        # Tiny static page with no app markers: short, but not a shell.
+        ("<html><title>Relative</title><body>relative target</body></html>",
+         "Relative\nrelative target"),
+        # Inline scripts and styles alone are not an app bundle.
+        ("<html><head><script>window.secret = 'x';</script></head>"
+         "<body>hi</body></html>", "hi"),
+        # A tiny jQuery page is still a page, not an app shell.
+        ('<html><head><title>Club</title>'
+         '<script src="https://cdn.example.test/jquery.min.js"></script></head>'
+         "<body><p>Chess club meets Fridays.</p></body></html>",
+         "Club\nChess club meets Fridays."),
+        # A mount node carrying real text is server-rendered content.
+        ('<html><body><div id="root"><article><h1>Notes</h1><p>'
+         + "Word. " * 40 + "</p></article></div></body></html>",
+         "Notes\n" + "Word. " * 40),
+        # Not HTML at all (JSON echo, plain probe bodies).
+        ('{"ok": true}', '{"ok": true}'),
+        ("ok", "ok"),
+    ],
+)
+def test_spa_shell_detection_ignores_normal_pages(html, text):
+    assert fetch_content.is_spa_shell(html, text) is False
+
+
+@pytest.mark.parametrize("html", [VITE_SHELL, CRA_SHELL, NEXT_SHELL, VUE_SHELL])
+def test_fetch_url_text_marks_spa_shell_instead_of_returning_title_only(html):
+    text = _fetch_html(html)
+
+    # The shell text stays first (backward compatible), the pointer is added.
+    assert text.startswith(("TokenForge", "octocat", "App"))
+    assert "spa_suspected=true" in text
+    assert "SPA: use browser session" in text
+    assert "browser session" in text
+
+
+def test_fetch_url_text_leaves_plain_pages_unchanged():
+    html = ("<html><head><title>Plain</title></head>"
+            "<body><p>Hello world.</p></body></html>")
+
+    assert _fetch_html(html) == "Plain\nHello world."
+
+
+def test_fetch_url_text_truncation_does_not_fake_an_spa_signal():
+    # WHY this guard: max_chars applies to page content, so detecting on the
+    # truncated slice would flag every long page fetched with a small budget.
+    html = ("<html><head><title>Guide</title></head><body>"
+            + "<p>Real paragraph. </p>" * 200 +
+            '<script src="/static/js/main.ab12.js"></script></body></html>')
+
+    text = _fetch_html(html, max_chars=20)
+
+    assert "spa_suspected" not in text
+    assert "browser session" not in text
+    assert len(text) == 20
+
+
+def test_fetch_url_text_raw_mode_keeps_source_without_spa_notice():
+    text = _fetch_html(VITE_SHELL, mode="raw")
+
+    assert "main.tsx" in text
+    assert "spa_suspected" not in text
+
+
+def test_fetch_url_text_skips_spa_check_for_json_payloads():
+    client = Mock(return_value=_fake_html_response(
+        '{"root": "short"}', content_type="application/json"))
+    text = fetch_content._fetch_url_text(
+        "https://example.test/api", request_client=client)
+
+    assert "spa_suspected" not in text

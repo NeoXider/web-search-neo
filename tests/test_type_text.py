@@ -115,6 +115,62 @@ def test_type_text_refuses_empty_text():
         browser_tools.type_text("", session_id="tt-empty")
 
 
+class _BridgeTypeDriver:
+    """Mimics the companion bridge: activeElement arrives as a plain dict."""
+
+    is_extension_bridge = True
+
+    def __init__(self):
+        self.inserted: list[str] = []
+        self.focus_scripts = 0
+
+    def execute_script(self, script, *args):
+        if "focus()" in script:
+            self.focus_scripts += 1
+            return None
+        if "document.activeElement" in script:
+            return {"type": "object", "className": "HTMLInputElement"}
+        return {"url": "https://example.test/form", "title": "Form"}
+
+    def execute_cdp_cmd(self, command, params):
+        if command == "Input.insertText":
+            self.inserted.append(params["text"])
+        return {}
+
+    def quit(self):
+        return None
+
+
+class _DeadTypeDriver(_TypeDriver):
+    """Neither a typable element nor a CDP channel: must fail gracefully."""
+
+    def execute_script(self, script, *args):
+        if "document.activeElement" in script:
+            return {"type": "object", "className": "HTMLBodyElement"}
+        return {"url": "https://example.test/form", "title": "Form"}
+
+
+def test_type_text_bridge_dict_focus_falls_back_to_cdp_insert():
+    driver = _BridgeTypeDriver()
+    _register(driver, "tt-bridge")
+    result = browser_tools.type_text("hello", session_id="tt-bridge")
+    assert result["success"] is True
+    assert result["typed_into"] == "focused_element"
+    assert result["inserted"] == 5
+    assert driver.inserted == ["hello"]
+    assert driver.focus_scripts == 1
+
+
+def test_type_text_without_typable_element_or_cdp_is_graceful():
+    # _TypeDriver has no execute_cdp_cmd at all, and _DeadTypeDriver answers
+    # the focus query with a plain dict: no send_keys, no CDP channel.
+    driver = _DeadTypeDriver()
+    assert getattr(driver, "execute_cdp_cmd", None) is None
+    _register(driver, "tt-dead")
+    with pytest.raises(ValueError, match="cannot receive text"):
+        browser_tools.type_text("hello", session_id="tt-dead")
+
+
 def test_type_text_registered_in_contract():
     assert "type_text" in main._ACTIONS
     spec = main._ACTIONS["type_text"]

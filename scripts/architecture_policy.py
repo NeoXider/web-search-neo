@@ -7,10 +7,10 @@ architecture review. New production files always use the ordinary hard limit.
 SOFT_LIMIT = 600
 HARD_LIMIT = 800
 LEGACY_MAX_LINES = {
-    "web_search_neo/browser_tools.py": 8201,
-    "web_search_neo/main.py": 2706,
-    "web_search_neo/page_perception.py": 2632,
-    "web_search_neo/chrome_bridge.py": 2051,
+    "web_search_neo/browser_tools.py": 8514,
+    "web_search_neo/main.py": 2724,
+    "web_search_neo/page_perception.py": 2720,
+    "web_search_neo/chrome_bridge.py": 2055,
     "chrome-extension/service-worker.js": 1719,
     "web_search_neo/bridge_daemon.py": 1166,
     "web_search_neo/macros.py": 849,

@@ -1307,9 +1307,10 @@ class _BridgeService:
 class ChromeBridgeElement:
     """Small Selenium WebElement subset backed by a stable CSS selector."""
 
-    def __init__(self, driver: "ChromeBridgeDriver", selector: str) -> None:
+    def __init__(self, driver: "ChromeBridgeDriver", selector: str, index: int = 0) -> None:
         self.parent = driver
         self.selector = selector
+        self.index = max(0, int(index))
 
     @property
     def tag_name(self) -> str:
@@ -1534,7 +1535,10 @@ class ChromeBridgeDriver:
 
     def _argument_expression(self, value: Any) -> str:
         if isinstance(value, ChromeBridgeElement):
-            return f"document.querySelector({json.dumps(value.selector)})"
+            reference = json.dumps(value.selector, ensure_ascii=False)
+            if value.index:
+                return f"document.querySelectorAll({reference})[{value.index}]"
+            return f"document.querySelector({reference})"
         return json.dumps(value, ensure_ascii=False)
 
     def _wrap_script(self, script: str, args: tuple[Any, ...], asynchronous: bool) -> str:

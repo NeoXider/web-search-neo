@@ -280,7 +280,7 @@ is no automatic substitute. If you would rather not install an extension at all,
 `profile_mode="temporary"` and `profile_mode="persistent"` drive a Selenium
 browser that needs no companion.
 
-The bundled companion is version 1.18.1. Chrome does not refresh an unpacked
+The bundled companion is version 1.18.2. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. That only works for
@@ -691,7 +691,7 @@ visible while it is not, and stops believing it the moment the debugger detaches
 
 Two consequences worth knowing. A targeted keyboard action can change DOM focus
 inside the controlled background page, but it does not take OS focus or change the
-active user tab. In Companion 1.18.1, viewport screenshots capture one fresh PNG
+active user tab. In Companion 1.18.2, viewport screenshots capture one fresh PNG
 video frame with an 8-second frame deadline, then stop the owned recording. This
 does not activate tabs, restore windows, resize the viewport, or alter emulation.
 An existing recording or overlapping capture is refused. Full-page and region

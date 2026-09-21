@@ -139,7 +139,9 @@ if (includeLinks && enabledCategory('links')) {
   counts.links = links.length;
   output.links = links.slice(offset, offset + limit).map(a => Object.assign({
     selector: wsnSelector(a),
-    text: (a.innerText || a.getAttribute('aria-label') || '').trim(),
+    // An icon-only control renders no text; its title is the only name the
+    // caller can hover or match by, so it stands in for the missing words.
+    text: (a.innerText || a.getAttribute('aria-label') || a.getAttribute('title') || '').trim(),
     href: a.href
   }, visibility(a)));
 }
@@ -166,7 +168,9 @@ if (includeButtons && enabledCategory('buttons')) {
     selector: wsnSelector(button), tag: button.tagName.toLowerCase(),
     type: (button.getAttribute('type') || '').toLowerCase(), id: button.id || '',
     name: button.getAttribute('name') || '',
-    text: (button.innerText || button.value || button.getAttribute('aria-label') || '').trim(),
+    // Same icon-only rule as links above: a title-bearing button with no text
+    // is otherwise reported as usable with nothing to call it by.
+    text: (button.innerText || button.value || button.getAttribute('aria-label') || button.getAttribute('title') || '').trim(),
     disabled: !!button.disabled
   }, visibility(button)));
 }

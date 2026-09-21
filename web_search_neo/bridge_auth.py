@@ -72,6 +72,31 @@ def _windows_account() -> str | None:
     return f"{domain}\\{user}" if domain else user
 
 
+def _run_icacls(args: list[str]) -> tuple[int, str]:
+    """Run icacls and return ``(returncode, decoded stdout)``.
+
+    Output is read as bytes and decoded leniently: under ``PYTHONUTF8=1`` a
+    text-mode pipe decodes with UTF-8 and its reader thread dies on the console
+    codepage's non-ASCII bytes, leaving ``stdout`` as None (AttributeError at
+    every bridge handshake). A failed run reports -1 with an empty listing.
+    """
+    try:
+        completed = subprocess.run(
+            args,
+            capture_output=True,
+            timeout=15,
+            check=False,
+            creationflags=_CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        LOGGER.warning("Could not run icacls %s: %s", " ".join(args[1:]), exc)
+        return -1, ""
+    text = (completed.stdout or b"").decode("cp1251", "replace")
+    if completed.returncode != 0 and not text.strip():
+        text = (completed.stderr or b"").decode("cp1251", "replace")
+    return completed.returncode, text
+
+
 def restrict_to_current_user(path: Path) -> bool:
     """Make ``path`` readable by the current account only; True on success.
 
@@ -90,25 +115,16 @@ def restrict_to_current_user(path: Path) -> bool:
     if account is None:
         LOGGER.warning("Could not restrict %s: USERNAME is not set", path)
         return False
-    try:
-        completed = subprocess.run(
-            ["icacls", str(path), "/inheritance:r", "/grant:r", f"{account}:F"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-            creationflags=_CREATE_NO_WINDOW,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        LOGGER.warning("Could not restrict %s to %s: %s", path, account, exc)
-        return False
-    if completed.returncode != 0:
+    code, output = _run_icacls(
+        ["icacls", str(path), "/inheritance:r", "/grant:r", f"{account}:F"]
+    )
+    if code != 0:
         LOGGER.warning(
             "icacls could not restrict %s to %s (exit %s): %s",
             path,
             account,
-            completed.returncode,
-            (completed.stdout or completed.stderr or "").strip()[:200],
+            code,
+            output.strip()[:200],
         )
         return False
     # Newer icacls builds (Windows Server 2022 images included) keep explicit
@@ -116,21 +132,19 @@ def restrict_to_current_user(path: Path) -> bool:
     # strip every ACE that is not this account so the token stays single-user.
     user_name = account.rsplit("\\", 1)[-1].lower()
     for _ in range(3):
-        check = subprocess.run(
-            ["icacls", str(path)],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            creationflags=_CREATE_NO_WINDOW,
-        )
-        if check.returncode != 0:
+        code, listing = _run_icacls(["icacls", str(path)])
+        if code != 0:
             break
         foreign = []
-        for line in check.stdout.splitlines():
+        for line in listing.splitlines():
             entry = line.replace(str(path), "").strip()
             if ":" not in entry or "Successfully" in entry:
                 continue
             principal = entry.split(":(", 1)[0]
+            # Locale summary lines (Russian text) decode as non-ASCII; real ACE
+            # principals on this machine are ASCII.
+            if any(ord(ch) > 127 for ch in principal):
+                continue
             if principal.rsplit("\\", 1)[-1].lower() != user_name:
                 foreign.append(principal)
         if not foreign:
@@ -138,13 +152,7 @@ def restrict_to_current_user(path: Path) -> bool:
         args = ["icacls", str(path)]
         for principal in foreign:
             args += ["/remove:g", principal]
-        subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-            timeout=15,
-            creationflags=_CREATE_NO_WINDOW,
-        )
+        _run_icacls(args)
     return True
 
 

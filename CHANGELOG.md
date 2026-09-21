@@ -9,6 +9,22 @@
 - Honor per-call script timeouts with the Selenium transport as well as the Chrome bridge, restoring the original timeout after success or failure.
 - Save the companion presence preference before changing its active state, so failed storage writes can be retried.
 
+## 1.18.2
+
+Bugfix release: the twelve defects from the field report (`websearchneo-bugs.md`), each with regression tests.
+
+- `type_text` without a selector no longer dies with `AttributeError: 'dict' object has no attribute 'send_keys'` on the companion bridge, where `document.activeElement` arrives as a plain dict. It focuses the control and types through CDP `Input.insertText`; a driver with neither a typable element nor a CDP channel gets a clear `ValueError` instead of an internal exception.
+- A dead tab no longer reads as `Error: No tab with given id`. When a call lands on a tab that is gone, the session is dropped and the error says the session lost its tab with the exact `open` call to redo it; a tab that is still alive (or a companion that never answered) keeps the original error untouched.
+- `execute_js` has one result contract: `value` is always plain JSON (DOM nodes arrive as `{element: tag}` descriptors, never live handles) and `value_json` is the same value as one JSON string. It also accepts `frame_selector` to run inside one same- or cross-origin frame - a top-document script cannot see into cross-origin frames, so framed pages no longer get silently partial answers - and always hands the driver back at the top document.
+- `cookies get` pages with `offset` (`count`/`returned`/`truncated` describe the window), so the thousands of cookies past the old hard window are reachable.
+- `click` reports `page_changed`, and `no_observable_change` with a `change_note` when the URL and title sit still after a successful click, instead of a bare `success: true`.
+- The session-cap error names every holder's idle age (`Idle for:`), and sessions idle past `WEB_SEARCH_NEO_SESSION_IDLE_TTL` (default 30m, `0` disables) are reaped automatically when the cap is hit. Busy sessions are never reaped.
+- Fill and every other locator path accept an occurrence suffix - `input.qty[1]` is the second match in document order (0-based); an N past the match count is refused naming how many matched. The `fill` notes document `typing=true` as required for React-controlled inputs (no keystroke stream means `onChange` never runs).
+- `fetch_text` flags SPA shells with `spa_suspected=true` plus "SPA: use browser session" instead of silently returning title-only content.
+- `page_text mode="main"` falls back to the full body with `fallback_used=true` instead of returning a fractional sliver; `page_elements` prefers `data-testid`/stable ids/`aria-label`/`title` over React-generated ids and `nth-of-type` chains; late titles settle up to 2.5 s and otherwise come back as `null` with `title_pending=true`.
+- `icacls` output is decoded from bytes (`cp1251`) instead of text mode, so the bridge handshake no longer breaks under `PYTHONUTF8=1`, and non-ASCII locale summary lines are skipped when pruning foreign ACEs.
+- Architecture ratchets raised to the new file sizes after explicit review (browser_tools 8514, main 2724, page_perception 2720, chrome_bridge 2055); `web_info(topic='screenshot')` already covers the standalone-screenshot ask.
+
 ## 1.18.1
 
 - Capture current-Chrome viewports through a bounded single-frame screencast without activating tabs, restoring windows or changing page geometry. Stop owned captures and remove listeners after success, timeout or detach; refuse overlapping captures.

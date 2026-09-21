@@ -14,6 +14,8 @@ import json
 import re
 from typing import Any
 
+from web_search_neo.perception.titles import settle_document_title
+
 
 # ``ref:<epoch>:<N>`` is the only handle that resolves; ``ref:N`` still parses so
 # that an old transcript gets a real explanation instead of a CSS syntax error.
@@ -439,6 +441,21 @@ function wsnEscape(value) {
     : String(value).replace(/[^a-zA-Z0-9_-]/g, character => '\\' + character);
 }
 
+function wsnCssString(value) {
+  // An attribute value is quoted, not an identifier, so CSS.escape is the
+  // wrong tool: only the backslash and the quote can end the string early.
+  return String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+function wsnGeneratedId(id) {
+  // React's useId() spells its handles ':r0:' (':R1:' in some builds) and
+  // several toolchains emit '_R_mf5_'-style suffixes; every one of them is
+  // re-minted on re-render, so a path built on one names a different element
+  // next time - or none. A hand-written id never looks like this.
+  const value = String(id || '');
+  return /:r[0-9]/i.test(value) || value.indexOf('_R_') >= 0;
+}
+
 function wsnUnique(root, path, el) {
   // "Probably this element" is the failure this whole function exists to avoid:
   // a path that matches two nodes silently addresses whichever comes first.
@@ -448,6 +465,51 @@ function wsnUnique(root, path, el) {
   } catch (error) {
     return false;
   }
+}
+
+function wsnStepPart(node, root) {
+  // The most stable single step for this node, most stable first. A testing
+  // hook ([data-testid] and its aliases) is a promise between the app and its
+  // automation; a hand-written id is nearly as good; the accessible name is
+  // what an agent can also point at. A generated id is worse than nothing -
+  // it resolves today and lies tomorrow - so it is skipped exactly like no id
+  // at all, and the climb below falls back to something that survives.
+  const tag = node.tagName.toLowerCase();
+  const hooks = ['data-testid', 'data-qa', 'data-test', 'data-cy'];
+  for (const attr of hooks) {
+    const value = wsnAttr(node, attr);
+    if (!value) continue;
+    const bare = '[' + attr + '="' + wsnCssString(value) + '"]';
+    if (wsnUnique(root, bare, node)) return bare;
+    const qualified = tag + bare;
+    if (wsnUnique(root, qualified, node)) return qualified;
+  }
+  if (node.id && !wsnGeneratedId(node.id)) {
+    const byId = '#' + wsnEscape(node.id);
+    if (wsnUnique(root, byId, node)) return byId;
+  }
+  const labelled = wsnAttr(node, 'aria-label');
+  if (labelled) {
+    const candidate = tag + '[aria-label="' + wsnCssString(labelled) + '"]';
+    if (wsnUnique(root, candidate, node)) return candidate;
+  }
+  const named = wsnAttr(node, 'name');
+  if (named) {
+    const candidate = tag + '[name="' + wsnCssString(named) + '"]';
+    if (wsnUnique(root, candidate, node)) return candidate;
+  }
+  // An icon button renders no text, so its title is its whole accessible name;
+  // anywhere else the visible words (which CSS cannot select by) are what the
+  // caller will ask for, and a title there adds nothing.
+  const own = node.innerText === undefined ? node.textContent : node.innerText;
+  if (!wsnClean(own, 0)) {
+    const titled = wsnAttr(node, 'title');
+    if (titled) {
+      const candidate = tag + '[title="' + wsnCssString(titled) + '"]';
+      if (wsnUnique(root, candidate, node)) return candidate;
+    }
+  }
+  return tag;
 }
 
 function wsnSelector(el) {
@@ -467,17 +529,15 @@ function wsnSelector(el) {
   let local = '';
   while (node && node.nodeType === 1 && hops < 40) {
     hops += 1;
-    let part = node.tagName.toLowerCase();
-    if (node.id) {
-      const byId = '#' + wsnEscape(node.id);
-      if (wsnUnique(root, byId, node)) part = byId;
-    }
+    let part = wsnStepPart(node, root);
     // A direct child of a shadow root has no parentElement, and skipping the
     // sibling count there left two identical buttons sharing one bare tag - and
     // therefore no usable path at all, though nth-of-type separates them.
+    // A stable step above already names exactly one node, so only a bare tag
+    // still needs its siblings counted; generated ids never reach this point.
     const parent = node.parentElement;
     const container = parent || node.parentNode;
-    if (part.charAt(0) !== '#' && container && container.children) {
+    if (part === node.tagName.toLowerCase() && container && container.children) {
       const siblings = Array.prototype.filter.call(
         container.children, other => other.tagName === node.tagName
       );
@@ -491,7 +551,7 @@ function wsnSelector(el) {
       local = candidate;
       break;
     }
-    if (part.charAt(0) === '#') break;
+    if (part.charAt(0) === '#' || part.charAt(0) === '[') break;
     node = parent;
   }
   if (!local) return '';
@@ -1440,9 +1500,13 @@ def outline(
     if not isinstance(raw, dict):
         raise RuntimeError("Page outline script returned an unexpected result")
     nodes = [node for node in raw.get("nodes") or [] if isinstance(node, dict)]
+    # SPAs set document.title from JS after load, so an empty title at
+    # readyState complete means "not said yet", never "has none".
+    title, title_pending = settle_document_title(driver, raw.get("title", ""))
     summary = {
         "url": raw.get("url", ""),
-        "title": raw.get("title", ""),
+        "title": title,
+        "title_pending": title_pending,
         "dom_epoch": raw.get("dom_epoch", ""),
         "counts": raw.get("counts", {}),
         "frames": raw.get("frames", {}),
@@ -1534,6 +1598,13 @@ function wsnPickRoot(doc) {
     for (const child of el.children) visit(child, depth + 1);
   };
   if (doc.body) visit(doc.body, 0);
+  // The weight contest always crowns something, even when the page has no main
+  // content at all - three equal columns, a dashboard of widgets. A winner
+  // holding a minority of the page's words is that case, and returning it as
+  // the page reads exactly like a complete answer, so the body wins instead.
+  if (best && wsnTextLength(best) * 2 < bodyChars) {
+    best = null;
+  }
   return {
     root: best || doc.body,
     reason: best ? 'text-weight' : 'body',
@@ -1689,7 +1760,16 @@ let dialogsAppended = wsnAppendDialogs(root);
 // Emptiness is the only reliable signal: on a page that is one big <form> the
 // noise list eats everything, and an over-eager root guess does the same. Either
 // way the caller must not be handed a blank page with no way to tell why.
-if (!chunks.join('').trim() && document.body && (mainOnly || root !== document.body)) {
+// A sliver is the same failure with a less obvious symptom: a settings page
+// returned 64 characters of <main> while rendering 280, and nothing said the
+// rest existed. Whatever holds only a fraction of the rendered words is not
+// the main content, so it is re-read as the body and labelled as a fallback.
+const keptChars = wsnClean(chunks.join(''), 0).length;
+const renderedChars = (picked.body_chars || 0) + (frames.chars || 0);
+const keptSliver = keptChars > 0
+  && ((keptChars < 120 && renderedChars - keptChars > 150)
+    || (keptChars * 3 < renderedChars && renderedChars - keptChars > 200));
+if ((!chunks.join('').trim() || keptSliver) && document.body && (mainOnly || root !== document.body)) {
   chunks.length = 0;
   links.length = 0;
   frames.same_origin = 0;
@@ -1838,6 +1918,10 @@ def page_text(
     A page whose whole content is chrome - a login or checkout form - would come
     back empty, so an empty result is retried without the noise list and reported
     as ``fallback_used``.
+
+    A script-set title can lag behind ``readyState`` complete; when it does the
+    call waits briefly rather than answering ``""``, and reports
+    ``title_pending`` with a ``None`` title when nothing arrived in time.
     """
     selected_mode = str(mode or "main").strip().lower()
     if selected_mode not in {"main", "full"}:
@@ -1880,9 +1964,11 @@ def page_text(
     excluded_chars, excluded = _text_exclusions(
         raw, full_text, selected_mode, fallback_used, truncated, frames
     )
+    title, title_pending = settle_document_title(driver, raw.get("title", ""))
     return {
         "url": raw.get("url", ""),
-        "title": raw.get("title", ""),
+        "title": title,
+        "title_pending": title_pending,
         "mode": selected_mode,
         "mode_used": "full" if fallback_used else selected_mode,
         "fallback_used": fallback_used,
@@ -2325,11 +2411,13 @@ def find(
     )
     if not isinstance(raw, dict):
         raise RuntimeError("Element find script returned an unexpected result")
+    title, title_pending = settle_document_title(driver, raw.get("title", ""))
     return {
         "query": text,
         "role": wanted_role,
         "url": raw.get("url", ""),
-        "title": raw.get("title", ""),
+        "title": title,
+        "title_pending": title_pending,
         "dom_epoch": raw.get("dom_epoch", ""),
         "matches": raw.get("matches") or [],
         "low_confidence": bool(raw.get("low_confidence")),

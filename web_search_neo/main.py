@@ -26,7 +26,7 @@ from web_search_neo.fetch import api as fetch_api
 from web_search_neo.fetch import content as fetch_content
 
 
-__version__ = "1.18.1"
+__version__ = "1.18.2"
 
 log = configure_server_log()  # per-user state dir; see log_setup.py
 
@@ -881,6 +881,7 @@ async def browser_run_script(
     retry_on_uncaught: bool = False,
     retries: int = 2,
     retry_delay_ms: int = 300, wait_ready: bool = False, timeout_seconds: float | None = None,
+    frame_selector: str | None = None,
 ) -> dict[str, Any]:
     """Execute a JavaScript snippet in a session's page and return its value.
 
@@ -888,6 +889,7 @@ async def browser_run_script(
     framework state) and for mutations without an input-shaped equivalent.
     Runs once by default. Enable retry_on_uncaught only for scripts safe to repeat:
     a thrown exception may follow an already completed mutation. With await_promise=true pass timeout_seconds (capped at 600) when the promise may outlive the ~15 s default - e.g. while a human solves a captcha or a long network round-trip completes.
+    frame_selector runs the script inside one frame (same- or cross-origin); without it the script runs in the top document and cannot see cross-origin frames.
     """
     return await asyncio.to_thread(
         functools.partial(
@@ -900,6 +902,7 @@ async def browser_run_script(
             retry_on_uncaught=retry_on_uncaught,
             retries=retries,
             retry_delay_ms=retry_delay_ms, wait_ready=wait_ready, timeout_seconds=timeout_seconds,
+            frame_selector=frame_selector,
         )
     )
 
@@ -909,6 +912,7 @@ async def browser_execute_js(
     script: str,
     args: list[Any] | None = None,
     session_id: str = "default", await_promise: bool = False, timeout_seconds: float | None = None,
+    frame_selector: str | None = None,
 ) -> dict[str, Any]:
     """Run a JavaScript snippet and report what it returns (info-topic form)."""
     return await asyncio.to_thread(
@@ -917,6 +921,7 @@ async def browser_execute_js(
             script,
             args=args,
             session_id=session_id, await_promise=await_promise, timeout_seconds=timeout_seconds,
+            frame_selector=frame_selector,
         )
     )
 
@@ -1973,10 +1978,11 @@ async def browser_cookies(
     name: str | None = None,
     set_cookies: list[dict[str, Any]] | None = None,
     limit: int = 100,
+    offset: int = 0,
 ) -> dict[str, Any]:
     """Read, write, or clear cookies as full objects with flags (secure, httpOnly, sameSite)."""
     return await asyncio.to_thread(
-        browser_tools.cookies, op, session_id, domain, name, set_cookies, limit
+        browser_tools.cookies, op, session_id, domain, name, set_cookies, limit, offset
     )
 
 
@@ -2522,7 +2528,16 @@ async def web_info(
             f"Unsupported info topic: {topic}. Available: {sorted(_INFO_TOPICS)}"
         )
     validated = _validate_arguments(handler.__name__, f"topic '{topic}'", arguments)
-    return _stamp_now(await handler(**validated))
+    try:
+        return _stamp_now(await handler(**validated))
+    except Exception as exc:
+        # Info reads hit the same dead tabs actions do (a page_text right after
+        # the navigation that dropped the tab), so they get the same translation
+        # from a Chrome target id to a session-lost error with a way to recover.
+        sid = validated.get("session_id") if isinstance(validated, dict) else None
+        raise browser_tools.translate_stale_tab_error(
+            sid if isinstance(sid, str) and sid.strip() else None, exc
+        ) from exc
 
 
 @mcp.tool()
@@ -2627,6 +2642,9 @@ async def _execute_actions(
             # burst where one click never landed is exactly what a watching
             # human wants to catch.
             await _mark_agent_presence(spec.tool_name, action_name, arguments, ok=False)
+            exc = browser_tools.translate_stale_tab_error(
+                _step_session(spec.tool_name, arguments), exc
+            )
             results.append(
                 {
                     "index": index,

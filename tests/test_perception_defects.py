@@ -17,6 +17,7 @@ from selenium.webdriver.common.by import By
 
 from web_search_neo import browser_tools
 from web_search_neo import page_perception
+from web_search_neo.perception.titles import settle_document_title
 
 
 def _open_or_skip(path: str, session_id: str):
@@ -1179,3 +1180,206 @@ def test_perception_and_input_aim_through_the_same_frame_map(local_site):
         )
     finally:
         browser_tools.close_session("defect-frame-agree")
+
+
+# ---------------------------------------------------------------------------
+# Bug #5: mode="main" must not hand over a sliver as if it were the page
+# ---------------------------------------------------------------------------
+
+
+def test_main_mode_never_returns_a_sliver_without_saying_so(local_site):
+    """Bug #5: github.com/settings/sessions answered 64 chars of <main> for a page
+    rendering 280, and nothing said the rest existed.
+
+    However the narrow read is produced - a landmark rejected at pick time in
+    favour of the real container, or a fallback after the walk - the caller must
+    either get a substantial text or a fallback flag saying the text is the whole
+    body. A bare sliver with no flag is the defect.
+    """
+    driver = _open_or_skip(f"{local_site.base_url}/page", "defect-text-sliver")
+    try:
+        driver.execute_script(
+            "document.body.innerHTML ="
+            " '<main><h1>Sessions</h1><p>SLIVER-BODY active sessions.</p></main>'"
+            " + '<div id=\"app\"><h1>Settings</h1><p>REAL-BODY '"
+            " + 'the rest of the settings page '.repeat(20) + '</p></div>';"
+        )
+        full = page_perception.page_text(driver, mode="full")
+        main = page_perception.page_text(driver, mode="main")
+        assert "REAL-BODY" in full["text"]
+        assert "REAL-BODY" in main["text"], (
+            "the tiny landmark was taken for the main content and the page lost"
+        )
+        assert main["chars"] > 0
+        sliver = main["chars"] * 3 < len(full["text"])
+        assert main["fallback_used"] or not sliver, (
+            f"mode='main' returned {main['chars']} chars for a "
+            f"{len(full['text'])}-char page with no fallback flag"
+        )
+    finally:
+        browser_tools.close_session("defect-text-sliver")
+
+
+def test_main_mode_falls_back_when_chrome_is_all_the_landmark_holds(local_site):
+    """Bug #5 continued: a <main> of a heading plus one big <form> walks to a sliver.
+
+    The landmark holds most of the page's words at pick time, so it is picked;
+    the walk then drops the form as chrome and keeps the heading. The sliver
+    that remains is re-read as the body, and the flag says so.
+    """
+    driver = _open_or_skip(f"{local_site.base_url}/page", "defect-text-form-main")
+    try:
+        driver.execute_script(
+            "document.body.innerHTML ="
+            " '<main><h1>Sign in</h1><form id=\"login\"><p>FORM-BODY '"
+            " + 'field label text '.repeat(60) + '</p></form></main>';"
+        )
+        main = page_perception.page_text(driver, mode="main")
+        assert main["fallback_used"] is True
+        assert main["mode_used"] == "full"
+        assert "FORM-BODY" in main["text"], (
+            "the fallback must recover the form text the narrow walk dropped"
+        )
+    finally:
+        browser_tools.close_session("defect-text-form-main")
+
+
+def test_main_mode_on_landmark_less_pages_keeps_substantial_content(local_site):
+    """Bug #5: with no landmarks the weight contest must not crown a minority slice.
+
+    Three equal columns share the page evenly, so no container is the main
+    content and the honest answer is the body with all three markers in it.
+    """
+    driver = _open_or_skip(f"{local_site.base_url}/page", "defect-text-nolandmark")
+    try:
+        driver.execute_script(
+            "document.body.innerHTML = '<div class=\"col\"><p>COLUMN-A '"
+            " + 'filler words '.repeat(25) + '</p></div>'"
+            " + '<div class=\"col\"><p>COLUMN-B '"
+            " + 'filler words '.repeat(25) + '</p></div>'"
+            " + '<div class=\"col\"><p>COLUMN-C '"
+            " + 'filler words '.repeat(25) + '</p></div>';"
+        )
+        columns = page_perception.page_text(driver, mode="main")
+        for marker in ("COLUMN-A", "COLUMN-B", "COLUMN-C"):
+            assert marker in columns["text"], f"mode='main' dropped {marker}"
+        assert columns["fallback_used"] is False
+        assert columns["chars"] > 200
+
+        driver.execute_script(
+            "document.body.innerHTML = '<div id=\"side\"><p>SIDEBAR links</p></div>'"
+            " + '<div id=\"content\"><h1>Guide</h1><p>GUIDE-BODY '"
+            " + 'the actual article '.repeat(30) + '</p></div>';"
+        )
+        main = page_perception.page_text(driver, mode="main")
+        assert "GUIDE-BODY" in main["text"]
+        assert main["fallback_used"] is False
+        assert main["chars"] > 200
+    finally:
+        browser_tools.close_session("defect-text-nolandmark")
+
+
+# ---------------------------------------------------------------------------
+# Bug #8: suggested selectors must survive a React re-render
+# ---------------------------------------------------------------------------
+
+
+def test_page_elements_prefers_stable_selectors_over_generated_ids(local_site):
+    """Bug #8: ids like #_R_mf5_ are re-minted on every render; a selector built on
+    one resolves today and lies tomorrow. Testing hooks, the accessible name and
+    the icon's title survive, so they are what the answer suggests - and every
+    suggestion must resolve to its element.
+    """
+    driver = _open_or_skip(f"{local_site.base_url}/page", "defect-elements-stable")
+    try:
+        driver.execute_script(
+            "document.body.innerHTML ="
+            " '<button data-testid=\"save-btn\" id=\"_R_mf5_\" aria-label=\"Save\">Save</button>'"
+            " + '<button id=\"_R_2iif5_\" title=\"Close dialog\">'"
+            " + '<svg width=\"10\" height=\"10\" aria-hidden=\"true\"></svg></button>'"
+            " + '<input data-testid=\"email-field\" id=\":r0:\" name=\"email\""
+            " placeholder=\"Email\">';"
+        )
+        elements = browser_tools.get_page_elements(session_id="defect-elements-stable")
+        buttons = {button["text"]: button for button in elements["buttons"]}
+        assert set(buttons) == {"Save", "Close dialog"}, (
+            f"the title-only icon button lost its name: {sorted(buttons)}"
+        )
+        assert buttons["Save"]["selector"] == '[data-testid="save-btn"]'
+        assert buttons["Close dialog"]["selector"] == 'button[title="Close dialog"]'
+        assert "[data-testid=\"email-field\"]" in {
+            field["selector"] for field in elements["fields"]
+        }
+        suggested = [button["selector"] for button in elements["buttons"]] + [
+            field["selector"] for field in elements["fields"]
+        ]
+        leaked = [
+            selector
+            for selector in suggested
+            if "_R_" in selector or ":r" in selector.lower()
+        ]
+        assert not leaked, f"generated ids leaked into suggested selectors: {leaked}"
+        # A suggested selector is a promise: each one must resolve to its element.
+        for selector in suggested:
+            assert browser_tools._resolve_element(driver, selector) is not None
+    finally:
+        browser_tools.close_session("defect-elements-stable")
+
+
+# ---------------------------------------------------------------------------
+# Bug #11: a title set by JS after load is pending, not missing
+# ---------------------------------------------------------------------------
+
+
+def test_settle_document_title_reports_pending_instead_of_an_empty_string():
+    """Bug #11 without a browser: a stub driver whose page never gains a title."""
+    probes = {"count": 0}
+
+    class _SilentDriver:
+        def execute_script(self, script, *args):
+            probes["count"] += 1
+            return {"title": "", "ready": "complete"}
+
+    started = time.monotonic()
+    title, pending = settle_document_title(_SilentDriver(), "", timeout_seconds=0.6)
+    assert title is None and pending is True
+    assert probes["count"] >= 2, "one read cannot tell 'late' from 'never'"
+    assert time.monotonic() - started < 30
+
+    class _LateDriver(_SilentDriver):
+        def execute_script(self, script, *args):
+            probes["count"] += 1
+            return {"title": "Hydrated" if probes["count"] > 5 else "", "ready": "complete"}
+
+    title, pending = settle_document_title(_LateDriver(), "")
+    assert (title, pending) == ("Hydrated", False)
+
+    # A title that is already there costs no wait and no flag.
+    assert settle_document_title(_SilentDriver(), "Present") == ("Present", False)
+
+
+def test_page_text_waits_for_a_script_set_title(local_site):
+    """Bug #11: github sets document.title from JS after readyState complete."""
+    driver = _open_or_skip(f"{local_site.base_url}/page", "defect-title-late")
+    try:
+        driver.execute_script(
+            "document.title = '';"
+            "setTimeout(() => { document.title = 'Late hydration title'; }, 400);"
+        )
+        result = page_perception.page_text(driver, mode="full")
+        assert result["title"] == "Late hydration title"
+        assert result["title_pending"] is False
+    finally:
+        browser_tools.close_session("defect-title-late")
+
+
+def test_page_text_marks_a_title_that_never_arrives(local_site):
+    """Bug #11: when nothing sets a title, null plus a flag beats a silent ""."""
+    driver = _open_or_skip(f"{local_site.base_url}/page", "defect-title-pending")
+    try:
+        driver.execute_script("document.title = '';")
+        result = page_perception.page_text(driver, mode="full")
+        assert result["title"] is None
+        assert result["title_pending"] is True
+    finally:
+        browser_tools.close_session("defect-title-pending")

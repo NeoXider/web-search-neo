@@ -92,6 +92,8 @@ _ACTION_NOTES = {
     },
     "fill": {
         "arguments": "fields is a map from fresh CSS selectors to values, e.g. fields={'#email': 'a@example.test'}, not a list or separate selector/value parameters.",
+        "occurrence": "A selector matching several controls fills the first; append [N] (0-based document order, e.g. 'input.qty[1]' for the second match) to choose explicitly. An N beyond the match count is refused naming how many matched.",
+        "typing_react": "typing=true is required for React-controlled, masked, or autocomplete inputs: without it the value is set but no keystroke/input stream fires, so the app never reacts (onChange never runs) and the write reads back as refused. Default false: plain inputs do not need the slower path.",
         "results": "filled took your value, field_values answers for every selector you sent including the failures, errors maps selector to the driver's own message, success=false if errors is non-empty.",
         "field_values": "null means nothing could be read back - the selector matched nothing, or the control is gone. A refused control reports what it still holds, so you can see the write did not land.",
         "checkbox": "1|yes|y|on|check|checked or 0|no|n|off|uncheck|unchecked|''; anything else is refused, and field_values reports a JSON boolean.",
@@ -184,8 +186,8 @@ _ACTION_NOTES = {
     },
     "execute_js": {
         "arguments": "params.script is a JavaScript function body, not code or an expression: use script='return document.title;' to read a result. Do not omit return.",
-        "scope": "Top document of the session's current tab only; reach into a frame from inside the script when you must.",
-        "result": "value is the JSON-serialisable return value, promise-awaited on the Chrome bridge driver; strings over 200k characters come back as {clipped, length, head}.",
+        "scope": "Top document of the session's current tab by default; frame_selector enters one frame first (same- or cross-origin - the bridge attaches to it, Selenium switches target) and the driver is left back at the top document. A top-document script cannot read a cross-origin frame - the browser refuses, not us - so a framed page needs frame_selector instead of a deeper querySelector.",
+        "result": "value is the JSON-serialisable return value, promise-awaited on the Chrome bridge driver; DOM elements arrive as {element: tag} descriptors, never live handles. value_json is the same value as one JSON string - read it whenever value is an object. Strings over 200k characters come back as {clipped, length, head}.",
         "prefer_actions": "Use fill/click/pointer for anything a user gesture should do; a script cannot simulate a trusted interaction.",
     },
     "game_probe": {

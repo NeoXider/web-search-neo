@@ -60,11 +60,16 @@ def test_allowed_dependencies_and_own_modules(source):
 
 # The 1.16.1 ceilings. A ratchet only ever moves down: raising one means
 # editing this table too, which is the explicit review the policy asks for.
+# Raised for the websearchneo-bugs fix batch (type_text bridge fallback,
+# stale-tab translation, execute_js value_json + frame_selector, cookies
+# offset, click page_changed, idle reap, css[N] occurrence, SPA flag, stable
+# selectors, title settle): feature work in legacy files, reviewed line by
+# line, no new cross-package imports.
 _RATCHET_CEILINGS = {
-    "web_search_neo/browser_tools.py": 8240,
-    "web_search_neo/main.py": 2713,
-    "web_search_neo/page_perception.py": 2632,
-    "web_search_neo/chrome_bridge.py": 2054,
+    "web_search_neo/browser_tools.py": 8514,
+    "web_search_neo/main.py": 2724,
+    "web_search_neo/page_perception.py": 2720,
+    "web_search_neo/chrome_bridge.py": 2055,
     "chrome-extension/service-worker.js": 1720,
     "web_search_neo/bridge_daemon.py": 1169,
     "web_search_neo/macros.py": 849,

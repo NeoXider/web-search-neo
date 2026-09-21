@@ -299,9 +299,12 @@ def test_a_companion_that_cannot_be_asked_condemns_nothing(monkeypatch):
 
 
 def test_the_cap_names_the_session_to_close(monkeypatch):
+    now = time.monotonic()
     for index in range(browser_tools.MAX_SESSIONS):
         session = _register(f"live{index}", _Tab(index, _Bridge()))
-        session.last_used = 100.0 + index
+        # Recent enough to survive the idle reap: this test is about the cap
+        # naming names, not about the TTL. live0 stays the stalest.
+        session.last_used = now - 10 - (browser_tools.MAX_SESSIONS - index)
     monkeypatch.setattr(browser_tools, "create_driver", lambda *a, **k: _Tab(99))
 
     with pytest.raises(RuntimeError) as failure:
@@ -535,6 +538,86 @@ def test_the_full_session_cap_names_the_setting_that_lifts_it(monkeypatch):
     assert "parallel agents" in str(refusal.value)
 
 
+# Idle slots belong to nobody: a session no agent touched for longer than
+# WEB_SEARCH_NEO_SESSION_IDLE_TTL is reaped when the cap is hit, and the cap
+# error names how long each holder has been idle so the reader can pick.
+
+
+def test_idle_ttl_parsing_and_default(monkeypatch):
+    monkeypatch.delenv("WEB_SEARCH_NEO_SESSION_IDLE_TTL", raising=False)
+    assert browser_tools._idle_ttl_seconds() == 1800.0
+    monkeypatch.setenv("WEB_SEARCH_NEO_SESSION_IDLE_TTL", "60")
+    assert browser_tools._idle_ttl_seconds() == 60.0
+    monkeypatch.setenv("WEB_SEARCH_NEO_SESSION_IDLE_TTL", "0")
+    assert browser_tools._idle_ttl_seconds() == 0.0
+    monkeypatch.setenv("WEB_SEARCH_NEO_SESSION_IDLE_TTL", "not a number")
+    assert browser_tools._idle_ttl_seconds() == 1800.0
+
+
+def test_format_idle_reads_as_ages():
+    assert browser_tools._format_idle(45) == "45s"
+    assert browser_tools._format_idle(12 * 60) == "12m"
+    assert browser_tools._format_idle(2 * 3600 + 5 * 60) == "2h5m"
+
+
+def test_idle_sessions_are_reaped_but_fresh_ones_survive(monkeypatch):
+    monkeypatch.setenv("WEB_SEARCH_NEO_SESSION_IDLE_TTL", "60")
+    old = _register("old", _Tab(1))
+    old.last_used = time.monotonic() - 3600
+    _register("fresh", _Tab(2))
+
+    assert browser_tools._drop_idle_sessions() == ["old"]
+    assert "old" not in browser_tools._sessions
+    assert "fresh" in browser_tools._sessions
+
+
+def test_idle_sweep_is_disabled_by_zero_ttl(monkeypatch):
+    monkeypatch.setenv("WEB_SEARCH_NEO_SESSION_IDLE_TTL", "0")
+    old = _register("ancient", _Tab(1))
+    old.last_used = time.monotonic() - 86400
+
+    assert browser_tools._drop_idle_sessions() == []
+    assert "ancient" in browser_tools._sessions
+
+
+def test_idle_sweep_skips_a_session_mid_action(monkeypatch):
+    monkeypatch.setenv("WEB_SEARCH_NEO_SESSION_IDLE_TTL", "60")
+    session = _register("busy", _Tab(9))
+    session.last_used = time.monotonic() - 3600
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hold():
+        with session.lock:
+            holding.set()
+            assert release.wait(10)
+
+    worker = threading.Thread(target=hold)
+    worker.start()
+    try:
+        assert holding.wait(5)
+        assert browser_tools._drop_idle_sessions() == []
+        assert "busy" in browser_tools._sessions
+    finally:
+        release.set()
+        worker.join(timeout=10)
+
+
+def test_the_full_session_cap_reports_idle_ages(monkeypatch):
+    for index in range(browser_tools.MAX_SESSIONS):
+        session = _register(f"agent{index}", _Tab(index + 1))
+        session.last_used = time.monotonic() - index * 60
+    with pytest.raises(RuntimeError) as refusal:
+        browser_tools._create_session(
+            "one-too-many", 1440, 900, False, "current", None, None, None,
+            browser_tools.DEFAULT_TAB_GROUP,
+        )
+    text = str(refusal.value)
+    assert "Idle for:" in text
+    assert "agent0" in text
+    assert "WEB_SEARCH_NEO_SESSION_IDLE_TTL" in text
+
+
 # What the real client and the real driver do, which is the only thing that
 # makes the fakes above worth anything: two of the tests here were green over
 # live defects because the fakes were kinder than the code they stood in for.
@@ -584,3 +667,59 @@ def test_the_real_driver_passes_on_a_detach_that_worked():
     driver.tab_id = 42
 
     assert driver.quit() == {"detached": True, "id": 42}
+
+
+# A call that lands after the session's tab is gone fails with Chrome's target
+# id, not with anything naming the session. The translation below is what turns
+# "No tab with given id" into a dropped session plus a reopen instruction.
+
+
+def _dead_tab_error() -> ChromeBridgeError:
+    return ChromeBridgeError("No tab with given id 1537400923")
+
+
+def test_dead_tab_error_becomes_session_lost_with_reopen_guidance():
+    _register("lost", _Tab(tab_id=42, bridge=_Bridge(gone=True)))
+
+    translated = browser_tools.translate_stale_tab_error("lost", _dead_tab_error())
+
+    assert isinstance(translated, ValueError)
+    assert "lost its tab" in str(translated)
+    assert '"session_id":"lost"' in str(translated)
+    assert "No tab with given id" in str(translated)
+    # Dropped rather than left to drive whatever inherited the tab id.
+    assert "lost" not in browser_tools._sessions
+
+
+def test_live_tab_keeps_the_original_error():
+    _register("alive", _Tab(tab_id=42, bridge=_Bridge(gone=False)))
+    original = _dead_tab_error()
+
+    assert browser_tools.translate_stale_tab_error("alive", original) is original
+    assert "alive" in browser_tools._sessions
+
+
+def test_unreachable_companion_proves_nothing_and_keeps_the_error():
+    _register("dark", _Tab(tab_id=42, bridge=_Bridge(reachable=False)))
+    original = _dead_tab_error()
+
+    assert browser_tools.translate_stale_tab_error("dark", original) is original
+    assert "dark" in browser_tools._sessions
+
+
+def test_non_tab_errors_pass_through_untouched():
+    _register("other", _Tab(tab_id=42, bridge=_Bridge(gone=True)))
+    original = ValueError("boom")
+
+    assert browser_tools.translate_stale_tab_error("other", original) is original
+    assert "other" in browser_tools._sessions
+
+
+def test_unknown_and_non_current_sessions_pass_through():
+    original = _dead_tab_error()
+    assert browser_tools.translate_stale_tab_error("missing", original) is original
+    assert browser_tools.translate_stale_tab_error(None, original) is original
+
+    _register("owned", _Tab(), profile_mode="temporary", owns_browser=True, owns_tab=True)
+    assert browser_tools.translate_stale_tab_error("owned", original) is original
+    assert "owned" in browser_tools._sessions
