@@ -964,6 +964,7 @@ class ChromeBridge:
 
             {"name": "Chrome",              # what the companion calls itself
              "extension_version": "1.3.2",  # its manifest version
+             "code_hash": "ab12...",         # sha256 of the worker it runs, or None
              "browser_run": "9f3c...b1"}    # str | None, see below
 
         ``browser_run`` is a 32-character hex string minted by the companion once

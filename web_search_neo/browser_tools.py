@@ -49,6 +49,7 @@ from web_search_neo.chrome_bridge import (
 )
 from web_search_neo.chrome_bootstrap import (
     EXTENSION_DIR,
+    expected_code_hash,
     expected_extension_version,
     setup_current_chrome,
 )
@@ -1990,9 +1991,13 @@ def _companion_status() -> dict[str, Any]:
     """
     status = dict(get_chrome_bridge().status(0.0))
     expected = expected_extension_version()
-    running = str((status.get("browser") or {}).get("extension_version") or "")
+    browser = status.get("browser") or {}
+    running = str(browser.get("extension_version") or "")
+    live_hash = browser.get("code_hash")
+    disk_hash = expected_code_hash()
+    stale_code = bool(isinstance(live_hash, str) and disk_hash is not None and live_hash != disk_hash)
     allowlist = _expected_cdp_methods()
-    live_methods = (status.get("browser") or {}).get("allowed_cdp_methods")
+    live_methods = browser.get("allowed_cdp_methods")
     live_known = isinstance(live_methods, list) and all(isinstance(x, str) for x in live_methods)
     missing_methods = sorted(set(allowlist["methods"]) - set(live_methods)) if live_known else None
     status.update(
@@ -2000,7 +2005,10 @@ def _companion_status() -> dict[str, Any]:
         extension_directory=str(EXTENSION_DIR),
         expected_version=expected,
         running_version=running or None,
-        outdated=bool((running and expected and running != expected) or missing_methods),
+        stale_code=stale_code,
+        outdated=bool(
+            (running and expected and running != expected) or missing_methods or stale_code
+        ),
         live_allowed_cdp_methods=sorted(set(live_methods)) if live_known else None,
         missing_cdp_methods=missing_methods,
         cdp_capabilities_verified=live_known,
@@ -2019,11 +2027,18 @@ def _companion_status() -> dict[str, Any]:
             "extension."
         )
     elif status["outdated"]:
-        status["next"] = (
-            f"The connected companion is {running} but this server ships {expected}. "
-            "Press Reload on its card at chrome://extensions; run "
-            "setup_current_chrome for the exact steps."
-        )
+        if stale_code and not (running and expected and running != expected):
+            status["next"] = (
+                f"The connected companion reports {running}, but it is running "
+                "older code than its folder contains. Press Reload on its card at "
+                "chrome://extensions; run setup_current_chrome for the exact steps."
+            )
+        else:
+            status["next"] = (
+                f"The connected companion is {running} but this server ships {expected}. "
+                "Press Reload on its card at chrome://extensions; run "
+                "setup_current_chrome for the exact steps."
+            )
     else:
         status["next"] = None
     return status

@@ -134,7 +134,12 @@ globalThis.__handshake = async (socket, token, serverNonce = "5e".repeat(16)) =>
 globalThis.fetch = async () => {
   fetchCalls += 1;
   if (tokenSource === null) throw new TypeError("bridge-token.js is missing");
-  return {ok: true, status: 200, text: async () => tokenSource};
+  const body = tokenSource;
+  return {
+    ok: true, status: 200,
+    text: async () => body,
+    arrayBuffer: async () => new TextEncoder().encode(body).buffer,
+  };
 };
 
 class FakeSocket {
@@ -380,6 +385,7 @@ def _hello(
     nonce: str = "0f" * 16,
     role: str | None = "extension",
     run: str | None = None,
+    code_hash: str | None = None,
     protocol: int | None = None,
 ) -> str:
     message: dict = {
@@ -394,6 +400,8 @@ def _hello(
     # 1.3.2 sends and the daemon has to keep serving it.
     if run is not None:
         message["browser"]["browser_run"] = run
+    if code_hash is not None:
+        message["browser"]["code_hash"] = code_hash
     return json.dumps(message)
 
 
@@ -450,10 +458,16 @@ def _attached_client(daemon: BridgeDaemon, **kwargs):
 class _FakeCompanion:
     """The extension's half of the protocol, driven by a test instead of Chrome."""
 
-    def __init__(self, port: int, nonce: str = "0f" * 16, run: str | None = None) -> None:
+    def __init__(
+        self,
+        port: int,
+        nonce: str = "0f" * 16,
+        run: str | None = None,
+        code_hash: str | None = None,
+    ) -> None:
         self.socket = _companion_socket(port)
         websocket = self.socket
-        websocket.send(_hello(nonce, run=run))
+        websocket.send(_hello(nonce, run=run, code_hash=code_hash))
         challenge = json.loads(websocket.recv(timeout=5.0))
         # The challenge proves the daemon knows the same secret, not just the port.
         assert bridge_auth.verify(
@@ -811,6 +825,24 @@ def test_the_token_is_re_read_after_it_was_missing() -> None:
     assert outcome["failure"], "the first read should fail while the token file is absent"
     assert outcome["recovered"] == TEST_TOKEN
     assert "no usable token" in outcome["junk"]
+
+
+@requires_node
+def test_hello_carries_the_hash_of_the_code_this_worker_is_running() -> None:
+    """Same version, different code must be visible in hello before auth."""
+    import hashlib
+
+    outcome = _node_worker_eval(
+        _WORKER_READY
+        + "await worker.connect();\n"
+        "const socket = globalThis.__sockets[globalThis.__sockets.length - 1];\n"
+        "socket.onopen();\n"
+        "return JSON.parse(socket.sent[0]);",
+    )
+    assert outcome["type"] == "hello"
+    token_source = f'export const BRIDGE_TOKEN = "{TEST_TOKEN}";'
+    expected_hash = hashlib.sha256(token_source.encode("utf-8")).hexdigest()
+    assert outcome["browser"]["code_hash"] == expected_hash
 
 
 # The bridge port is closed for most of the day and Chrome logs every refused
@@ -1411,6 +1443,21 @@ def test_the_run_id_reaches_a_client_when_the_browser_arrives() -> None:
                 assert client.browser_run == "run-of-the-first-browser"
                 assert client.status()["browser"]["browser_run"] == "run-of-the-first-browser"
                 assert daemon.browser_info["browser_run"] == "run-of-the-first-browser"
+            finally:
+                companion.close()
+
+
+def test_the_code_hash_reaches_a_client_when_the_browser_arrives() -> None:
+    """Stale-code detection lives on the daemon side of this field."""
+    with _running_daemon() as daemon:
+        with _attached_client(daemon) as client:
+            companion = _FakeCompanion(
+                daemon.port, run="run-of-the-third-browser", code_hash="ab" * 32
+            )
+            try:
+                assert client.wait_connected(2.0)
+                assert client.status()["browser"]["code_hash"] == "ab" * 32
+                assert daemon.browser_info["code_hash"] == "ab" * 32
             finally:
                 companion.close()
 

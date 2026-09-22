@@ -231,3 +231,83 @@ def test_companion_icons_exist_at_the_sizes_the_manifest_promises():
         icon = chrome_bootstrap.EXTENSION_DIR / relative
         assert icon.is_file(), relative
         assert _png_size(icon) == (int(size), int(size)), relative
+
+
+class _StaleCodeBridge(_ConnectedBridge):
+    """Same manifest version, but the worker runs older code than its folder."""
+
+    def __init__(self):
+        super().__init__()
+        self.reloads = 0
+        self.code_hash = "old" * 16
+
+    def status(self, wait_seconds):
+        state = super().status(wait_seconds)
+        state["browser"]["code_hash"] = self.code_hash
+        return state
+
+    def request(self, method, params=None, timeout=20.0):
+        assert method == "runtime.reload"
+        self.reloads += 1
+        self.code_hash = chrome_bootstrap.expected_code_hash()
+        return {"reloading": True}
+
+
+class _StubbornStaleCodeBridge(_StaleCodeBridge):
+    """A build that predates runtime.reload, so a person still has to click."""
+
+    def request(self, method, params=None, timeout=20.0):
+        raise RuntimeError(f"Unknown bridge method: {method}")
+
+
+def test_companion_state_flags_stale_code_when_the_worker_runs_old_code(monkeypatch):
+    monkeypatch.setattr(chrome_bootstrap, "expected_code_hash", lambda: "disk" * 16)
+    state = chrome_bootstrap._companion_state(
+        {
+            "connected": True,
+            "browser": {
+                "extension_version": chrome_bootstrap.expected_extension_version(),
+                "code_hash": "old" * 16,
+            },
+        },
+        chrome_bootstrap.expected_extension_version(),
+    )
+    assert state["stale_code"] is True
+    assert state["ready"] is False
+    assert state["update_required"] is True
+
+
+def test_companion_state_stays_ready_when_the_worker_hash_matches(monkeypatch):
+    monkeypatch.setattr(chrome_bootstrap, "expected_code_hash", lambda: "disk" * 16)
+    state = chrome_bootstrap._companion_state(
+        {
+            "connected": True,
+            "browser": {
+                "extension_version": chrome_bootstrap.expected_extension_version(),
+                "code_hash": "disk" * 16,
+            },
+        },
+        chrome_bootstrap.expected_extension_version(),
+    )
+    assert state["stale_code"] is False
+    assert state["ready"] is True
+
+
+def test_setup_reloads_a_same_version_companion_running_stale_code(monkeypatch):
+    monkeypatch.setattr(chrome_bootstrap, "expected_code_hash", lambda: "disk" * 16)
+    bridge = _use_bridge(monkeypatch, _StaleCodeBridge())
+    result = chrome_bootstrap.setup_current_chrome()
+
+    assert bridge.reloads == 1
+    assert result["ready"] is True
+    assert result["update_required"] is False
+
+
+def test_setup_demands_a_click_when_the_stale_worker_cannot_self_update(monkeypatch):
+    monkeypatch.setattr(chrome_bootstrap, "expected_code_hash", lambda: "disk" * 16)
+    _use_bridge(monkeypatch, _StubbornStaleCodeBridge())
+    result = chrome_bootstrap.setup_current_chrome()
+
+    assert result["ready"] is False
+    assert result["update_required"] is True
+    assert any("Reload" in step for step in result["manual_steps"])

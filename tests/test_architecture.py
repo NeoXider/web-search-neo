@@ -66,11 +66,11 @@ def test_allowed_dependencies_and_own_modules(source):
 # selectors, title settle): feature work in legacy files, reviewed line by
 # line, no new cross-package imports.
 _RATCHET_CEILINGS = {
-    "web_search_neo/browser_tools.py": 8514,
+    "web_search_neo/browser_tools.py": 8529,
     "web_search_neo/main.py": 2724,
     "web_search_neo/page_perception.py": 2720,
-    "web_search_neo/chrome_bridge.py": 2055,
-    "chrome-extension/service-worker.js": 1720,
+    "web_search_neo/chrome_bridge.py": 2056,
+    "chrome-extension/service-worker.js": 1741,
     "web_search_neo/bridge_daemon.py": 1169,
     "web_search_neo/macros.py": 849,
 }

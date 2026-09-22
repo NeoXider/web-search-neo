@@ -1527,6 +1527,25 @@ async function startBrowserRun() {
   if (socket) socket.close();
 }
 
+// The manifest version is a promise about the folder; this hash is a promise
+// about what Chrome actually executed. An unpacked extension keeps running the
+// worker it loaded until someone presses Reload, so a folder that gained new
+// commands can sit behind an old worker whose version string still matches -
+// and only comparing code, not versions, sees it.
+async function selfCodeHash() {
+  try {
+    const response = await fetch(chrome.runtime.getURL("service-worker.js"));
+    const digest = await crypto.subtle.digest(
+      "SHA-256",
+      new Uint8Array(await response.arrayBuffer()),
+    );
+    return bytesToHex(new Uint8Array(digest));
+  } catch (error) {
+    console.warn("bridge: could not hash the companion code", error);
+    return null;
+  }
+}
+
 export async function connect() {
   if (!(await loadEnabled())) {
     connecting = false;
@@ -1538,11 +1557,13 @@ export async function connect() {
   connecting = true;
   let token = null;
   let run = null;
+  let codeHash = null;
   const nonce = newNonce();
   try {
     token = await loadBridgeToken();
     // Read last, and before the socket exists, because onopen cannot await.
     run = await browserRun();
+    codeHash = await selfCodeHash();
     if (!enabled) {
       connecting = false;
       setBadge(false);
@@ -1577,6 +1598,7 @@ export async function connect() {
       browser: {
         name: "Chrome",
         extension_version: chrome.runtime.getManifest().version,
+        code_hash: codeHash,
         allowed_cdp_methods: [...ALLOWED_CDP_METHODS].sort(),
         browser_run: run,
         max_sessions: maxSessions,

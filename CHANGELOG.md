@@ -9,6 +9,13 @@
 - Honor per-call script timeouts with the Selenium transport as well as the Chrome bridge, restoring the original timeout after success or failure.
 - Save the companion presence preference before changing its active state, so failed storage writes can be retried.
 
+## 1.18.3
+
+Detect a stale companion even when its manifest version matches. Chrome keeps running the service worker it loaded until someone presses Reload, so an unpacked extension whose folder gained new commands (such as `capture.viewport`) can report the current version while refusing the method with "Unknown bridge method". The companion now hashes its own service worker at connect and sends the digest in hello; the daemon compares it against the file on disk, flags `stale_code` in browser_status, and setup_current_chrome reloads the companion automatically when only the code is out of date.
+
+- `browser_status` reports `stale_code` alongside `outdated`.
+- `setup_current_chrome` self-reloads a same-version-but-stale companion instead of saying "Nothing to do".
+
 ## 1.18.2
 
 Bugfix release: the twelve defects from the field report (`websearchneo-bugs.md`), each with regression tests.

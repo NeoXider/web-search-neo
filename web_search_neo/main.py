@@ -26,7 +26,7 @@ from web_search_neo.fetch import api as fetch_api
 from web_search_neo.fetch import content as fetch_content
 
 
-__version__ = "1.18.2"
+__version__ = "1.18.3"
 
 log = configure_server_log()  # per-user state dir; see log_setup.py
 

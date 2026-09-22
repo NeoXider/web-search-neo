@@ -20,6 +20,7 @@ worker is too old to understand the request.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -48,6 +49,21 @@ def expected_extension_version() -> str:
         return str(json.loads((EXTENSION_DIR / "manifest.json").read_text(encoding="utf-8"))["version"])
     except Exception:
         return ""
+
+
+def expected_code_hash() -> str | None:
+    """SHA-256 of the service worker this clone ships, or None when unreadable.
+
+    The manifest version is a promise about the folder; the hash is a promise
+    about what Chrome actually executed. An unpacked extension keeps running
+    the worker it loaded until someone presses Reload, so a folder that gained
+    new commands can sit behind an old worker whose version string still
+    matches - and only this comparison sees it.
+    """
+    try:
+        return hashlib.sha256((EXTENSION_DIR / "service-worker.js").read_bytes()).hexdigest()
+    except Exception:
+        return None
 
 
 def manual_steps(extension_dir: Path | None = None) -> list[str]:
@@ -85,12 +101,19 @@ def _reload_companion(bridge: Any, expected_version: str) -> dict[str, Any]:
 
     replaced = (answer or {}).get("version") if isinstance(answer, dict) else None
     # The worker answers before it dies, so the old version is still on the wire
-    # here; only a later status read can tell whether the new one came back.
+    # here; only a later status read can tell whether the new one came back. A
+    # same-version companion with stale code comes back the same way: its hello
+    # carries the hash of what it now runs, and that must match the folder.
+    disk_hash = expected_code_hash()
     deadline = time.monotonic() + 15.0
     while time.monotonic() < deadline:
         status = bridge.status(1.0)
-        running = str((status.get("browser") or {}).get("extension_version") or "")
-        if status.get("connected") and running == expected_version:
+        browser = status.get("browser") or {}
+        running = str(browser.get("extension_version") or "")
+        live_hash = browser.get("code_hash")
+        version_ok = not expected_version or running == expected_version
+        hash_ok = disk_hash is None or not isinstance(live_hash, str) or live_hash == disk_hash
+        if status.get("connected") and version_ok and hash_ok:
             return {"self_update": "done", "replaced_version": replaced}
         # status() answers at once while the daemon knows the worker is gone,
         # so without a pause this loop spins a core for the whole deadline.
@@ -100,12 +123,22 @@ def _reload_companion(bridge: Any, expected_version: str) -> dict[str, Any]:
 
 def _companion_state(status: dict[str, Any], expected_version: str) -> dict[str, Any]:
     connected = bool(status.get("connected"))
-    running = str((status.get("browser") or {}).get("extension_version") or "")
+    browser = status.get("browser") or {}
+    running = str(browser.get("extension_version") or "")
     outdated = bool(connected and expected_version and running != expected_version)
+    live_hash = browser.get("code_hash")
+    disk_hash = expected_code_hash()
+    stale_code = bool(
+        connected
+        and isinstance(live_hash, str)
+        and disk_hash is not None
+        and live_hash != disk_hash
+    )
     return {
         "already_connected": connected,
-        "ready": connected and not outdated,
-        "update_required": outdated,
+        "ready": connected and not outdated and not stale_code,
+        "update_required": outdated or stale_code,
+        "stale_code": stale_code,
         "extension_version": expected_version or None,
         "connected_version": running or None,
     }
@@ -130,16 +163,22 @@ def _guidance(state: dict[str, Any], manifest_error: str) -> dict[str, Any]:
             ),
         }
     if state["update_required"]:
+        reason = (
+            f"The connected companion is {state['connected_version']} but this "
+            f"server ships {state['extension_version']}"
+            if not state.get("stale_code")
+            else "The connected companion reports the same version as this server, "
+                 "but it is running older code than its folder contains"
+        )
         return {
             "steps": reload_steps(),
             "next": (
-                f"The connected companion is {state['connected_version']} but this "
-                f"server ships {state['extension_version']}, and it could not be "
-                "reloaded from here. Chrome keeps running the service worker it "
-                "already loaded; builds before 1.3.1 cannot reload themselves and "
-                "builds 1.2.0 and older do not authenticate against the bridge at "
-                "all. Press Reload on the card to pick up the current build. Every "
-                "update after this one applies without a click."
+                f"{reason}, and it could not be reloaded from here. Chrome keeps "
+                "running the service worker it already loaded; builds before 1.3.1 "
+                "cannot reload themselves and builds 1.2.0 and older do not "
+                "authenticate against the bridge at all. Press Reload on the card "
+                "to pick up the current build. Every update after this one applies "
+                "without a click."
             ),
         }
     return {
