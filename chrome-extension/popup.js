@@ -102,6 +102,8 @@ function render(state) {
   presenceInput.checked = state.presence !== false;
   presenceInput.disabled = false;
   reconnectButton.disabled = !state.enabled;
+  // A worker that answered is alive again: undo the restart-only mode.
+  reconnectButton.textContent = "Reconnect";
   releaseButton.disabled = !state.controlled_tabs;
   tabsNode.textContent = String(state.controlled_tabs ?? 0);
   bridgeNode.textContent = String(state.bridge_url || "ws://127.0.0.1:8765")
@@ -204,10 +206,46 @@ function markRelease(text, state, title) {
   releaseChipNode.title = title || "Latest GitHub release vs this build";
 }
 
+// Chrome's answer when the extension's service worker is not running at all:
+// the popup is alive, the worker behind it is not, and every message is lost.
+// Nothing inside the worker can fix that - it is not there to run - but the
+// popup can restart the whole extension, which is exactly what pressing
+// Reload on chrome://extensions does.
+const WORKER_GONE = /Receiving end does not exist|Could not establish connection|No SW/i;
+let workerGone = false;
+
+function markWorkerGone(error) {
+  workerGone = true;
+  panelNode.dataset.state = "error";
+  statusNode.dataset.state = "error";
+  statusNode.textContent = "Companion stopped";
+  // The switches cannot reach a dead worker; Reconnect is the one control
+  // that still works, so it is the one left enabled.
+  enabledInput.disabled = true;
+  presenceInput.disabled = true;
+  reconnectButton.disabled = false;
+  reconnectButton.textContent = "Restart companion";
+  messageNode.textContent =
+    `The companion's background worker is not running (${error.message}). ` +
+    "Press Restart companion to reload it.";
+}
+
+function restartCompanion() {
+  messageNode.textContent = "Restarting the companion...";
+  // Closes this popup; the extension comes back with a fresh worker, which
+  // reconnects to the bridge on its own.
+  chrome.runtime.reload();
+}
+
 async function refresh() {
   try {
     render(await send("companion.status"));
+    workerGone = false;
   } catch (error) {
+    if (!PREVIEW && WORKER_GONE.test(error.message || "")) {
+      markWorkerGone(error);
+      return;
+    }
     panelNode.dataset.state = "error";
     statusNode.dataset.state = "error";
     statusNode.textContent = "Companion error";
@@ -299,11 +337,20 @@ presenceInput.addEventListener("change", async () => {
 });
 
 reconnectButton.addEventListener("click", async () => {
+  if (workerGone) {
+    restartCompanion();
+    return;
+  }
   messageNode.textContent = "Reconnecting...";
   try {
     render(await send("companion.reconnect"));
     setTimeout(refresh, 350);
   } catch (error) {
+    // The worker died between the last status read and this click.
+    if (!PREVIEW && WORKER_GONE.test(error.message || "")) {
+      markWorkerGone(error);
+      return;
+    }
     messageNode.textContent = error.message;
   }
 });

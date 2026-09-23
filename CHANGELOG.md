@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Recover a companion whose service worker is not running. When Chrome answers the popup with "Receiving end does not exist" (the bridge then sees "No SW" on every command), the switches cannot reach the worker at all and Reconnect used to fail silently. The popup now says the worker is stopped, disables the switches it cannot deliver, and turns Reconnect into "Restart companion", which calls `chrome.runtime.reload()` from the popup - the same as pressing Reload on chrome://extensions, without leaving the browser.
+
 - Keep ChromeDriver windowless for cached, uncached, and retry launches. Avoid passing Selenium a duplicate startup-info argument that previously forced an unprotected fallback. Test processes now also cover the native Windows multiprocessing spawn path.
 
 - Show the virtual cursor for ordinary selector clicks as well as coordinate input. Capture the target before it disappears, map iframe targets into the main viewport, restore a cursor removed by page updates, and recognize the public pointer-action names for click rings.
