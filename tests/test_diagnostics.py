@@ -667,21 +667,22 @@ def test_console_reports_what_a_replacement_document_logged_while_booting(local_
             headless=True,
             profile_mode="temporary",
         )
-        after = browser_tools.get_console("console-boot", limit=200)
+        # Reading moves nothing (1.19): the next page starts after the last one read.
+        after = browser_tools.get_console("console-boot", limit=200, since_seq=first["next_seq"])
         assert {"boot-log-second", "boot-warn-second", "boot-error-second"} <= _hooked_texts(after)
         assert after["cursor_reset"] is True
 
         # A reload is the same boundary with the same text on either side of it,
         # which is what a level restart looks like.
         browser_tools._get_session("console-boot").driver.refresh()
-        reloaded = browser_tools.get_console("console-boot", limit=200)
+        reloaded = browser_tools.get_console("console-boot", limit=200, since_seq=after["next_seq"])
         assert {"boot-log-second", "boot-warn-second", "boot-error-second"} <= _hooked_texts(
             reloaded
         )
         assert reloaded["cursor_reset"] is True
 
         # Reading twice inside one document still reports each entry once.
-        repeated = browser_tools.get_console("console-boot", limit=200)
+        repeated = browser_tools.get_console("console-boot", limit=200, since_seq=reloaded["next_seq"])
         assert _hooked_texts(repeated) == set()
         assert repeated["cursor_reset"] is False
     finally:
@@ -784,7 +785,7 @@ def test_console_replays_when_the_companion_backend_restarts_its_counter():
         # A navigation is not a boundary for this backend: one buffer serves the
         # whole tab, so the numbering carries on across it.
         driver.log("after-navigation")
-        second = browser_tools.get_console("fake-companion", limit=200)
+        second = browser_tools.get_console("fake-companion", limit=200, since_seq=first["next_seq"])
         assert [item["text"] for item in second["entries"]] == ["after-navigation"]
         assert second["cursor_reset"] is False
 
@@ -792,7 +793,7 @@ def test_console_replays_when_the_companion_backend_restarts_its_counter():
         # counter passes the old cursor is the failure being fixed here.
         driver.evict_worker()
         driver.log("after-the-worker-restarted")
-        third = browser_tools.get_console("fake-companion", limit=200)
+        third = browser_tools.get_console("fake-companion", limit=200, since_seq=second["next_seq"])
         assert [item["text"] for item in third["entries"]] == ["after-the-worker-restarted"]
         assert third["cursor_reset"] is True
     finally:

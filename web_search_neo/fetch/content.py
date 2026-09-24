@@ -7,6 +7,7 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from bs4.element import Tag
 
+from web_search_neo.fetch.decoding import decode_response
 from web_search_neo.fetch.safety import redact_url, write_download
 from web_search_neo.web_client import clamp_timeout
 
@@ -121,26 +122,30 @@ def _fetch_url_text(
     headers: dict[str, str] | None = None,
     save_to: str | None = None,
     overwrite: bool = False,
-    *, request_client: Any,
-) -> str:
+    *, request_client: Any, offset: int = 0, output: str = "text",
+) -> Any:
     """Fetch a URL as readable text, raw source, or straight to a file.
 
-    ``mode="text"`` (default) strips scripts/styles and returns readable text.
-    ``mode="html"``/``"raw"`` return the raw response body (for mining JS
-    bundles and markup without a browser). ``headers`` sends custom request
-    headers. ``save_to`` writes the raw bytes to a file inside the download
-    directory (fetch.safety) and returns a short confirmation instead of the
-    body; an existing file is only replaced with ``overwrite=True``.
-    When ``mode="text"`` sees an SPA shell (title-only text plus an empty
-    mount node or bundled JS), the shell text is kept and a
-    ``[spa_suspected=true] SPA: use browser session`` pointer is appended,
-    since a static fetch cannot render the real content.
+    ``mode="text"`` (default) strips scripts/styles and returns readable text;
+    ``"html"``/``"raw"`` return the source. The body is decoded like a browser
+    would (header charset, BOM, ``<meta charset>``, UTF-8, detection), so a page
+    served without a charset keeps its Cyrillic. Nothing is cut silently: text
+    past ``max_chars`` ends with a ``[truncated=true ...]`` line naming
+    ``next_offset`` (pass it as ``offset`` for the next part), and a body over the
+    byte budget says ``body_cut=true`` with the bytes read. ``output="json"``
+    returns the same as ``{text, status, final_url, content_type, charset_used,
+    total_chars, offset, returned_chars, truncated, next_offset, body_cut,
+    spa_suspected}``. An SPA shell (title-only text plus an app bundle) is
+    flagged with ``[spa_suspected=true]`` and the exact browser calls.
     """
     normalized_mode = str(mode or "text").strip().lower()
     if normalized_mode not in {"text", "html", "raw"}:
         raise ValueError("mode must be 'text', 'html', or 'raw'")
     log.info("Fetching text from %s", redact_url(url))
-    byte_limit = min(max(1_000_000, int(max_chars) * 8), 10_000_000)
+    # The window ends at offset + max_chars, so the byte budget has to reach it too,
+    # or a long page could never be read to its end.
+    wanted_chars = max(0, int(offset or 0)) + max(1, int(max_chars))
+    byte_limit = min(max(1_000_000, wanted_chars * 8), 20_000_000)
     extra: dict[str, Any] = {}
     if headers:
         if not isinstance(headers, dict):
@@ -149,29 +154,48 @@ def _fetch_url_text(
     response = request_client(
         url, timeout_seconds=clamp_timeout(timeout_seconds), max_response_bytes=byte_limit, **extra
     )
+    body_cut = getattr(response, "wsn_truncated", False) is True
+    final_url = str(getattr(response, "url", None) or url)
     if save_to:
         body = response.content
         resolved = write_download(str(save_to), body, overwrite=bool(overwrite))
-        return f"Saved {len(body)} bytes from {response.url} to {resolved}"
+        cut = f" (body_cut=true: only the first {len(body)} bytes arrived)" if body_cut else ""
+        return f"Saved {len(body)} bytes from {final_url} to {resolved}{cut}"
+    decoded, charset = decode_response(response)
+    spa_suspected = False
     if normalized_mode in {"html", "raw"}:
-        limit = max(1, min(int(max_chars), 500_000))
-        return response.text[:limit]
-    raw_html = response.text
-    soup = BeautifulSoup(raw_html, "html.parser")
-    for element in soup(["script", "style", "noscript", "template"]):
-        element.decompose()
-    full_text = soup.get_text(separator="\n", strip=True)
-    # WHY detect before truncating: a long page fetched with a small max_chars
-    # would otherwise look "almost empty" and earn a notice it does not need.
-    spa_suspected = _is_html_response(response) and is_spa_shell(raw_html, full_text)
+        full_text = decoded
+    else:
+        soup = BeautifulSoup(decoded, "html.parser")
+        for element in soup(["script", "style", "noscript", "template"]):
+            element.decompose()
+        full_text = soup.get_text(separator="\n", strip=True)
+        # Detected before cutting: a long page read in parts is not a shell.
+        spa_suspected = _is_html_response(response) and is_spa_shell(decoded, full_text)
+    start = max(0, int(offset or 0))
     limit = max(1, min(int(max_chars), 500_000))
-    text = full_text[:limit]
+    text = full_text[start:start + limit]
+    next_offset = start + len(text) if start + len(text) < len(full_text) else None
+    if output == "json":
+        headers_in = getattr(response, "headers", None) or {}
+        return {
+            "text": text, "status": getattr(response, "status_code", None), "final_url": final_url,
+            "content_type": str(headers_in.get("content-type", "") if hasattr(headers_in, "get") else ""),
+            "charset_used": charset, "total_chars": len(full_text), "offset": start,
+            "returned_chars": len(text), "truncated": next_offset is not None or body_cut,
+            "next_offset": next_offset, "body_cut": body_cut,
+            **({"bytes_read": len(response.content or b"")} if body_cut else {}),
+            "spa_suspected": spa_suspected,
+        }
+    # Fetch metadata is appended after the cut, so max_chars never hides it.
+    if next_offset is not None:
+        text += (f"\n\n[truncated=true returned {len(text)} of {len(full_text)} characters "
+                 f"from offset {start}; next_offset={next_offset}]")
+    if body_cut:
+        text += (f"\n\n[body_cut=true only the first {len(response.content or b'')} bytes of the "
+                 "response were read; the page is longer than the byte budget]")
     if spa_suspected:
-        # WHY appended after the limit: the notice is fetch metadata, not page
-        # content, so it must never be cut off by max_chars - and the original
-        # shell text stays first, keeping the str return a superset of before.
-        final_url = getattr(response, "url", None) or url
-        text += _spa_notice(str(final_url))
+        text += _spa_notice(final_url)
     return text
 
 
@@ -182,6 +206,7 @@ def _fetch_page_links(
     headers: dict[str, str] | None = None,
     *, request_client: Any,
 ) -> list[str]:
+    """Absolute links of one page; a last line starting with ``# `` says the list was cut."""
     log.info("Fetching links from %s", redact_url(url))
     extra: dict[str, Any] = {}
     if headers:
@@ -191,16 +216,26 @@ def _fetch_page_links(
     response = request_client(
         url, timeout_seconds=clamp_timeout(timeout_seconds), max_response_bytes=5_000_000, **extra
     )
-    soup = BeautifulSoup(response.text, "html.parser")
+    decoded, _charset = decode_response(response)
+    soup = BeautifulSoup(decoded, "html.parser")
     maximum = max(1, min(int(limit), 5000))
     links: list[str] = []
     seen: set[str] = set()
+    more = 0
     for anchor in soup.find_all("a", href=True):
         link = urljoin(response.url, str(anchor["href"]))
         if not link.startswith(("http://", "https://")) or link in seen:
             continue
         seen.add(link)
-        links.append(link)
         if len(links) >= maximum:
-            break
+            more += 1
+            continue
+        links.append(link)
+    # The answer stays a list of URLs; a cut is said in a last line that starts with
+    # "#" - never a URL, so a caller filtering on http(s) drops it and a reader sees it.
+    if more:
+        links.append(f"# truncated=true: returned {maximum} of {maximum + more} links; raise limit (max 5000)")
+    if getattr(response, "wsn_truncated", False) is True:
+        links.append(f"# body_cut=true: only the first {len(response.content or b'')} bytes of the page "
+                     "were read; links further down are missing")
     return links

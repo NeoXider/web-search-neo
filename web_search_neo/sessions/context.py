@@ -49,6 +49,12 @@ def apply_overrides(
         accuracy = float(geolocation.get("accuracy", 1.0))
         applied["geolocation"] = {"latitude": lat, "longitude": lng, "accuracy": accuracy}
         driver.execute_cdp_cmd("Emulation.setGeolocationOverride", applied["geolocation"])
+        # Without the permission getCurrentPosition answered "User denied Geolocation".
+        try:
+            driver.execute_cdp_cmd("Browser.grantPermissions", {"permissions": ["geolocation"]})
+            applied["geolocation"]["permission"] = "granted"
+        except Exception as exc:
+            applied["geolocation"]["permission"] = f"not granted: {type(exc).__name__}"
     return applied
 
 

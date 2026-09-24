@@ -56,12 +56,20 @@ from web_search_neo.chrome_bootstrap import (
 )
 from web_search_neo import captcha
 from web_search_neo import diagnostics
+from web_search_neo import network_log as _network_log
+from web_search_neo import console_log as _console_log
+from web_search_neo import frame_capture as _frame_capture
+from web_search_neo import frame_health as _frame_health
+from web_search_neo.sessions import roster as _roster
+from web_search_neo import page_guards as _page_guards
+from web_search_neo import script_results as _script_results
 from web_search_neo import key_table
 from web_search_neo import page_perception
 from web_search_neo.web_client import validate_http_url
 from web_search_neo.fetch.safety import redact_url, resolve_save_path, write_download
 from web_search_neo.actions.render_source import _RENDER_BOOTSTRAP_SCRIPT, _RENDER_CONTROL_SCRIPT
 from web_search_neo.actions.scripts import execute as _execute_script
+from web_search_neo.actions import scripts as _script_guard
 from web_search_neo.actions.stealth import stealth_source
 from web_search_neo.actions import verification as _verification
 from web_search_neo.actions import cookie_scope as _cookie_scope
@@ -73,7 +81,7 @@ from web_search_neo.actions.waits import (
     wait_for_condition as _poll_condition,
     wait_out_challenge as _wait_out_challenge,
 )
-from web_search_neo.cdp import request_mocks
+from web_search_neo.cdp import element_handles, request_mocks
 # Re-exported for tests that exercise the mock validator through this module.
 from web_search_neo.cdp.request_mocks import (  # noqa: F401
     _MOCK_BODY_LIMIT, _MOCK_STUB_SOURCE, _validate_mock,
@@ -81,7 +89,7 @@ from web_search_neo.cdp.request_mocks import (  # noqa: F401
 from web_search_neo.perception.challenge import _CHALLENGE_WIDGET_SCRIPT
 from web_search_neo.perception.action_scripts import (  # noqa: F401
     _CLICK_TEXT_SCRIPT, _FRAME_HIT_SCRIPT, _FRAME_MAP_SCRIPT, _GAME_PROBE_SCRIPT, _RENDER_STEP_SCRIPT,
-    _REPLAY_SCRIPT, _SCROLL_INTO_VIEW_SCRIPT, _SUBMIT_RESULT_SCRIPT, _SUBMIT_WATCH_SCRIPT,
+    _REPLAY_SCRIPT, _replay_window_note, _SCROLL_INTO_VIEW_SCRIPT, _SUBMIT_RESULT_SCRIPT, _SUBMIT_WATCH_SCRIPT,
     _SET_VALUE_SCRIPT, _FILE_INPUT_STATE_SCRIPT, _UPLOAD_TRACE_SCRIPT, _SCROLL_METRICS_SCRIPT, _POINTER_LOCK_SCRIPT, _POINTER_LOCK_STATUS_SCRIPT,
 )
 from web_search_neo.perception.elements import _ELEMENT_LIST_KEYS, _INSPECT_SCRIPT, _restate_element_ranges
@@ -756,16 +764,16 @@ def _drop_idle_sessions() -> list[str]:
                 "Dropped idle session '%s' after %s without use",
                 session_id, _format_idle(time.monotonic() - session.last_used),
             )
+            # A browser frozen by a script is stopped outright here too: quit() would wait 120 s.
+            forced = _script_guard.stop_hung_driver(session)
             try:
-                if session.owns_tab and hasattr(session.driver, "close_tab"):
+                if forced is None and session.owns_tab and hasattr(session.driver, "close_tab"):
                     session.driver.close_tab()
             except Exception:
                 pass
             try:
-                if session.owns_browser:
-                    session.driver.quit()
-                else:
-                    session.driver.service.stop()
+                if forced is None:
+                    session.driver.quit() if session.owns_browser else session.driver.service.stop()
             except Exception:
                 pass
             _release_claimed_tab(session.current_tab_id)
@@ -1908,6 +1916,7 @@ def _leave_claimed_tab(
     _remove_tab_label(session)
     _remove_tab_activity(session)
     _remove_agent_presence(session)
+    _page_guards.restore_dialogs(session)
     released = session.current_tab_id
     borrowed = session.driver
     driver = create_driver(
@@ -1938,6 +1947,7 @@ def _leave_claimed_tab(
     # Every buffer below is an account of the borrowed tab. Carrying it into the
     # new one would answer "what did this page do" with another page's history.
     session.console = ConsoleCursor()
+    session.console_history = []
     session.probe_console = ConsoleCursor()
     session.probe_console_seen = []
     session.browser_log = []
@@ -2073,6 +2083,7 @@ def open_page(
                     applied_overrides.get("geolocation") or geolocation
                 )
             _register_render_bootstrap(session)
+            _page_guards.setup_owned(session, session_id)  # own download folder, logged dialogs
             # Before the navigation, so the label script is already installed
             # when the new document's own scripts run.
             _apply_tab_label(session, session_id, label_tab=label_tab)
@@ -3299,6 +3310,9 @@ def _attach_files(driver: Any, element: Any, paths: list[str]) -> list[str]:
     that had just been made. The names are read back off the input for the same
     reason a filled value is: only the input knows what it ended up with.
     """
+    # The companion bridge holds the input itself for the whole attach (cdp/element_handles).
+    if (attach := getattr(driver, "attach_files", None)) is not None:
+        return attach(element, paths)
     state = driver.execute_script(_FILE_INPUT_STATE_SCRIPT, element) or {}
     if state.get("type") != "file":
         raise ValueError("Selector does not point to an input[type=file]")
@@ -3811,6 +3825,7 @@ def click(
                 "frame_selector": frame_selector,
                 "trusted": trusted,
                 "selector_must_be_unique": selector_must_be_unique,
+                **_page_guards.click_evidence(session, started_ms / 1000),
             }
             post.update(_verification.collect_click_effects(
                 session.driver, element if top_level else None, pre_click, post, measurable=top_level
@@ -3868,7 +3883,7 @@ def execute_js(
     retry_on_uncaught: bool = False, retries: int = 2,
     retry_delay_ms: int = 300, wait_ready: bool = False, timeout_seconds: float | None = None,
     frame_selector: str | None = None,
-    report_frames: bool = False,
+    report_frames: bool = False, max_chars: int | None = None, offset: int = 0, save_to: str | None = None,
 ) -> dict[str, Any]:
     """Run page JS once; retry only when explicitly safe. timeout_seconds extends the CDP await.
 
@@ -3911,6 +3926,7 @@ def execute_js(
                 timeout_seconds=timeout_seconds, page_summary=_top_summary,
                 wait_until_ready=_wait_until_ready, describe_error=_brief_error,
             )
+            answer = _script_results.shape(answer, save_to=save_to, offset=offset, max_chars=max_chars)
             # An empty answer on a framed page may be a script that looked for
             # something living in a cross-origin frame; say so (and only then,
             # so an ordinary call pays no extra round trip).
@@ -4010,7 +4026,8 @@ def click_text(
 
 _KEY_ALIASES = {
     "SPACE": Keys.SPACE,
-    "ENTER": Keys.ENTER,
+    "ENTER": Keys.RETURN,  # Keys.ENTER is Numpad Enter to chromedriver
+    "NUMPAD_ENTER": Keys.ENTER,
     "RETURN": Keys.RETURN,
     "ESC": Keys.ESCAPE,
     "ESCAPE": Keys.ESCAPE,
@@ -4077,10 +4094,15 @@ def _normalize_game_key(key: str) -> str:
     if len(value) == 1 and value.isprintable():
         return value
     alias = value.upper().replace("-", "_").replace(" ", "_")
-    if alias in _KEY_ALIASES:
-        return _KEY_ALIASES[alias]
+    alias = alias if alias in _KEY_ALIASES else (key_table.dom_key_name(value) or alias)
+    if alias in _KEY_ALIASES or len(alias) == 1:
+        return _KEY_ALIASES.get(alias, alias)
+    if alias.replace("_", "") in key_table.UNSENDABLE_KEYS:
+        raise ValueError(f"Unsupported key '{key}': {key_table.UNSENDABLE_KEYS[alias.replace('_', '')]}.")
     raise ValueError(
-        f"Unsupported key '{key}'; use a printable character or a named keyboard key"
+        f"Unsupported key '{key}'. Use one printable character, a DOM key/code name "
+        "(Enter, Tab, ArrowLeft, KeyW, Digit1, ShiftLeft, F5, Numpad1) or an alias "
+        "(SPACE, ESC, LEFT, CTRL); 'Control+Shift+K' is a chord."
     )
 
 
@@ -4372,6 +4394,7 @@ def press_keys(
     before lifting it, because an engine that polls key state in its loop cannot
     observe a press that was already released before the frame ran.
     """
+    keys = key_table.expand_chords(keys)
     if not keys or len(keys) > 8:
         raise ValueError("Provide 1-8 keys")
     selected_action = action.strip().lower()
@@ -4792,7 +4815,10 @@ def _resolve_element(driver: Any, locator: str) -> Any:
     A ref or a path may name something inside a frame. The driver is switched into
     that frame and **left there**, because an element handed over from another
     browsing context is refused as stale; whoever acts on the element calls
-    ``_leave_element_frame`` afterwards.
+    ``_leave_element_frame`` afterwards. The companion bridge has no element
+    handles: there a ref or a path is carried as the JS expression that finds
+    it, and the element is found again through it for every call
+    (``cdp/element_handles.resolve_locator``).
 
     A plain-CSS locator may carry an occurrence suffix - ``input.qty[1]`` is
     the second match in document order (0-based) - resolved through
@@ -4805,11 +4831,7 @@ def _resolve_element(driver: Any, locator: str) -> Any:
             return driver.find_element(By.CSS_SELECTOR, locator)
         return _nth_element(driver, css, occurrence)
     if getattr(driver, "is_extension_bridge", False):
-        raise ValueError(
-            f"Locator '{locator}' needs a live element handle, which the companion "
-            f"bridge cannot return. Use a CSS selector in current-Chrome mode. "
-            f"{_POINTER_FALLBACK_HINT}"
-        )
+        return element_handles.resolve_locator(driver, str(locator).strip(), expression, LocatorGone)
     if page_perception.REF_PATTERN.match(str(locator).strip()):
         return _resolve_ref(driver, str(locator).strip(), expression)
     return _resolve_piercing(driver, str(locator).strip())
@@ -4866,8 +4888,6 @@ def _wait_for_locator(driver: Any, locator: str, state: str, timeout: float) -> 
             if time.monotonic() >= deadline:
                 raise TimeoutException(f"{failure} ({waited})")
             time.sleep(0.1)
-    if getattr(driver, "is_extension_bridge", False):
-        _resolve_element(driver, locator)  # raises the bridge-specific explanation
     deadline = time.monotonic() + timeout
     failure = f"Locator '{locator}' never became {state}"
     while True:
@@ -4945,6 +4965,7 @@ def get_page_text(
     mode: str = "main",
     include_links: bool = False,
     frame_selector: str | None = None,
+    offset: int = 0,
 ) -> dict[str, Any]:
     """Return the readable text of the rendered page, not of its HTML source."""
     session = _get_session(session_id)
@@ -4953,7 +4974,7 @@ def get_page_text(
         try:
             _select_frame(driver, frame_selector)
             result = page_perception.page_text(
-                driver, max_chars=max_chars, mode=mode, include_links=include_links
+                driver, max_chars=max_chars, mode=mode, include_links=include_links, offset=offset
             )
         finally:
             _leave_element_frame(driver)
@@ -5078,7 +5099,7 @@ def _console_since(
     """
     driver = session.driver
     if hasattr(driver, "get_events"):
-        payload = driver.get_events(kinds=["console"], since_seq=cursor.seq, limit=500)
+        payload = driver.get_events(kinds=["console"], since_seq=cursor.seq, limit=2000)
         entries = list(payload.get("entries") or [])
         # The extension replays from the beginning when its own counter restarted.
         rebased = bool(payload.get("reset"))
@@ -5142,91 +5163,36 @@ def get_console(
     limit: int = 50,
     since_seq: int = 0,
     clear: bool = False,
+    since_ms: float | None = None,
+    dedupe: bool = False,
+    order: str = "asc",
 ) -> dict[str, Any]:
-    """Read page console output, uncaught errors, and browser log entries.
+    """Read console output, uncaught errors and browser-log entries (console_log.py).
 
-    ``console.log`` never reaches Chrome's browser log, so this merges the
-    in-page hook with the browser log rather than reporting one of them.
-
-    A page that is replaced takes its numbering with it, so after a navigation the
-    reading resumes at the new document's first entry and ``cursor_reset`` says
-    so; ``next_seq`` from before that navigation means nothing afterwards.
+    Reading has no side effect: ``since_seq`` 0 reads from the start of the kept
+    history, filters apply before the first ``limit``, and ``next_seq`` passed
+    back as ``since_seq`` reads the next page (``has_more`` says whether there is
+    one). ``clear`` empties the history and the sources after this read.
     """
     session = _get_session(session_id)
     with session.lock:
-        if since_seq:
-            # An explicit cursor replaces the sequence number only: which document
-            # minted it, and how much of the browser log was read, are still ours.
-            session.console.seq = int(since_seq)
-        payload = _console_since(session, session.console, clear)
+        answer = _console_log.read(
+            # One read that also clears the sources: nothing logged in between is lost.
+            session, lambda: _console_since(session, session.console, clear), levels=levels,
+            contains=contains, kinds=kinds, limit=limit, since_seq=since_seq, since_ms=since_ms,
+            dedupe=dedupe, order=order,
+        )
         if clear:
-            # The buffers everyone reads are gone, so no reader may keep a place
-            # in them: a stale index would skip whatever arrives next.
+            session.console_history.clear()
+            # The buffers everyone reads are gone, so no reader may keep a place in them.
             session.probe_console = ConsoleCursor()
             session.probe_console_seen.clear()
-        selected = diagnostics.filter_console(
-            payload["entries"], levels, contains, kinds, limit
-        )
-        return {
-            "success": True,
-            "session_id": session_id,
-            "entries": selected,
-            "returned": len(selected),
-            "next_seq": session.console.seq,
-            "cursor_reset": payload["cursor_reset"],
-            "dropped": payload["dropped"],
-            "levels": levels or list(diagnostics.LEVELS),
-            "note": _console_note(session),
-        }
-
-
-def _drain_network_rows(session: BrowserSession) -> tuple[list[dict[str, Any]], int]:
-    """Every recorded request of this session, newest history kept bounded.
-
-    The caller holds ``session.lock``. Both backends are folded here because two
-    readers now need the capture - the network topic and the stalled-submit
-    check - and they must not disagree about what the page did.
-    """
-    driver = session.driver
-    if hasattr(driver, "get_events"):
-        # The tab subscribed when it opened; this only repairs a subscription
-        # that failed then. It can never recover traffic from before it runs,
-        # which is why it cannot be the only place capture is turned on. A
-        # stand-in driver that does not track the flag is already capturing.
-        if not getattr(driver, "events_subscribed", True):
-            driver.subscribe_events(["console", "network"])
-        payload = driver.get_events(kinds=["network"], since_seq=0, limit=500)
-        return list(payload.get("entries") or []), int(
-            (payload.get("dropped") or {}).get("network") or 0
-        )
-    session.network_rows.extend(
-        diagnostics.selenium_network_rows(driver, session.network_pending)
-    )
-    overflow = len(session.network_rows) - 500
-    if overflow > 0:
-        del session.network_rows[:overflow]
-        session.network_dropped += overflow
-    return list(session.network_rows), session.network_dropped
+        return {"success": True, "session_id": session_id, **answer,
+                "levels": levels or list(diagnostics.LEVELS), "note": _console_note(session)}
 
 
 def _requests_since(session: BrowserSession, started_ms: float) -> list[dict[str, Any]]:
-    """The requests the page started after ``started_ms`` (epoch milliseconds).
-
-    A request still in flight counts: on the Selenium backend it sits in the
-    pending map until its last log entry arrives, and "the POST has not finished
-    yet" is the opposite of "no POST was ever made".
-    """
-    try:
-        rows, _ = _drain_network_rows(session)
-    except Exception:
-        # The capture is a diagnostic. Losing it must never turn into a failed
-        # click, so an unreadable log simply says nothing about what happened.
-        return []
-    fresh = [row for row in rows if float(row.get("ts") or 0) >= started_ms]
-    for row in list((getattr(session, "network_pending", None) or {}).values()):
-        if float(row.get("ts") or 0) >= started_ms:
-            fresh.append(row)
-    return fresh
+    return _network_log.requests_since(session, started_ms)
 
 
 # How long a click is given to produce a request before silence is worth naming.
@@ -5272,38 +5238,24 @@ def get_network(
     only_errors: bool = False,
     limit: int = 50,
     output: str = "text",
+    include_pending: bool = True,
 ) -> dict[str, Any]:
-    """List finished HTTP requests made by the page.
+    """List the page's HTTP requests: finished ones and, by default, those still open.
 
-    Recording starts when the session takes its tab, not when this is first
-    called, so the requests of the very first navigation are here to be read. A
-    tab claimed with ``attach_tab`` is recorded from the moment it was claimed:
-    whatever it did before that was observed by nobody and cannot be recovered.
-
-    Both backends keep a bounded history - the newest 500 records - so a session
-    that outlives its own buffer loses the oldest requests rather than growing
-    without limit. ``dropped`` says how many went that way instead of leaving the
-    gap to be mistaken for a quiet page.
+    Recording starts when the session takes its tab (an attach_tab tab from the
+    claim on). Both backends keep the newest 500 finished records; ``dropped``
+    counts what fell out. A request Chrome never reported finished - a body the
+    page never read, a fire-and-forget POST, a long poll, an ignored 5xx - is
+    listed with ``done: false``. The newest ``limit`` rows are returned;
+    ``matched``/``omitted_older`` say what the window left out.
     """
     session = _get_session(session_id)
     with session.lock:
-        rows, dropped = _drain_network_rows(session)
-        selected = diagnostics.filter_network(
-            rows, url_pattern, types, status_min, status_max, only_errors, limit
+        return _network_log.report(
+            session, session_id, url_pattern=url_pattern, types=types, status_min=status_min,
+            status_max=status_max, only_errors=only_errors, limit=limit, output=output,
+            include_pending=include_pending,
         )
-        response = {
-            "success": True,
-            "session_id": session_id,
-            "returned": len(selected),
-            "only_errors": bool(only_errors),
-            "dropped": dropped,
-        }
-        if output == "json":
-            response["requests"] = selected
-        else:
-            response["requests"] = diagnostics.format_network(selected)
-            response["format"] = "method status type ms size url"
-        return response
 
 
 def get_network_body(
@@ -5314,23 +5266,7 @@ def get_network_body(
     """Return one response body by the request_id reported by the network topic."""
     session = _get_session(session_id)
     with session.lock:
-        driver = session.driver
-        if hasattr(driver, "get_network_body"):
-            payload = driver.get_network_body(str(request_id))
-        else:
-            payload = driver.execute_cdp_cmd(
-                "Network.getResponseBody", {"requestId": str(request_id)}
-            )
-        body = str(payload.get("body") or "")
-        limit = max(256, min(int(max_chars), 500_000))
-        return {
-            "success": True,
-            "request_id": request_id,
-            "session_id": session_id,
-            "binary": bool(payload.get("binary") or payload.get("base64Encoded")),
-            "truncated": len(body) > limit,
-            "body": body[:limit],
-        }
+        return _network_log.read_body(session.driver, request_id, session_id, max_chars, _brief_error)
 
 
 def inject_script(
@@ -5496,8 +5432,8 @@ def local_storage(
     if not result.get("success"):
         return {"success": False, "session_id": session_id, "key": key, "error": result.get("error")}
     payload: dict[str, Any] = {"success": True, "session_id": session_id, "key": key}
-    if op == "read":
-        payload["value"] = result.get("value")
+    if op == "read":  # a big value keeps its window flags (script_results.carry)
+        payload.update(_script_results.carry(result, hint="Read the rest with run_script and offset=next_offset."))
     elif op == "write":
         payload["value"] = value
     return payload
@@ -5579,6 +5515,10 @@ def set_extra_headers(
     """
     session = _get_session(session_id)
     payload = {str(key): str(value) for key, value in (headers or {}).items()}
+    wrong = sorted(key for key, value in payload.items() if not (key + value).isascii())
+    if wrong:  # Chrome would send '?' for every such character, silently
+        raise ValueError(f"Header(s) {wrong} contain non-ASCII characters, which HTTP headers cannot "
+                         "carry (Chrome would send '?'). Percent-encode the value first, e.g. %D0%B4%D0%B0.")
     with session.lock:
         session.driver.execute_cdp_cmd("Network.enable", {})
         session.driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {"headers": payload})
@@ -5652,7 +5592,7 @@ def replay_request(
     body: str | None = None,
     credentials: str = "include",
 ) -> dict[str, Any]:
-    """Re-send a request from the page's own context and return the full response.
+    """Re-send a request from the page's own context and return status, headers and body.
 
     Give it a ``request_id`` from the network topic to repeat that captured
     request - the url and method are taken from the row - or spell out ``url`` /
@@ -5663,7 +5603,10 @@ def replay_request(
 
     Captured bodies are not retained by the network buffer, so a replay by
     ``request_id`` alone repeats a GET faithfully but cannot resend the original
-    POST body - pass ``body`` explicitly for that.
+    POST body - pass ``body`` explicitly for that. The body is cut at
+    ``REPLAY_BODY_CHARS`` (``response.truncated``) and the answer may be windowed;
+    either way ``window_note`` names the same fetch as a ``run_script`` with
+    ``save_to``, which brings the whole body back as a file.
     """
     session = _get_session(session_id)
     target_url, target_method = url, method
@@ -5694,7 +5637,8 @@ def replay_request(
     result = execute_js(_REPLAY_SCRIPT, args=[spec], session_id=session_id, await_promise=True)
     if not result.get("success"):
         return {"success": False, "session_id": session_id, "error": result.get("error")}
-    return {"success": True, "session_id": session_id, "request": spec, "response": result.get("value")}
+    carried = _script_results.carry(result, "response")
+    return {"success": True, "session_id": session_id, "request": spec, **carried, **_replay_window_note(spec, carried)}
 
 
 # Third-party response stubs: answering the page with a canned response instead
@@ -6934,6 +6878,7 @@ def game_probe(
             "frame_selector": frame_selector,
             **probe,
             "animation": animation,
+            "frame_health": _frame_health.health(driver, animation.get("fps"), session.render_mode),
             "console_messages": console_messages,
             "console_scope": "new since the previous game_probe call",
             "console_error": console_error,
@@ -7667,6 +7612,27 @@ def screenshot(
             _hide_presence_overlays(driver, False)
 
 
+def capture_with_metadata(
+    session_id: str = "default", width: int | None = None, height: int | None = None,
+    full_page: bool = False, mode: str | None = None, x: float | None = None,
+    y: float | None = None, wait_frames: int = 0,
+) -> tuple[bytes, dict[str, Any]]:
+    """A capture plus its geometry and freshness (frame_capture), after wait_frames frames."""
+    with _sessions_lock:
+        session = _sessions.get(session_id)
+    settled = None
+    if session is not None and wait_frames:
+        with session.lock:
+            settled = _frame_capture.wait_frames(session.driver, wait_frames)
+    png = screenshot(session_id, width, height, full_page, mode, x, y)
+    meta: dict[str, Any] = {"image_width": _frame_capture.png_size(png)[0],
+                            "image_height": _frame_capture.png_size(png)[1]}
+    if session is not None:
+        with session.lock:
+            meta = _frame_capture.describe(session, png, "full_page" if full_page else mode, x, y, width, height)
+    return png, {**meta, **(settled or {})}
+
+
 def save_screenshot(
     session_id: str = "default",
     mode: str = "viewport",
@@ -7676,6 +7642,7 @@ def save_screenshot(
     height: int | None = None,
     path: str | None = None,
     overwrite: bool = False,
+    wait_frames: int = 0,
 ) -> dict[str, Any]:
     """The web_action form of a screenshot: the PNG goes to a file, the answer names it.
 
@@ -7690,12 +7657,11 @@ def save_screenshot(
     # Checked before the capture, so a refused path costs no screenshot.
     if resolve_save_path(target).exists() and not overwrite:
         raise ValueError(f"{target} already exists; pass overwrite=true to replace it")
-    png = screenshot(session_id, width, height, False, mode, x, y)
+    png, meta = capture_with_metadata(session_id, width, height, False, mode, x, y, wait_frames)
     saved = write_download(target, png, overwrite=bool(overwrite))
-    size = [int.from_bytes(png[i:i + 4], "big") if len(png) >= 24 else None for i in (16, 20)]
     return {
         "success": True, "session_id": session_id, "mode": mode, "saved_to": str(saved),
-        "size_bytes": len(png), "image_width": size[0], "image_height": size[1],
+        "size_bytes": len(png), **meta,
         "image_note": "web_info(topic='screenshot') returns the image inline instead of a file.",
     }
 
@@ -7734,14 +7700,7 @@ def show_session(session_id: str = "default") -> dict[str, Any]:
         }
 
 
-def _iso_local(timestamp: float | None) -> str | None:
-    """Format a wall-clock timestamp the way a reader can compare against a clock."""
-    if not timestamp:
-        return None
-    try:
-        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(timestamp)))
-    except (OverflowError, OSError, ValueError):
-        return None
+_iso_local = _roster.iso_local
 
 
 def sessions_overview() -> dict[str, Any]:
@@ -7761,48 +7720,7 @@ def sessions_overview() -> dict[str, Any]:
     cap, cap_source = effective_max_sessions()
     with _sessions_lock:
         items = sorted(_sessions.items())
-        rows = []
-        for name, session in items:
-            idle_seconds = round(max(0.0, time.monotonic() - session.last_used), 1)
-            busy = bool(session.lock.busy)
-            # Active means driven right now or within the last five minutes -
-            # the same window the tab's activity badge glows. A human reading
-            # the roster sees which tabs are agent-held; an agent sees which
-            # tabs to observe read-only rather than drive.
-            agent_active = busy or idle_seconds < _TAB_ACTIVITY_IDLE_SECONDS
-            rows.append(
-                {
-                    "session_id": name,
-                    "agent_label": session.agent_label,
-                    "current_tab_id": session.current_tab_id,
-                    "tab_group": session.tab_group,
-                    "profile_mode": session.profile_mode,
-                    "headless": session.headless,
-                    # "Last seen", not "current": see the docstring. A session that
-                    # has never been summarised reports None rather than a guess.
-                    "last_url": session.last_url,
-                    "last_title": session.last_title,
-                    "created_at": _iso_local(session.created_at),
-                    "last_used_at": _iso_local(session.last_used_at),
-                    "idle_seconds": idle_seconds,
-                    "busy": busy,
-                    "concurrent_callers": session.lock.concurrent_callers,
-                    "agent_active": agent_active,
-                    **(
-                        {
-                            "activity_note": (
-                                "An agent is driving this tab now or was within "
-                                "the last 5 minutes (its favicon carries the "
-                                "activity dot). Observe it read-only via "
-                                "page_text/page_outline/screenshot, or open your "
-                                "own session instead of acting on this one."
-                            )
-                        }
-                        if agent_active
-                        else {}
-                    ),
-                }
-            )
+        rows = [_roster.session_row(name, session, _TAB_ACTIVITY_IDLE_SECONDS) for name, session in items]
     busy = [row["session_id"] for row in rows if row["busy"]]
     live = {row["session_id"] for row in rows}
     expired = _reap_expired_parked()
@@ -8025,10 +7943,10 @@ def upload_file(
             **_page_summary(session.driver, session_id),
             "success": True,
             "selector": selector,
-            "files_uploaded": {selector: attached},
-            "file_names": attached,
+            "files_uploaded": {selector: attached}, "file_names": attached,
             "upload_state": outcome["state"],
             "frame_selector": frame_selector,
+            **(getattr(session.driver, "_wsn_last_attach", None) or {"attach_method": "set_file_input_files"}),
         }
         if outcome["state"] != "attached":
             answer["input_cleared_by_widget"] = outcome["state"] == "taken_by_widget"
@@ -8097,39 +8015,30 @@ def _reset_session_runtime_state(session: BrowserSession) -> None:
             session.render_deterministic = False
 
 
-def _clear_injected_state(session: BrowserSession, session_id: str | None = None) -> None:
+def _clear_injected_state(
+    session: BrowserSession, session_id: str | None = None, deadline: float | None = None
+) -> list[str]:
     """Undo the per-target state we set, for a tab that outlives this session.
 
     Extra HTTP headers and evaluate-on-new-document scripts live on the Chrome
     target, not the session object, so forgetting the session does not stop them:
     a later session claiming the same tab would send an old Authorization header
-    and run a webdriver-override it never asked for. Each removal is best-effort -
-    teardown may not raise - and only a borrowed, surviving tab ever gets here.
+    and run a webdriver-override it never asked for. Teardown may not raise, and
+    only a borrowed, surviving tab ever gets here. Every command is one step under
+    the shared teardown ``deadline`` (``PageSteps``): nothing page-side is sent
+    after it, and what was skipped or failed is returned, not swallowed.
     """
-    driver = session.driver
+    step = _script_guard.PageSteps(deadline)
     # Before the CDP check, because this one also has a page-side half: a tab
     # handed back still wearing the agent badge would tell the user someone is
     # working in a tab that is theirs again.
-    _remove_agent_presence(session)
-    if not hasattr(driver, "execute_cdp_cmd"):
-        return
-    if session.extra_headers:
-        try:
-            driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {"headers": {}})
-        except Exception:
-            pass
-        session.extra_headers = {}
-    for identifier in list(session.injected_scripts):
-        try:
-            driver.execute_cdp_cmd(
-                "Page.removeScriptToEvaluateOnNewDocument", {"identifier": identifier}
-            )
-        except Exception:
-            pass
-    session.injected_scripts.clear()
-    session.stealth_identifier = None
-    _remove_tab_activity(session)
-    _clear_mock_state(session, session_id)
+    step("removing the agent badge", lambda: _remove_agent_presence(session))
+    step("restoring the page's own dialogs", lambda: _page_guards.restore_dialogs(session))
+    if hasattr(session.driver, "execute_cdp_cmd"):
+        _script_guard.clear_target_state(session, step)
+        step("removing the tab activity marker", lambda: _remove_tab_activity(session))
+        step("removing the request stubs", lambda: _clear_mock_state(session, session_id))
+    return step.problems
 
 
 def _shutdown_session(
@@ -8172,8 +8081,15 @@ def _shutdown_session(
         }
 
     problems: list[str] = []
+    # After a script timed out the page may not answer: page-side work gets one shared
+    # deadline (and a short per-command limit), checked before every step and inside the
+    # injected-state step before every command, so close never waits 15 s per command.
+    deadline = _script_guard.teardown_deadline(session.driver)
 
-    def attempt(step: str, action: Any) -> Any:
+    def attempt(step: str, action: Any, page_side: bool = False) -> Any:
+        if page_side and deadline is not None and time.monotonic() > deadline:
+            problems.append(f"{step} skipped: the page stopped answering and teardown ran out of time")
+            return None
         try:
             return action()
         except Exception as exc:
@@ -8185,16 +8101,14 @@ def _shutdown_session(
 
     tab_closed = False
     should_close_tab = session.owns_tab if close_tab is None else bool(close_tab)
-    attempt("releasing held input", lambda: _reset_session_runtime_state(session))
+    attempt("releasing held input", lambda: _reset_session_runtime_state(session), page_side=True)
     # A tab that is handed back rather than closed keeps whatever we set on it -
     # extra request headers, scripts that run before every document - and the next
     # session to claim it would inherit them unaware. A tab about to close needs
     # none of this. So the cleanup runs exactly when the tab survives us.
     if not should_close_tab:
-        attempt(
-            "clearing injected page state",
-            lambda: _clear_injected_state(session, session_id),
-        )
+        problems.extend(attempt("clearing injected page state", lambda: _clear_injected_state(
+            session, session_id, deadline), True) or [])
     if should_close_tab and hasattr(session.driver, "close_tab"):
         removed = attempt("closing the tab", session.driver.close_tab)
         tab_closed = bool((removed or {}).get("removed"))
@@ -8257,14 +8171,13 @@ def close_session(session_id: str = "default", close_tab: bool | None = None) ->
     closed = session is not None
     outcome: dict[str, Any] = {"tab_closed": False, "browser_gone": False, "problem": None}
     if session is not None:
-        with session.lock:
-            outcome = _shutdown_session(session, close_tab, session_id)
+        outcome = _close_one(session, close_tab, session_id) or outcome
     problem = outcome["problem"]
     return {
         "session_id": session_id,
         "closed": closed,
         "tab_closed": bool(outcome["tab_closed"]),
-        "active_sessions": remaining,
+        "active_sessions": remaining, **({"forced": outcome["forced"]} if outcome.get("forced") else {}),
         # Closing something that is not there is a no-op rather than a failure,
         # but saying nothing lets a typo in a session id read as a clean close.
         **(
@@ -8291,6 +8204,16 @@ def close_session(session_id: str = "default", close_tab: bool | None = None) ->
     }
 
 
+def _close_one(
+    session: BrowserSession, close_tab: bool | None, session_id: str, lock_timeout: float | None = None
+) -> dict[str, Any] | None:
+    """One session, by every close path: a browser frozen by a script is stopped outright."""
+    return _script_guard.close_one(
+        session, lambda: _shutdown_session(session, close_tab, session_id), lock_timeout=lock_timeout,
+        release_claim=lambda: session.profile_mode == "current" and _release_claimed_tab(session.current_tab_id),
+        forget=lambda: request_mocks.forget(session_id))
+
+
 def close_all_sessions(
     agent_label: str | None = None,
     scope: str = "mine",
@@ -8314,7 +8237,8 @@ def close_all_sessions(
 
     Whatever the scope, the answer names both halves: what was closed and what
     was left standing, with its owner. A tidy-up that quietly skipped four
-    sessions would be as confusing as one that quietly closed them.
+    sessions would be as confusing as one that quietly closed them. A browser
+    frozen by a script is stopped outright, as by ``close`` (``forced``).
     """
     wanted = str(scope or "mine").strip().lower()
     if wanted not in {"mine", "all"}:
@@ -8326,6 +8250,7 @@ def close_all_sessions(
         time.monotonic() - max(0.0, float(idle_for_seconds))
         if idle_for_seconds is not None else None
     )
+    recent: list[tuple[str, BrowserSession]] = []
     with _sessions_lock:
         everything = sorted(_sessions.items())
         if wanted == "all":
@@ -8350,11 +8275,12 @@ def close_all_sessions(
     tabs_closed = 0
     problems: dict[str, str] = {}
     browsers_gone: list[str] = []
+    forced: dict[str, str] = {}
     for session_id, session in sessions:
-        with session.lock:
-            outcome = _shutdown_session(session, None, session_id)
+        outcome = _close_one(session, None, session_id)
         if session.persist:
             _forget_parked(session_id)
+        forced.update({session_id: outcome["forced"]} if outcome.get("forced") else {})
         tabs_closed += int(bool(outcome["tab_closed"]))
         if outcome["browser_gone"]:
             browsers_gone.append(session_id)
@@ -8374,20 +8300,12 @@ def close_all_sessions(
         # able to tell "nothing else was open" from "four of somebody else's
         # sessions are still running".
         "kept_sessions": [
-            {"session_id": name, "agent_label": item.agent_label} for name, item in kept
+            {"session_id": name, "agent_label": item.agent_label,
+             "kept_because": "used_recently" if (name, item) in recent else "other_agent"}
+            for name, item in kept
         ],
-        "scope_note": (
-            "scope='all' closed every session in this MCP server, including other "
-            "agents'."
-            if wanted == "all"
-            else (
-                "Closed only the sessions owned by "
-                + (f"'{owner}'" if owner else "no agent_label (anonymous)")
-                + f"; {len(kept)} session(s) belonging to other agents were left "
-                "running. Pass scope='all' to close those too."
-            )
-        ),
-        **({"warnings": problems} if problems else {}),
+        "scope_note": _roster.close_all_note(wanted, owner, len(kept) - len(recent), len(recent), idle_for_seconds),
+        **({"warnings": problems} if problems else {}), **({"forced": forced} if forced else {}),
         **(
             {
                 "browser_gone": browsers_gone,
@@ -8428,13 +8346,8 @@ def _close_everything_at_exit() -> dict[str, Any]:
             _sessions.pop(name, None)
     kept: list[str] = []
     for name, item in parked:
-        if not item.lock.acquire(timeout=5.0):
-            continue
-        try:
-            outcome = _shutdown_session(item, False, name)
-        finally:
-            item.lock.release()
-        if not outcome["browser_gone"]:
+        outcome = _close_one(item, False, name, lock_timeout=5.0)
+        if outcome is not None and not outcome["browser_gone"] and not outcome.get("forced"):
             _remember_parked(name, item)
             kept.append(name)
     result = close_all_sessions(scope="all")

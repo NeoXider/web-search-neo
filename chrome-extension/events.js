@@ -406,15 +406,31 @@ export function collectEvents(buffer, options = {}) {
   pool.sort((left, right) => left.seq - right.seq);
   const entries = pool.slice(0, limit);
   const truncated = pool.length > entries.length;
+  // Requests Chrome never reported finished (a body nobody read, a fire-and-forget
+  // POST, a long poll, a 5xx the page ignored) are listed apart, so they are seen
+  // without taking a seq a later read would page past.
+  const pendingEntries = streams.has("network") && options.include_pending !== false
+    ? [...buffer.pending.values()].map(pendingView).filter(entry => matchesEntry(entry, filter))
+    : [];
   return {
     entries,
     next_seq: truncated ? entries[entries.length - 1].seq : buffer.seq,
     dropped: {...buffer.dropped},
     started_at: buffer.startedAt,
     truncated,
+    matched: pool.length,
     reset,
     pending: buffer.pending.size,
+    pending_entries: pendingEntries,
   };
+}
+
+export function pendingView(row) {
+  const status = Number(row.status || 0);
+  const view = {...row, done: false, pending: true, state: status ? "headers" : "sent"};
+  view.level = networkLevel(view);
+  view.text = `${view.method || "GET"} ${status || "---"} ${view.url || ""}`;
+  return view;
 }
 
 // Legacy shape kept for ChromeBridgeDriver.get_log("browser").

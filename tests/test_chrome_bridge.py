@@ -3178,6 +3178,9 @@ class _FileInputBridge(_FakeBridge):
             cdp_method = params.get("method")
             if cdp_method == "Runtime.evaluate":
                 self.runtime_expressions.append(params)
+                if params["params"].get("returnByValue", True):
+                    # The page-side hold and release of the input (cdp/element_handles).
+                    return {"result": {"type": "boolean", "value": True}}
                 return {"result": {"type": "object", "objectId": "file-input"}}
             if cdp_method == "DOM.setFileInputFiles":
                 self.file_commands.append(params)
@@ -3721,7 +3724,25 @@ RECEIVED_CDP_EVENTS = frozenset(
     }
 )
 
-CDP_DOMAINS = "DOM|Emulation|Input|Network|Page|Runtime|Storage|Target"
+# Methods sent only to a browser this server launched (Selenium/chromedriver),
+# never through the companion - each with the reason it cannot reach the user's
+# Chrome. A name used on a path that can run in profile_mode="current" does not
+# belong here: it belongs in ALLOWED_CDP_METHODS.
+OWNED_BROWSER_ONLY_CDP_METHODS = {
+    "Browser.grantPermissions": "sessions/context.py: context overrides are refused on current/attach",
+    "Browser.setDownloadBehavior": "page_guards.setup_owned: downloads rerouted only in owned browsers",
+    "Page.setDownloadBehavior": "page_guards.setup_owned: the fallback of the line above",
+}
+
+# Every DevTools domain, so a method of a domain nobody expected is still seen.
+CDP_DOMAINS = (
+    "Accessibility|Animation|Audits|Autofill|BackgroundService|Browser|CSS|CacheStorage|Cast|"
+    "DOM|DOMDebugger|DOMSnapshot|DOMStorage|Database|Debugger|DeviceAccess|DeviceOrientation|"
+    "Emulation|EventBreakpoints|Extensions|FedCm|Fetch|FileSystem|HeadlessExperimental|"
+    "HeapProfiler|IO|IndexedDB|Input|Inspector|LayerTree|Log|Media|Memory|Network|Overlay|"
+    "PWA|Page|Performance|PerformanceTimeline|Preload|Profiler|Runtime|Schema|Security|"
+    "ServiceWorker|Storage|SystemInfo|Target|Tethering|Tracing|WebAudio|WebAuthn"
+)
 _CDP_NAME = re.compile(rf'"(({CDP_DOMAINS})\.[a-z][A-Za-z]*)"')
 
 
@@ -3735,15 +3756,30 @@ def _allowed_cdp_methods() -> set[str]:
     return set(re.findall(r'"([^"]+)"', block.group(1)))
 
 
-def _cdp_names_in_python() -> set[str]:
-    """Every DevTools method name written in the modules that drive the bridge."""
-    root = Path(__file__).resolve().parents[1] / "web_search_neo"
+def _cdp_names_in(paths) -> set[str]:
     found: set[str] = set()
-    for name in ("chrome_bridge.py", "browser_tools.py", "page_perception.py", "diagnostics.py"):
-        found |= {
-            match[0] for match in _CDP_NAME.findall((root / name).read_text(encoding="utf-8"))
-        }
+    for path in paths:
+        found |= {match[0] for match in _CDP_NAME.findall(Path(path).read_text(encoding="utf-8"))}
     return found
+
+
+def _cdp_names_in_python() -> set[str]:
+    """Every DevTools method name written anywhere in the package, not a chosen few.
+
+    Scanning four files let modules added since (page_guards, frame_health,
+    sessions/context) send methods nobody had classified.
+    """
+    root = Path(__file__).resolve().parents[1] / "web_search_neo"
+    return _cdp_names_in(sorted(root.rglob("*.py")))
+
+
+def test_the_scanner_sees_a_planted_method_in_any_module(tmp_path) -> None:
+    planted = tmp_path / "new_module.py"
+    planted.write_text('driver.execute_cdp_cmd("Browser.close", {})\n'
+                       'driver.execute_cdp_cmd("Tracing.start", {})\n', encoding="utf-8")
+    found = _cdp_names_in([planted])
+    assert found == {"Browser.close", "Tracing.start"}
+    assert found - _allowed_cdp_methods() - RECEIVED_CDP_EVENTS - set(OWNED_BROWSER_ONLY_CDP_METHODS)
 
 
 def test_the_companion_allows_exactly_the_methods_the_server_sends() -> None:
@@ -3755,16 +3791,21 @@ def test_the_companion_allows_exactly_the_methods_the_server_sends() -> None:
     appears in a released extension because nobody looked.
     """
     allowed = _allowed_cdp_methods()
-    unclassified = _cdp_names_in_python() - allowed - RECEIVED_CDP_EVENTS
+    owned_only = set(OWNED_BROWSER_ONLY_CDP_METHODS)
+    used = _cdp_names_in_python()
+    unclassified = used - allowed - RECEIVED_CDP_EVENTS - owned_only
     assert not unclassified, (
         f"DevTools method(s) {sorted(unclassified)} are used by the server but the "
         "companion would refuse them. Add each to ALLOWED_CDP_METHODS in "
-        "chrome-extension/service-worker.js, or to RECEIVED_CDP_EVENTS here if it "
-        "is an event the server only reads."
+        "chrome-extension/service-worker.js, to RECEIVED_CDP_EVENTS here if it "
+        "is an event the server only reads, or to OWNED_BROWSER_ONLY_CDP_METHODS with "
+        "the reason it can never reach the user's Chrome."
     )
     # An allowlist that outgrows its call sites is the same failure in reverse:
     # a capability kept open for nothing.
     assert not allowed & RECEIVED_CDP_EVENTS
+    assert not allowed & owned_only
+    assert owned_only <= used, "an owned-browser-only entry no longer used: drop it"
 
 
 @requires_node
@@ -4078,3 +4119,34 @@ def test_supervisor_can_be_switched_off():
     bridge._supervise_every = 0
     bridge._ensure_supervisor()
     assert bridge._supervisor is None
+
+
+@requires_node
+def test_requests_that_never_finish_are_listed_as_pending_entries() -> None:
+    """A 5xx whose body nobody read and a POST in flight used to be invisible."""
+    result = _node_eval(
+        """
+        const buffer = events.createBuffer(1000);
+        events.trackPending(buffer, events.networkRow({requestId: "1",
+          request: {method: "GET", url: "https://api.test/fail"}, type: "Fetch",
+          timestamp: 1, wallTime: 1700000000}, {ts: 1700000000000}));
+        events.applyResponse(buffer.pending.get("1"), {response: {status: 503}}, false);
+        events.trackPending(buffer, events.networkRow({requestId: "2",
+          request: {method: "POST", url: "https://api.test/beacon"}, type: "Ping",
+          timestamp: 2, wallTime: 1700000001}, {ts: 1700000001000}));
+        return {
+          all: events.collectEvents(buffer, {kinds: ["network"]}),
+          errors: events.collectEvents(buffer, {kinds: ["network"], only_errors: true}),
+          without: events.collectEvents(buffer, {kinds: ["network"], include_pending: false}),
+          console: events.collectEvents(buffer, {kinds: ["console"]}),
+        };
+        """
+    )
+    pending = result["all"]["pending_entries"]
+    assert [(row["id"], row["state"], row["done"]) for row in pending] == [
+        ("1", "headers", False), ("2", "sent", False)]
+    assert pending[0]["level"] == "error" and pending[0]["text"] == "GET 503 https://api.test/fail"
+    assert [row["id"] for row in result["errors"]["pending_entries"]] == ["1"]
+    assert result["without"]["pending_entries"] == []
+    assert result["console"]["pending_entries"] == []
+    assert result["all"]["entries"] == []  # no seq was spent on them

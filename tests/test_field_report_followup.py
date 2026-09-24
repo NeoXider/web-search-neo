@@ -496,6 +496,18 @@ def test_close_all_idle_for_seconds_releases_only_orphans():
     assert "fresh" in browser_tools._sessions
 
 
+def test_close_all_says_why_a_session_was_kept():
+    # 1.19 (BUG-15): an anonymous session kept by the idle filter was called
+    # "another agent's", with scope='all' - which closes other agents' too - as the cure.
+    old = _register("old-anon", _Tab(1))
+    old.last_used = time.monotonic() - 3600
+    _register("fresh-anon", _Tab(2))
+    answer = browser_tools.close_all_sessions(idle_for_seconds=600)
+    assert answer["kept_sessions"] == [
+        {"session_id": "fresh-anon", "agent_label": None, "kept_because": "used_recently"}]
+    assert "other agents" not in answer["scope_note"] and "idle_for_seconds" in answer["scope_note"]
+
+
 # ------------------------------------------------------ A. wait seconds
 
 
@@ -631,9 +643,18 @@ def test_only_changes_around_the_target_verify_a_click():
     assert near["verified"] is True and near["post_state"]["dom_mutations_near_target"] == 2
     elsewhere = _effects({"mutations": 40, "near_target": 0, "focus_before": "a", "focus_after": "a",
                           "target_attached": True})
-    assert elsewhere["verified"] is False and elsewhere["no_observable_change"] is True
+    # 1.19: a change elsewhere is an effect of low confidence - neither "verified"
+    # (it may be page noise) nor "nothing happened" (it may be the modal it opened).
+    assert elsewhere["verified"] is None and elsewhere["effect_detected"] is True
+    assert elsewhere["effect_confidence"] == "low" and "no_observable_change" not in elsewhere
     assert "Do not repeat the click" in elsewhere["change_note"]
     assert "retry" not in elsewhere["change_note"]
+    still = _effects({"mutations": 0, "near_target": 0, "focus_before": "a", "focus_after": "a",
+                      "target_attached": True})
+    assert still["verified"] is False and still["no_observable_change"] is True
+    opened = _effects({"mutations": 3, "near_target": 0, "focus_before": "a", "focus_after": "a",
+                       "target_attached": True, "dialog_open": True, "dialog_before": False})
+    assert opened["verified"] is True and opened["post_state"]["dialog_opened"] is True
 
 
 def test_frame_or_shadow_targets_are_never_claimed_unverified():
@@ -967,7 +988,7 @@ def test_a_click_is_judged_by_changes_around_its_target_not_page_noise(local_sit
     _open_fixture_or_skip(local_site, "click-probe", "focus_and_probe.html")
     quiet = browser_tools.click("#noop", session_id="click-probe", wait_seconds=0.3)
     assert quiet["post_state"]["dom_mutations"] > 0  # the ticker kept ticking
-    assert quiet["verified"] is False and quiet["no_observable_change"] is True
+    assert quiet["verified"] is None and quiet["effect_confidence"] == "low"  # noise never verifies
     pressed = browser_tools.click("#toggle", session_id="click-probe", wait_seconds=0.3)
     assert pressed["verified"] is True and pressed["post_state"]["dom_mutations_near_target"] >= 1
     shadow = browser_tools.click("#editor >>> #shadow-input", session_id="click-probe", wait_seconds=0.1)
@@ -1221,7 +1242,7 @@ def test_stop_tells_a_silent_listener_from_a_free_port(monkeypatch):
 class _StatusBridge:
     """A companion one version behind whose reload either takes or does not."""
 
-    def __init__(self, connected=True, version="0.0.1-old", code_hash="old", claims=(), takes=True):
+    def __init__(self, connected=True, version="0.0.1", code_hash="old", claims=(), takes=True):
         self.connected = connected
         self.version = version
         self.code_hash = code_hash
@@ -1280,7 +1301,7 @@ def test_a_reload_that_does_not_take_is_never_looped(refresh_state, monkeypatch)
         again = refresh_state.refresh_stale_companion(stuck)
         assert again["self_update"] == "ineffective"
     assert stuck.reloads == 1  # the same build is not reloaded again
-    other = _StatusBridge(version="0.0.2-other", takes=False)
+    other = _StatusBridge(version="0.0.2", takes=False)
     refresh_state.refresh_stale_companion(other)
     assert other.reloads == 1  # a different combination is judged afresh
 
@@ -1295,11 +1316,11 @@ def test_the_reload_pause_holds_across_server_processes(refresh_state, tmp_path)
         "class B:\n"
         "    reloads = 0\n"
         "    def status(self, _w=0.0):\n"
-        "        return {'connected': True, 'browser': {'extension_version': '0.0.1-old', 'code_hash': 'x'},\n"
+        "        return {'connected': True, 'browser': {'extension_version': '0.0.1', 'code_hash': 'x'},\n"
         "                'daemon': {'linked': True, 'claims': []}}\n"
         "    def request(self, method, params=None, timeout=None):\n"
         "        B.reloads += 1\n"
-        "        return {'version': '0.0.1-old'}\n"
+        "        return {'version': '0.0.1'}\n"
         "chrome_bootstrap._reload_companion = lambda bridge, expected: (bridge.request('runtime.reload'), {'self_update': 'done'})[1]\n"
         "companion_refresh._reload_companion = chrome_bootstrap._reload_companion\n"
         "companion_refresh.refresh_stale_companion(B())\n"
@@ -1346,3 +1367,80 @@ def test_the_extended_suffix_list(suffix):
 
     assert is_public_suffix(suffix) is True
     assert is_public_suffix("shop." + suffix) is False
+
+
+# ------------------------------------------------ 1.18.5 audit leftovers (B1-B4)
+
+
+def test_a_damaged_state_file_is_treated_as_absent(refresh_state):
+    path = refresh_state.state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"last_auto_reload": time.time() + 10 ** 7, "ineffective": "junk"}),
+                    encoding="utf-8")
+    bridge = _StatusBridge()
+    assert refresh_state.refresh_stale_companion(bridge)["self_update"] == "done"
+    path.write_text(json.dumps({"last_auto_reload": "yesterday", "ineffective": [1, None]}),
+                    encoding="utf-8")
+    assert refresh_state._read(path) == {"last_auto_reload": 0.0, "ineffective": []}
+
+
+def test_only_an_older_companion_is_reloaded(refresh_state):
+    newer = _StatusBridge(version="99.0.0")
+    answer = refresh_state.refresh_stale_companion(newer)
+    assert answer["self_update"] == "not_attempted" and newer.reloads == 0
+    odd = _StatusBridge(version="dev-build")
+    assert refresh_state.refresh_stale_companion(odd)["self_update"] == "not_attempted"
+
+
+def test_claims_that_appear_just_before_the_reload_defer_it(refresh_state):
+    class _Late(_StatusBridge):
+        def status(self, wait=0.0):
+            answer = super().status(wait)
+            if wait:  # the re-read right before the reload
+                answer["daemon"]["claims"] = [{"tab_id": 9, "holder": "late"}]
+            return answer
+
+    late = _Late()
+    assert refresh_state.refresh_stale_companion(late)["self_update"] == "deferred"
+    assert late.reloads == 0
+
+
+def test_the_daemon_refuses_a_companion_reload_while_tabs_are_claimed():
+    import threading as _threading
+
+    daemon = BridgeDaemon.__new__(BridgeDaemon)
+    daemon._lock = _threading.Lock()
+    daemon._claims = {5: object()}
+    holder, refusal = daemon._claim_check(object(), "runtime.reload", {})
+    assert holder is None and "driving a tab" in refusal
+    daemon._claims = {}
+    assert daemon._claim_check(object(), "runtime.reload", {}) == (None, None)
+
+
+def test_tldextract_is_asked_about_private_domains(monkeypatch):
+    import sys as _sys
+    import types
+
+    from web_search_neo.actions import cookie_scope
+
+    seen = {}
+
+    class _Extract:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+        def __call__(self, name):
+            return types.SimpleNamespace(domain="", suffix=name)
+
+    monkeypatch.setitem(_sys.modules, "tldextract", types.SimpleNamespace(TLDExtract=_Extract))
+    assert cookie_scope._library_says("example.pages.example") is True
+    assert seen["include_psl_private_domains"] is True
+
+    class _Broken:
+        def __init__(self, **_kwargs):
+            raise RuntimeError("snapshot missing")
+
+    monkeypatch.setitem(_sys.modules, "tldextract", types.SimpleNamespace(TLDExtract=_Broken))
+    monkeypatch.setitem(_sys.modules, "publicsuffix2", types.SimpleNamespace(
+        get_tld=lambda name, strict=True: name))
+    assert cookie_scope._library_says("anything.example") is True

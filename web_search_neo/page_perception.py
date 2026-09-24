@@ -14,6 +14,7 @@ import json
 import re
 from typing import Any
 
+from web_search_neo.perception import text_window
 from web_search_neo.perception.titles import settle_document_title
 
 
@@ -1806,7 +1807,7 @@ _WHITESPACE_RUN = re.compile(r"\s+")
 _MULTI_SPACE = re.compile(r"[ \t]{2,}")
 _SPACE_BEFORE_NEWLINE = re.compile(r"[ \t]+\n")
 _LEADING_CELL = re.compile(r"\n ?\| ")
-_MARKER_PATTERN = re.compile(r"\[(\d+)\]")
+_MARKER_PATTERN = text_window.MARKER_PATTERN
 
 
 def _normalize_text(text: str) -> str:
@@ -1818,27 +1819,7 @@ def _normalize_text(text: str) -> str:
     return text.strip()
 
 
-def _clip_on_boundary(text: str, limit: int) -> tuple[str, bool]:
-    """Cut at a paragraph boundary so the tail is never half a sentence."""
-    if len(text) <= limit:
-        return text, False
-    window = text[:limit]
-    boundary = window.rfind("\n\n")
-    return (window[:boundary].rstrip() if boundary > limit // 4 else window.rstrip()), True
-
-
-def _link_listing(text: str, links: list[Any]) -> tuple[str, list[dict[str, Any]]]:
-    kept = {int(marker) for marker in _MARKER_PATTERN.findall(text)}
-    selected = [
-        link
-        for link in links
-        if isinstance(link, dict) and int(link.get("index", 0)) in kept
-    ]
-    listing = "\n".join(
-        f"[{link['index']}] {link.get('text') or ''} -> {link.get('url') or ''}"
-        for link in selected
-    )
-    return listing, selected
+_clip_on_boundary, _link_listing = text_window.clip_on_boundary, text_window.link_listing
 
 
 def _text_exclusions(
@@ -1896,7 +1877,7 @@ def _text_exclusions(
             f"{frames['too_deep']} frame(s) nested deeper than {MAX_FRAME_DEPTH} were not entered"
         )
     if truncated:
-        reasons.append("clipped at max_chars; raise max_chars for the rest")
+        reasons.append("clipped at max_chars; read on with offset=next_offset")
     return missing, reasons
 
 
@@ -1906,8 +1887,11 @@ def page_text(
     max_chars: int = 20000,
     mode: str = "main",
     include_links: bool = False,
+    offset: int = 0,
 ) -> dict[str, Any]:
     """Extract the readable text of the rendered page, keeping block structure.
+
+    ``offset`` starts the window further in; ``next_offset`` is where the next one starts.
 
     ``mode='full'`` is the whole rendered ``<body>``, including same-origin frames
     and open dialogs. ``mode='main'`` narrows to the main-content sub-tree and also
@@ -1935,31 +1919,8 @@ def page_text(
     full_text = _normalize_text(str(raw.get("text") or ""))
     total = len(full_text)
     fallback_used = bool(raw.get("fallback_used"))
-    text, truncated = _clip_on_boundary(full_text, limit)
-    links: list[dict[str, Any]] = []
-    if include_links:
-        # The link index is part of what the caller receives, so it has to be paid
-        # for out of the same budget instead of silently overflowing it. Both the
-        # kept text and its index grow with the text budget, so the largest budget
-        # that still fits is found by bisection.
-        listing = ""
-        low, high = 0, limit
-        text = ""
-        while low <= high:
-            middle = (low + high) // 2
-            candidate, _ = _clip_on_boundary(full_text, middle)
-            candidate_listing, candidate_links = _link_listing(
-                candidate, raw.get("links") or []
-            )
-            spent = len(candidate) + (len(candidate_listing) + 2 if candidate_listing else 0)
-            if spent <= limit:
-                text, listing, links = candidate, candidate_listing, candidate_links
-                low = middle + 1
-            else:
-                high = middle - 1
-        truncated = text != full_text
-        if listing:
-            text = f"{text}\n\n{listing}"
+    windowed = text_window.window(full_text, raw.get("links") or [], limit, include_links, offset)
+    text, truncated, links = windowed["text"], windowed["truncated"], windowed["links"]
     frames = raw.get("frames") or {}
     excluded_chars, excluded = _text_exclusions(
         raw, full_text, selected_mode, fallback_used, truncated, frames
@@ -1983,8 +1944,8 @@ def page_text(
         "excluded": excluded,
         "frames": frames,
         "dialogs_appended": int(raw.get("dialogs_appended") or 0),
-        "truncated": truncated,
-        "max_chars": limit,
+        "truncated": truncated, "offset": windowed["offset"], "next_offset": windowed["next_offset"],
+        "max_chars": limit, **({"max_chars_capped": True} if int(max_chars) > limit else {}),
         **({"links": links} if include_links else {}),
     }
 

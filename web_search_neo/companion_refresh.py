@@ -47,11 +47,30 @@ def state_path() -> Path:
 
 
 def _read(path: Path) -> dict[str, Any]:
+    """The state file, with anything damaged treated as absent (B1)."""
     try:
         state = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    return state if isinstance(state, dict) else {}
+    if not isinstance(state, dict):
+        return {}
+    stamp = state.get("last_auto_reload")
+    if isinstance(stamp, bool) or not isinstance(stamp, (int, float)) or stamp > time.time() + 60:
+        state["last_auto_reload"] = 0.0  # garbage or a clock that jumped: no pause
+    ineffective = state.get("ineffective")
+    state["ineffective"] = (
+        [item for item in ineffective if isinstance(item, str)]
+        if isinstance(ineffective, list) else []
+    )
+    return state
+
+
+def _version_tuple(version: str) -> tuple[int, ...] | None:
+    """``1.18.5`` -> ``(1, 18, 5)``; None for anything that is not plain dotted numbers."""
+    try:
+        return tuple(int(part) for part in str(version).split("."))
+    except ValueError:
+        return None
 
 
 def _manual(reason: str, pair: str | None = None) -> dict[str, Any]:
@@ -74,6 +93,9 @@ def refresh_stale_companion(bridge: Any = None, *, local_sessions: int = 0) -> d
     expected = expected_extension_version()
     live_hash, disk_hash = browser.get("code_hash"), expected_code_hash()
     version_differs = bool(running and expected and running != expected)
+    running_version, expected_version = _version_tuple(running), _version_tuple(expected)
+    older = (running_version is not None and expected_version is not None
+             and running_version < expected_version)
     hash_differs = bool(isinstance(live_hash, str) and disk_hash and live_hash != disk_hash)
     if not version_differs:
         if hash_differs:
@@ -83,9 +105,14 @@ def refresh_stale_companion(bridge: Any = None, *, local_sessions: int = 0) -> d
                 "Reload it with setup_current_chrome or the steps below."),
                 "manual_steps": reload_steps()}
         return None
-    if (status.get("daemon") or {}).get("claims") or local_sessions:
-        return {"self_update": "deferred",
+    if not older:  # a newer companion, or versions that do not compare: never downgrade
+        return {"self_update": "not_attempted", "reason": (
+            f"The companion runs {running} and this server ships {expected}; only an older "
+            "companion is reloaded automatically."), "manual_steps": reload_steps()}
+    deferred = {"self_update": "deferred",
                 "reason": "an agent is driving a tab; the companion is reloaded once none is"}
+    if (status.get("daemon") or {}).get("claims") or local_sessions:
+        return deferred
     pair = f"{running}|{live_hash}|{expected}|{disk_hash}"
     path = state_path()
     with exclusive(path):
@@ -97,6 +124,10 @@ def refresh_stale_companion(bridge: Any = None, *, local_sessions: int = 0) -> d
             return None
         state["last_auto_reload"] = time.time()
         atomic_write_text(path, json.dumps(state))
+    # Claims can appear while the lock above was held: look again right before the
+    # reload (B3). The daemon also refuses runtime.reload while any tab is claimed.
+    if (bridge.status(1.0).get("daemon") or {}).get("claims"):
+        return deferred
     result = _reload_companion(bridge, expected)
     if result.get("self_update") == "done":
         return result

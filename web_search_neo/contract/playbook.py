@@ -282,12 +282,13 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
         "summary": "Getting current facts with no API key, and reading pages without a browser.",
         "when": "The task needs information rather than interaction.",
         "steps": [
-            "web_action search with the query. Keep engine='duckduckgo', fallback=true, challenge_mode='fallback'.",
+            "web_action search with the query. Leave engine at its default (brave), fallback=true, challenge_mode='fallback'.",
             "fetch_text on the promising URLs, or fetch_many for several at once.",
             "fetch_links when the target is a page's outgoing links rather than its prose.",
         ],
         "rules": [
             "Fallback across engines is automatic; search_status reports availability, latency, and cooldowns.",
+            "result_status says how good the answer is: ok, partial, empty, or off_topic (no row mentions the query). unreliable_engines names engines that keep answering nothing where others find hits; they are tried last.",
             "challenge_mode='manual' hands a visible browser to the user for up to three minutes. The server never solves a CAPTCHA by itself.",
             "Plain http:// to a public host is refused; use https. Loopback and private addresses stay reachable.",
         ],
@@ -297,7 +298,7 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
         ],
         "example": {
             "actions": [
-                {"action": "search", "query": "mcp browser automation", "engine": "duckduckgo"}
+                {"action": "search", "query": "mcp browser automation", "engine": "brave"}
             ]
         },
     },
@@ -339,6 +340,11 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
             "Tapping a held key, pressing a touch id already down, or a point outside the window are refused before anything reaches the page: fix them, do not retry.",
             "After a failed input batch held_keys over-reports on purpose. Call release_inputs rather than reading it.",
             "Text into a canvas (Unity WebGL): type_text mode='keys' presses one key per character, any script; insertText never reaches a canvas engine.",
+            "Throttling: game_probe.frame_health says throttled=true with a reason when Chrome holds frames back (hidden tab, covered or unfocused window); input is then lost and screenshots lag. Try unthrottle; if raf_fps stays low only raising the window helps (show, with the user's consent).",
+            "Focus lands on the next frames: after the click that focuses a canvas, wait_frames {frames: 2-3} before keys, or the first keys are lost.",
+            "Fresh frames: screenshot wait_frames=N renders N frames first; frame_id and changed_since_last tell a new image from a repeat.",
+            "Aiming from an image: every screenshot reports image size, css_box, device_pixel_ratio and scale; pointer coordinate_space='image' takes the image's pixels directly.",
+            "FPS / gaze cameras: pointer_lock acquire, then look {dx, dy, steps, duration_ms} turns smoothly (a single big relative move is clamped by many engines); pointer_lock status reports the lock.",
         ],
         "avoid": [
             "Leaving render in step mode or keys held at the end of a task.",
@@ -352,6 +358,60 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
                     "session_id": "game",
                     "key_actions": [{"key": "SPACE", "action": "tap"}],
                 },
+            ]
+        },
+    },
+    "audit": {
+        "summary": "Site audit and security review: headers, cookies, console, network, third parties.",
+        "when": "Checking a site you own or may test for defects, misconfiguration or leaks.",
+        "steps": [
+            "open {url, profile_mode: 'isolated'} - a clean profile: no owner logins, no stale cache.",
+            "http_request {url} for the raw answer: status, redirects, headers and set_cookies (every Set-Cookie, unmerged).",
+            "Check the security headers in it: content-security-policy, strict-transport-security, x-frame-options or CSP frame-ancestors, x-content-type-options, referrer-policy, cross-origin-opener-policy, permissions-policy.",
+            "cookies {op: 'get'}: every cookie with Secure, HttpOnly, SameSite, domain, expiry - a session cookie without HttpOnly/Secure is a finding.",
+            "console {levels: ['error', 'warn']} and network {only_errors: true}: failed requests (in-flight ones too), CSP violations, mixed content; page through with since_seq / next_offset.",
+            "network: hosts that are not the site's own are the third parties; network_body reads one response.",
+            "page_text / page_outline for content and accessibility; execute_js with performance.getEntriesByType('navigation'|'resource') for timings and sizes.",
+        ],
+        "rules": [
+            "Every cut is flagged (truncated, has_more, next_offset); an audit reads to the end.",
+            "Test only what you are allowed to test; the server never bypasses a login or a CAPTCHA.",
+            "http_request carries no cookies between calls: send a Cookie header when you need a session.",
+        ],
+        "avoid": [
+            "Auditing in profile_mode='current': the owner's logins and extensions change what the site sends.",
+        ],
+        "example": {
+            "actions": [
+                {"action": "open", "url": "https://example.com", "session_id": "audit", "profile_mode": "isolated"},
+                {"action": "http_request", "url": "https://example.com"},
+                {"action": "cookies", "op": "get", "session_id": "audit"},
+            ]
+        },
+    },
+    "testing": {
+        "summary": "A test scenario: act, then assert page state, console and network per step.",
+        "when": "Verifying that a flow works (sign-up, cart, a game level) and reporting pass/fail.",
+        "steps": [
+            "open in an isolated session; dialogs {policy: 'accept'} when the flow confirms with confirm()/prompt().",
+            "Per step: the action (click/fill/press_keys/...), then assert with wait {selector|script} or page_text/find.",
+            "After each step: console {since_seq} for new errors and network {only_errors: true} for failed requests.",
+            "Files a step downloads land in the session's own folder: downloads lists them.",
+            "On a failure: screenshot (it reports frame_id and scale) and page_text for the report.",
+        ],
+        "rules": [
+            "click reports dialogs and downloads it caused; effect_confidence='low' means the page changed elsewhere - assert, do not assume.",
+            "run_script / execute_js / wait.script share one semantics: async body, top-level await, return; a one-line expression returns itself; a syntax error fails at once.",
+            "web_action continue_on_error=true runs every step and reports each; each result has duration_ms.",
+            "A persistent CLI client for scripts: scripts/mcp_cli.py serve, then send/repl - sessions survive between calls.",
+        ],
+        "avoid": [
+            "Retrying a consequential step after a timeout: read the page first.",
+        ],
+        "example": {
+            "actions": [
+                {"action": "click", "selector": "#buy", "session_id": "test"},
+                {"action": "wait", "script": "return document.querySelector('#total').textContent === '42'", "session_id": "test"},
             ]
         },
     },

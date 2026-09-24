@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import threading
-from types import SimpleNamespace
 
 import pytest
 
@@ -26,6 +25,8 @@ def reset_search_runtime(monkeypatch):
         {},
     )
     monkeypatch.setattr(msp_search, "MIN_PROVIDER_INTERVAL_SECONDS", 0)
+    # The stub rows ("Result") mention no query word; relevance has its own tests.
+    monkeypatch.setattr(msp_search, "off_topic", lambda *_a: False)
 
 
 def _provider(name, fn):
@@ -292,7 +293,8 @@ def test_search_validates_query_and_engine():
 
 def test_status_without_live_check_lists_provider_registry():
     status = msp_search.get_search_engines_status(check_live=False)
-    assert status["default_engine"] == "duckduckgo"
+    # 1.19: brave, the engine that answers; duckduckgo came back empty for everything.
+    assert status["default_engine"] == "brave" == msp_search.ENGINE_ORDER[0]
     assert status["configured"] == list(msp_search.ENGINE_ORDER)
     assert all(item["state"] == "configured" for item in status["engines"])
 
@@ -502,3 +504,57 @@ def test_new_provider_registration_updates_dispatch_and_invalidates_status(monke
     assert msp_search.ENGINE_ORDER[-1] == "local_test"
     assert response["engine_used"] == "local_test"
     assert msp_search._status_cache is None
+
+
+# ------------------------------------------------ 1.19: honest engines
+
+
+def test_bing_tracking_links_are_unwrapped():
+    from web_search_neo.search_quality import unwrap_bing
+    import base64
+
+    target = "https://docs.python.org/3/library/asyncio.html"
+    token = "a1" + base64.urlsafe_b64encode(target.encode()).decode().rstrip("=")
+    assert unwrap_bing(f"https://www.bing.com/ck/a?!&&p=abc&u={token}&ntb=1") == target
+    assert unwrap_bing("https://example.com/ck/a?u=a1xyz") == "https://example.com/ck/a?u=a1xyz"
+    assert unwrap_bing("https://www.bing.com/ck/a?u=zz") == "https://www.bing.com/ck/a?u=zz"
+
+
+def test_off_topic_rows_are_skipped_for_an_engine_that_answers(monkeypatch):
+    from web_search_neo import search_quality
+
+    monkeypatch.setattr(msp_search, "off_topic", search_quality.off_topic)
+    monkeypatch.setattr(msp_search, "ENGINE_ORDER", ["bing", "brave"])
+    garbage = [{"title": "Manage your YouTube TV area", "url": "https://support.google.com/x", "snippet": ""}]
+    good = [{"title": "Погода в Москве на 10 дней", "url": "https://www.gismeteo.ru/", "snippet": ""}]
+    monkeypatch.setitem(msp_search.SEARCH_PROVIDERS, "bing", _provider("bing", lambda *_a: garbage))
+    monkeypatch.setitem(msp_search.SEARCH_PROVIDERS, "brave", _provider("brave", lambda *_a: good))
+
+    response = msp_search.search_web("Москва погода", num=1)
+    assert response["engine_used"] == "brave" and response["results"] == good
+    assert response["engines_off_topic"] == ["bing"] and response["result_status"] == "ok"
+
+    # Nothing better anywhere: the rows come back, labelled, and are not cached.
+    monkeypatch.setitem(msp_search.SEARCH_PROVIDERS, "brave", _provider("brave", lambda *_a: []))
+    only = msp_search.search_web("Москва погода", num=1, fresh=True)
+    assert only["result_status"] == "off_topic" and only["results"] == garbage and only["note"]
+
+
+def test_an_engine_that_keeps_answering_nothing_is_named_and_tried_last(monkeypatch):
+    calls = []
+    monkeypatch.setattr(msp_search, "ENGINE_ORDER", ["brave", "duckduckgo", "yahoo"])
+    monkeypatch.setitem(msp_search.SEARCH_PROVIDERS, "brave",
+                        _provider("brave", lambda *_a: calls.append("brave") or []))
+    monkeypatch.setitem(msp_search.SEARCH_PROVIDERS, "duckduckgo",
+                        _provider("duckduckgo", lambda *_a: calls.append("duckduckgo") or []))
+    monkeypatch.setitem(msp_search.SEARCH_PROVIDERS, "yahoo",
+                        _provider("yahoo", lambda *_a: calls.append("yahoo") or RESULT))
+    for query in ("one", "two"):
+        answer = msp_search.search_web(query, num=1)
+    assert answer["unreliable_engines"] == {
+        "brave": {"empty_while_others_found": 2}, "duckduckgo": {"empty_while_others_found": 2}}
+    calls.clear()
+    third = msp_search.search_web("three", num=1, engine="brave")
+    # The requested engine still goes first; the doubtful fallback goes after yahoo.
+    assert calls == ["brave", "yahoo"] and third["engine_used"] == "yahoo"
+    assert msp_search._cooldown_remaining("duckduckgo") == 0  # named, never cooled down

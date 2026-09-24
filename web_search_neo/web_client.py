@@ -466,6 +466,11 @@ def request(
     if max_response_bytes is not None:
         kwargs["stream"] = True
     session = _session()
+    # Every call starts with an empty jar. The session is per worker thread, so
+    # cookies one call received used to ride along on a later, unrelated call -
+    # another path, another agent - depending on which thread picked it up.
+    # Redirect hops within this call still carry the cookies set along the way.
+    session.cookies.clear()
     timeouts = (min(5.0, timeout), timeout)
     response = session.request(
         method=method,
@@ -491,13 +496,11 @@ def request(
                     continue
                 size += len(chunk)
                 if size > limit:
-                    status = getattr(response, "status_code", None)
-                    if not (isinstance(status, int) and status >= 400):
-                        raise ValueError(f"Response exceeded the {limit}-byte safety limit")
-                    # An error status is still an answer: keep its head and say so,
-                    # so the HTTPError below carries the status instead of this.
+                    # Keep the head and say so - for a success as for an error
+                    # status: a big page is still a page, never an exception.
                     chunks.append(chunk[: len(chunk) - (size - limit)])
                     response.wsn_truncated = True
+                    response.wsn_byte_limit = limit
                     break
                 chunks.append(chunk)
             response._content = b"".join(chunks)

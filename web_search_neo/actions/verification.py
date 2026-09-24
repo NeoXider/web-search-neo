@@ -12,6 +12,23 @@ from typing import Any
 
 from web_search_neo import key_table
 
+# A dialog counts as open only while it is on screen: a hidden role=dialog left in
+# the DOM, or a modal already closed, used to read as dialog_open=true forever.
+_VISIBLE_DIALOG = r"""
+const wsnVisibleDialog = () => {
+  try {
+    return [...document.querySelectorAll('dialog[open], [role="dialog"], [role="alertdialog"], [aria-modal="true"]')]
+      .some(el => {
+        if (el.closest('[aria-hidden="true"], [hidden], [inert]')) return false;
+        const box = el.getBoundingClientRect();
+        if (box.width < 1 || box.height < 1) return false;
+        const style = getComputedStyle(el);
+        return style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity) > 0.01;
+      });
+  } catch (error) { return null; }
+};
+"""
+
 # Installed before a click. The probe lives under a registry Symbol as a
 # non-enumerable property, so page code that walks window's keys never sees it,
 # and it keeps the DOM nodes each mutation touched (bounded) so the collect step
@@ -19,7 +36,7 @@ from web_search_neo import key_table
 # a ticking clock or a rotating ad elsewhere on the page is not the click's doing.
 # Our own overlays (presence flash, ghost cursor, favicon badge in <head>) are
 # never recorded.
-CLICK_ARM_SCRIPT = r"""
+CLICK_ARM_SCRIPT = _VISIBLE_DIALOG + r"""
 const key = Symbol.for('wsn.clickProbe');
 try {
   const previous = window[key];
@@ -30,7 +47,7 @@ try {
       return !!(el && el.closest && (el.closest('[data-wsn-presence]') || el.closest('head')));
     } catch (error) { return false; }
   };
-  const probe = {count: 0, nodes: [], observer: null, focus: ''};
+  const probe = {count: 0, nodes: [], observer: null, focus: '', dialog: wsnVisibleDialog()};
   probe.observer = new MutationObserver(records => {
     for (const record of records) {
       if (ours(record.target) || String(record.attributeName || '').startsWith('data-wsn')) continue;
@@ -55,7 +72,7 @@ try {
 # ``arguments[0]`` is the clicked element (or null) and ``arguments[1]`` whether
 # one was given; on the companion bridge the element is re-resolved from its
 # selector, so "attached" means "the selector still finds an element".
-CLICK_COLLECT_SCRIPT = r"""
+CLICK_COLLECT_SCRIPT = _VISIBLE_DIALOG + r"""
 const key = Symbol.for('wsn.clickProbe');
 const probe = window[key];
 try {
@@ -82,7 +99,7 @@ try {
       role: (active.getAttribute && active.getAttribute('role')) || ''
     } : null,
     target_attached: attached,
-    dialog_open: !!document.querySelector('dialog[open], [role="dialog"]:not([aria-hidden="true"]), [aria-modal="true"]')
+    dialog_open: wsnVisibleDialog(), dialog_before: probe ? probe.dialog : null
   };
 } finally {
   if (probe && probe.observer) probe.observer.disconnect();
@@ -163,6 +180,9 @@ def collect_click_effects(
         and not evidence.get("focus_on_target")
     )
     detached = evidence.get("target_attached") is False
+    dialog_opened = evidence.get("dialog_open") is True and evidence.get("dialog_before") is False
+    raised = bool(post.get("dialogs") or post.get("downloads"))  # page_guards.click_evidence
+    elsewhere = bool(evidence.get("mutations")) and not near
     measurable = measurable and not evidence.get("scoped")
     fields: dict[str, Any] = {
         "page_changed": page_changed,
@@ -173,18 +193,33 @@ def collect_click_effects(
             "focused_element": evidence.get("focused_element"),
             "target_still_attached": evidence.get("target_attached"),
             "dialog_open": evidence.get("dialog_open"),
+            "dialog_opened": dialog_opened if evidence else None,
         },
     }
-    if not measurable:
-        effect: bool | None = True if page_changed else None
-    elif page_changed is True or bool(near) or focus_moved or detached:
+    if raised or dialog_opened or (page_changed is True):
+        effect: bool | None = True
+    elif not measurable:
+        effect = None
+    elif bool(near) or focus_moved or detached:
         effect = True
+    elif elsewhere:
+        effect = True  # something changed, just not provably because of this click
     elif near == 0 and evidence.get("target_attached") is True and page_changed is False:
         effect = False
     else:
         effect = None
+    low = effect is True and elsewhere and not (
+        raised or dialog_opened or page_changed or near or focus_moved or detached)
     fields["effect_detected"] = effect
-    fields["verified"] = effect
+    fields["verified"] = None if low else effect
+    if effect is True:
+        fields["effect_confidence"] = "low" if low else "high"
+    if low:
+        fields["change_note"] = (
+            f"The page changed elsewhere ({evidence.get('mutations')} DOM mutation(s)), not in "
+            "or around the clicked element: a modal, a status line - or an unrelated timer. "
+            "Read the page to confirm. " + _NO_REPEAT
+        )
     if effect is False:
         fields["no_observable_change"] = True
         fields["change_note"] = (

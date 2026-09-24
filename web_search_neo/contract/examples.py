@@ -38,31 +38,28 @@ _RECIPES = {
         "screenshot or game_probe between batches",
         "release_inputs, then render mode=normal",
     ],
+    "fps_game": ["pointer_lock acquire", "look {dx, dy}", "wait_frames {frames: 2}",
+                 "screenshot {wait_frames: 1}; frame_health if slow"],
+    "audit": ["open {profile_mode: 'isolated'}", "skill section=audit"],
+    "test_run": ["skill section=testing"],
 }
 
 _PITFALLS = [
-    "Noisy page: page_elements category='interactive', visible_only=true, enabled_only=true, narrowed by role/text_pattern; filters run before pagination (follow range.interactive.next_offset).",
+    "Noisy page: page_elements category='interactive', visible_only, enabled_only, role/text_pattern (filters run before pagination).",
     "web_action success=true is not task success: check failure_count and every results[i].success.",
-    "click verified=false/null is no reason to click again: read the page first, it may have submitted.",
+    "Never repeat a click or submit on verified=false/null or after a timeout: read the page first - it may have gone through.",
     "Never guess optional names: call action_schema (timeout_ms does not exist).",
-    "page_elements takes no selector filter: filter the returned objects yourself.",
     "Selectors and screenshots die when the page changes; reread after navigation, rerender, scroll, resize or animation.",
-    "In current Chrome every action locator is plain CSS: never send ref: from page_outline or >>> to click/fill/wait/upload/submit/input; refs expire after rerender.",
-    "Repeated text is not identity: compare exact href/value/stable attributes from fresh page_elements, or click_text with exact text plus role; never index or nth-child alone.",
-    "challenge_detected means a CAPTCHA blocks the page: use captcha, never hammer clicks. invisible_challenge_pending (no box) holds the form: a submit hangs silently until captcha clears it.",
+    "In current Chrome every action locator is plain CSS: never send ref: from page_outline or >>> to click/fill/wait/upload/submit/input.",
+    "Repeated text is not identity: compare exact href/value/attributes from fresh page_elements, or click_text with exact text plus role; never nth-child alone.",
+    "challenge_detected means a CAPTCHA blocks the page: use captcha, never hammer clicks.",
     "find low_confidence=true means it is guessing: re-query, do not click matches[0].",
-    "profile_mode=current drives the user's real Chrome: close closes only a tab the agent opened (an attach_tab tab is handed back); other tabs close via close_tabs with their ids.",
-    "Parallel agents must each use their own session_id (two on 'default' drive one tab; browser_status reports shared_session) and pass agent_label on open, so close_all (scope='mine') ends only their own sessions.",
-    "page_elements, page_outline and find are bounded by max_chars too: budget_truncated=true means cut to fit; continue at range[*].next_offset.",
-    "Automation stays in the background and never changes window state; show is the only foreground opt-in, only when the user asks.",
-    "In render=step nothing moves until input or step runs, so a first screenshot shows the old frame.",
-    "Always release_inputs after hold, and return render to normal before you finish.",
-    "Pointer coordinates are viewport-local; inside an iframe pass frame_selector and frame-local x/y.",
-    "Image-guided clicks: fresh viewport screenshot, scale to reported viewport CSS size; full-page/region pixels are not pointer coordinates.",
-    "Consequential submit: verify live choices, click once, never retry after a timeout - the first click may have succeeded.",
-    "scroll delta_y is positive to move down; reread page_elements after scrolling a lazy page.",
-    "Plain http:// to public hosts is refused; use https. Loopback and private addresses stay allowed.",
-    "A macro saved without project_root lands in the per-user store; every macro answer reports scope/project_root/storage.",
+    "profile_mode=current drives the user's real Chrome: close closes only a tab the agent opened; other tabs close via close_tabs with their ids.",
+    "Parallel agents must each use their own session_id and pass agent_label on open, so close_all (scope='mine') ends only their own sessions.",
+    "Every cut is flagged: truncated/budget_truncated/has_more=true means more exists; continue at next_offset/next_seq.",
+    "Automation stays in the background; show is the only foreground opt-in, only when the user asks.",
+    "In render=step nothing moves until input or step runs; always release_inputs after hold and return render to normal.",
+    "Pointer coordinates are viewport CSS pixels (iframe: frame_selector plus frame-local x/y); scale screenshot pixels by the reported ratio.",
 ]
 
 
@@ -72,7 +69,7 @@ _EXAMPLES = {
             {
                 "action": "search",
                 "query": "free browser automation MCP",
-                "engine": "duckduckgo",
+                "engine": "brave",
                 "fallback": True,
             }
         ]
@@ -157,7 +154,7 @@ _CONTRACT_EXAMPLE_NAMES = ("search", "input", "pointer_lock", "script")
 _RUNTIME_REQUIREMENTS = {
     "input": "at least one of key_actions=[{key,action}] or pointer_actions=[{action,x,y}]",
     "touch": (
-        "points=[{x,y}], swipe adds end_x/end_y; only release and cancel need "
-        "none, and release may name ids instead to lift just those fingers"
+        "points=[{x,y}] (swipe: end_x/end_y inside each point); release and cancel need "
+        "none (release may list ids)"
     ),
 }

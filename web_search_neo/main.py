@@ -6,14 +6,16 @@ import functools
 import json
 import os
 import sys
+import time
 from typing import Any, Literal
 from mcp.server.fastmcp import FastMCP, Image
 from pydantic import ValidationError
 
 from web_search_neo.contract.notes import _SERVER_INSTRUCTIONS, _ARGUMENT_RECOVERY
+from web_search_neo.contract.param_docs import annotate as annotate_params
 from web_search_neo import bridge_daemon
 from web_search_neo import browser_tools
-from web_search_neo import chrome_bridge
+from web_search_neo import chrome_bridge, extra_actions
 from web_search_neo import macros
 from web_search_neo import msp_date_time
 from web_search_neo import msp_search
@@ -26,7 +28,7 @@ from web_search_neo.fetch import api as fetch_api
 from web_search_neo.fetch import content as fetch_content
 
 
-__version__ = "1.18.5"
+__version__ = "1.19.0"
 
 log = configure_server_log()  # per-user state dir; see log_setup.py
 
@@ -34,7 +36,7 @@ log = configure_server_log()  # per-user state dir; see log_setup.py
 mcp = FastMCP(
     "Web Search Neo",
     instructions=(
-        "Free web search and browser automation without API keys. DuckDuckGo is the "
+        "Free web search and browser automation without API keys. Brave is the "
         "default search engine. Open a browser page before inspecting, filling, clicking, "
         "submitting, or capturing it; reuse the same session_id for subsequent actions. "
         "For canvas/WebGL games use browser_game_probe, browser_pointer, "
@@ -54,8 +56,11 @@ def _fetch_url_text(
     headers: dict[str, str] | None = None,
     save_to: str | None = None,
     overwrite: bool = False,
-) -> str:
-    return fetch_content._fetch_url_text(url, max_chars, timeout_seconds, mode, headers, save_to, overwrite, request_client=request)
+    offset: int = 0,
+    output: str = "text",
+) -> Any:
+    return fetch_content._fetch_url_text(url, max_chars, timeout_seconds, mode, headers, save_to,
+                                         overwrite, request_client=request, offset=offset, output=output)
 
 @mcp.tool()
 async def fetch_url_text(
@@ -66,16 +71,21 @@ async def fetch_url_text(
     headers: dict[str, str] | None = None,
     save_to: str | None = None,
     overwrite: bool = False,
-) -> str:
+    offset: int = 0,
+    output: Literal["text", "json"] = "text",
+) -> str | dict[str, Any]:
     """Download an HTTP(S) page without blocking parallel MCP tool calls.
 
-    mode='raw'/'html' returns the raw source (JS bundles, markup); headers
-    sends custom request headers; save_to writes the body to a file under
-    WEB_SEARCH_NEO_DOWNLOAD_DIR (default ./downloads) and never replaces an
-    existing file unless overwrite=true. timeout_seconds is capped at 120.
+    mode='raw'/'html' returns the raw source; headers sends custom request
+    headers; save_to writes the body under WEB_SEARCH_NEO_DOWNLOAD_DIR (never
+    replacing a file unless overwrite=true). A cut is always stated: the text
+    ends with [truncated=true ... next_offset=N] (read on with offset=N) or
+    [body_cut=true ...]; output='json' returns the text with status, charset,
+    total_chars, truncated and next_offset. timeout_seconds is capped at 120.
     """
     return await asyncio.to_thread(
-        _fetch_url_text, url, max_chars, timeout_seconds, mode, headers, save_to, overwrite
+        _fetch_url_text, url, max_chars, timeout_seconds, mode, headers, save_to, overwrite,
+        offset, output,
     )
 
 
@@ -181,14 +191,14 @@ async def get_search_engines_status(
 async def search_web(
     query: str,
     num: int = 5,
-    engine: str = "duckduckgo",
+    engine: str | None = None,
     fallback: bool = True,
     timeout_seconds: float = 10.0,
     fresh: bool = False,
     challenge_mode: Literal["fallback", "manual"] = "fallback",
     manual_timeout_seconds: float = 180.0,
 ) -> dict:
-    """Search with immediate fallback, or allow a three-minute manual challenge handoff."""
+    """Search (engine default: brave) with fallback, or a three-minute manual challenge handoff."""
     if challenge_mode not in {"fallback", "manual"}:
         raise ValueError("challenge_mode must be 'fallback' or 'manual'")
     if challenge_mode == "fallback":
@@ -373,7 +383,7 @@ async def browser_open_page(
     headless: bool | None = None,
     profile_mode: Literal[
         "auto", "current", "temporary", "isolated", "persistent", "attach"
-    ] = "current",
+    ] | None = None,
     profile_id: str | None = None,
     debugger_address: str | None = None,
     current_tab_id: int | None = None,
@@ -387,6 +397,8 @@ async def browser_open_page(
     persist: bool = False,
 ) -> dict[str, Any]:
     """Open in the current Chrome's agent tab group by default; auto falls back to Selenium.
+
+    Without profile_mode an existing session keeps its own mode (and profile).
 
     profile_mode='isolated' opens a disposable separate browser profile;
     user_agent/timezone/locale/geolocation override per session
@@ -402,9 +414,7 @@ async def browser_open_page(
             height=height,
             timeout_seconds=timeout_seconds,
             headless=headless,
-            profile_mode=profile_mode,
-            profile_id=profile_id,
-            debugger_address=debugger_address,
+            **extra_actions.inherited_open_options(session_id, profile_mode, profile_id, debugger_address),
             current_tab_id=current_tab_id,
             tab_group=tab_group,
             agent_label=agent_label,
@@ -618,18 +628,12 @@ async def browser_page_text(
     mode: Literal["main", "full"] = "main",
     include_links: bool = False,
     frame_selector: str | None = None,
+    offset: int = 0,
 ) -> dict[str, Any]:
-    """Read the rendered page as text, including content that only exists after JS."""
-    return await asyncio.to_thread(
-        functools.partial(
-            browser_tools.get_page_text,
-            session_id=session_id,
-            max_chars=max_chars,
-            mode=mode,
-            include_links=include_links,
-            frame_selector=frame_selector,
-        )
-    )
+    """Read the rendered page as text (after JS); truncated=true -> read on at offset=next_offset."""
+    return await asyncio.to_thread(functools.partial(
+        browser_tools.get_page_text, session_id=session_id, max_chars=max_chars, mode=mode,
+        include_links=include_links, frame_selector=frame_selector, offset=offset))
 
 
 @mcp.tool()
@@ -695,20 +699,16 @@ async def browser_console(
     limit: int = 50,
     since_seq: int = 0,
     clear: bool = False,
+    since_ms: float | None = None,
+    dedupe: bool = False,
+    order: Literal["asc", "desc"] = "asc",
 ) -> dict[str, Any]:
-    """Read console output and uncaught page errors with stack traces."""
-    return await asyncio.to_thread(
-        functools.partial(
-            browser_tools.get_console,
-            session_id=session_id,
-            levels=levels,
-            contains=contains,
-            kinds=kinds,
-            limit=limit,
-            since_seq=since_seq,
-            clear=clear,
-        )
-    )
+    """Console output and uncaught errors; since_seq pages forward, reading moves nothing."""
+    return await asyncio.to_thread(functools.partial(
+        browser_tools.get_console, session_id=session_id, levels=levels, contains=contains,
+        kinds=kinds, limit=limit, since_seq=since_seq, clear=clear, since_ms=since_ms,
+        dedupe=dedupe, order=order,
+    ))
 
 
 @mcp.tool()
@@ -721,21 +721,14 @@ async def browser_network(
     only_errors: bool = False,
     limit: int = 50,
     output: Literal["text", "json"] = "text",
+    include_pending: bool = True,
 ) -> dict[str, Any]:
-    """List the page's HTTP requests with status, type, duration, and size."""
-    return await asyncio.to_thread(
-        functools.partial(
-            browser_tools.get_network,
-            session_id=session_id,
-            url_pattern=url_pattern,
-            types=types,
-            status_min=status_min,
-            status_max=status_max,
-            only_errors=only_errors,
-            limit=limit,
-            output=output,
-        )
-    )
+    """HTTP requests with status, type, ms, size; unfinished ones too (done=false)."""
+    return await asyncio.to_thread(functools.partial(
+        browser_tools.get_network, session_id=session_id, url_pattern=url_pattern, types=types,
+        status_min=status_min, status_max=status_max, only_errors=only_errors, limit=limit,
+        output=output, include_pending=include_pending,
+    ))
 
 
 @mcp.tool()
@@ -893,8 +886,13 @@ async def browser_run_script(
     retries: int = 2,
     retry_delay_ms: int = 300, wait_ready: bool = False, timeout_seconds: float | None = None,
     frame_selector: str | None = None,
+    max_chars: int = browser_tools.DEFAULT_RESPONSE_CHAR_BUDGET, offset: int = 0, save_to: str | None = None,
 ) -> dict[str, Any]:
     """Execute a JavaScript snippet in a session's page and return its value.
+
+    The script is an async function body: top-level await works, `return` returns,
+    and a one-line expression returns itself. A value over max_chars comes back as
+    a window (truncated, next_offset); save_to writes all of it to a JSON file.
 
     Use for state the DOM reads do not expose (localStorage, virtualised lists,
     framework state) and for mutations without an input-shaped equivalent.
@@ -913,7 +911,7 @@ async def browser_run_script(
             retry_on_uncaught=retry_on_uncaught,
             retries=retries,
             retry_delay_ms=retry_delay_ms, wait_ready=wait_ready, timeout_seconds=timeout_seconds,
-            frame_selector=frame_selector, report_frames=True,
+            frame_selector=frame_selector, report_frames=True, max_chars=max_chars, offset=offset, save_to=save_to,
         )
     )
 
@@ -924,17 +922,13 @@ async def browser_execute_js(
     args: list[Any] | None = None,
     session_id: str = "default", await_promise: bool = False, timeout_seconds: float | None = None,
     frame_selector: str | None = None,
+    max_chars: int = browser_tools.DEFAULT_RESPONSE_CHAR_BUDGET, offset: int = 0, save_to: str | None = None,
 ) -> dict[str, Any]:
-    """Run a JavaScript snippet and report what it returns (info-topic form)."""
-    return await asyncio.to_thread(
-        functools.partial(
-            browser_tools.execute_js,
-            script,
-            args=args,
-            session_id=session_id, await_promise=await_promise, timeout_seconds=timeout_seconds,
-            frame_selector=frame_selector, report_frames=True,
-        )
-    )
+    """Run a JavaScript snippet and report what it returns (info-topic form; same semantics as run_script)."""
+    return await asyncio.to_thread(functools.partial(
+        browser_tools.execute_js, script, args=args, session_id=session_id, await_promise=await_promise,
+        timeout_seconds=timeout_seconds, frame_selector=frame_selector, report_frames=True,
+        max_chars=max_chars, offset=offset, save_to=save_to))
 
 
 @mcp.tool()
@@ -1029,31 +1023,22 @@ async def browser_pointer(
     delta_x: float = 0.0,
     delta_y: float = 0.0,
     include_summary: bool = True,
+    coordinate_space: Literal["viewport", "image"] = "viewport",
 ) -> dict[str, Any]:
     """Click, hover, drag, scroll the wheel, or hold a mouse button.
 
-    Use coordinate_mode='relative' while pointer lock is held: the cursor cannot
-    move, so only the movement delta reaches the game.
+    x/y are viewport CSS pixels; coordinate_space='image' takes pixels of this session's
+    last screenshot instead (scale and scroll applied). Use coordinate_mode='relative'
+    while pointer lock is held: x/y are then the movement delta the game reads.
+    delta_x/delta_y are the wheel's scroll amounts only.
     """
-    return await asyncio.to_thread(
-        functools.partial(
-            browser_tools.pointer_action,
-            pointer_action,
-            x,
-            y,
-            session_id=session_id,
-            end_x=end_x,
-            end_y=end_y,
-            button=button,
-            duration_seconds=duration_seconds,
-            frame_selector=frame_selector,
-            wait_seconds=wait_seconds,
-            coordinate_mode=coordinate_mode,
-            delta_x=delta_x,
-            delta_y=delta_y,
-            include_summary=include_summary,
-        )
-    )
+    if coordinate_space == "image":
+        x, y, end_x, end_y = await asyncio.to_thread(extra_actions.image_to_viewport, session_id, x, y, end_x, end_y, frame_selector)
+    return await asyncio.to_thread(functools.partial(
+        browser_tools.pointer_action, pointer_action, x, y, session_id=session_id, end_x=end_x,
+        end_y=end_y, button=button, duration_seconds=duration_seconds, frame_selector=frame_selector,
+        wait_seconds=wait_seconds, coordinate_mode=coordinate_mode, delta_x=delta_x, delta_y=delta_y,
+        include_summary=include_summary))
 
 
 @mcp.tool()
@@ -1303,12 +1288,12 @@ async def browser_screenshot(
     mode: Literal["viewport", "full_page", "region"] | None = None,
     x: float | None = None,
     y: float | None = None,
-) -> Image:
-    """Return a viewport, full-page, or page-region PNG screenshot."""
-    png = await asyncio.to_thread(
-        browser_tools.screenshot, session_id, width, height, full_page, mode, x, y
-    )
-    return Image(data=png, format="png")
+    wait_frames: int = 0,
+) -> Any:
+    """A viewport/full-page/region PNG plus a JSON text: image size, CSS box, DPR, scale, frame_id."""
+    png, meta = await asyncio.to_thread(
+        browser_tools.capture_with_metadata, session_id, width, height, full_page, mode, x, y, wait_frames)
+    return [Image(data=png, format="png"), json.dumps(meta)]
 
 
 @mcp.tool()
@@ -1321,10 +1306,15 @@ async def browser_save_screenshot(
     height: int | None = None,
     path: str | None = None,
     overwrite: bool = False,
+    wait_frames: int = 0,
 ) -> dict[str, Any]:
-    """Capture a PNG to a file (web_action form); web_info topic=screenshot returns the image."""
+    """Capture a PNG to a file (web_action form); web_info topic=screenshot returns the image.
+
+    wait_frames lets that many animation frames render first; the answer carries image
+    size, CSS box, device_pixel_ratio, scale, frame_id and changed_since_last.
+    """
     return await asyncio.to_thread(
-        browser_tools.save_screenshot, session_id, mode, x, y, width, height, path, overwrite
+        browser_tools.save_screenshot, session_id, mode, x, y, width, height, path, overwrite, wait_frames
     )
 
 
@@ -2051,6 +2041,7 @@ def get_current_time_and_region() -> dict:
 
 # Keep the narrow Python wrappers above for compatibility and direct testing, but expose
 # only a compact self-documenting MCP surface to models.
+extra_actions.register(mcp)  # dialogs, downloads, navigate
 legacy_mcp = mcp
 mcp = ReportingFastMCP(  # failed web_action batches come back with isError=true
     "Web Search Neo",
@@ -2248,6 +2239,7 @@ _ACTIONS: dict[str, ActionSpec] = {
         ),
     )
 }
+_ACTIONS.update((spec[0], _action(*spec)) for spec in extra_actions.ACTION_SPECS)
 
 
 def _argument_model(tool_name: str) -> Any:
@@ -2431,6 +2423,7 @@ def _capabilities(action_name: str | None = None, full_schemas: bool = False) ->
             "required": ["action", *original.get("required", [])],
             "title": f"{selected}Action",
         }
+        input_schema = annotate_params(selected, input_schema)  # descriptions per property
         response = {
             "action": selected,
             "input_schema": input_schema,
@@ -2485,7 +2478,7 @@ def _capabilities(action_name: str | None = None, full_schemas: bool = False) ->
             "topic": "action_schema",
             "params_example": {"action": "input"},
             "list_actions": "web_info(topic='actions') is the action index alone; params.group narrows it.",
-            "playbook": "web_info(topic='skill') is the loop plus a section index; params.section='<name>' opens one in full (start, loop, locators, forms, macros, guarded, parallel, search, diagnostics, games, troubleshooting).",
+            "playbook": "web_info(topic='skill') is the loop plus a section index; params.section='<name>' opens one in full (start, loop, locators, forms, macros, guarded, parallel, search, diagnostics, games, audit, testing, troubleshooting).",
             "note": "params.action names an action or an info topic; a topic's parameters are published nowhere else, and any key it does not list is refused.",
             "parameters": (
                 "actions[name].required lists parameters you must always send; "
@@ -2709,6 +2702,7 @@ async def _execute_actions(
             if not continue_on_error:
                 break
             continue
+        started = time.monotonic()  # duration_ms: every step says what it cost
         try:
             validated = _validate_arguments(spec.tool_name, f"action '{action_name}'", arguments)
             data = await _run_following_tab(spec, action_name, validated)
@@ -2722,7 +2716,7 @@ async def _execute_actions(
                 {
                     "index": index,
                     "action": action_name,
-                    "success": not reported_failure,
+                    "success": not reported_failure, "duration_ms": round((time.monotonic() - started) * 1000),
                     "data": data,
                     **(
                         {"error": str(data.get("error") or "Action reported success=false")}
@@ -2734,16 +2728,13 @@ async def _execute_actions(
             if reported_failure and not continue_on_error:
                 break
         except Exception as exc:
-            # A refused step is worth showing too, in the failure colour: a
-            # burst where one click never landed is exactly what a watching
-            # human wants to catch.
-            # Dead-tab errors were already translated in _run_following_tab.
+            # A refused step shows too, in the failure colour (dead-tab errors are translated already).
             await _mark_agent_presence(spec.tool_name, action_name, arguments, ok=False)
             results.append(
                 {
                     "index": index,
                     "action": action_name,
-                    "success": False,
+                    "success": False, "duration_ms": round((time.monotonic() - started) * 1000),
                     "error": f"{type(exc).__name__}: {exc}",
                 }
             )

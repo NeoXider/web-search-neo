@@ -11,6 +11,17 @@ Usage:
   python scripts/mcp_cli.py run steps.json --out-dir out/
   python scripts/mcp_cli.py run - < steps.json
 
+Persistent mode - one server process kept alive between calls, so sessions survive
+and a call costs a round trip instead of a ~12 s cold start:
+  python scripts/mcp_cli.py serve [--port 47811] [--out-dir out/] [--idle-minutes 30]
+  python scripts/mcp_cli.py send web_action '{"actions":[...]}' [--port 47811]
+  python scripts/mcp_cli.py send web_info @request.json          (@file reads the JSON from a file)
+  python scripts/mcp_cli.py repl                                 (one "tool json" per line)
+  python scripts/mcp_cli.py stop
+The daemon listens on 127.0.0.1 only and answers only callers that present the
+random token it writes to ~/.web-search-neo/cli-<port>.token (readable by you
+only); images go to --out-dir (default ./downloads/cli) and are named in the answer.
+
 A ``run`` script is a JSON list of steps:
   {"tool": "web_action", "args": {...}}            one tool call
   {"tool": "web_info", "args": {"topic": "..."}}   one read
@@ -27,10 +38,16 @@ from __future__ import annotations
 
 import argparse
 import base64
+import getpass
 import json
+import os
 from pathlib import Path
+import secrets
+import socket
+import socketserver
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 
@@ -58,12 +75,16 @@ class StdioClient:
             bufsize=1,
         )
         self._next_id = 0
-        self._request("initialize", {
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {},
-            "clientInfo": {"name": "web-search-neo-cli", "version": "1.0"},
-        })
-        self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        try:
+            self._request("initialize", {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "web-search-neo-cli", "version": "1.0"},
+            })
+            self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        except BaseException:
+            self._proc.kill()  # a failed handshake must not leave the server child behind
+            raise
 
     def _send(self, message: dict) -> None:
         assert self._proc.stdin is not None
@@ -164,8 +185,8 @@ def _action_value(text: str) -> Any:
 
 
 def _store_value(step: dict, text: str) -> None:
-    # run_script clips strings at 200k characters, so large payloads (a generated image as base64)
-    # are returned in slices by consecutive steps and reassembled here.
+    # A big run_script value comes in windows (max_chars, offset -> next_offset), so large payloads
+    # (a generated image as base64) can be fetched by consecutive steps and reassembled here.
     target = step.get("append_value_to") or step.get("write_value_to")
     if not target:
         return
@@ -199,6 +220,222 @@ def run_steps(steps: list[dict], out_dir: Path | None, quiet: bool = False) -> i
         client.close()
 
 
+DEFAULT_PORT = 47811
+
+
+def _token_path(port: int) -> Path:
+    return Path.home() / ".web-search-neo" / f"cli-{port}.token"
+
+
+def _restrict_to_owner(path: Path) -> str | None:
+    """Make ``path`` readable by the current user only; the problem text if that failed."""
+    if os.name != "nt":
+        try:
+            os.chmod(path, 0o600)
+            return None
+        except OSError as exc:
+            return str(exc)
+    user = os.environ.get("USERNAME") or getpass.getuser()
+    domain = os.environ.get("USERDOMAIN")
+    account = f"{domain}\\{user}" if domain else user
+    try:
+        result = subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r", f"{account}:F"],
+                                capture_output=True, text=True, timeout=30,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"icacls could not run: {type(exc).__name__}: {exc}"
+    return None if result.returncode == 0 else (result.stderr or result.stdout).strip()
+
+
+TOKEN_REPLACE_ATTEMPTS = 3
+
+
+def _write_token(port: int) -> str:
+    """A fresh token, written atomically to a file only this user can read.
+
+    The port was bound before this runs, so a token file already there belongs to
+    a daemon that is no longer listening: it is replaced, never shared. Any failure
+    removes the temporary file - a half-written secret is never left next to the
+    token - and a ``PermissionError`` on the replace (Windows: a reader or an
+    antivirus holding the old file for a moment) is retried before it is raised.
+    """
+    token = secrets.token_urlsafe(32)
+    path = _token_path(port)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        # Empty first, private next, the secret last: the token is never on disk under
+        # the folder's inherited permissions, not even for a moment.
+        os.close(os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600))
+        problem = _restrict_to_owner(temporary)
+        if problem:
+            raise RuntimeError(f"could not make the token file private ({problem})")
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write(token)
+        for attempt in range(1, TOKEN_REPLACE_ATTEMPTS + 1):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if attempt == TOKEN_REPLACE_ATTEMPTS:
+                    raise
+                time.sleep(0.2 * attempt)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return token
+
+
+def _remove_token(port: int, token: str) -> None:
+    """Remove the token file, but only if it is still ours."""
+    path = _token_path(port)
+    try:
+        if path.read_text(encoding="utf-8").strip() == token:
+            path.unlink()
+    except OSError:
+        pass
+
+
+def _content_parts(result: dict, out_dir: Path, counter: list[int]) -> list[dict]:
+    """Text as text (JSON decoded when it is JSON), images written to files."""
+    parts: list[dict] = []
+    for content in result.get("content", []):
+        if content.get("type") == "text":
+            text = content.get("text", "")
+            try:
+                parts.append({"type": "json", "value": json.loads(text)})
+            except json.JSONDecodeError:
+                parts.append({"type": "text", "text": text})
+        elif content.get("type") == "image":
+            counter[0] += 1
+            out_dir.mkdir(parents=True, exist_ok=True)
+            path = out_dir / f"image_{int(time.time())}_{counter[0]:03d}.png"
+            path.write_bytes(base64.b64decode(content.get("data", "")))
+            parts.append({"type": "image", "file": str(path), "mime": content.get("mimeType")})
+    return parts
+
+
+def serve(port: int, out_dir: Path, idle_minutes: float) -> int:
+    """Keep one server alive and answer one JSON request per TCP connection.
+
+    Order matters: the port is bound first (a busy port is an error, and on
+    Windows nobody else can bind it after us), then the token is written, then
+    the MCP server child is started - and every step is undone if a later one
+    fails, so neither a stray token nor a child process outlives the daemon.
+    """
+    token = ""
+    client: StdioClient | None = None
+    lock = threading.Lock()
+    counter = [0]
+    last_used = [time.monotonic()]
+    stopping = threading.Event()
+
+    class Handler(socketserver.StreamRequestHandler):
+        def handle(self) -> None:
+            try:
+                request = json.loads(self.rfile.readline(64 * 1024 * 1024).decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return  # not ours (an HTTP probe, garbage): no answer at all
+            if not isinstance(request, dict) or not secrets.compare_digest(
+                    str(request.get("token", "")).encode("utf-8"), token.encode("utf-8")):
+                self.wfile.write(b'{"error": "bad token"}\n')
+                return
+            started = time.monotonic()
+            answer: dict[str, Any]
+            try:
+                if request.get("op") == "stop":
+                    answer = {"stopped": True}
+                    stopping.set()
+                else:
+                    with lock:
+                        assert client is not None
+                        result = client.call(str(request["tool"]), request.get("args") or {})
+                    answer = {"isError": bool(result.get("isError")),
+                              "content": _content_parts(result, out_dir, counter)}
+            except Exception as exc:
+                answer = {"error": f"{type(exc).__name__}: {exc}"}
+            last_used[0] = time.monotonic()
+            answer["elapsed_ms"] = round((time.monotonic() - started) * 1000)
+            self.wfile.write((json.dumps(answer, ensure_ascii=False) + "\n").encode("utf-8"))
+
+    class Server(socketserver.ThreadingTCPServer):
+        daemon_threads = True
+        allow_reuse_address = False
+
+        def server_bind(self) -> None:
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):  # Windows: no second listener on our port
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            super().server_bind()
+
+    try:
+        server = Server(("127.0.0.1", port), Handler)
+    except OSError as exc:
+        print(f"Port {port} is not free ({exc}); is a daemon already running? "
+              f"Use --port, or `mcp_cli.py stop --port {port}`.", file=sys.stderr, flush=True)
+        return 2
+    serving = False
+    try:
+        token = _write_token(port)
+        client = StdioClient()
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        serving = True
+        print(f"READY {port} (token in {_token_path(port)})", flush=True)
+        while not stopping.is_set():
+            if idle_minutes > 0 and time.monotonic() - last_used[0] > idle_minutes * 60:
+                print("idle timeout, stopping", flush=True)
+                break
+            stopping.wait(1.0)
+    finally:
+        if serving:
+            server.shutdown()
+        server.server_close()
+        if client is not None:
+            client.close()
+        if token:
+            _remove_token(port, token)
+    return 0
+
+
+def send(port: int, request: dict, timeout: float = 600.0) -> dict:
+    try:
+        token = _token_path(port).read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise SystemExit(f"No daemon on port {port}: start one with `mcp_cli.py serve` ({exc})")
+    payload = json.dumps({**request, "token": token}, ensure_ascii=False) + "\n"
+    with socket.create_connection(("127.0.0.1", port), timeout=timeout) as connection:
+        connection.sendall(payload.encode("utf-8"))
+        buffer = b""
+        while not buffer.endswith(b"\n"):
+            chunk = connection.recv(1 << 20)
+            if not chunk:
+                break
+            buffer += chunk
+    return json.loads(buffer.decode("utf-8"))
+
+
+def _arguments(text: str) -> dict:
+    return json.loads(Path(text[1:]).read_text(encoding="utf-8") if text.startswith("@") else text)
+
+
+def _print_answer(answer: dict) -> int:
+    print(json.dumps(answer, ensure_ascii=False, indent=1))
+    return 1 if answer.get("error") or answer.get("isError") else 0
+
+
+def repl(port: int) -> int:
+    print("tool json   (web_info {...} / web_action {...}); empty line or 'quit' ends", flush=True)
+    for line in sys.stdin:
+        line = line.strip()
+        if not line or line in {"quit", "exit"}:
+            break
+        tool, _, raw = line.partition(" ")
+        try:
+            _print_answer(send(port, {"tool": tool, "args": _arguments(raw or "{}")}))
+        except (ValueError, OSError) as exc:
+            print(f"[{type(exc).__name__}: {exc}]")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -209,10 +446,32 @@ def main() -> int:
     run = sub.add_parser("run", help="run a JSON list of steps in one server process")
     run.add_argument("script", help="path to the steps JSON, or - for stdin")
     run.add_argument("--out-dir", type=Path)
+    daemon = sub.add_parser("serve", help="keep one server alive for send/repl")
+    daemon.add_argument("--port", type=int, default=DEFAULT_PORT)
+    daemon.add_argument("--out-dir", type=Path, default=ROOT / "downloads" / "cli")
+    daemon.add_argument("--idle-minutes", type=float, default=30.0, help="0 = never")
+    one = sub.add_parser("send", help="one call to a running daemon")
+    one.add_argument("tool", choices=["web_info", "web_action"])
+    one.add_argument("args", nargs="?", default="{}", help="JSON arguments, or @file")
+    one.add_argument("--port", type=int, default=DEFAULT_PORT)
+    one.add_argument("--timeout", type=float, default=600.0)
+    loop = sub.add_parser("repl", help="interactive calls to a running daemon")
+    loop.add_argument("--port", type=int, default=DEFAULT_PORT)
+    halt = sub.add_parser("stop", help="stop a running daemon")
+    halt.add_argument("--port", type=int, default=DEFAULT_PORT)
     ns = parser.parse_args()
 
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
+
+    if ns.command == "serve":
+        return serve(ns.port, ns.out_dir, ns.idle_minutes)
+    if ns.command == "send":
+        return _print_answer(send(ns.port, {"tool": ns.tool, "args": _arguments(ns.args)}, ns.timeout))
+    if ns.command == "repl":
+        return repl(ns.port)
+    if ns.command == "stop":
+        return _print_answer(send(ns.port, {"op": "stop"}))
 
     if ns.command == "call":
         return run_steps([{"tool": ns.tool, "args": json.loads(ns.args)}], ns.out_dir)

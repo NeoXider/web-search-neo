@@ -1,7 +1,11 @@
 """Page-side JavaScript the action tools send (pure sources, no runtime imports).
 
 Moved out of ``browser_tools.py`` unchanged; re-exported there under the same names.
+``_replay_window_note`` is the one helper: the note that goes with ``_REPLAY_SCRIPT``.
 """
+
+import json
+from typing import Any
 
 from web_search_neo import page_perception
 
@@ -113,8 +117,9 @@ return (async () => {
       url: response.url,
       redirected: response.redirected,
       headers: headers,
-      body: text.length > 20000 ? text.slice(0, 20000) : text,
-      truncated: text.length > 20000,
+      body: text.length > __BODY_CHARS__ ? text.slice(0, __BODY_CHARS__) : text,
+      truncated: text.length > __BODY_CHARS__,
+      body_chars: text.length,
       ms: Math.round(performance.now() - started),
       body_ignored: spec.body != null && noBody,
     };
@@ -123,6 +128,35 @@ return (async () => {
   }
 })();
 """
+REPLAY_BODY_CHARS = 20_000
+_REPLAY_SCRIPT = _REPLAY_SCRIPT.replace("__BODY_CHARS__", str(REPLAY_BODY_CHARS))
+
+
+def _replay_window_note(spec: dict[str, Any], carried: dict[str, Any]) -> dict[str, Any]:
+    """``{"window_note": ...}`` when a replayed response came back cut, else ``{}``.
+
+    Two cuts can happen - the body past ``REPLAY_BODY_CHARS`` (``response.truncated``)
+    and the whole answer windowed by the script-result budget (``truncated``) - and
+    neither could be read further from ``replay_request`` itself. The note spells
+    out the same fetch as a ``run_script`` with ``save_to``, which returns all of it.
+    """
+    response = carried.get("response")
+    body_cut = isinstance(response, dict) and bool(response.get("truncated"))
+    if not (body_cut or carried.get("truncated")):
+        return {}
+    options: dict[str, Any] = {"method": spec.get("method") or "GET",
+                               "credentials": spec.get("credentials") or "include"}
+    if spec.get("headers"):
+        options["headers"] = spec["headers"]
+    if spec.get("body") is not None and options["method"] not in {"GET", "HEAD"}:
+        options["body"] = spec["body"]
+    script = (f"const r = await fetch({json.dumps(spec.get('url'))}, {json.dumps(options, ensure_ascii=False)}); "
+              "return {status: r.status, headers: Object.fromEntries(r.headers), body: await r.text()};")
+    what = (f"the body was cut at {REPLAY_BODY_CHARS} characters (response.body_chars has its length)"
+            if body_cut else "the answer is a window of the response")
+    return {"window_note": (f"Part of the response: {what}. For all of it, send the same request as "
+                            f"run_script with save_to (it writes the whole value to a file): "
+                            f"script={json.dumps(script, ensure_ascii=False)}, save_to='replay-response.json'.")}
 
 
 # ``scrollIntoView`` brings the target into view first, so the wheel point below

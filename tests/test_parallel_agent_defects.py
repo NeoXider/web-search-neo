@@ -180,7 +180,8 @@ def test_close_all_leaves_other_agents_sessions_running():
     result = browser_tools.close_all_sessions(agent_label="filer-1")
 
     assert result["closed_sessions"] == ["mine"]
-    assert result["kept_sessions"] == [{"session_id": "theirs", "agent_label": "filer-2"}]
+    assert result["kept_sessions"] == [
+        {"session_id": "theirs", "agent_label": "filer-2", "kept_because": "other_agent"}]
     assert result["active_sessions"] == ["theirs"]
     assert "theirs" in browser_tools._sessions
 

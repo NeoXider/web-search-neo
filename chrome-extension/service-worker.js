@@ -422,16 +422,15 @@ async function ensureDebugger(tabId) {
   persistState();
 }
 
-// Every DevTools method the server sends through "cdp.send", and nothing else.
-// This narrows the protocol surface, not the power: Runtime.evaluate, Input.*,
-// cookies and Fetch interception still let an authenticated peer do anything
-// the page (and its cookies) can. The token handshake is the real boundary.
-// tests/test_chrome_bridge.py asserts the list against the Python call sites.
+// Every DevTools method the server sends through "cdp.send", and nothing else. This narrows
+// the protocol surface, not the power: Runtime.evaluate, Input.*, cookies and Fetch still let an
+// authenticated peer do what the page can; the token handshake is the real boundary.
 export const ALLOWED_CDP_METHODS = new Set([
   "DOM.setFileInputFiles",
   "Emulation.sendGamepadEvents",
   "Emulation.setDeviceMetricsOverride",
   "Emulation.setEmitTouchEventsForMouse",
+  "Emulation.setFocusEmulationEnabled",
   "Emulation.setGeolocationOverride",
   "Emulation.setLocaleOverride",
   "Emulation.setTimezoneOverride",
@@ -458,6 +457,7 @@ export const ALLOWED_CDP_METHODS = new Set([
   "Page.getLayoutMetrics",
   "Page.reload",
   "Page.removeScriptToEvaluateOnNewDocument",
+  "Page.setWebLifecycleState",
   "Runtime.evaluate",
   "Storage.clearCookies",
   "Storage.getCookies",

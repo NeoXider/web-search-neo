@@ -14,10 +14,10 @@ _INFO_TOPICS = {
     "console": "console.log/warn/error and uncaught errors; params.levels, params.contains.",
     "network": "HTTP requests with status, type, ms, size; params.only_errors=true.",
     "network_body": "One response body; params.request_id is the id from a network read with output='json'.",
-    "execute_js": "Run a JavaScript snippet in a session's page and read its return value.",
+    "execute_js": "Run page JavaScript (async body) and read its value.",
     "screenshot": "PNG viewport, full-page, or exact page-region image.",
-    "game_probe": "Canvas/WebGL/iframe surfaces, FPS, focus, console, held input.",
-    "browser_status": "Chrome availability, one session's state, and every session here: owner, tab, last page, idle, busy, N of M in use.",
+    "game_probe": "Canvas/WebGL surfaces, FPS, frame_health (throttling), focus, console, held input.",
+    "browser_status": "Chrome availability, one session's state, and every session: owner, tab, last page, idle, busy, cap.",
     "browser_tabs": "Tabs open in the user's Chrome, with ids and groups.",
     "search_status": "Search providers, live availability, latency, cooldowns.",
 }
@@ -119,6 +119,7 @@ _ACTION_NOTES = {
     "upload": {
         "replaces": "The input is cleared first: this sets its selection to exactly file_paths. Two files means one call with two paths; a second call discards the first file.",
         "files_uploaded": "{selector: [names]}, read back off the input - the same shape fill returns.",
+        "attach_method": "set_file_input_files = Chrome read the path itself. streamed (current Chrome) = Chrome refused access to the file ('Not allowed'), so the server read it and handed the bytes to the page; stream_reason says why, and the input/change events were synthetic (isTrusted=false). File access switched off and an administrator's ban give the same 'Not allowed'; a refusal naming a policy is an error instead.",
         "upload_state": "attached = the input holds the files. taken_by_widget = a Dropzone-style widget emptied the input and the page names the file or posted it, so it worked. unconfirmed = nothing vouches either way; that is not a refusal, so read note, check page_text/elements for the name and network for the request before attaching again. success is false only when the attach itself failed.",
         "frame_selector": _FRAME_ANY,
     },
@@ -140,12 +141,12 @@ _ACTION_NOTES = {
         "frame_selector": _FRAME_ANY,
     },
 "run_script": {
-        "scope": "Runs in the top document of the session's current tab; there is no frame_selector - address a frame from inside the script if needed.",
+        "scope": "Runs in the top document of the session's current tab; frame_selector runs it inside one frame (same- or cross-origin).",
         "args": "args arrive as arguments[0..n]; only JSON-serialisable values can cross into the page.",
-        "body": "Your script is the body of a wrapper function: end with `return <value>;` for value to be returned - an expression statement or an IIFE without an outer return comes back as null. A promise result needs await_promise=true.",
-        "result": "value is the JSON-serialisable return value; a promise is awaited when await_promise=true (Chrome bridge driver). Long strings are clipped at 200k characters and reported as {clipped, length, head}. attempts reports how many tries the call took.",
+        "body": "One semantics for run_script, execute_js and wait.script: the script is the body of an async function - await works at top level, `return <value>;` returns, and a one-line expression without return returns itself (document.title). A statement without return comes back as null with value_note. A SyntaxError fails at once (syntax_error=true); a thrown error or rejected promise is a script error.",
+        "result": "value is the JSON-serialisable return value; returned promises are awaited. A value over max_chars (default 18000) comes back as a window: truncated=true, total_length (characters, items or JSON characters), offset, next_offset - strings by characters, arrays by whole items, objects as a slice of value_json. save_to='x.json' writes the whole value to the download folder instead. attempts reports how many tries the call took.",
         "retry": "Single-shot by default (retry_on_uncaught=false). An exception may follow a completed mutation. Only enable retries for scripts safe to repeat; retries=2, retry_delay_ms=300. wait_ready=true additionally settles readiness first.",
-        "timeout": "await_promise=true waits on the promise at the CDP layer with the ~15 s script timeout by default - a promise that outlives it (waiting on a human solving a captcha, a long network round-trip) fails as 'cdp.send timed out'. Pass timeout_seconds to extend the wait; it is capped at 600.",
+        "timeout": "Every script runs under a limit: timeout_seconds, default 15, capped at 600; past it the call answers timed_out=true instead of hanging. A slow await leaves the page working. Only when a browser the server launched stops answering (an endless loop froze its tab) does close stop that browser outright (forced); the user's own Chrome is never killed - there close detaches and releases the tab as usual.",
         "safety": "This is raw page-side JavaScript: it can navigate, mutate, or delete state. Prefer fill/click/pointer for input-shaped work and reserve scripts for state only the page holds (localStorage, virtualised rows, framework stores).",
     },
     "click_text": {
@@ -191,9 +192,9 @@ _ACTION_NOTES = {
         "id": "The default output='text' carries no ids. Pass output='json' and hand that row's id to network_body as request_id.",
     },
     "execute_js": {
-        "arguments": "params.script is a JavaScript function body, not code or an expression: use script='return document.title;' to read a result. Do not omit return.",
+        "arguments": "params.script is the body of an async function: script='return document.title;' - or the bare one-line expression 'document.title', which returns itself. Top-level await works. Same semantics as run_script.",
         "scope": "Top document of the session's current tab by default; frame_selector enters one frame first (same- or cross-origin - the bridge attaches to it, Selenium switches target) and the driver is left back at the top document. A top-document script cannot read a cross-origin frame - the browser refuses, not us - so a framed page needs frame_selector instead of a deeper querySelector.",
-        "result": "One contract, always a JSON object: {success, value, value_json, value_type, attempts, ...page summary}. value is plain JSON (objects and arrays arrive as JSON, never '[object Object]' and never MCP content parts), promise-awaited on the Chrome bridge driver; DOM elements arrive as {element: tag} descriptors. value_json is the same value as one JSON string; value_type is null|boolean|number|string|array|object. A script with no return reports value_note. A cyclic or window object fails with a note to return a plain object. Strings over 200k characters come back as {clipped, length, head}.",
+        "result": "One contract, always a JSON object: {success, value, value_json, value_type, attempts, ...page summary}. value is plain JSON (objects and arrays arrive as JSON, never '[object Object]' and never MCP content parts), promise-awaited on the Chrome bridge driver; DOM elements arrive as {element: tag} descriptors. value_json is the same value as one JSON string; value_type is null|boolean|number|string|array|object. A script with no return reports value_note. A cyclic or window object fails with a note to return a plain object. A value over max_chars comes back as a flagged window (truncated, total_length, next_offset); save_to writes it whole to a file.",
         "frames": "Without frame_selector an empty value (null, '', [], {}) on a page with frames a top-document script cannot see comes with cross_origin_frames (count) and frames_note. With frame_selector, a frame that cannot be entered (cross-origin and not yet loaded, not a frame, ambiguous) is a clear ValueError naming why - never a silently partial result.",
         "prefer_actions": "Use fill/click/pointer for anything a user gesture should do; a script cannot simulate a trusted interaction.",
     },
@@ -286,6 +287,7 @@ _ACTION_NOTES = {
     "press_keys": {
         "key_action": "tap|hold|release",
         "note": "The dispatcher key is 'action'; the keyboard verb is 'key_action'.",
+        "chord": "Several keys in one call are one chord (all down, then all up): send a sequence as separate calls, or type_text mode='keys'. Names: ENTER, TAB, ARROW_LEFT or DOM ArrowLeft/KeyW/Digit1; 'Control+Shift+K' is a chord.",
         "hold_frames": "With key_action='tap' in render=step, the key stays down for N released frames - so one call releases hold_frames per repeat, not one. Read frames_advanced.",
         "limits": "1-8 keys, repeat 1-50, hold_frames 1-30.",
         "refusals": "Tapping a key this session already holds is refused before anything is sent; release it first, or drop the tap.",
@@ -381,7 +383,7 @@ _SERVER_INSTRUCTIONS = (
         "the compact contract is not already known. Use web_action for one or many "
         "ordered mutations. Read action_schema before an unfamiliar action or topic; "
         "after validation failure fix the call from that schema, never guess aliases. "
-        "execute_js takes script (a function body with explicit return), not code; "
+        "execute_js takes script (an async function body: return a value, or send a one-line expression), not code; "
         "fill takes fields={CSS_selector: value}. Give each task/agent a unique session_id "
         "and agent_label on open; reuse only that task's session. Never close or take over "
         "another agent's tab. After a zero-match click inspect fresh page_elements/find "
@@ -391,6 +393,6 @@ _SERVER_INSTRUCTIONS = (
     )
 
 _ARGUMENT_RECOVERY = {
-        "browser_execute_js": " Use params={'script': 'return document.title;', 'session_id': '<your-session>'}. script is a function body; an expression without return yields no value. Do not use code.",
+        "browser_execute_js": " Use params={'script': 'return document.title;', 'session_id': '<your-session>'}. script is an async function body (a one-line expression returns itself). Do not use code.",
         "browser_fill_fields": " Use fields={'<CSS selector from fresh page_elements>': '<value>'}, not selector/value or a list. Read field_values and errors before continuing.",
     }

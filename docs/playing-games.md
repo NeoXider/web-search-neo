@@ -461,6 +461,55 @@ exactly the delta it was given:
 `coordinate_mode="delta"` is the related mode for an unlocked cursor: it moves
 relatively but stays inside the viewport.
 
+### Turning smoothly: `look`
+
+One big relative move arrives as one `mousemove`, and many engines clamp the
+movement they accept per frame, so a 400 px turn lands as a fraction of it. `look`
+splits the turn into `steps` relative moves spread over `duration_ms`, and the moves
+add up to exactly `dx`/`dy`:
+
+```json
+{"actions": [
+  {"action": "pointer_lock", "operation": "acquire", "session_id": "fps", "selector": "#game"},
+  {"action": "look", "session_id": "fps", "dx": 400, "dy": -30, "steps": 8, "duration_ms": 160},
+  {"action": "screenshot", "session_id": "fps", "wait_frames": 1}
+]}
+```
+
+A gaze interface (a crosshair in the middle of the screen, Minecraft-style) is aimed
+the same way: read where the target is on a screenshot, turn by the difference, take
+a fresh frame, correct. There is no automatic `aim_at`: what "on target" means is
+the game's, not the browser's.
+
+### Three things that lose input silently
+
+- **Throttling.** Chrome holds frames back in a background tab, a minimised or a
+  covered window: `requestAnimationFrame` drops to a frame a second or stops, and a
+  game that reads input per frame drops keys. `game_probe` reports
+  `frame_health: {raf_fps, throttled, throttle_reason, hint}`. The `unthrottle`
+  action asks Chrome to treat the tab as focused and active and measures again; when
+  `still_throttled` stays true the window itself is covered, and only raising it
+  helps (`show`, with the user's consent). Browsers the server launches start with
+  background throttling switched off; the user's own Chrome (`current`) does not.
+- **Focus lands on the next frames.** The click that focuses a canvas takes effect
+  on the game's following frames; keys sent in the same instant are lost. Put
+  `{"action": "wait_frames", "frames": 2}` between the click and the keys.
+- **A stale screenshot.** `screenshot` with `wait_frames: N` renders N frames first;
+  every capture carries `frame_id`, `captured_at_ms` and `changed_since_last`, and
+  `raf_stalled: true` when no frame came at all.
+
+### Aiming from a screenshot
+
+A PNG is in device pixels, pointer coordinates in CSS pixels. Every capture reports
+`image_width/height`, `css_box`, `device_pixel_ratio` and `scale`; `pointer` with
+`coordinate_space: "image"` takes the image's own pixels and converts them from the
+session's last capture (scale and scroll included):
+
+```json
+{"actions": [{"action": "pointer", "pointer_action": "click", "x": 812, "y": 440,
+              "coordinate_space": "image", "session_id": "fps"}]}
+```
+
 ## Touch games
 
 A mobile game usually feature-detects touch and never runs its touch code path

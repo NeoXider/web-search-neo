@@ -49,12 +49,11 @@ def _library_says(name: str) -> bool | None:
     try:
         import tldextract  # type: ignore[import-not-found]
 
-        extracted = tldextract.TLDExtract(suffix_list_urls=())(name)
+        # Private domains (github.io, blogspot.com) are exactly the registries that matter here.
+        extracted = tldextract.TLDExtract(suffix_list_urls=(), include_psl_private_domains=True)(name)
         return not extracted.domain and bool(extracted.suffix)
-    except ImportError:
-        pass
     except Exception:
-        return None
+        pass  # not installed, or its snapshot failed: try the next list
     try:
         import publicsuffix2  # type: ignore[import-not-found]
 

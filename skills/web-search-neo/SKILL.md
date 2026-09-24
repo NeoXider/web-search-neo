@@ -113,7 +113,7 @@ stable returned attribute from a fresh `page_elements` read. Never choose by arr
 
 ## Search and fetch
 
-Send a `search` action. Keep `engine="duckduckgo"`, `fallback=true`, and
+Send a `search` action. Leave `engine` at its default (`brave`), keep `fallback=true` and
 `challenge_mode="fallback"` unless the user asks otherwise. Use `challenge_mode="manual"`
 only when a visible three-minute human handoff is useful, and never claim the server solves
 CAPTCHA. Use `fetch_text`, `fetch_links`, or `fetch_many` when the URLs are already known.

@@ -25,8 +25,9 @@ look, `web_action` to act — and behind them four capabilities:
 | **Perception** | An accessibility outline, readable text, semantic element lookup, the page console, and its HTTP traffic. |
 | **Isolation** | Separate Selenium profiles — temporary, persistent, or attached — when a clean or headless browser is preferable. |
 
-DuckDuckGo is the default search route. Brave, Mojeek, Yahoo, Bing, and
-Startpage are available as fallbacks.
+Brave is the default search route. DuckDuckGo, Yahoo, Bing, Mojeek, and
+Startpage are available as fallbacks; an engine that keeps answering "nothing"
+where another finds hits is tried last and named in `unreliable_engines`.
 
 ## Contents
 
@@ -43,8 +44,9 @@ Startpage are available as fallbacks.
 - [Forms and multi-step flows](#forms-and-multi-step-flows) · [Reviewable macros](#reviewable-macros)
 - [Where macros live](#where-macros-live) · [Macro files](#macro-files) · [There is no write API](#there-is-no-write-api)
 - [Architecture invariants](ARCHITECTURE.md) · [Project-local and guarded macros](#project-local-and-guarded-macros)
+- [Dialogs, downloads, navigation](#dialogs-downloads-navigation)
 - [Canvas and WebGL games](#canvas-and-webgl-games) · [Render modes](#render-modes) · [Input latency](#input-latency)
-- [Two-tool MCP contract](#two-tool-mcp-contract) · [Optional agent skill](#optional-agent-skill)
+- [Two-tool MCP contract](#two-tool-mcp-contract) · [Optional agent skill](#optional-agent-skill) · [Command-line client](#command-line-client)
 - [Optional configuration](#optional-configuration) · [Transport policy](#transport-policy)
 - [Tests](#tests) · [Safety notes](#safety-notes) · [Contributing](#contributing)
 
@@ -295,7 +297,7 @@ companion popup's Reconnect (Restart companion when its service worker has
 stopped) is the one action; Reload on its card at chrome://extensions is the
 fallback.
 
-The bundled companion is version 1.18.5. Chrome does not refresh an unpacked
+The bundled companion is version 1.19.0. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. That only works for
@@ -556,7 +558,7 @@ The normal agent call is:
     "action": "search",
     "query": "best local-first MCP tools",
     "num": 5,
-    "engine": "duckduckgo",
+    "engine": "brave",
     "fallback": true,
     "challenge_mode": "fallback"
   }]
@@ -574,6 +576,14 @@ state, and detected challenges. A live probe is a diagnostic: a provider that
 fails during the probe is not pushed into the cooldown used by real searches, so
 checking status can no longer degrade the next search. Status checks are cached
 for five minutes; search results are cached for two minutes.
+
+`result_status` says how good an answer is: `ok`, `partial` (fewer hits than
+asked), `empty`, or `off_topic` — no returned row mentions any word of the
+query (Bing does this for some queries, Cyrillic ones reliably). An off-topic
+answer is treated like an empty one: the next engine is asked, the skipped
+engine is listed in `engines_off_topic`, and off-topic rows are returned only
+when nothing better exists, with a `note`. Bing's `bing.com/ck/a` tracking
+links are unwrapped to the real page URL.
 
 ### CAPTCHA and challenge modes
 
@@ -788,7 +798,7 @@ visible while it is not, and stops believing it the moment the debugger detaches
 
 Two consequences worth knowing. A targeted keyboard action can change DOM focus
 inside the controlled background page, but it does not take OS focus or change the
-active user tab. In Companion 1.18.5, viewport screenshots capture one fresh PNG
+active user tab. In Companion 1.19.0, viewport screenshots capture one fresh PNG
 video frame with an 8-second frame deadline, then stop the owned recording. This
 does not activate tabs, restore windows, resize the viewport, or alter emulation.
 An existing recording or overlapping capture is refused. Full-page and region
@@ -1110,6 +1120,8 @@ choice, submit exactly once, then prove the outcome with fresh DOM/text.
 - Date, time, datetime-local, month, week, range and colour inputs are set rather than typed, since typing into them depends on the browser's locale. The value is rehearsed on a throwaway input first, so an unparseable one is refused **without touching the control** — no more valid-looking wrong date, no more slider dropped to its midpoint — and the error names the format the control wants.
 - A `contenteditable` editor — TipTap, ProseMirror, Slate, Quill, a webmail message body — is written as a real edit and keeps its paragraphs: the text goes in a line at a time with a soft break between the lines (Shift+Enter, never Enter, which in a chat composer would send what is written so far), because inserting it in one go puts `\n` inside a single text node where it renders as a space. The read-back is `innerText`, not `textContent`, which ran every paragraph together and reported a fill that had worked as a refusal. If an editor folds the breaks away regardless, the error says exactly that and names the way through: put the text on the clipboard with `run_script` (`user_gesture=true`, `navigator.clipboard.writeText`) and paste it with a real `Ctrl+V` through `input`. Some chat composers never pick up a DOM write at all — their send control stays inert — so paste there always.
 - `upload` no longer treats an empty file input as proof of failure. Any Dropzone-style widget takes the file off the input and uploads it itself, so reading the input back finds nothing a millisecond later while the file is already stored and its chip with the name is on the screen. `upload_state` says how far the evidence goes: `attached` (the input holds the files, which is exact), `taken_by_widget` (the input was emptied, and either the page now names the file or a POST/PUT/PATCH followed the attach) or `unconfirmed` (nothing vouches for it either way — which is *not* a refusal; `note` says to look for the name with `page_text`/`elements` and for the request in the `network` topic before attaching again). `success` is false only when the attach itself failed. `fill` with `files` reports the same thing in `upload_states` and `upload_notes`.
+- `upload` says how the file got in: `attach_method: "set_file_input_files"` (Chrome read the path itself) or `"streamed"` with `stream_reason`. In your own Chrome, if Chrome refuses access to the file (a bare "Not allowed"), the server reads the file and hands its bytes to the page and reports `attach_method: streamed`; the page then sees synthetic `input`/`change` events (`isTrusted=false`). Chrome gives the same "Not allowed" when the companion's "Allow access to file URLs" is off and, apparently, when an administrator forbids file access - the two cannot be told apart. A refusal whose text names a policy is returned as an error.
+- `fetch_links` returns a list of URLs; when the `limit` or the byte budget cut it, the last line starts with `# ` (`# truncated=true: …`, `# body_cut=true: …`) and is never a URL.
 - `submit` runs native validation first and reports `validation_passed` with the offending field ids, then `submit_triggered` from the fired `submit` event or from the document being replaced — including a reload of the same URL, which a check on url and title alone reported as a failed submit. `submit_default_prevented` marks the SPA case where a handler cancelled the navigation on purpose. `submit_evidence` states in a sentence what the verdict rests on, and `new_tab_opened` warns that a `target="_blank"` result landed in a tab this session does not own — so the `url` and `title` beside it are still this page's, not the answer you are looking for.
 - A checkbox takes `1`/`yes`/`y`/`on`/`check`/`checked` or `0`/`no`/`n`/`off`/`uncheck`/`unchecked`/`""` and refuses anything else, a `<select>` takes an option `value` or its visible text, and a file input must go through `files`/`upload`.
 - Every control `fill` writes is blurred afterwards, because that is the only way the last field of a fill ever fires its `change` event. Three consequences follow and the third bites: focus ends on `document.body`, an autocomplete list the fill opened is dismissed, and a following `press_keys(["ENTER"])` goes to the body rather than the field — pass `target_selector`, or `focus_mode="click"`, when you mean to submit by keyboard. The `files` entries are the exception: nothing is typed into them, so nothing is blurred.
@@ -1335,6 +1347,14 @@ projects and are not bundled in this repository.
 the single attempt, use ordinary read-only inspection actions (for example fresh page text or a
 screenshot) to collect destination-specific proof.
 
+## Dialogs, downloads, navigation
+
+| Action | What it does |
+| --- | --- |
+| `dialogs` | Reads the `alert`/`confirm`/`prompt` texts the page raised and sets how the next ones are answered: `policy: "accept"` (confirm -> true, prompt -> `prompt_text`) or `"dismiss"` (the default). Automatic in browsers the server launches; in your own Chrome only after the first `dialogs` call. A `click` reports the dialogs it raised. |
+| `downloads` | Lists the files the session downloaded. Browsers the server launches download into their own folder under the download directory, never into `~/Downloads`; a `click` reports the files it downloaded. |
+| `navigate` | Goes to a URL in an open session, keeping its browser, profile and viewport. `open` without `profile_mode` also keeps an existing session's mode. |
+
 ## Canvas and WebGL games
 
 Browser automation is not limited to DOM forms. The compact contract covers common HTML5 game controls:
@@ -1347,11 +1367,20 @@ Browser automation is not limited to DOM forms. The compact contract covers comm
 | `touch`, `touch_emulation` | `tap`, `press`, `move`, `release`, `swipe`, or `cancel` with up to ten simultaneous points; the emulation makes the page report `navigator.maxTouchPoints` and `ontouchstart` so a game's mobile code path actually runs. |
 | `pointer_lock` | Acquires, releases, or reports pointer lock for first-person controls; while locked, `coordinate_mode="relative"` moves without clamping to the viewport, which is what feeds `movementX`/`movementY`. |
 | `render`, `step`, `release_inputs` | Control the animation gate and safely reset held input. |
+| `look` | Turns a pointer-locked camera by exactly `dx`/`dy`, split into `steps` relative moves over `duration_ms` (engines that clamp one big jump per frame still turn fully). |
+| `wait_frames` | Lets N animation frames render - between the click that focuses a canvas and the first keys, which would otherwise be lost. |
+| `unthrottle` | When `game_probe.frame_health.throttled` is true, asks Chrome to treat the tab as focused and active and measures `raf_fps` again; says when only raising the window helps. |
+| `screenshot` `wait_frames`, `pointer` `coordinate_space="image"` | Every capture reports image size, CSS box, `device_pixel_ratio`, `scale`, `frame_id` and `changed_since_last`; `pointer` can aim directly in the last capture's pixels. |
 | `frame_selector` | Targets a cross-origin game iframe such as the one used by Yandex Games. |
 
 The verb of each action is namespaced because the dispatcher already owns
 `action`: `key_action`, `pointer_action`, `touch_action`, and `pointer_lock`'s
 `operation`.
+
+Key names also accept the DOM spellings (`ArrowLeft`, `KeyW`, `Digit1`, `ShiftLeft`) and
+`"Control+Shift+K"` chords; several keys in one `press_keys` are pressed together as a
+chord. `ENTER` is the main Enter key (`NUMPAD_ENTER` the keypad one) and produces the
+same `keydown`/`keypress`/`insertLineBreak` sequence as a real keyboard in both input paths.
 
 Keyboard coverage includes `F1`-`F12`, `NUMPAD0`-`NUMPAD9` with the numeric keypad location, `MULTIPLY`/`ADD`/`SUBTRACT`/`DECIMAL`/`DIVIDE`, `META` (also `WIN`, `CMD`, `COMMAND`), the arrow, navigation, and editing keys, and any single printable character. A key held as `W` is released by `w` as well, and the release dispatches exactly the character that was pressed. A modifier held with `hold` is carried into subsequent mouse and touch events, so `Shift`-click and `Ctrl`-click behave as a user's would. Giving a canvas keyboard focus no longer costs a synthetic click, which used to reach the game as a shot or a jump.
 
@@ -1465,6 +1494,12 @@ the post-action page read: `input` 34 ms → 29 ms, `press_keys` 25 ms → 21 ms
 11 ms → 8 ms. It saves nothing measurable on `pointer`, whose summary is already the
 cheapest of the four. Absolute numbers depend on the machine; the ratios do not.
 
+These are **step-mode** numbers: the page does no work between actions. In `normal`
+render mode the same call waits on the page's own main thread, so on a heavy page (a
+144 FPS canvas, a busy SPA) or a throttled window it takes 0.3-2 s. `game_probe`
+reports `frame_health` (measured `raf_fps`, `throttled`, `throttle_reason`) so a slow
+round trip can be told apart from a slow page.
+
 ## Two-tool MCP contract
 
 | Tool | Responsibility |
@@ -1540,6 +1575,27 @@ Copy-Item -Recurse -Force skills\web-search-neo "$env:USERPROFILE\.codex\skills\
 ```
 
 Invoke it explicitly as `$web-search-neo`, or let its task description trigger it for web search, visible Chrome automation, authorized attach sessions, form work, and browser-game testing.
+
+## Command-line client
+
+`scripts/mcp_cli.py` drives the server over stdio for scripts and agents without an MCP
+connector. `call` and `run` start a server per invocation (a cold start is about 12 s and
+sessions end with it). For iterative work keep one server alive:
+
+```
+python scripts/mcp_cli.py serve --port 47811          # prints READY; stops after 30 idle minutes
+python scripts/mcp_cli.py send web_action '{"actions":[{"action":"open","url":"https://example.com","session_id":"s","profile_mode":"isolated"}]}'
+python scripts/mcp_cli.py send web_info '{"topic":"screenshot","params":{"session_id":"s"}}'
+python scripts/mcp_cli.py repl                         # one "tool json" per line
+python scripts/mcp_cli.py stop
+```
+
+The daemon listens on 127.0.0.1 only (a busy port is an error, and on Windows the port is
+bound exclusively) and answers only callers holding the random token it writes to
+`~/.web-search-neo/cli-<port>.token`, made readable by your user only (`chmod 600`; on
+Windows an `icacls` ACL for the current user alone - the daemon refuses to start if that fails). Images are
+written to `--out-dir` (default `downloads/cli`) and named in the answer; JSON text parts are
+decoded.
 
 ## Optional configuration
 

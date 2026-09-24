@@ -8,6 +8,7 @@ from typing import Any
 
 from selenium.common.exceptions import TimeoutException
 
+from . import repl
 from .scripts import clip_result
 
 _ZERO_WAIT = re.compile(r"\b(after|waited) 0s\b")
@@ -46,8 +47,17 @@ def wait_for_condition(
             enter_frame(driver, frame_selector, script)
             try:
                 try:
-                    last_value = driver.execute_script(f"return ({script});")
+                    if hasattr(driver, "execute_async_script"):
+                        # The same semantics as run_script: an expression or a body
+                        # with return, top-level await allowed.
+                        last_value, _ = repl.run(driver, script)
+                    else:
+                        last_value = driver.execute_script(f"return ({script});")
                     last_error = None
+                except repl.ScriptError as exc:
+                    if exc.syntax:  # it will never compile: fail now, not at the timeout
+                        raise ValueError(f"wait script does not compile: {exc}") from exc
+                    last_value, last_error = None, str(exc)
                 except Exception as exc:
                     last_value, last_error = None, describe_error(exc)
             finally:

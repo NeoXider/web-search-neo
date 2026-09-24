@@ -18,10 +18,16 @@ from urllib.parse import quote_plus
 from bs4 import BeautifulSoup
 from ddgs import DDGS
 
+from web_search_neo.search_quality import off_topic, unwrap_bing
 from web_search_neo.web_client import clamp_timeout, request
 
 
-DEFAULT_ENGINE = "duckduckgo"
+# brave: the one keyless engine that answered every probe in the 1.19 audit;
+# duckduckgo/mojeek/startpage (via ddgs) came back empty for every query.
+DEFAULT_ENGINE = "brave"
+# An engine that answered "nothing" this many times in a row while a later
+# engine had hits is tried last on fallback and named in unreliable_engines.
+UNRELIABLE_AFTER_MISSES = 2
 STATUS_CACHE_TTL_SECONDS = 300
 SEARCH_CACHE_TTL_SECONDS = 120
 PROVIDER_COOLDOWN_SECONDS = 180
@@ -222,6 +228,7 @@ class BingHtmlSearchProvider(SearchProvider):
             params={"q": query, "count": min(max(num, 1), 20)},
         )
         body = response.text
+        cut = getattr(response, "wsn_truncated", False) is True  # said on every row, never silent
         lower = body.lower()
         if any(
             marker in lower
@@ -240,7 +247,7 @@ class BingHtmlSearchProvider(SearchProvider):
             anchor = item.select_one("h2 a[href]")
             if anchor is None:
                 continue
-            url = str(anchor.get("href") or "").strip()
+            url = unwrap_bing(str(anchor.get("href") or "").strip())  # not the ck/a tracker
             title = " ".join(anchor.get_text(" ", strip=True).split())
             if not url.startswith(("http://", "https://")) or not title:
                 continue
@@ -254,6 +261,7 @@ class BingHtmlSearchProvider(SearchProvider):
                         if snippet_node is not None
                         else ""
                     ),
+                    **({"page_cut_at_bytes": str(len(response.content or b""))} if cut else {}),
                 }
             )
             if len(results) >= num:
@@ -290,14 +298,19 @@ def register_search_provider(provider: SearchProvider) -> None:
 
 
 for _provider in (
-    DdgsSearchProvider("duckduckgo", "duckduckgo", "https://duckduckgo.com/?q={query}"),
     DdgsSearchProvider("brave", "brave", "https://search.brave.com/search?q={query}"),
-    DdgsSearchProvider("mojeek", "mojeek", "https://www.mojeek.com/search?q={query}"),
+    DdgsSearchProvider("duckduckgo", "duckduckgo", "https://duckduckgo.com/?q={query}"),
     DdgsSearchProvider("yahoo", "yahoo", "https://search.yahoo.com/search?p={query}"),
     BingHtmlSearchProvider(),
+    DdgsSearchProvider("mojeek", "mojeek", "https://www.mojeek.com/search?q={query}"),
     DdgsSearchProvider("startpage", "startpage", "https://www.startpage.com/do/search?q={query}"),
 ):
     register_search_provider(_provider)
+
+
+def default_engine() -> str:
+    """The first registered engine (brave unless the order was changed)."""
+    return ENGINE_ORDER[0] if ENGINE_ORDER else DEFAULT_ENGINE
 
 
 def _error_kind(exc: Exception) -> str:
@@ -323,6 +336,23 @@ def _set_provider_result(name: str, error: Exception | None) -> None:
             error_kind=kind,
             cooldown_until=now + cooldown,
         )
+
+
+def _note_misses(names: list[str], found_by: str | None) -> None:
+    """Count answers of "nothing" that another engine contradicted; a hit resets."""
+    with _runtime_lock:
+        for name in names:
+            state = _provider_state.setdefault(name, {})
+            state["misses"] = int(state.get("misses") or 0) + 1 if found_by else 0
+        if found_by:
+            _provider_state.setdefault(found_by, {})["misses"] = 0
+
+
+def _unreliable(names: list[str]) -> dict[str, dict]:
+    with _runtime_lock:
+        return {name: {"empty_while_others_found": int(_provider_state.get(name, {}).get("misses") or 0)}
+                for name in names
+                if int(_provider_state.get(name, {}).get("misses") or 0) >= UNRELIABLE_AFTER_MISSES}
 
 
 def _cooldown_remaining(name: str) -> int:
@@ -435,7 +465,7 @@ def get_search_engines_status(
     global _status_cache
     if not check_live:
         return {
-            "default_engine": DEFAULT_ENGINE,
+            "default_engine": default_engine(),
             "checked_live": False,
             "configured": list(ENGINE_ORDER),
             "available": [],
@@ -473,7 +503,7 @@ def get_search_engines_status(
             by_name[item["name"]] = item
     engines = [by_name[name] for name in ENGINE_ORDER]
     status = {
-        "default_engine": DEFAULT_ENGINE,
+        "default_engine": default_engine(),
         "checked_live": True,
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "cached": False,
@@ -490,12 +520,12 @@ def get_search_engines_status(
 def search_web(
     query: str,
     num: int = 5,
-    engine: str = DEFAULT_ENGINE,
+    engine: str | None = None,
     fallback: bool = True,
     timeout_seconds: float = 10.0,
     fresh: bool = False,
 ) -> dict:
-    """Search with DuckDuckGo by default, skipping challenged providers on cooldown.
+    """Search with Brave by default, skipping challenged providers on cooldown.
 
     A provider that answers "no hits" is not a failed provider: the answer is
     passed on as a successful, empty result set (``result_status`` says
@@ -504,6 +534,7 @@ def search_web(
     query = query.strip()
     if not query:
         raise ValueError("query must not be empty")
+    engine = engine or default_engine()
     if engine not in SEARCH_PROVIDERS:
         raise ValueError(f"Unknown engine '{engine}'. Choose from: {', '.join(ENGINE_ORDER)}")
     num = max(1, min(int(num), 20))
@@ -528,10 +559,14 @@ def search_web(
 
     candidates = [engine]
     if fallback:
-        candidates.extend(name for name in ENGINE_ORDER if name != engine)
+        rest = [name for name in ENGINE_ORDER if name != engine]
+        doubtful = set(_unreliable(rest))
+        candidates.extend([name for name in rest if name not in doubtful] + [n for n in rest if n in doubtful])
     errors: dict[str, dict] = {}
     recoveries: list[dict] = []
     empty_answers: list[str] = []
+    off_topic_answers: list[str] = []
+    off_topic_rows: tuple[str, list[SearchResult]] | None = None
     deadline = time.monotonic() + timeout
     for attempt_index, candidate in enumerate(candidates):
         budget = deadline - time.monotonic()
@@ -571,6 +606,12 @@ def search_web(
             # next one; the provider itself is fine and stays uncooled.
             empty_answers.append(candidate)
             continue
+        if off_topic(query, results):
+            # Rows that never mention the query are an empty answer in disguise.
+            off_topic_answers.append(candidate)
+            off_topic_rows = off_topic_rows or (candidate, results)
+            continue
+        _note_misses(empty_answers + off_topic_answers, candidate)
         return _successful_search(
             cache_key,
             query=query,
@@ -581,9 +622,16 @@ def search_web(
             errors=errors,
             recoveries=recoveries,
             empty_answers=empty_answers,
-            started=started,
+            started=started, off_topic_answers=off_topic_answers,
         )
 
+    if off_topic_rows is not None:
+        # Nothing better anywhere: pass the rows on, labelled for what they are.
+        return _successful_search(
+            cache_key, query=query, engine=engine, candidate=off_topic_rows[0], num=num,
+            results=off_topic_rows[1], errors=errors, recoveries=recoveries,
+            empty_answers=empty_answers, started=started, off_topic_answers=off_topic_answers,
+        )
     if empty_answers:
         # Every engine that could be asked answered, and the honest answer is
         # that this query has no hits. That is a successful search.
@@ -630,6 +678,7 @@ def _successful_search(
     recoveries: list[dict],
     empty_answers: list[str],
     started: float,
+    off_topic_answers: list[str] | None = None,
 ) -> dict:
     """Build, cache and return a successful response.
 
@@ -637,8 +686,11 @@ def _successful_search(
     making them compare lengths: ``ok`` for a full set, ``partial`` when the
     engine had fewer than ``num`` hits, ``empty`` when it had none.
     """
+    off_topic_answers = off_topic_answers or []
     if not results:
         status = "empty"
+    elif candidate in off_topic_answers:
+        status = "off_topic"
     elif len(results) < num:
         status = "partial"
     else:
@@ -659,7 +711,15 @@ def _successful_search(
         "errors": errors,
         "challenge_recoveries": recoveries,
     }
-    if results or not errors:
+    if off_topic_answers:
+        response["engines_off_topic"] = off_topic_answers
+    unreliable = _unreliable([name for name in ENGINE_ORDER if name in SEARCH_PROVIDERS])
+    if unreliable:
+        response["unreliable_engines"] = unreliable
+    if status == "off_topic":
+        response["note"] = ("No engine returned a row that mentions the query; these rows are "
+                            "probably unrelated. Rephrase, or search in the browser.")
+    if status != "off_topic" and (results or not errors):
         # "No hits anywhere" is worth caching, but not when an engine could not
         # be asked: that empty answer is incomplete, and repeating it for two
         # minutes would hide the retry that fixes it.

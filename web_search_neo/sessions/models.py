@@ -171,6 +171,22 @@ class BrowserSession:
     # what is new to *it*, so it carries its own place in both of them.
     probe_console: ConsoleCursor = field(default_factory=ConsoleCursor)
     probe_console_seen: list[dict[str, Any]] = field(default_factory=list)
+    # The console topic's own history (console_log.py): every entry ever collected
+    # for this session, numbered by the history, read without moving any cursor.
+    console_history: list[dict[str, Any]] = field(default_factory=list)
+    console_hseq: int = 0
+    console_history_dropped: int = 0
+    # page_guards.py: where this browser downloads, and how JS dialogs are answered.
+    download_dir: str | None = None
+    download_routing_error: str | None = None
+    dialog_script_id: str | None = None
+    dialog_policy: str = "dismiss"
+    dialog_prompt_text: str = ""
+    dialog_policy_set: bool = False
+    # frame_capture.py: the last capture's counter, hash and geometry.
+    capture_seq: int = 0
+    capture_hash: str | None = None
+    capture_geometry: dict[str, Any] | None = None
     network_pending: dict[str, dict[str, Any]] = field(default_factory=dict)
     network_rows: list[dict[str, Any]] = field(default_factory=list)
     # Capture runs from the moment the tab opens, so a long session outlives its

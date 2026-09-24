@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from web_search_neo.fetch.decoding import decode_response
 from web_search_neo.fetch.safety import redact_url, write_download
 from web_search_neo.web_client import clamp_timeout, request, validate_http_url
 
@@ -35,6 +36,8 @@ def http_request(
     status, while transport failures (DNS, timeout) raise like fetch_text.
     ``save_to`` is confined to the download directory (see fetch.safety) and
     refuses to replace an existing file unless ``overwrite`` is true.
+    No cookies carry over between calls: send a Cookie header yourself; every
+    Set-Cookie of the response is listed in ``set_cookies``.
     """
     normalized_method = "GET" if method is None else str(method).strip().upper()
     if normalized_method not in _METHODS:
@@ -79,9 +82,13 @@ def http_request(
     status = int(response.status_code)
     final_url = getattr(response, "url", None) or normalized_url
     resp_headers = dict(getattr(response, "headers", None) or {})
-    text_value = getattr(response, "text", "")
-    if not isinstance(text_value, str):
-        text_value = "" if text_value is None else str(text_value)
+    # requests folds repeated Set-Cookie headers into one ", "-joined string,
+    # which the commas inside Expires make unparseable: keep them apart too.
+    raw_headers = getattr(getattr(response, "raw", None), "headers", None)
+    listed = raw_headers.getlist("Set-Cookie") if hasattr(raw_headers, "getlist") else None
+    set_cookies = [str(item) for item in listed] if isinstance(listed, (list, tuple)) else []
+    cookie_field = {"set_cookies": set_cookies} if set_cookies else {}
+    text_value, _charset = decode_response(response)
     raw = getattr(response, "content", None)
     if isinstance(raw, (bytes, bytearray)):
         raw_bytes = bytes(raw)
@@ -96,7 +103,7 @@ def http_request(
             "success": True,
             "url": final_url,
             "status": status,
-            "headers": resp_headers,
+            "headers": resp_headers, **cookie_field,
             "saved_to": str(resolved),
             "size_bytes": size_bytes,
             **({"truncated": True} if cut_by_transport else {}),
@@ -106,8 +113,8 @@ def http_request(
         "success": True,
         "url": final_url,
         "status": status,
-        "headers": resp_headers,
-        "body": text_value[:limit],
+        "headers": resp_headers, **cookie_field,
+        "body": text_value[:limit], "total_chars": len(text_value),
         "truncated": len(text_value) > limit or cut_by_transport,
         "size_bytes": size_bytes,
     }

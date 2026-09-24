@@ -30,6 +30,7 @@ from selenium.common.exceptions import NoSuchElementException, TimeoutException,
 from web_search_neo import bridge_auth
 from web_search_neo import bridge_daemon
 from web_search_neo import bridge_handshake
+from web_search_neo.cdp import element_handles
 from web_search_neo.bridge_daemon import (
     CHROME_EXTENSION_ID,
     DEFAULT_HOST,
@@ -38,14 +39,13 @@ from web_search_neo.bridge_daemon import (
     TOKEN_MISMATCH_REASON,
     close_quietly,
 )
-from web_search_neo.key_table import MODIFIER_BITS, resolve_key
+from web_search_neo.key_table import MODIFIER_BITS, key_text, resolve_key
 from web_search_neo.process_probe import popen_detached
 
 
 # The tab group the agent's pages land in. It carries the project's mascot so a
 # user glancing at a crowded window can tell at once which tabs are not theirs.
 DEFAULT_TAB_GROUP = "🟢 AI"
-
 
 class ChromeBridgeError(RuntimeError):
     """Raised when the companion extension isn't connected or rejects a command."""
@@ -1340,12 +1340,16 @@ class _BridgeService:
 
 
 class ChromeBridgeElement:
-    """Small Selenium WebElement subset backed by a stable CSS selector."""
+    """Small Selenium WebElement subset backed by a stable CSS selector or, for a ref
+    handle or piercing path, the JS ``expression`` that finds it (cdp/element_handles)."""
 
-    def __init__(self, driver: "ChromeBridgeDriver", selector: str, index: int = 0) -> None:
+    def __init__(
+        self, driver: "ChromeBridgeDriver", selector: str, index: int = 0, expression: str | None = None
+    ) -> None:
         self.parent = driver
         self.selector = selector
         self.index = max(0, int(index))
+        self.expression = expression
 
     @property
     def tag_name(self) -> str:
@@ -1418,7 +1422,7 @@ class ChromeBridgeElement:
         text = str(value)
         input_type = str(self.get_attribute("type") or "").lower()
         if input_type == "file":
-            self.parent.set_file_input_files(self.selector, text.splitlines())
+            self.parent.set_file_input_files(self, text.splitlines())
             return
         self.parent.execute_script(
             "arguments[0].scrollIntoView({block:'center',inline:'center'}); arguments[0].focus();",
@@ -1570,14 +1574,20 @@ class ChromeBridgeDriver:
 
     def _argument_expression(self, value: Any) -> str:
         if isinstance(value, ChromeBridgeElement):
+            if value.expression:
+                return f"({value.expression})"
             reference = json.dumps(value.selector, ensure_ascii=False)
             if value.index:
                 return f"document.querySelectorAll({reference})[{value.index}]"
             return f"document.querySelector({reference})"
         return json.dumps(value, ensure_ascii=False)
 
-    def _wrap_script(self, script: str, args: tuple[Any, ...], asynchronous: bool) -> str:
+    def _wrap_script(
+        self, script: str, args: tuple[Any, ...], asynchronous: bool, plain: bool = True
+    ) -> str:
+        # plain: DOM nodes in the result come back as {} (cdp/element_handles.PLAIN_RESULT_JS).
         arguments = ",".join(self._argument_expression(arg) for arg in args)
+        plain_prefix = element_handles.PLAIN_RESULT_JS if plain else element_handles.RAW_RESULT_JS
         frame_prefix = ""
         frame_suffix = ""
         if self._same_origin_frame_selector:
@@ -1592,17 +1602,19 @@ class ChromeBridgeDriver:
         if asynchronous:
             return (
                 "new Promise((__done,__reject)=>{try{"
+                + plain_prefix
                 + frame_prefix
-                + f"const arguments=[{arguments},__done];"
+                + f"const arguments=[{arguments},(__value)=>__done(__wsnPlain(__value))];"
                 + f"(function(){{{script}}}).apply(window,arguments);"
                 + frame_suffix
                 + "}catch(__error){__reject(__error);}})"
             )
         return (
             "(()=>{"
+            + plain_prefix
             + frame_prefix
             + f"const arguments=[{arguments}];"
-            + f"return (function(){{{script}}}).apply(window,arguments);"
+            + f"return __wsnPlain((function(){{{script}}}).apply(window,arguments));"
             + frame_suffix
             + "})()"
         )
@@ -1729,23 +1741,11 @@ class ChromeBridgeDriver:
         if not selected:
             raise ValueError(f"No select option matches '{value}'")
 
-    def set_file_input_files(self, selector: str, paths: list[str]) -> None:
-        # Runtime.evaluate is issued against the selected child target for a
-        # cross-origin frame, but same-origin frames stay in the tab target and
-        # are represented by the frame selector in _wrap_script.  Keep the
-        # lookup in that same execution context; querying the top-level
-        # document here made an otherwise valid upload fail with Chrome's
-        # unhelpful "Uncaught" when the input lived in an iframe.
-        expression = self._wrap_script(
-            "return document.querySelector(arguments[0]);", (selector,), False
-        )
-        remote_object = self._evaluate(expression, return_by_value=False)
-        object_id = remote_object.get("objectId")
-        if not object_id:
-            raise NoSuchElementException(f"No file input matches selector: {selector}")
-        self.execute_cdp_cmd(
-            "DOM.setFileInputFiles", {"objectId": object_id, "files": paths}
-        )
+    def set_file_input_files(self, target: "str | ChromeBridgeElement", paths: list[str]) -> None:
+        element_handles.set_file_input_files(self, target, paths)
+
+    def attach_files(self, element: ChromeBridgeElement, paths: list[str]) -> list[str]:
+        return element_handles.attach_files(self, element, paths)
 
     def perform_key_events(self, events: list[dict[str, Any]]) -> None:
         modifiers = self._modifier_mask
@@ -1769,9 +1769,9 @@ class ChromeBridgeDriver:
                 "location": location,
                 "autoRepeat": bool(event.get("repeat", False)),
             }
-            if event_type == "keyDown" and len(key) == 1 and not (modifiers & 3):
-                # Only a printable keypress carries text; Ctrl/Alt chords never do.
-                params["text"] = key
+            text = key_text(key)  # a printable key, or Enter's CR (keypress, insertLineBreak)
+            if event_type == "keyDown" and text and not (modifiers & 3):  # never on Ctrl/Alt chords
+                params.update(text=text, unmodifiedText=text)
             self.execute_cdp_cmd("Input.dispatchKeyEvent", params)
             if event_type == "keyUp":
                 modifiers &= ~bit

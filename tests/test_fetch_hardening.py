@@ -111,9 +111,9 @@ def test_an_oversized_error_body_still_reports_the_status_truncated():
         result = api.http_request(f"{base}/error", max_chars=10)
         with pytest.raises(requests.HTTPError) as caught:
             web_client.request(f"{base}/error", max_response_bytes=2048)
-        # A success body over the limit is still refused outright.
-        with pytest.raises(ValueError, match="safety limit"):
-            web_client.request(f"{base}/ok", max_response_bytes=2048)
+        # 1.19: a success body over the limit is cut and flagged, not refused.
+        cut = web_client.request(f"{base}/ok", max_response_bytes=2048)
+        assert cut.wsn_truncated is True and len(cut.content) == 2048
     assert result["success"] is True and result["status"] == 502
     assert result["truncated"] is True
     assert result["body"] == "E" * 10

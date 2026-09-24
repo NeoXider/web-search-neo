@@ -24,7 +24,12 @@ def test_fetch_url_text_uses_local_http_and_strips_non_visible_content(local_sit
 def test_fetch_url_text_honors_max_chars(local_site):
     text = asyncio.run(main.fetch_url_text(f"{local_site.base_url}/page", max_chars=12))
 
-    assert len(text) == 12
+    # 1.19: the cut is always stated, with where to continue.
+    content, marker = text.split("\n\n[truncated=true", 1)
+    assert len(content) == 12 and "next_offset=12]" in marker
+    page = asyncio.run(main.fetch_url_text(f"{local_site.base_url}/page", max_chars=12,
+                                           offset=12, output="json"))
+    assert page["offset"] == 12 and page["text"] and page["total_chars"] > 12
 
 
 def test_fetch_page_links_resolves_relative_urls_and_deduplicates(local_site):
@@ -183,7 +188,7 @@ def test_fetch_url_text_truncation_does_not_fake_an_spa_signal():
 
     assert "spa_suspected" not in text
     assert "browser session" not in text
-    assert len(text) == 20
+    assert len(text.split("\n\n[truncated=true", 1)[0]) == 20
 
 
 def test_fetch_url_text_raw_mode_keeps_source_without_spa_notice():

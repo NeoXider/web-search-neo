@@ -1,0 +1,14 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Dialogs and downloads</title></head>
+<body>
+  <button id="alert" onclick="alert('Saved!'); document.getElementById('out').textContent = 'alerted'">Alert</button>
+  <button id="confirm" onclick="document.getElementById('out').textContent = confirm('Delete the item?') ? 'deleted' : 'kept'">Delete</button>
+  <button id="prompt" onclick="document.getElementById('out').textContent = 'name=' + prompt('Your name?', 'guest')">Name</button>
+  <a id="download" download="report.txt" href="data:text/plain;charset=utf-8,hello%20report">Download</a>
+  <button id="open-modal" onclick="document.getElementById('modal').style.display = 'block'">Open modal</button>
+  <div id="modal" role="dialog" aria-modal="true" style="display:none">A modal</div>
+  <div role="dialog" hidden>A dialog left in the DOM, closed</div>
+  <p id="out">idle</p>
+</body>
+</html>

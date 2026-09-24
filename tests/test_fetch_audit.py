@@ -101,7 +101,7 @@ def test_rejected_redirect_closes_response():
     response.close.assert_called_once()
 
 
-@pytest.mark.parametrize("failure", ["http", "stream", "limit"])
+@pytest.mark.parametrize("failure", ["http", "stream"])
 def test_failed_request_closes_response(monkeypatch, failure):
     response = Mock(is_redirect=False)
     response.raise_for_status.return_value = None
@@ -123,3 +123,15 @@ def test_failed_request_closes_response(monkeypatch, failure):
 def test_origin_normalizes_default_ports():
     assert web_client._origin("https://example.test/a") == web_client._origin("https://example.test:443/b")
     assert web_client._origin("http://example.test/a") != web_client._origin("https://example.test/a")
+
+
+def test_a_body_over_the_limit_is_cut_and_flagged_not_refused(monkeypatch):
+    response = Mock(is_redirect=False)
+    response.raise_for_status.return_value = None
+    response.iter_content.return_value = iter([b"x" * 1025])
+    session = Mock()
+    session.request.return_value = response
+    monkeypatch.setattr(web_client, "_session", lambda: session)
+    answer = web_client.request("http://localhost/file", max_response_bytes=1024)
+    assert answer.wsn_truncated is True and answer._content == b"x" * 1024
+    response.close.assert_not_called()

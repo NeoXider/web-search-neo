@@ -50,6 +50,9 @@ def test_stdio_server_exposes_compact_discovery_and_action_tools(local_site):
                     "render",
                     "step",
                     "release_inputs",
+                    "wait_frames",
+                    "unthrottle",
+                    "look",
                 ]
                 assert "action_types" not in capabilities
                 # The contract must stand alone, with no external skill file.

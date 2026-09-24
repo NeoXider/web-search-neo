@@ -986,13 +986,8 @@ class BridgeDaemon:
         with self._lock:
             extension = self._extension
         if extension is None:
-            client.send_quietly(
-                {
-                    "type": "result",
-                    "id": client_id,
-                    "error": "Chrome companion extension is not connected",
-                }
-            )
+            client.send_quietly({"type": "result", "id": client_id,
+                                 "error": "Chrome companion extension is not connected"})
             return
         # The companion sees one id space, so ids from different clients — which
         # may well collide — are replaced by one the daemon mints and maps back.
@@ -1036,6 +1031,8 @@ class BridgeDaemon:
         is read as the companion's ``Number()`` reads it and rewritten to that
         int; a claim of this client's own superseded connection moves to it.
         """
+        if method == "runtime.reload" and self._claims:  # it would detach every agent's tabs
+            return None, "The companion was not reloaded: an agent is driving a tab right now."
         if not isinstance(params, dict):
             return None, None
         tab_id, bad = js_number_tab_id(params.get("tabId"))

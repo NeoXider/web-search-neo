@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Key events</title></head>
+<body>
+  <textarea id="ta"></textarea>
+  <input id="next">
+  <script>
+    // Every keyboard-facing event the page sees, in order, in the shape a game
+    // or a text field would read it.
+    window.__events = [];
+    const log = event => window.__events.push({
+      t: event.type, key: event.key, code: event.code, keyCode: event.keyCode,
+      which: event.which, charCode: event.charCode, location: event.location,
+      inputType: event.inputType || "", target: (event.target && event.target.id) || ""
+    });
+    for (const type of ["keydown", "keypress", "keyup", "beforeinput"]) {
+      document.addEventListener(type, log, true);
+    }
+  </script>
+</body>
+</html>

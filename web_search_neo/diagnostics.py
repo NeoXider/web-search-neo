@@ -43,7 +43,7 @@ const mintDocumentId = () => {
   try { origin = Math.round(performance.timeOrigin || Date.now()); } catch (_) { origin = Date.now(); }
   return origin + '-' + suffix;
 };
-const state = {seq: 0, dropped: 0, items: [], limit: 500, doc: mintDocumentId()};
+const state = {seq: 0, dropped: 0, items: [], limit: 2000, doc: mintDocumentId()};
 const clip = (value, max) => {
   // Strings go through verbatim; quoting them would make every log line noisy.
   let text;
@@ -413,6 +413,23 @@ def filter_console(
     return selected[-max(1, limit):]
 
 
+def pending_view(row: dict[str, Any]) -> dict[str, Any]:
+    """A request that has not finished, as a row that says so.
+
+    Chrome only reports loadingFinished once the page has read the whole body. A
+    fetch() whose body is never read, a fire-and-forget POST, a long poll or an
+    SSE stream never get there - and a 5xx whose body the page ignored was hidden
+    the same way. They are listed with ``done: false`` and ``state``: "headers"
+    once the response arrived (status known), "sent" before that.
+    """
+    view = {key: value for key, value in row.items() if key != "started"}
+    status = view.get("status") or 0
+    view.update(done=False, pending=True, state="headers" if status else "sent")
+    view["level"] = "error" if status >= 400 else ("warn" if 300 <= status < 400 else "info")
+    view["text"] = f"{view.get('method', 'GET')} {status or '---'} {view.get('url', '')}"
+    return view
+
+
 def filter_network(
     rows: list[dict[str, Any]],
     url_pattern: str | None = None,
@@ -447,6 +464,12 @@ def filter_network(
     return selected[-max(1, limit):]
 
 
+def _clip_url(url: str, limit: int = 200) -> str:
+    """A data: URL or a huge query is shortened in text output, and says by how much."""
+    url = str(url or "")
+    return url if len(url) <= limit else f"{url[:limit]}...(+{len(url) - limit} chars)"
+
+
 def format_network(rows: list[dict[str, Any]]) -> list[str]:
     """Render rows as one compact line each, which is what an agent reads."""
     lines = []
@@ -462,8 +485,8 @@ def format_network(rows: list[dict[str, Any]]) -> list[str]:
                     f"{str(row.get('type', 'Other')):<10}",
                     f"{row.get('ms', 0):>5}ms",
                     f"{round(size / 1024, 1)}KB" if size else "",
-                    row.get("error") or "",
-                    row.get("url", ""),
+                    row.get("error") or ("(in flight)" if row.get("done") is False else ""),
+                    _clip_url(row.get("url", "")),
                 )
                 if part
             )

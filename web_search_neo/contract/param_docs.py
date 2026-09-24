@@ -1,0 +1,85 @@
+"""Parameter descriptions for action_schema, so a caller does not have to guess.
+
+FastMCP builds each action's input schema from the wrapper's signature, which
+gives names, types and defaults but no meaning; element shapes such as
+``points`` or ``key_actions`` were opaque. ``annotate`` adds a description to
+the properties named here. Only ``web_info(topic='action_schema')`` carries
+them: the compact capabilities document lists required names and stays small.
+"""
+from __future__ import annotations
+
+import copy
+from typing import Any
+
+_COMMON = {
+    "session_id": "One session = one page. Reuse it; parallel agents use their own.",
+    "frame_selector": "CSS of the iframe to act inside; coordinates are then the frame's own.",
+    "wait_seconds": "Settle time after the action before the page summary is read (0 = none).",
+    "include_summary": "false skips the post-action page read - faster in game loops.",
+    "max_chars": "Answer budget in characters. Anything cut is flagged (truncated) with next_offset.",
+    "offset": "Where this window starts: the next_offset of the previous answer.",
+    "save_to": "File name under the download folder; the whole value is written there instead.",
+    "timeout_seconds": "Upper bound for the wait; the call fails (does not hang) past it.",
+}
+
+_BY_ACTION: dict[str, dict[str, str]] = {
+    "press_keys": {
+        "keys": ("1-8 key names pressed together as a chord (all down, then all up) - send "
+                 "separate calls for a sequence. Names: a-z, 0-9, ENTER, TAB, SPACE, BACKSPACE, "
+                 "DELETE, ESCAPE, ARROW_LEFT/LEFT, HOME, END, F1-F12, NUMPAD0-9, NUMPAD_ENTER; DOM "
+                 "spellings too (ArrowLeft, KeyW, Digit1, ShiftLeft) and 'Control+Shift+K' chords."),
+        "key_action": "tap (down and up), hold (stays down until release), release.",
+    },
+    "input": {
+        "key_actions": "[{key, action: tap|hold|release}] - key names as in press_keys.",
+        "pointer_actions": ("[{action: click|double_click|hover|move|drag|press|release|wheel, x, y, "
+                            "end_x?, end_y?, button?, coordinate_mode?, delta_x?, delta_y?}] - viewport CSS px."),
+    },
+    "touch": {
+        "points": ("[{x, y, id?, end_x?, end_y?}] - swipe reads end_x/end_y inside each point, not "
+                   "at the top level; release may list only {id} to lift those fingers."),
+        "touch_action": "tap | press | move | release | swipe | cancel.",
+    },
+    "pointer": {
+        "x": "Viewport CSS px (coordinate_space='image': pixels of the last screenshot). Relative mode: the delta.",
+        "y": "As x.",
+        "coordinate_mode": "absolute (a point) | delta (move by x/y, stays in the window) | relative (unbounded delta, for pointer lock).",
+        "coordinate_space": "viewport (CSS px) | image (pixels of this session's last screenshot; scale and scroll applied; not with frame_selector).",
+        "delta_x": "Wheel only: horizontal scroll amount. Moves use x/y.",
+        "delta_y": "Wheel only: vertical scroll amount (positive = down). Moves use x/y.",
+    },
+    "cookies": {
+        "set_cookies": "[{name, value, domain?|url?, path?, secure?, httpOnly?, sameSite?, expires?}] for op='set'.",
+        "op": "get (read with flags, paged) | set | clear (needs a domain unless confirm_clear_all).",
+    },
+    "fill": {"fields": "{css_selector: value} map; append [N] to a selector for its N-th match."},
+    "run_script": {
+        "script": ("Body of an async function: await works at top level, `return` returns; a one-line "
+                   "expression returns itself. Arguments arrive as arguments[0..]."),
+        "args": "JSON values passed as arguments[0..] - data never goes into the script text.",
+    },
+    "screenshot": {"wait_frames": "Render this many animation frames before capturing (fresh frame)."},
+    "dialogs": {
+        "policy": "accept (confirm -> true, prompt -> prompt_text) | dismiss (confirm -> false, prompt -> null).",
+        "clear": "Empty the dialog log after reading it.",
+    },
+    "look": {
+        "dx": "Horizontal turn in movement pixels (movementX total).",
+        "dy": "Vertical turn in movement pixels (movementY total).",
+        "steps": "Relative moves the turn is split into (1-60).",
+        "duration_ms": "Time the whole turn takes.",
+    },
+    "wait": {"script": "Same semantics as run_script; the wait ends when it returns a truthy value."},
+    "open": {"profile_mode": ("current (the user's Chrome) | isolated/temporary (a clean separate "
+                              "browser) | persistent | attach | auto. Omitted: an existing session keeps its own.")},
+}
+
+
+def annotate(action: str, schema: dict[str, Any]) -> dict[str, Any]:
+    """A copy of ``schema`` with descriptions on the properties this table knows."""
+    notes = {**_COMMON, **_BY_ACTION.get(action, {})}
+    annotated = copy.deepcopy(schema)
+    for name, prop in (annotated.get("properties") or {}).items():
+        if name in notes and isinstance(prop, dict) and not prop.get("description"):
+            prop["description"] = notes[name]
+    return annotated

@@ -16,7 +16,11 @@ MODIFIER_BITS = {"Alt": 1, "Control": 2, "Meta": 4, "Shift": 8}
 SELENIUM_KEYS = {
     "BACKSPACE": "",
     "TAB": "",
-    "ENTER": "",
+    # Selenium's ENTER (U+E007) is the NUMPAD Enter to chromedriver; the main Enter
+    # key is RETURN (U+E006), which is what a keyboard sends for "Enter".
+    "ENTER": "",
+    "RETURN": "",
+    "NUMPAD_ENTER": "",
     "SHIFT": "",
     "CONTROL": "",
     "ALT": "",
@@ -56,7 +60,7 @@ _SPECIAL_KEYS: dict[str, tuple[str, str, int, int]] = {
     "": ("Backspace", "Backspace", 8, 0),
     "": ("Tab", "Tab", 9, 0),
     "": ("Enter", "Enter", 13, 0),
-    "": ("Enter", "Enter", 13, 0),
+    "": ("Enter", "NumpadEnter", 13, 3),
     "": ("Shift", "ShiftLeft", 16, 1),
     "": ("Control", "ControlLeft", 17, 1),
     "": ("Alt", "AltLeft", 18, 1),
@@ -179,3 +183,68 @@ def resolve_key(raw: str, *, shifted: bool = False) -> tuple[str, str, int, int]
     if punctuation is not None:
         return (raw, punctuation[0], punctuation[1], 0)
     return (raw, "", 0, 0)
+
+
+# The text a real keyboard's keyDown carries besides printable characters: Enter
+# types a carriage return. Without it Chrome raises no keypress and no
+# beforeinput insertLineBreak, so a textarea or a canvas text field that builds
+# its text from keypress never gets the new line.
+_KEY_TEXT = {"Enter": "\r"}
+
+
+def key_text(key: str) -> str | None:
+    """The ``text`` a keyDown of ``key`` carries, or None for a key that types nothing."""
+    return key if len(key) == 1 else _KEY_TEXT.get(key)
+
+
+# DOM ``key``/``code`` spellings accepted as key names (upper-cased, no separators),
+# mapped to the names the alias table already knows.
+DOM_KEY_NAMES = {
+    "ARROWLEFT": "LEFT", "ARROWRIGHT": "RIGHT", "ARROWUP": "UP", "ARROWDOWN": "DOWN",
+    "SHIFTLEFT": "SHIFT", "SHIFTRIGHT": "SHIFT", "CONTROLLEFT": "CONTROL",
+    "CONTROLRIGHT": "CONTROL", "ALTLEFT": "ALT", "ALTRIGHT": "ALT", "METALEFT": "META",
+    "METARIGHT": "META", "PAGEUP": "PAGE_UP", "PAGEDOWN": "PAGE_DOWN", "NUMPADENTER": "NUMPAD_ENTER",
+    # KeyboardEvent.code of the US punctuation keys: the unshifted character.
+    "MINUS": "-", "EQUAL": "=", "BRACKETLEFT": "[", "BRACKETRIGHT": "]", "BACKSLASH": "\\",
+    "SEMICOLON": ";", "QUOTE": "'", "COMMA": ",", "PERIOD": ".", "SLASH": "/", "BACKQUOTE": "`",
+    "NUMPADADD": "ADD", "NUMPADSUBTRACT": "SUBTRACT", "NUMPADMULTIPLY": "MULTIPLY",
+    "NUMPADDIVIDE": "DIVIDE", "NUMPADDECIMAL": "DECIMAL",
+    **{f"NUMPAD{digit}": f"NUMPAD{digit}" for digit in range(10)},
+}
+
+# Keys a real keyboard has and WebDriver cannot send; named in the refusal.
+UNSENDABLE_KEYS = {
+    "CAPSLOCK": "CapsLock has no WebDriver or CDP key event that toggles it; send Shift+<letter> for capitals",
+    "NUMLOCK": "NumLock cannot be toggled through WebDriver; the NUMPAD0-9 names always send digits",
+    "SCROLLLOCK": "ScrollLock cannot be sent through WebDriver",
+}
+
+
+def dom_key_name(name: str) -> str | None:
+    """``KeyW`` -> ``w``, ``Digit1`` -> ``1``, ``ArrowLeft`` -> ``LEFT``; None when unknown."""
+    compact = name.replace("-", "").replace("_", "").replace(" ", "")
+    if len(compact) == 4 and compact[:3].lower() == "key" and compact[3].isalpha():
+        return compact[3].lower()
+    if len(compact) == 6 and compact[:5].lower() == "digit" and compact[5].isdigit():
+        return compact[5]
+    return DOM_KEY_NAMES.get(compact.upper())
+
+
+def expand_chords(keys: list[str]) -> list[str]:
+    """``["Control+Shift+K"]`` -> ``["Control", "Shift", "K"]``; a lone ``+`` stays a key.
+
+    The keys of one press_keys call are one chord either way: all go down in
+    order, then all come up in reverse.
+    """
+    expanded: list[str] = []
+    for key in keys or []:
+        text = str(key)
+        plus_key = len(text) > 2 and text.endswith("++")  # "Shift++": Shift and the + key
+        body = text[:-2] if plus_key else text
+        if plus_key or (len(body) > 1 and "+" in body.strip("+")):
+            expanded.extend(part for part in body.split("+") if part)
+            if plus_key:
+                expanded.append("+")
+        else:
+            expanded.append(text)
+    return expanded
