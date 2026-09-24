@@ -17,8 +17,8 @@ A ``run`` script is a JSON list of steps:
   {"sleep": 5}                                     wait N seconds
   {"until": {"tool": "web_info", "args": {...},    repeat a call until its text contains
              "contains": "text", "not_contains": "...", "timeout": 180, "interval": 5}}
-  A tool step may add "write_value_to": "file" / "append_value_to": "file" to store the first action
-  result's ``value`` (e.g. a run_script return), and "quiet": true to skip printing the result.
+  A tool step may add "write_value_to": "file" / "append_value_to": "file" to store the ``value`` of its
+  last action that returned one (e.g. a run_script return), and "quiet": true to skip printing the result.
 Image content returned by a tool (for example the ``screenshot`` topic) is written to ``--out-dir``
 as numbered PNG files; the text part of every result is printed to stdout.
 """
@@ -146,17 +146,21 @@ def _run_until(client: StdioClient, output: Output, spec: dict) -> None:
         time.sleep(interval)
 
 
-def _first_value(text: str) -> Any:
-    """``value`` of the first action result (run_script and similar), or None."""
+def _action_value(text: str) -> Any:
+    """``value`` of the last action result that has one (run_script and similar), or None.
+
+    A step often clicks or types before its run_script, so the value is not always in the first result.
+    """
     try:
         payload = json.loads(text)
     except json.JSONDecodeError:
         return None
     results = payload.get("results") if isinstance(payload, dict) else None
-    if not results:
-        return None
-    data = results[0].get("data") or {}
-    return data.get("value")
+    for result in reversed(results or []):
+        value = (result.get("data") or {}).get("value")
+        if value is not None:
+            return value
+    return None
 
 
 def _store_value(step: dict, text: str) -> None:
@@ -165,7 +169,7 @@ def _store_value(step: dict, text: str) -> None:
     target = step.get("append_value_to") or step.get("write_value_to")
     if not target:
         return
-    value = _first_value(text)
+    value = _action_value(text)
     if value is None:
         print(f"[no value to store in {target}]")
         return
