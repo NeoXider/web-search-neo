@@ -7,10 +7,10 @@ architecture review. New production files always use the ordinary hard limit.
 SOFT_LIMIT = 600
 HARD_LIMIT = 800
 LEGACY_MAX_LINES = {
-    "web_search_neo/browser_tools.py": 8468,
+    "web_search_neo/browser_tools.py": 8446,
     "web_search_neo/main.py": 2822,
     "web_search_neo/page_perception.py": 2720,
-    "web_search_neo/chrome_bridge.py": 2092,
+    "web_search_neo/chrome_bridge.py": 2090,
     "chrome-extension/service-worker.js": 1734,
     "web_search_neo/bridge_daemon.py": 1166,
     "web_search_neo/macros.py": 849,
@@ -29,7 +29,12 @@ PACKAGE_DEPENDENCIES = {
 
 # Third-party imports are separate so a leaf cannot silently acquire a new
 # runtime dependency by importing any arbitrary top-level package.
-EXTERNAL_DEPENDENCIES = {"fetch": ("bs4",), "actions": ("selenium.common.exceptions",)}
+# tldextract/publicsuffix2 are optional: cookie_scope uses one only when it is
+# already installed and never makes it a requirement.
+EXTERNAL_DEPENDENCIES = {
+    "fetch": ("bs4",),
+    "actions": ("selenium.common.exceptions", "tldextract", "publicsuffix2"),
+}
 
 EXCLUDED_DIRECTORIES = frozenset({
     ".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache",

@@ -107,7 +107,7 @@ _ACTION_NOTES = {
         "frame_selector": _FRAME_ANY,
     },
     "cookies": {
-        "paging": "get returns one window in Chrome's own order: total (= count) matched, limit/offset, returned, truncated and next_offset. Follow next_offset until it is null to read every cookie. domain means the domain and its subdomains (never a substring) for get and clear alike. clear needs a domain (a name alone exists on every site) and deletes exactly the matches - partitioned (CHIPS) cookies with their partition - reporting deleted_cookies from a fresh read and anything still there as not_deleted (success=false). Clearing without a domain wipes the whole profile - every login of the user in current Chrome - and is refused unless confirm_clear_all=true.",
+        "paging": "get returns one window in Chrome's own order: total (= count) matched, limit/offset, returned, truncated and next_offset. Follow next_offset until it is null to read every cookie. domain means the domain and its subdomains (never a substring) for get and clear alike. clear needs a domain (a name alone exists on every site) and deletes exactly the matches - partitioned (CHIPS) cookies with their partition - reporting deleted_cookies from a fresh read and anything still there as not_deleted (success=false). A domain without a dot or a public suffix (com, co.uk, github.io) would hit every site under it and, like clearing without a domain (the whole profile - every login of the user in current Chrome), is refused unless confirm_clear_all=true.",
     },
     "local_storage": {
         "ops": "op is read (whole store without key, one value with key), write (needs key and value), or delete (needs key); kind is local (localStorage) or session (sessionStorage, cleared when the tab closes).",
@@ -225,7 +225,7 @@ _ACTION_NOTES = {
         "capture": "Console and network are recorded from the claim onwards; whatever the tab did before it was claimed is unrecoverable.",
         "badge": "The tab gets the agent-activity favicon dot while driven (gone after 5 quiet minutes); a dotted tab in the strip is agent-held - do not act on it from another session.",
         "alias": "action 'attach' is accepted as attach_tab. Attaching the tab a parked session of the same session_id holds continues it (like reattach); attaching another tab under a parked name retires that record first (retired_parked says what happened to its tab).",
-        "persist": "persist=true is refused: a tab claimed with attach_tab is the user's and is never parked. Open your own tab with open persist=true instead.",
+        "parked": "A claimed tab is the user's and is never parked across MCP clients (persist exists only on open). Attaching the tab a parked session of the same session_id holds continues it, like reattach.",
     },
     "reattach": {
         "what": "Continues a persist=true session an earlier MCP client left parked, by session_id. Refused with success=false (record dropped, tab untouched) unless the tab is provably the server's parked tab: same Chrome run, agent tab group, recorded origin, and no other client driving it; a server tab that now shows another site comes back as left_open_tab for you to close.",
@@ -260,6 +260,7 @@ _ACTION_NOTES = {
         "co_tenants": "sessions_in_use names the sessions another caller of this server is inside right now; shared_session=true means this very session is one of them. current_chrome.daemon.clients counts the MCP servers sharing the browser and .claims lists every tab any of them drives, with mine telling ours apart.",
     },
     "browser_tabs": {
+        "reconnect": "connected=false with companion_note means the bridge is up but the Chrome companion has not reconnected yet (it retries on its own within about a minute of a bridge restart): call again with wait_seconds=75 (max 90). A connected companion whose version differs from its folder is reloaded automatically while no agent drives a tab, at most every 5 minutes (companion_refresh, also on open); a reload that did not take is not retried (self_update=ineffective with manual_steps), and a same-version companion with older code is only reported (not_attempted).",
         "ownership": "A tab another agent is already driving carries driven_by (and driven_by_me when it is this server's). Attaching to one of those is refused, so pick an unmarked tab or open your own.",
     },
     "input": {
@@ -279,7 +280,7 @@ _ACTION_NOTES = {
     "type_text": {
         "text": "Non-empty string, any script (Cyrillic and other non-Latin text arrive unchanged).",
         "selector": "Optional CSS target, located and focused first. Omit it to type into whatever already has focus - fill and click leave their target there. Focus is found through open shadow roots and same-origin frames; a cross-origin frame counts as unknown and the text is sent. With nothing focused, or a read-only/disabled control, the call is refused instead of dropping the text.",
-        "mode": "mode='insert' (default) sends one CDP Input.insertText, so controlled inputs (React) see one composed edit. mode='keys' presses one key per character (keydown/keypress/keyup carrying the character, at most 500) for canvas games such as Unity WebGL, which never see insertText. Without selector keys go only to an editable control, a canvas, an element with an explicit tabindex, or a frame - a focused button or link (Enter/Space would activate it) or the bare page is refused; a custom element that hides its focus is unknown and allowed. A focused <canvas> switches to keys automatically (mode_used says which ran).",
+        "mode": "mode='insert' (default) sends one CDP Input.insertText, so controlled inputs (React) see one composed edit. mode='keys' presses one key per character (keydown/keypress/keyup carrying the character, at most 500) for canvas games such as Unity WebGL, which never see insertText. Without selector keys go only to an editable control, a canvas, an element with an explicit tabindex, or a frame - a focused button or link (Enter/Space would activate it) or the bare page is refused; a custom element that hides its focus is unknown and allowed. Keys into a tabindex element are meant for canvas/game surfaces only and come with keys_warning: on an ordinary site with keyboard shortcuts every character may trigger one, so pass selector for a text field there. A focused <canvas> switches to keys automatically (mode_used says which ran).",
         "speed": _HOT_PATH_SPEED,
     },
     "press_keys": {

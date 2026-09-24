@@ -280,7 +280,22 @@ is no automatic substitute. If you would rather not install an extension at all,
 `profile_mode="temporary"` and `profile_mode="persistent"` drive a Selenium
 browser that needs no companion.
 
-The bundled companion is version 1.18.4. Chrome does not refresh an unpacked
+After the server is updated, the running companion keeps the code it loaded.
+The server now reloads a connected companion whose manifest version differs from
+its folder by itself (on `browser_tabs` and before `open`; both answers report it
+as `companion_refresh`), but only while no agent is driving a tab - a reload
+detaches every debugger session at once - at most once per five minutes across
+all server processes, and never again for a build whose reload did not take (the
+answer then carries the manual steps). A companion that differs only in its code
+hash (same version, an edited checkout) is reported, not reloaded. When the bridge has just (re)started,
+the companion reconnects on its own retry schedule, which backs off to about a
+minute: `browser_tabs` then answers `connected: false` with a `companion_note`,
+and `wait_seconds` (up to 90) waits it out. If it still does not connect, the
+companion popup's Reconnect (Restart companion when its service worker has
+stopped) is the one action; Reload on its card at chrome://extensions is the
+fallback.
+
+The bundled companion is version 1.18.5. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. That only works for
@@ -611,8 +626,11 @@ Unity WebGL, which build text from key events and never receive an insertText.
 Without a selector the keys go only to an editable control, a canvas, an element
 with an explicit `tabindex`, or a frame; a focused button or link (Enter or Space
 would activate it) or the bare page is refused, and a custom element that hides
-its focus in a closed shadow root counts as unknown and is allowed. A focused
-`<canvas>` switches to keys by itself. `fill` writes text through the browser's input channel and,
+its focus in a closed shadow root counts as unknown and is allowed. Keys into a
+`tabindex` element are meant for canvas and game surfaces and come with a
+`keys_warning`: on an ordinary site with keyboard shortcuts each character may
+trigger one, so pass a selector for a text field there. A focused `<canvas>`
+switches to keys by itself. `fill` writes text through the browser's input channel and,
 when a React-style controlled input's value tracker still missed the edit,
 raises one input/change event so `onChange` runs (`framework_resynced`);
 `typing=true` stays for masked and per-keystroke inputs.
@@ -645,7 +663,7 @@ really gone still drops the session.
 
 `open` accepts `persist: true` (current Chrome only, with an explicit
 `session_id` - never `default`). Only tabs the server opens can be parked: a tab
-claimed with `attach_tab` is the user's, and `persist` there is refused. Such a
+claimed with `attach_tab` is the user's, and `attach_tab` has no `persist`. Such a
 session survives the MCP client process: at exit its tab is detached and left
 open, and a record in the per-user state directory keeps its tab id, Chrome run,
 agent group and redacted URL; while the session is in use the record is kept
@@ -666,7 +684,9 @@ A `domain` filter on `cookies` means that domain and its subdomains, never a
 substring, for `get` and `clear` alike. `op: "clear"` needs a domain - a cookie
 name alone exists on every site - and deletes exactly the matching cookies
 (partitioned CHIPS cookies with their partition), reporting what a fresh read
-shows as gone and anything left as `not_deleted`. Chrome's own clear has no
+shows as gone and anything left as `not_deleted`. A domain without a dot or a
+public suffix (`com`, `co.uk`, `github.io`) would match every site under it and
+needs `confirm_clear_all: true` too. Chrome's own clear has no
 filter at all and wipes every cookie of the profile - in current Chrome, every
 login of the user - so clearing without a domain is refused unless
 `confirm_clear_all: true` says that is really meant.
@@ -768,7 +788,7 @@ visible while it is not, and stops believing it the moment the debugger detaches
 
 Two consequences worth knowing. A targeted keyboard action can change DOM focus
 inside the controlled background page, but it does not take OS focus or change the
-active user tab. In Companion 1.18.4, viewport screenshots capture one fresh PNG
+active user tab. In Companion 1.18.5, viewport screenshots capture one fresh PNG
 video frame with an 8-second frame deadline, then stop the owned recording. This
 does not activate tabs, restore windows, resize the viewport, or alter emulation.
 An existing recording or overlapping capture is refused. Full-page and region

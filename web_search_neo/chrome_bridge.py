@@ -1267,26 +1267,24 @@ class ChromeBridge:
         }
 
     def stop_daemon(self, reason: str = "requested") -> bool:
-        """Ask the daemon to exit. Only a caller replacing it should want this.
+        """Ask the daemon to exit; ``stop_problem`` says why a False came back.
 
-        ``start`` gives up waiting after the start timeout, which a cold process
-        (interpreter start, token ACL check) can outlast while the handshake is
-        still under way (the client keeps retrying a handshake that timed out); so
-        while something accepts on the port, wait for the link itself.
+        While something accepts on the port, wait up to 15 s for the link: a cold
+        process can outlast the start timeout mid-handshake. ``stop_problem`` is
+        None for a free port, else names a listener that never completed it.
         """
+        self.stop_problem: str | None = None
         self.start()
         try:  # nothing accepting on the port: there is no daemon to wait for
             socket.create_connection((self.host, self.port), timeout=1.0).close()
         except OSError:
             return False
-        deadline = time.monotonic() + max(self._connect_timeout, 15.0)
-        while True:
-            with self._state_lock:
-                connection = self._daemon
-            if connection is not None or time.monotonic() >= deadline:
-                break
+        deadline = time.monotonic() + 15.0
+        while (connection := self._daemon) is None and time.monotonic() < deadline:
             time.sleep(0.05)
         if connection is None:
+            self.stop_problem = (f"something is listening on {self.host}:{self.port} but did not "
+                                 f"complete the bridge handshake ({self._startup_error or 'no answer'})")
             return False
         self._closing = True
         self._wake.set()

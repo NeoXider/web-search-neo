@@ -89,6 +89,7 @@ os.environ.setdefault("WEB_SEARCH_NEO_BRIDGE_PORT", str(_unused_port()))
 _PARKED_DIR = tempfile.mkdtemp(prefix="wsn-parked-")
 atexit.register(shutil.rmtree, _PARKED_DIR, ignore_errors=True)
 os.environ["WEB_SEARCH_NEO_PARKED_SESSIONS_FILE"] = str(Path(_PARKED_DIR) / "parked_sessions.json")
+os.environ["WEB_SEARCH_NEO_COMPANION_STATE_FILE"] = str(Path(_PARKED_DIR) / "companion_refresh.json")
 
 
 @dataclass

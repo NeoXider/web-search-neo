@@ -441,15 +441,14 @@ def test_persist_needs_current_chrome_and_a_real_session_id(monkeypatch):
         )
     with pytest.raises(ValueError, match="not 'default'"):
         browser_tools.open_page("https://example.test/", persist=True)
-    with pytest.raises(ValueError, match="only for tabs the server opens"):
-        browser_tools.attach_current_tab(5, persist=True)
     assert browser_tools._sessions == {}
 
 
 def test_open_and_attach_publish_persist_reattach_and_attach_alias():
-    for action in ("open", "attach_tab"):
-        schema = asyncio.run(main.web_info("action_schema", {"action": action}))
-        assert schema["input_schema"]["properties"]["persist"]["default"] is False
+    schema = asyncio.run(main.web_info("action_schema", {"action": "open"}))
+    assert schema["input_schema"]["properties"]["persist"]["default"] is False
+    attach = asyncio.run(main.web_info("action_schema", {"action": "attach_tab"}))
+    assert "persist" not in attach["input_schema"]["properties"]
     alias = asyncio.run(main.web_info("action_schema", {"action": "attach"}))
     assert alias["action"] == "attach_tab"
     assert "reattach" in main._ACTIONS
@@ -458,16 +457,16 @@ def test_open_and_attach_publish_persist_reattach_and_attach_alias():
 def test_the_attach_alias_dispatches_attach_tab(monkeypatch):
     seen = {}
 
-    def attach(tab_id, session_id, agent_label, label_tab, persist):
-        seen.update(tab_id=tab_id, session_id=session_id, persist=persist)
+    def attach(tab_id, session_id, agent_label, label_tab):
+        seen.update(tab_id=tab_id, session_id=session_id)
         return {"success": True}
 
     monkeypatch.setattr(browser_tools, "attach_current_tab", attach)
     result = asyncio.run(main.web_action(
-        [{"action": "attach", "tab_id": 7, "session_id": "a", "persist": True}]
+        [{"action": "attach", "tab_id": 7, "session_id": "a"}]
     ))
     assert result["success"] is True and result["results"][0]["action"] == "attach_tab"
-    assert seen == {"tab_id": 7, "session_id": "a", "persist": True}
+    assert seen == {"tab_id": 7, "session_id": "a"}
 
 
 # ------------------------------------------------ 9. cap roster and orphans
@@ -980,8 +979,10 @@ def test_a_click_is_judged_by_changes_around_its_target_not_page_noise(local_sit
 
 
 def test_a_borrowed_tab_is_never_parked_or_reattached(companion):
-    with pytest.raises(ValueError, match="only for tabs the server opens"):
-        browser_tools.attach_current_tab(50, session_id="borrow", persist=True)
+    refused = asyncio.run(main.web_action(
+        [{"action": "attach_tab", "tab_id": 50, "session_id": "borrow", "persist": True}]
+    ))
+    assert refused["success"] is False and "persist" in refused["results"][0]["error"]
     # Even a record claiming a borrowed tab (written by an older build) is refused.
     _park("borrow", 50, owns_tab=False)
     companion.alive.add(50)
@@ -1015,7 +1016,7 @@ def test_an_expired_record_never_touches_a_live_persist_session(monkeypatch, com
 
     assert 42 in companion.alive and ("tabs.remove", {"tabId": 42}) not in companion.calls
     assert released == [] and "live" in browser_tools._sessions
-    assert overview["parked_expired"][0]["tab_closed"] is False
+    assert "parked_expired" not in overview  # a live session's record is not "expired"
     assert parking.lookup("live") is not None  # put back, not lost
 
 
@@ -1102,3 +1103,246 @@ def test_a_click_that_never_happened_disarms_its_probe(monkeypatch):
 
 def test_the_contract_keeps_a_real_margin_under_its_budget():
     assert len(json.dumps(main._capabilities())) < 14_000
+
+
+
+# ------------------------------------------------ round 3 (1.18.5)
+
+
+@pytest.mark.parametrize("domain", ["com", ".com", "ru", "co.uk", ".co.uk", "github.io", "com.br"])
+def test_clearing_cookies_of_a_public_suffix_needs_confirmation(domain):
+    class _Jar(_Tab):
+        def execute_cdp_cmd(self, command, *_args, **_kwargs):
+            return {"cookies": [{"name": "sid", "domain": ".shop.co.uk", "path": "/"}]} \
+                if command == "Storage.getCookies" else {}
+
+    driver = _Jar(1)
+    _register("suffix", driver, profile_mode="temporary")
+    with pytest.raises(ValueError, match="public suffix"):
+        browser_tools.cookies("clear", session_id="suffix", domain=domain)
+    assert browser_tools.cookies("clear", session_id="suffix", domain="shop.co.uk")["deleted"] >= 0
+
+
+def test_the_public_suffix_list_keeps_real_sites_clearable():
+    from web_search_neo.actions.cookie_scope import is_public_suffix
+
+    for site in ("example.com", "shop.co.uk", "me.github.io", "yandex.ru", "a.b.c.org",
+                 "localhost", "127.0.0.1"):
+        assert is_public_suffix(site) is False, site
+    for suffix in ("com", "co.uk", "github.io", "intranet", "co.jp"):
+        assert is_public_suffix(suffix) is True, suffix
+
+
+def test_a_click_whose_settle_fails_still_disarms_its_probe(monkeypatch):
+    scripts = []
+
+    class _Page(_Tab):
+        def execute_script(self, script, *args):
+            scripts.append(script)
+            return super().execute_script(script, *args)
+
+    driver = _Page(1)
+    _register("settle", driver, profile_mode="temporary")
+
+    class _Element:
+        tag_name = "button"
+
+        def click(self):
+            return None
+
+    monkeypatch.setattr(browser_tools, "_wait_for_locator", lambda *a, **k: _Element())
+
+    def broken_summary(*_args):
+        raise RuntimeError("the page went away")
+
+    monkeypatch.setattr(browser_tools, "_page_summary", broken_summary)
+    with pytest.raises(RuntimeError, match="went away"):
+        browser_tools.click("#go", session_id="settle", wait_seconds=0)
+    assert verification.CLICK_ARM_SCRIPT in scripts
+    assert scripts[-1] == verification.CLICK_DISARM_SCRIPT
+
+
+def test_keys_into_a_tabindex_surface_carry_a_shortcut_warning():
+    driver = _KeyDriver({"editable": False, "tag": "div", "focused": True, "tabindex": True})
+    _register("hotkeys", driver, profile_mode="temporary")
+    answer = browser_tools.type_text("gg", session_id="hotkeys", mode="keys")
+    assert "keyboard shortcut" in answer["keys_warning"]
+    canvas = _KeyDriver({"editable": False, "tag": "canvas", "canvas": True, "focused": True})
+    _register("game", canvas, profile_mode="temporary")
+    assert "keys_warning" not in browser_tools.type_text("gg", session_id="game", mode="keys")
+
+
+def test_stop_tells_a_silent_listener_from_a_free_port(monkeypatch):
+    import socket as socket_module
+    import threading
+
+    from web_search_neo.chrome_bridge import ChromeBridge
+
+    server = socket_module.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(5)
+    port = server.getsockname()[1]
+    stop = threading.Event()
+
+    def swallow():
+        server.settimeout(0.2)
+        held = []
+        while not stop.is_set():
+            try:
+                held.append(server.accept()[0])  # accept, never answer
+            except OSError:
+                continue
+        for conn in held:
+            conn.close()
+
+    thread = threading.Thread(target=swallow, daemon=True)
+    thread.start()
+    client = ChromeBridge(port=port, spawn=False, connect_timeout=0.5, start_timeout=0.2)
+    try:
+        started = time.monotonic()
+        assert client.stop_daemon("test") is False
+        assert "did not complete the bridge handshake" in client.stop_problem
+        assert time.monotonic() - started < 25
+    finally:
+        client.shutdown()
+        stop.set()
+        thread.join(timeout=5)
+        server.close()
+    free = ChromeBridge(port=port, spawn=False, connect_timeout=0.5, start_timeout=0.2)
+    try:
+        assert free.stop_daemon("test") is False and free.stop_problem is None
+    finally:
+        free.shutdown()
+
+
+# ------------------------------------------------ companion after a server update
+
+
+class _StatusBridge:
+    """A companion one version behind whose reload either takes or does not."""
+
+    def __init__(self, connected=True, version="0.0.1-old", code_hash="old", claims=(), takes=True):
+        self.connected = connected
+        self.version = version
+        self.code_hash = code_hash
+        self.claims = list(claims)
+        self.takes = takes
+        self.reloads = 0
+
+    def status(self, _wait=0.0):
+        return {"connected": self.connected,
+                "browser": {"extension_version": self.version, "code_hash": self.code_hash},
+                "daemon": {"linked": True, "claims": self.claims}}
+
+    def request(self, method, params=None, timeout=None):
+        assert method == "runtime.reload"
+        self.reloads += 1
+        if self.takes:
+            self.version = chrome_bootstrap.expected_extension_version()
+            self.code_hash = chrome_bootstrap.expected_code_hash()
+        return {"version": self.version}
+
+
+@pytest.fixture
+def refresh_state(monkeypatch, tmp_path):
+    from web_search_neo import companion_refresh
+
+    monkeypatch.setenv("WEB_SEARCH_NEO_COMPANION_STATE_FILE", str(tmp_path / "state.json"))
+    monkeypatch.setattr(chrome_bootstrap, "_SELF_UPDATE_POLL_SECONDS", 0.0)
+    return companion_refresh
+
+
+def test_an_outdated_companion_is_reloaded_only_when_nobody_drives(refresh_state):
+    busy = _StatusBridge(claims=[{"tab_id": 5, "holder": "other"}])
+    assert refresh_state.refresh_stale_companion(busy)["self_update"] == "deferred"
+    local = _StatusBridge()
+    assert refresh_state.refresh_stale_companion(local, local_sessions=1)["self_update"] == "deferred"
+    assert busy.reloads == local.reloads == 0
+    idle = _StatusBridge()
+    assert refresh_state.refresh_stale_companion(idle)["self_update"] == "done"
+    assert idle.reloads == 1 and refresh_state.refresh_stale_companion(idle) is None
+    assert refresh_state.refresh_stale_companion(_StatusBridge(connected=False)) is None
+
+
+def test_a_hash_only_difference_is_reported_never_reloaded(refresh_state):
+    same_version = _StatusBridge(version=chrome_bootstrap.expected_extension_version(), code_hash="edited")
+    answer = refresh_state.refresh_stale_companion(same_version)
+    assert answer["self_update"] == "not_attempted" and answer["manual_steps"]
+    assert same_version.reloads == 0
+
+
+def test_a_reload_that_does_not_take_is_never_looped(refresh_state, monkeypatch):
+    monkeypatch.setattr(refresh_state, "AUTO_RELOAD_INTERVAL_SECONDS", 0.0)
+    stuck = _StatusBridge(takes=False)  # e.g. a second checkout's folder on the same port
+    first = refresh_state.refresh_stale_companion(stuck)
+    assert first["self_update"] == "ineffective" and first["manual_steps"] and stuck.reloads == 1
+    for _ in range(3):
+        again = refresh_state.refresh_stale_companion(stuck)
+        assert again["self_update"] == "ineffective"
+    assert stuck.reloads == 1  # the same build is not reloaded again
+    other = _StatusBridge(version="0.0.2-other", takes=False)
+    refresh_state.refresh_stale_companion(other)
+    assert other.reloads == 1  # a different combination is judged afresh
+
+
+def test_the_reload_pause_holds_across_server_processes(refresh_state, tmp_path):
+    script = tmp_path / "one_process.py"
+    script.write_text(
+        "import sys\n"
+        f"sys.path.insert(0, {str(Path(__file__).resolve().parents[1])!r})\n"
+        "from web_search_neo import chrome_bootstrap, companion_refresh\n"
+        "chrome_bootstrap._SELF_UPDATE_POLL_SECONDS = 0.0\n"
+        "class B:\n"
+        "    reloads = 0\n"
+        "    def status(self, _w=0.0):\n"
+        "        return {'connected': True, 'browser': {'extension_version': '0.0.1-old', 'code_hash': 'x'},\n"
+        "                'daemon': {'linked': True, 'claims': []}}\n"
+        "    def request(self, method, params=None, timeout=None):\n"
+        "        B.reloads += 1\n"
+        "        return {'version': '0.0.1-old'}\n"
+        "chrome_bootstrap._reload_companion = lambda bridge, expected: (bridge.request('runtime.reload'), {'self_update': 'done'})[1]\n"
+        "companion_refresh._reload_companion = chrome_bootstrap._reload_companion\n"
+        "companion_refresh.refresh_stale_companion(B())\n"
+        "print(B.reloads)\n",
+        encoding="utf-8",
+    )
+    import os as _os
+    import sys as _sys
+
+    env = dict(_os.environ)
+    runs = [subprocess.run([_sys.executable, str(script)], capture_output=True, text=True,
+                           timeout=120, env=env) for _ in range(2)]
+    assert [r.returncode for r in runs] == [0, 0], [r.stderr for r in runs]
+    assert [r.stdout.strip().splitlines()[-1] for r in runs] == ["1", "0"]
+
+
+def test_browser_tabs_explains_a_companion_that_has_not_reconnected_yet(monkeypatch):
+    monkeypatch.setattr(browser_tools, "list_current_chrome_tabs",
+                        lambda wait: {"connected": False, "tabs": [], "daemon": {"linked": True}})
+    answer = browser_tools.get_current_tabs(0)
+    assert "wait_seconds=75" in answer["companion_note"] and "Reconnect" in answer["companion_note"]
+
+
+
+def test_clearing_a_cookie_filter_that_reaches_many_hosts_needs_confirmation():
+    class _Wide(_Tab):
+        def execute_cdp_cmd(self, command, *_args, **_kwargs):
+            if command == "Storage.getCookies":
+                return {"cookies": [{"name": "sid", "domain": f".shop{i}.example.org", "path": "/"}
+                                    for i in range(6)]}
+            return {}
+
+    _register("wide", _Wide(1), profile_mode="temporary")
+    with pytest.raises(ValueError, match="6 different hosts"):
+        browser_tools.cookies("clear", session_id="wide", domain="example.org")
+    assert browser_tools.cookies("clear", session_id="wide", domain="example.org",
+                                 confirm_clear_all=True)["success"] is False  # fake never deletes
+
+
+@pytest.mark.parametrize("suffix", ["kiev.ua", "in.ua", "pp.ua", "ca.us", "eu.org", "ngrok.io",
+                                    "s3.amazonaws.com", "myshopify.com", "blogspot.com", "blogspot.ru"])
+def test_the_extended_suffix_list(suffix):
+    from web_search_neo.actions.cookie_scope import is_public_suffix
+
+    assert is_public_suffix(suffix) is True
+    assert is_public_suffix("shop." + suffix) is False

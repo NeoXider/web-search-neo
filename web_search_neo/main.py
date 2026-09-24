@@ -26,7 +26,7 @@ from web_search_neo.fetch import api as fetch_api
 from web_search_neo.fetch import content as fetch_content
 
 
-__version__ = "1.18.4"
+__version__ = "1.18.5"
 
 log = configure_server_log()  # per-user state dir; see log_setup.py
 
@@ -543,14 +543,10 @@ async def browser_attach_tab(
     session_id: str = "default",
     agent_label: str | None = None,
     label_tab: bool = True,
-    persist: bool = False,
 ) -> dict[str, Any]:
-    """Attach a reusable MCP session to one existing Chrome tab without navigating it.
-
-    persist=true is refused: a user's tab is never parked (open persist=true instead).
-    """
+    """Attach a reusable MCP session to one existing Chrome tab without navigating it."""
     return await asyncio.to_thread(
-        browser_tools.attach_current_tab, tab_id, session_id, agent_label, label_tab, persist
+        browser_tools.attach_current_tab, tab_id, session_id, agent_label, label_tab
     )
 
 
@@ -2789,6 +2785,10 @@ def stop_bridge_daemon() -> int:
         if bridge.stop_daemon("stopped from the command line"):
             print("The bridge daemon was asked to stop.")
             return 0
+        problem = getattr(bridge, "stop_problem", None)
+        if problem:  # a listener that is not (or not yet) our daemon: say so
+            print(f"Could not stop the bridge daemon: {problem}.")
+            return 1
         print(f"No bridge daemon is listening on {bridge.host}:{bridge.port}.")
         return 0
     finally:

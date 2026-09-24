@@ -47,6 +47,7 @@ from web_search_neo.chrome_bridge import (
     get_chrome_bridge,
     list_current_chrome_tabs,
 )
+from web_search_neo import companion_refresh as _companion_refresh
 from web_search_neo.chrome_bootstrap import (
     EXTENSION_DIR,
     expected_code_hash,
@@ -63,6 +64,7 @@ from web_search_neo.actions.render_source import _RENDER_BOOTSTRAP_SCRIPT, _REND
 from web_search_neo.actions.scripts import execute as _execute_script
 from web_search_neo.actions.stealth import stealth_source
 from web_search_neo.actions import verification as _verification
+from web_search_neo.actions import cookie_scope as _cookie_scope
 from web_search_neo.cdp.tab_follow import find_successor as _find_successor_tab
 from web_search_neo.sessions import parking as _parking
 from web_search_neo.actions.waits import (
@@ -1413,7 +1415,7 @@ def _retire_parked(
                 _parking.remember(session_id, {k: v for k, v in record.items() if k != "updated_at"})
             except Exception as exc:
                 logger.warning("Could not restore the record of live session '%s': %s", session_id, exc)
-        return {**answer, "left_open_reason": check["reason"]}
+        return {**answer, "kept_live": True, "left_open_reason": check["reason"]}
     _forget_parked(session_id)
     if check["ok"] or (explicit and check["site_changed"]):
         try:
@@ -1430,8 +1432,10 @@ def _reap_expired_parked() -> list[dict[str, Any]]:
         expired = _parking.take_expired()
     except Exception:
         return []
+    # A live session's record was only put back, not expired: it is not reported.
     return [answer for record in expired
-            if (answer := _retire_parked(str(record.get("session_id")), record, expired=True))]
+            if (answer := _retire_parked(str(record.get("session_id")), record, expired=True))
+            and not answer.get("kept_live")]
 
 
 class _ReattachRefused(ValueError):
@@ -1995,7 +1999,13 @@ def open_page(
     normalized = validate_http_url(url)
     session_id = _validate_session_id(session_id)
     width, height = _bounded_size(width, height)
-    parked_note: dict[str, Any] = {}
+    refresh = None
+    if profile_mode in {"auto", "current"} and current_tab_id is None:
+        try:  # an outdated companion lacks the newest commands; refresh it while nobody drives
+            refresh = _companion_refresh.refresh_stale_companion(local_sessions=_local_current_sessions())
+        except Exception as exc:
+            logger.debug("Companion refresh before open failed: %s", exc)
+    parked_note: dict[str, Any] = {"companion_refresh": refresh} if refresh else {}
     if persist:
         if session_id == "default":
             raise ValueError("persist=true needs an explicit session_id, not 'default'")
@@ -2011,7 +2021,7 @@ def open_page(
             try:
                 _adopt_parked_session(session_id, record)
             except _ReattachRefused as exc:  # refused and dropped: open a fresh tab instead
-                parked_note = {"parked_refused": str(exc),
+                parked_note = {**parked_note, "parked_refused": str(exc),
                                **({"left_open_tab": exc.left_open_tab} if exc.left_open_tab else {})}
     session = _create_session(
         session_id,
@@ -2226,8 +2236,16 @@ def _companion_status() -> dict[str, Any]:
 
 
 def get_current_tabs(wait_seconds: float = 1.0) -> dict[str, Any]:
-    """List normal web tabs exposed by the companion extension."""
-    return list_current_chrome_tabs(max(0.0, min(float(wait_seconds), 5.0)))
+    """List normal web tabs exposed by the companion (see companion_refresh.explain_tabs)."""
+    wait = max(0.0, min(float(wait_seconds), 90.0))
+    return _companion_refresh.explain_tabs(
+        list_current_chrome_tabs(wait), _local_current_sessions(),
+        lambda: list_current_chrome_tabs(5.0))
+
+
+def _local_current_sessions() -> int:
+    with _sessions_lock:
+        return sum(1 for item in _sessions.values() if item.profile_mode == "current")
 
 
 def close_tabs(
@@ -2278,12 +2296,12 @@ def attach_current_tab(
     session_id: str = "default",
     agent_label: str | None = None,
     label_tab: bool = True,
-    persist: bool = False,
 ) -> dict[str, Any]:
     """Attach a named MCP session to an existing Chrome tab without navigating it.
 
-    ``persist=True`` records the session so a later MCP client re-attaches it by
-    ``session_id`` alone (the tab is the user's and stays open either way).
+    A claimed tab is the user's and is never parked across MCP clients; the one
+    exception is the tab a parked session of the same ``session_id`` holds, which
+    is continued exactly like ``reattach_session``.
 
     Console and network recording starts at the attach, so the console and
     network topics report what the tab does from here on. What it did before -
@@ -2296,12 +2314,6 @@ def attach_current_tab(
     document immediately.
     """
     session_id = _validate_session_id(session_id)
-    if persist:
-        raise ValueError(
-            "persist=true is only for tabs the server opens (open with persist=true): a tab "
-            "claimed with attach_tab is the user's and is never parked. To continue a parked "
-            "session use web_action reattach {session_id}."
-        )
     with _sessions_lock:
         known = session_id in _sessions
     record = None if known else _parked_record(session_id)
@@ -2323,7 +2335,6 @@ def attach_current_tab(
         DEFAULT_TAB_GROUP,
         agent_label,
     )
-    session.persist = session.persist or bool(persist)
     session.label_tab = bool(label_tab)
     try:
         with session.lock:
@@ -2336,7 +2347,6 @@ def attach_current_tab(
             return {
                 **summary,
                 "success": True,
-                "persist": session.persist,
                 **({"retired_parked": retired} if retired else {}),
                 "headless": False,
                 "window_mode": "visible",
@@ -3792,19 +3802,24 @@ def click(
             _release_action_frame(session.driver, frame_selector, selector)
             if not clicked:
                 _verification.disarm_click_probe(session.driver)
-        _wait_after_action(session.driver, wait_seconds)
-        post = {
-            **_page_summary(session.driver, session_id),
-            "success": True,
-            "clicked": selector,
-            "frame_selector": frame_selector,
-            "trusted": trusted,
-            "selector_must_be_unique": selector_must_be_unique,
-        }
-        # Elements inside a frame are not re-read from the top document.
-        post.update(_verification.collect_click_effects(
-            session.driver, element if top_level else None, pre_click, post, measurable=top_level
-        ))
+        try:
+            _wait_after_action(session.driver, wait_seconds)
+            post = {
+                **_page_summary(session.driver, session_id),
+                "success": True,
+                "clicked": selector,
+                "frame_selector": frame_selector,
+                "trusted": trusted,
+                "selector_must_be_unique": selector_must_be_unique,
+            }
+            post.update(_verification.collect_click_effects(
+                session.driver, element if top_level else None, pre_click, post, measurable=top_level
+            ))
+        except Exception:
+            # The click happened but its evidence was never collected (the settle or
+            # the summary failed): the observer must not keep running on the page.
+            _verification.disarm_click_probe(session.driver)
+            raise
         return _note_stalled_submit(session, post, started_ms)
 
 
@@ -4265,10 +4280,17 @@ def type_text(
                     + ". Click the canvas or text field first, or pass selector."
                 )
             _perform_key_events(driver, _verification.text_key_events(text))
+            hotkeys = bool(not target and focused and focused.get("tabindex")
+                           and not focused.get("editable") and not focused.get("canvas"))
             return _note_stalled_submit(session, {
                 **_page_summary(driver, session_id), "success": True,
                 "typed_into": target or "focused_element", "inserted": len(text),
                 "mode_used": "keys",
+                **({"keys_warning": (
+                    "The keys went to a focusable non-text element (tabindex). That is right "
+                    "for a canvas or game surface; on an ordinary site every character may "
+                    "fire a keyboard shortcut - pass selector for a text field instead."
+                )} if hotkeys else {}),
             }, started_ms)
         element = (
             _wait_for_locator(driver, target, "clickable", 10.0)
@@ -5368,18 +5390,6 @@ def inject_script(
     raise ValueError(f"inject_script op must be add, list, or remove, not '{op}'")
 
 
-def _cookie_in_domain(cookie: dict[str, Any], domain: str) -> bool:
-    """The domain itself or a subdomain of it - never a mere substring."""
-    wanted = str(domain or "").lstrip(".").lower()
-    have = str(cookie.get("domain") or "").lstrip(".").lower()
-    return have == wanted or have.endswith("." + wanted)
-
-
-def _cookie_identity(cookie: dict[str, Any]) -> tuple[Any, ...]:
-    return (cookie.get("name"), cookie.get("domain"), cookie.get("path"),
-            json.dumps(cookie.get("partitionKey"), sort_keys=True))
-
-
 def cookies(
     op: str = "get",
     session_id: str = "default",
@@ -5413,7 +5423,7 @@ def cookies(
             payload = driver.execute_cdp_cmd("Storage.getCookies", {})
             found = payload.get("cookies") or []
             if domain:
-                found = [c for c in found if _cookie_in_domain(c, domain)]
+                found = [c for c in found if _cookie_scope.in_domain(c, domain)]
             if name:
                 found = [c for c in found if c.get("name") == name]
             kept = max(1, min(int(limit), 1000))
@@ -5438,39 +5448,7 @@ def cookies(
             driver.execute_cdp_cmd("Storage.setCookies", {"cookies": set_cookies})
             return {"success": True, "session_id": session_id, "count": len(set_cookies)}
         if op == "clear":
-            # Storage.clearCookies takes no filter at all: it wipes every cookie of
-            # the browser profile - in current Chrome, the user's logins everywhere.
-            # So a filtered clear deletes exactly the matching cookies one by one,
-            # and the unfiltered one needs its own explicit confirmation.
-            if not domain and not confirm_clear_all:
-                # A name alone ("sid", "session") exists on hundreds of sites.
-                raise ValueError(
-                    "cookies clear needs a domain: without one it would delete "
-                    + (f"every '{name}' cookie of every site" if name else
-                       "every cookie of this browser profile (every site's login)")
-                    + ". Pass domain, or confirm_clear_all=true if that is really what is wanted."
-                )
-            if not domain and not name:
-                driver.execute_cdp_cmd("Storage.clearCookies", {})
-                return {"success": True, "session_id": session_id, "cleared": "all"}
-            jar = (driver.execute_cdp_cmd("Storage.getCookies", {}) or {}).get("cookies") or []
-            matched = [c for c in jar if (not name or c.get("name") == name)
-                       and (not domain or _cookie_in_domain(c, domain))]
-            for c in matched:
-                # A partitioned (CHIPS) cookie is only deleted with its partition.
-                driver.execute_cdp_cmd("Network.deleteCookies", {
-                    "name": c.get("name"), "domain": c.get("domain"), "path": c.get("path") or "/",
-                    **({"partitionKey": c["partitionKey"]} if c.get("partitionKey") else {}),
-                })
-            # Counted from a fresh read, not from what was asked for.
-            left = {_cookie_identity(c) for c in
-                    (driver.execute_cdp_cmd("Storage.getCookies", {}) or {}).get("cookies") or []}
-            gone = [c for c in matched if _cookie_identity(c) not in left]
-            stayed = [c for c in matched if _cookie_identity(c) in left]
-            return {"success": not stayed, "session_id": session_id, "deleted": len(gone),
-                    "deleted_cookies": [{k: c.get(k) for k in ("name", "domain", "path")} for c in gone],
-                    **({"not_deleted": [{k: c.get(k) for k in ("name", "domain", "path", "partitionKey")}
-                                        for c in stayed]} if stayed else {})}
+            return _cookie_scope.clear(driver, session_id, domain, name, confirm_clear_all)
     raise ValueError(f"cookies op must be get, set, or clear, not '{op}'")
 
 

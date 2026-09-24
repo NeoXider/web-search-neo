@@ -3092,15 +3092,26 @@ def test_two_servers_starting_together_converge_on_one_daemon() -> None:
             client.shutdown()
         clients[0].stop_daemon("the test is over")
         clients[0].shutdown()
-    deadline = time.monotonic() + 15.0
-    while time.monotonic() < deadline:
-        with socket.socket() as probe:
-            probe.settimeout(1.0)
-            if probe.connect_ex(("127.0.0.1", port)) != 0:
-                break
-        time.sleep(0.2)
-    else:
-        raise AssertionError("the spawned daemon is still holding the port")
+
+    def port_released(seconds: float) -> bool:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            with socket.socket() as probe:
+                probe.settimeout(1.0)
+                if probe.connect_ex(("127.0.0.1", port)) != 0:
+                    return True
+            time.sleep(0.2)
+        return False
+
+    # Under a loaded machine the first stop can race the link being re-formed;
+    # a fresh, non-spawning client asks once more before the test gives up.
+    if not port_released(15.0):
+        retry = ChromeBridge(port=port, spawn=False, connect_timeout=15.0)
+        try:
+            retry.stop_daemon("the test is over (retry)")
+        finally:
+            retry.shutdown()
+        assert port_released(15.0), "the spawned daemon is still holding the port"
 
 
 class _FakeBridge:

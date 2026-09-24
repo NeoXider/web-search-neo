@@ -73,10 +73,10 @@ def test_allowed_dependencies_and_own_modules(source):
 # sessions/tab_label_source.py unchanged; service-worker.js went down after its
 # code hash moved to code-hash.js.
 _RATCHET_CEILINGS = {
-    "web_search_neo/browser_tools.py": 8468,
+    "web_search_neo/browser_tools.py": 8446,
     "web_search_neo/main.py": 2822,
     "web_search_neo/page_perception.py": 2720,
-    "web_search_neo/chrome_bridge.py": 2092,
+    "web_search_neo/chrome_bridge.py": 2090,
     "chrome-extension/service-worker.js": 1734,
     "web_search_neo/bridge_daemon.py": 1166,
     "web_search_neo/macros.py": 849,
