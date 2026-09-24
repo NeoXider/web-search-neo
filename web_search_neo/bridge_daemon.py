@@ -884,8 +884,8 @@ class BridgeDaemon:
         answer: dict[str, Any] = {"type": "result", "id": route.client_id}
         if message.get("error"):
             answer["error"] = message.get("error")
-        else:
-            answer["result"] = message.get("result")
+        else:  # tab_followed: the companion redirected a command to a replacing tab
+            answer.update(result=message.get("result"), **({"tab_followed": message["tab_followed"]} if isinstance(message.get("tab_followed"), dict) else {}))
         route.client.send_quietly(answer)
 
     def _serve_client(self, websocket: Any, hello: dict[str, Any], token: str) -> None:

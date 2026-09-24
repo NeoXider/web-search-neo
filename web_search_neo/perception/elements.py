@@ -118,14 +118,36 @@ function labelFor(el) {
   }
   return parent ? (parent.innerText || '').trim() : '';
 }
+// Locators that survive a React re-render. Auto ids and nth-of-type chains
+// resolve today and name another element tomorrow, so a row whose selector is
+// fragile says so (stable_selector: false) and suggests role + accessible name
+// for click text+role instead; a testing hook is always surfaced. Rows with a
+// plain stable selector carry nothing extra, which keeps big pages in budget.
+function stableHints(el, selector) {
+  const hints = {};
+  const testid = el.getAttribute('data-testid') || el.getAttribute('data-test') ||
+    el.getAttribute('data-qa') || el.getAttribute('data-cy') || '';
+  const stable = !!selector && selector.indexOf(':nth-of-type(') < 0 && !/#[^ >]*(\\?:r[0-9a-z]|«r|_r_[0-9a-z])/i.test(selector);
+  if (testid) hints.testid = testid;
+  if (stable) {
+    if (testid) hints.suggested_locator = {selector: selector};
+    return hints;
+  }
+  hints.stable_selector = false;
+  const role = wsnRole(el) || '';
+  const name = wsnClean(wsnName(el, role) || el.getAttribute('title') || '', 120);
+  if (role && name) hints.suggested_locator = {text: name, role: role};
+  return hints;
+}
 function fieldInfo(el) {
+  const fieldSelector = wsnSelector(el);
   const result = Object.assign({
-    selector: wsnSelector(el), tag: el.tagName.toLowerCase(),
+    selector: fieldSelector, tag: el.tagName.toLowerCase(),
     type: (el.getAttribute('type') || '').toLowerCase(),
     id: el.id || '', name: el.getAttribute('name') || '',
     label: labelFor(el), placeholder: el.getAttribute('placeholder') || '',
     required: !!el.required, disabled: !!el.disabled
-  }, visibility(el));
+  }, visibility(el), stableHints(el, fieldSelector));
   if (el.tagName.toLowerCase() === 'select') {
     result.options = Array.from(el.options).map(o => ({value: o.value, text: o.text, selected: o.selected}));
   }
@@ -137,13 +159,13 @@ const FIELD_SELECTOR = 'input, textarea, select, [contenteditable="true"]';
 if (includeLinks && enabledCategory('links')) {
   const links = category('links', 'a[href]');
   counts.links = links.length;
-  output.links = links.slice(offset, offset + limit).map(a => Object.assign({
-    selector: wsnSelector(a),
+  output.links = links.slice(offset, offset + limit).map(a => { const sel = wsnSelector(a); return Object.assign({
+    selector: sel,
     // An icon-only control renders no text; its title is the only name the
     // caller can hover or match by, so it stands in for the missing words.
     text: (a.innerText || a.getAttribute('aria-label') || a.getAttribute('title') || '').trim(),
     href: a.href
-  }, visibility(a)));
+  }, visibility(a), stableHints(a, sel)); });
 }
 if (includeForms && (enabledCategory('forms') || enabledCategory('fields'))) {
   const forms = category('forms', 'form');
@@ -164,25 +186,25 @@ if (includeButtons && enabledCategory('buttons')) {
     'input[type="image"], [role="button"]'
   );
   counts.buttons = buttons.length;
-  output.buttons = buttons.slice(offset, offset + limit).map(button => Object.assign({
-    selector: wsnSelector(button), tag: button.tagName.toLowerCase(),
+  output.buttons = buttons.slice(offset, offset + limit).map(button => { const sel = wsnSelector(button); return Object.assign({
+    selector: sel, tag: button.tagName.toLowerCase(),
     type: (button.getAttribute('type') || '').toLowerCase(), id: button.id || '',
     name: button.getAttribute('name') || '',
     // Same icon-only rule as links above: a title-bearing button with no text
     // is otherwise reported as usable with nothing to call it by.
     text: (button.innerText || button.value || button.getAttribute('aria-label') || button.getAttribute('title') || '').trim(),
     disabled: !!button.disabled
-  }, visibility(button)));
+  }, visibility(button), stableHints(button, sel)); });
 }
 if (selectedCategory === 'interactive') {
   const controls = category('interactive', 'a[href], button, input:not([type="hidden"]), textarea, select, summary, [contenteditable]:not([contenteditable="false"]), [role="button"], [role="link"], [role="textbox"], [role="searchbox"], [role="combobox"], [role="checkbox"], [role="radio"], [role="switch"], [role="tab"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [role="option"], [role="slider"], [role="spinbutton"], [tabindex]:not([tabindex="-1"])');
   counts.interactive = controls.length;
-  output.interactive = controls.slice(offset, offset + limit).map(el => Object.assign({
-    selector: wsnSelector(el), tag: el.tagName.toLowerCase(), role: wsnRole(el),
+  output.interactive = controls.slice(offset, offset + limit).map(el => { const sel = wsnSelector(el); return Object.assign({
+    selector: sel, tag: el.tagName.toLowerCase(), role: wsnRole(el),
     name: wsnName(el, wsnRole(el)), text: (el.innerText || '').trim().slice(0, 300),
     type: el.getAttribute('type') || '', href: el.href || '',
     disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true'
-  }, visibility(el)));
+  }, visibility(el), stableHints(el, sel)); });
 }
 const frames = enabledCategory('iframes') ? category('iframes', 'iframe, frame') : [];
 counts.iframes = frames.length;

@@ -21,6 +21,10 @@ SPA_VISIBLE_TEXT_LIMIT = 300
 # empty: a server-rendered page may legitimately mount into #root/#app and
 # still carry real text, which the visible-text check above already let pass.
 SPA_MOUNT_TEXT_LIMIT = 50
+# Visible text left once the title is removed, below which a page that loads
+# external scripts is a shell no matter how its bundle is named: the body said
+# nothing at all, which a static page with even one sentence never does.
+SPA_TITLE_ONLY_LIMIT = 3
 SPA_MOUNT_IDS = frozenset({"root", "app", "__next"})
 # Substrings typical of app bundles (webpack/Vite/Next chunks). Deliberately
 # not a generic ".min.js": a tiny static page pulling jQuery is still a page,
@@ -71,7 +75,13 @@ def is_spa_shell(html: str, text: str) -> bool:
         lowered_src = str(script.get("src", "") or "").lower()
         if lowered_src and any(part in lowered_src for part in BUNDLE_SRC_PARTS):
             return True
-    return False
+    # Title-only text: once the <title> is taken away nothing is left, and the
+    # page loads external scripts - the rest is drawn by JavaScript whatever the
+    # bundle happens to be called.
+    title_node = soup.find("title")
+    title = title_node.get_text(strip=True) if isinstance(title_node, Tag) else ""
+    remainder = (text or "").replace(title, "", 1).strip() if title else (text or "").strip()
+    return len(remainder) < SPA_TITLE_ONLY_LIMIT and soup.find("script", src=True) is not None
 
 
 def _is_html_response(response: Any) -> bool:
@@ -97,8 +107,9 @@ def _spa_notice(url: str) -> str:
     return (
         "\n\n[spa_suspected=true] SPA: use browser session - this page renders "
         "its content with JavaScript, so the static fetch only sees the shell "
-        "(usually just the title). Open "
-        f"{url} in a browser session to read it."
+        "(usually just the title). Render it in a browser session instead: "
+        f'web_action [{{"action":"open","url":"{url}","session_id":"<id>"}}] then '
+        "web_info(topic='page_text', params={'session_id':'<id>'})."
     )
 
 

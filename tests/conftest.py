@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import atexit
+import shutil
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
@@ -7,6 +9,7 @@ from pathlib import Path
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from urllib.parse import parse_qs, urlparse
@@ -81,6 +84,11 @@ def _unused_port() -> int:
 # start a daemon, and the default port points where nobody is listening.
 os.environ["WEB_SEARCH_NEO_BRIDGE_AUTOSPAWN"] = "0"
 os.environ.setdefault("WEB_SEARCH_NEO_BRIDGE_PORT", str(_unused_port()))
+# Persistent (parked) session records are per user; a test run gets its own file
+# so it never re-attaches to, or forgets, a tab the real companion parked.
+_PARKED_DIR = tempfile.mkdtemp(prefix="wsn-parked-")
+atexit.register(shutil.rmtree, _PARKED_DIR, ignore_errors=True)
+os.environ["WEB_SEARCH_NEO_PARKED_SESSIONS_FILE"] = str(Path(_PARKED_DIR) / "parked_sessions.json")
 
 
 @dataclass

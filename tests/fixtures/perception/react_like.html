@@ -1,0 +1,34 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>React-like settings</title></head>
+<body>
+  <main>
+    <button data-testid="save-button">Save</button>
+    <ul>
+      <li><div><span role="button">Edit</span></div></li>
+      <li><div><span role="button">Rename</span></div></li>
+    </ul>
+    <label>Name <input id="name" name="profile-name"></label>
+  </main>
+  <script>
+    // A stand-in for React's private value tracker: it only learns a value from
+    // a change React itself saw, so native typing leaves it stale.
+    const field = document.getElementById("name");
+    window.__changes = [];
+    field._valueTracker = {
+      value: "",
+      getValue() { return this.value; },
+      setValue(next) { this.value = next; },
+    };
+    // Model a controlled input whose keystroke path was swallowed: trusted
+    // (keyboard) input never reaches "React", only a dispatched change does.
+    field.addEventListener("input", event => {
+      if (event.isTrusted) return;
+      if (field._valueTracker.getValue() !== field.value) {
+        window.__changes.push(field.value);
+        field._valueTracker.setValue(field.value);
+      }
+    });
+  </script>
+</body>
+</html>

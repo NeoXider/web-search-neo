@@ -58,9 +58,13 @@ from web_search_neo import diagnostics
 from web_search_neo import key_table
 from web_search_neo import page_perception
 from web_search_neo.web_client import validate_http_url
+from web_search_neo.fetch.safety import redact_url, resolve_save_path, write_download
 from web_search_neo.actions.render_source import _RENDER_BOOTSTRAP_SCRIPT, _RENDER_CONTROL_SCRIPT
 from web_search_neo.actions.scripts import execute as _execute_script
 from web_search_neo.actions.stealth import stealth_source
+from web_search_neo.actions import verification as _verification
+from web_search_neo.cdp.tab_follow import find_successor as _find_successor_tab
+from web_search_neo.sessions import parking as _parking
 from web_search_neo.actions.waits import (
     clamp_wait as _clamp_wait,
     poll_under_lock as _poll_under_lock,
@@ -71,6 +75,12 @@ from web_search_neo.cdp import request_mocks
 # Re-exported for tests that exercise the mock validator through this module.
 from web_search_neo.cdp.request_mocks import (  # noqa: F401
     _MOCK_BODY_LIMIT, _MOCK_STUB_SOURCE, _validate_mock,
+)
+from web_search_neo.perception.challenge import _CHALLENGE_WIDGET_SCRIPT
+from web_search_neo.perception.action_scripts import (  # noqa: F401
+    _CLICK_TEXT_SCRIPT, _FRAME_HIT_SCRIPT, _FRAME_MAP_SCRIPT, _GAME_PROBE_SCRIPT, _RENDER_STEP_SCRIPT,
+    _REPLAY_SCRIPT, _SCROLL_INTO_VIEW_SCRIPT, _SUBMIT_RESULT_SCRIPT, _SUBMIT_WATCH_SCRIPT,
+    _SET_VALUE_SCRIPT, _FILE_INPUT_STATE_SCRIPT, _UPLOAD_TRACE_SCRIPT, _SCROLL_METRICS_SCRIPT, _POINTER_LOCK_SCRIPT, _POINTER_LOCK_STATUS_SCRIPT,
 )
 from web_search_neo.perception.elements import _ELEMENT_LIST_KEYS, _INSPECT_SCRIPT, _restate_element_ranges
 from web_search_neo.sessions.activity import (
@@ -185,6 +195,9 @@ _SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _BROWSER_LOG_LIMIT = 500
 
 
+from web_search_neo.sessions.tab_label_source import (  # noqa: F401
+    _TAB_LABEL_RESTORE_SCRIPT, _TAB_LABEL_SCRIPT_TEMPLATE,
+)
 from web_search_neo.sessions.models import BrowserSession, ConsoleCursor, SessionLock  # noqa: F401
 
 
@@ -845,12 +858,24 @@ def _create_session(
                             _sessions.items(), key=lambda kv: kv[1].last_used
                         )
                     }
+                    holders = "; ".join(
+                        f"{name} (agent={item.agent_label or '-'}, tab={item.current_tab_id}, "
+                        f"age={_format_idle(time.time() - item.created_at)}, "
+                        f"idle={_format_idle(now - item.last_used)}, "
+                        f"busy={'yes' if item.lock.busy else 'no'}, "
+                        f"url={redact_url(item.last_url) if item.last_url else '-'})"
+                        for name, item in sorted(_sessions.items(), key=lambda kv: kv[1].last_used)
+                    )
                     raise RuntimeError(
                         f"Maximum of {cap} browser sessions reached; close one first. "
                         f"Open: {sorted(_sessions)}."
                         + (f" Owners: {owners}." if owners else "")
                         + f" Idle for: {idle}."
+                        + f" Holders: {holders}."
                         + (f" Least recently used: '{stalest}'." if stalest else "")
+                        + " Release orphans explicitly with web_action close_all "
+                        "{scope: 'all', idle_for_seconds: 600} (closes only sessions idle "
+                        "that long, whoever owns them), or close {session_id} by name."
                         + " The cap counts every session in this MCP server, so parallel "
                         "agents share it; raise it with WEB_SEARCH_NEO_MAX_SESSIONS in the "
                         "server's environment, or in the companion extension's popup under "
@@ -1071,6 +1096,116 @@ def _is_stale_tab_error(exc: BaseException) -> bool:
     return any(marker in text for marker in _STALE_TAB_MARKERS)
 
 
+class SessionTabFollowed(RuntimeError):
+    """Chrome replaced the session's tab (onReplaced) and the session now drives the new one."""
+
+    def __init__(self, session_id: str, old_tab: int | None, new_tab: int, original: BaseException):
+        self.session_id, self.old_tab, self.new_tab = session_id, old_tab, new_tab
+        super().__init__(
+            f"Session '{session_id}' lost tab {old_tab}: Chrome itself replaced it with "
+            f"tab {new_tab} (a prerendered/instant navigation or a restored discarded tab), "
+            f"and the session now follows tab {new_tab}. This step was not repeated because "
+            "it may already have taken effect - read the page (page_text) before doing "
+            f"anything else. Original error: {type(original).__name__}: {original}"
+        )
+
+
+def _follow_replaced_tab(
+    session_id: str, session: BrowserSession, new_tab: int | None = None
+) -> int | None:
+    """Re-point a companion session at the tab Chrome recorded as replacing its own.
+
+    Only Chrome's own replacement record counts (``cdp/tab_follow.py``): never a
+    tab the lost one opened, never a tab on the same URL. A replacement is the
+    same page in a new tab object, so whether the session owns it is unchanged.
+    ``None`` means there is nothing to follow; :class:`_FollowRefused` means the
+    successor is somebody else's (another session here, or another agent's
+    claim) and the session must not keep driving; ``TimeoutError`` means another
+    thread is inside the session, so nothing was decided.
+    """
+    driver = session.driver
+    if not getattr(driver, "is_extension_bridge", False):
+        return None
+    old_tab = session.current_tab_id
+    if new_tab is None:
+        new_tab = _find_successor_tab(getattr(driver, "bridge", None), old_tab)
+    if new_tab is None or new_tab == old_tab:
+        return None
+    with _sessions_lock:
+        if any(item.current_tab_id == new_tab for item in _sessions.values() if item is not session):
+            raise _FollowRefused(f"tab {new_tab} is driven by another session in this server")
+    # Another thread may be mid-action on this session; waiting forever for it
+    # would stall a caller that is only reporting an error.
+    if not session.lock.acquire(timeout=5.0):
+        raise TimeoutError(f"session '{session_id}' is busy")
+    try:
+        try:
+            _claim_tab(new_tab)
+        except Exception as exc:
+            raise _FollowRefused(f"tab {new_tab} could not be claimed: {exc}") from exc
+        driver.tab_id = new_tab
+        session.current_tab_id = new_tab
+        try:
+            driver.switch_to.default_content()
+            driver._start_capture()
+        except Exception:
+            pass
+        _reapply_tab_scripts(session, session_id)
+    finally:
+        session.lock.release()
+    _release_claimed_tab(old_tab)
+    session.pending_notice = {"tab_followed": {"from": old_tab, "to": new_tab}}
+    _remember_parked(session_id, session)
+    logger.info("Session '%s' follows replaced tab %s -> %s", session_id, old_tab, new_tab)
+    return new_tab
+
+
+class _FollowRefused(RuntimeError):
+    """The successor tab belongs to somebody else; the session must stop."""
+
+
+def _drop_for_refused_follow(session_id: str, session: BrowserSession, reason: str) -> ValueError:
+    _discard_stale_session(session_id, session)
+    _release_claimed_tab(session.current_tab_id)
+    return ValueError(
+        f"Browser session '{session_id}' lost its tab: Chrome replaced it, but {reason}, so "
+        "the session was dropped rather than driving somebody else's tab. Open the page "
+        f'again: web_action [{{"action":"open","url":...,"session_id":"{session_id}"}}].'
+    )
+
+
+def _apply_reported_follow(session_id: str, session: BrowserSession) -> None:
+    """Adopt a replacement the companion reported on an earlier answer (tab_followed)."""
+    bridge = getattr(session.driver, "bridge", None)
+    take = getattr(bridge, "take_followed", None)
+    if session.profile_mode != "current" or not callable(take):
+        return
+    try:
+        reported = take(session.current_tab_id)
+    except Exception:
+        return
+    if reported is None:
+        return
+    try:
+        _follow_replaced_tab(session_id, session, int(reported))
+    except TimeoutError:
+        return  # the companion keeps redirecting and reports it again next call
+    except _FollowRefused as refused:
+        raise _drop_for_refused_follow(session_id, session, str(refused)) from None
+
+
+def _reapply_tab_scripts(session: BrowserSession, session_id: str) -> None:
+    """Best-effort: a new tab has none of the render/label/badge scripts of the old one."""
+    for step in (lambda: _register_render_bootstrap(session),
+                 lambda: _apply_tab_label(session, session_id, label_tab=session.label_tab),
+                 lambda: _apply_tab_activity(session, session_id, label_tab=session.label_tab),
+                 lambda: _apply_agent_presence(session, session_id)):
+        try:
+            step()
+        except Exception:
+            pass
+
+
 def translate_stale_tab_error(
     session_id: str | None, exc: BaseException
 ) -> BaseException:
@@ -1083,7 +1218,7 @@ def translate_stale_tab_error(
     addressing failure keeps its original text), a link that never answered
     (nothing proven about the tab), and every non-tab error.
     """
-    if not session_id or not _is_stale_tab_error(exc):
+    if isinstance(exc, SessionTabFollowed) or not session_id or not _is_stale_tab_error(exc):
         return exc
     try:
         _validate_session_id(session_id)
@@ -1096,6 +1231,15 @@ def translate_stale_tab_error(
     # One probe, and only on this failure path: the happy path pays nothing.
     if _tab_still_exists(session) is not False:
         return exc
+    old_tab = session.current_tab_id
+    try:
+        followed = _follow_replaced_tab(session_id, session)  # Chrome's own record only
+    except TimeoutError:
+        return exc  # another thread is inside the session: decide nothing
+    except _FollowRefused as refused:
+        return _drop_for_refused_follow(session_id, session, str(refused))
+    if followed is not None:
+        return SessionTabFollowed(session_id, old_tab, followed, exc)
     _discard_stale_session(session_id, session)
     return ValueError(
         f"Browser session '{session_id}' lost its tab - it was closed or "
@@ -1148,6 +1292,224 @@ def _shared_session_note(session_id: str, session: BrowserSession) -> dict[str, 
     }
 
 
+def _remember_parked(session_id: str, session: BrowserSession) -> None:
+    """Write (or refresh) the persist record of a current-Chrome session. Never raises.
+
+    Only a tab the server opened is ever recorded: a borrowed (attach_tab) tab is
+    the user's and is never parked. The URL is stored redacted (no credentials,
+    secrets masked, no fragment); only its origin is compared, no title is kept.
+    """
+    if (not session.persist or not session.owns_tab or session.profile_mode != "current"
+            or session.current_tab_id is None):
+        return
+    try:
+        _parking.remember(session_id, {
+            "tab_id": int(session.current_tab_id), "browser_run": session.browser_run,
+            "agent_label": session.agent_label, "owns_tab": True,
+            "tab_group": session.tab_group, "label_tab": bool(session.label_tab),
+            "url": redact_url(session.last_url) if session.last_url else None,
+        })
+        session.parked_at = time.time()
+    except Exception as exc:
+        logger.warning("Could not record persistent session '%s': %s", session_id, exc)
+
+
+def _refresh_parked(session_id: str, session: BrowserSession) -> None:
+    """Keep a live persist session's record from expiring under it (throttled)."""
+    if session.persist and time.time() - session.parked_at > min(300.0, _parking.ttl_seconds() / 4):
+        _remember_parked(session_id, session)
+
+
+def _parked_record(session_id: str) -> dict[str, Any] | None:
+    try:
+        return _parking.lookup(session_id)
+    except Exception:
+        return None
+
+
+def _forget_parked(session_id: str) -> None:
+    try:
+        _parking.forget(session_id)
+    except Exception as exc:
+        logger.debug("Could not forget persistent session '%s': %s", session_id, exc)
+
+
+def _origin(url: Any) -> str | None:
+    parts = urlsplit(str(url or ""))
+    return f"{parts.scheme}://{parts.netloc}".lower() if parts.scheme and parts.netloc else None
+
+
+def _parked_tab_check(session_id: str, record: dict[str, Any]) -> dict[str, Any]:
+    """Is the recorded tab provably still the server's parked tab, and free to touch?
+
+    ``{"ok", "reason", "busy", "site_changed"}``. ``busy`` - the session or its tab
+    is live, in this server or another MCP client - means hands off entirely: no
+    close, no claim release, no record change. Otherwise every condition must hold
+    or the tab is treated as somebody else's: a tab the server opened, the same
+    Chrome run (a restarted browser reuses ids), the same tab id, still in the
+    agent tab group it was opened in, still on the recorded origin.
+    ``site_changed`` marks the one refusal where only the origin differs.
+    """
+    tab_id = record.get("tab_id")
+    with _sessions_lock:
+        live = session_id in _sessions or any(
+            item.current_tab_id == tab_id for item in _sessions.values()
+        )
+    if live:
+        return {"ok": False, "busy": True, "site_changed": False,
+                "reason": "it is live in this server right now"}
+
+    def refuse(reason: str, site_changed: bool = False) -> dict[str, Any]:
+        return {"ok": False, "busy": False, "site_changed": site_changed, "reason": reason}
+
+    run = _current_browser_run()
+    if not record.get("owns_tab"):
+        return refuse("only tabs the server opened are ever parked")
+    if tab_id is None or not record.get("browser_run") or not run:
+        return refuse("the Chrome run it was parked in cannot be confirmed")
+    if run != record["browser_run"]:
+        return refuse("Chrome was restarted since, so the tab id names another tab")
+    if not record.get("tab_group") or not _origin(record.get("url")):
+        return refuse("the record names no agent tab group or page to check against")
+    try:
+        tab = get_chrome_bridge().request("tabs.get", {"tabId": int(tab_id)}, timeout=3.0) or {}
+    except Exception:
+        return refuse("the tab is gone")
+    if int(tab.get("id") or -1) != int(tab_id):
+        return refuse("Chrome replaced the tab since")
+    if tab.get("group") != record.get("tab_group"):
+        return refuse("the tab has left the agent's tab group")
+    try:
+        _claim_tab(int(tab_id))
+    except RuntimeError as exc:
+        return {"ok": False, "busy": True, "site_changed": False,
+                "reason": f"it is live in another MCP client ({exc})"}
+    # The claim was taken by this check alone (nothing here holds the tab), so it
+    # is this check's to give back.
+    _release_claimed_tab(int(tab_id))
+    if _origin(tab.get("url")) != _origin(record.get("url")):
+        return refuse("the tab now shows a different site", site_changed=True)
+    return {"ok": True, "busy": False, "site_changed": False, "reason": ""}
+
+
+def _retire_parked(
+    session_id: str, record: dict[str, Any] | None = None, *, explicit: bool = False,
+    expired: bool = False,
+) -> dict[str, Any] | None:
+    """End a parked session for good: close its tab if it is provably the server's.
+
+    ``explicit`` (a close or attach under the name) also closes a server tab whose
+    only change is the site it shows. A live session or tab is never touched; an
+    expired record of one is put back rather than lost.
+    """
+    record = record or _parked_record(session_id)
+    if not record:
+        return None
+    check = _parked_tab_check(session_id, record)
+    answer = {"session_id": session_id, "tab_id": record.get("tab_id"), "tab_closed": False}
+    if check["busy"]:
+        if expired:
+            try:
+                _parking.remember(session_id, {k: v for k, v in record.items() if k != "updated_at"})
+            except Exception as exc:
+                logger.warning("Could not restore the record of live session '%s': %s", session_id, exc)
+        return {**answer, "left_open_reason": check["reason"]}
+    _forget_parked(session_id)
+    if check["ok"] or (explicit and check["site_changed"]):
+        try:
+            get_chrome_bridge().request("tabs.remove", {"tabId": int(record["tab_id"])}, timeout=5.0)
+            return {**answer, "tab_closed": True}
+        except Exception as exc:
+            return {**answer, "left_open_reason": f"closing it failed ({exc})"}
+    return {**answer, "left_open_reason": check["reason"]}
+
+
+def _reap_expired_parked() -> list[dict[str, Any]]:
+    """Retire records past WEB_SEARCH_NEO_PARKED_SESSION_TTL; their tabs are not left behind."""
+    try:
+        expired = _parking.take_expired()
+    except Exception:
+        return []
+    return [answer for record in expired
+            if (answer := _retire_parked(str(record.get("session_id")), record, expired=True))]
+
+
+class _ReattachRefused(ValueError):
+    """A parked session could not be re-attached; ``left_open_tab`` names a tab left behind."""
+
+    def __init__(self, message: str, left_open_tab: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.left_open_tab = left_open_tab
+
+
+def _adopt_parked_session(session_id: str, record: dict[str, Any]) -> BrowserSession:
+    """Re-attach a ``persist=true`` session an earlier MCP client parked, or refuse.
+
+    Refusing drops the record and leaves the tab as it is; a live one keeps its
+    record. A server tab that only shows another site now is named in the refusal
+    (``left_open_tab``) so the caller can close it instead of it lingering.
+    """
+    check = _parked_tab_check(session_id, record)
+    if not check["ok"]:
+        if not check["busy"]:
+            _forget_parked(session_id)
+        left = ({"tab_id": record.get("tab_id"), "note": (
+            "This tab was opened by the server and is still in the agent tab group, but "
+            "shows another site now; close it with close_tabs if it is not needed.")}
+            if check["site_changed"] else None)
+        raise _ReattachRefused(
+            f"Parked session '{session_id}' cannot be re-attached: {check['reason']}. "
+            + ("" if check["busy"] else "Its record was dropped. ")
+            + f'Open a new page instead: web_action [{{"action":"open","url":...,"session_id":"{session_id}"}}].',
+            left,
+        )
+    session = _create_session(
+        session_id, 1440, 900, False, "current", None, None, int(record["tab_id"]),
+        str(record["tab_group"]), record.get("agent_label"),
+    )
+    if not session.browser_run or session.browser_run != record.get("browser_run"):
+        close_session(session_id, close_tab=False)  # also drops the record
+        raise _ReattachRefused(
+            f"Parked session '{session_id}' cannot be re-attached: the claimed tab belongs "
+            "to a different Chrome run than the one it was parked in."
+        )
+    session.owns_tab = True
+    session.persist = True
+    session.label_tab = bool(record.get("label_tab", True))
+    session.last_url = record.get("url")
+    with session.lock:
+        _reapply_tab_scripts(session, session_id)
+    session.pending_notice = {"reattached": True, "reattach_note": (
+        f"Session '{session_id}' was re-attached to its persisted tab {record['tab_id']}, "
+        "left open by an earlier MCP client."
+    )}
+    _remember_parked(session_id, session)
+    return session
+
+
+def reattach_session(session_id: str) -> dict[str, Any]:
+    """Explicitly continue a ``persist=true`` session an earlier MCP client left parked."""
+    session_id = _validate_session_id(session_id)
+    _reap_expired_parked()
+    with _sessions_lock:
+        live = _sessions.get(session_id)
+    if live is None:
+        record = _parked_record(session_id)
+        if not record:
+            raise ValueError(
+                f"No parked session named '{session_id}': it was never opened with "
+                "persist=true, it was closed, or its record expired. Open a new page instead."
+            )
+        try:
+            live = _adopt_parked_session(session_id, record)
+        except _ReattachRefused as refused:
+            return {"session_id": session_id, "success": False, "error": str(refused),
+                    **({"left_open_tab": refused.left_open_tab} if refused.left_open_tab else {})}
+    with live.lock:
+        return {**_page_summary(live.driver, session_id), "success": True, "reattached": True,
+                "persist": live.persist, "current_tab_id": live.current_tab_id}
+
+
 def _get_session(session_id: str) -> BrowserSession:
     _validate_session_id(session_id)
     with _sessions_lock:
@@ -1165,12 +1527,18 @@ def _get_session(session_id: str) -> BrowserSession:
         )
     if session is None:
         # Name the call the caller actually has. Pointing at an internal helper
-        # leaves a small model stuck with no way to recover.
+        # leaves a small model stuck with no way to recover. A parked session is
+        # never picked up implicitly: continuing one is an explicit reattach.
+        parked = _parked_record(session_id) is not None
         raise ValueError(
-            f"Browser session '{session_id}' does not exist. Open one first: "
-            f'web_action [{{"action":"open","url":...,"session_id":"{session_id}"}}]. '
+            f"Browser session '{session_id}' does not exist. "
+            + (f"It is parked by an earlier MCP client; continue it with web_action "
+               f'[{{"action":"reattach","session_id":"{session_id}"}}], or ' if parked else "")
+            + f'Open one first: web_action [{{"action":"open","url":...,"session_id":"{session_id}"}}]. '
             f"Open sessions: {open_sessions}."
         )
+    _apply_reported_follow(session_id, session)
+    _refresh_parked(session_id, session)
     session.last_used = time.monotonic()
     session.last_used_at = time.time()
     return session
@@ -1233,233 +1601,7 @@ def apply_context_overrides(
         }
 
 
-# A challenge is a live widget, not the word "captcha" in prose. Matching text
-# alone flags every article about CAPTCHAs and every search result for the word,
-# and then the agent waits three minutes for a human who is not needed.
-#
-# The probe therefore gathers three things and leaves the verdict to
-# _classify_challenge: which provider widgets are on the page, wherever they are -
-# shadow roots and same-origin frames included, because half of them live one
-# document down - which provider SDKs the markup loads, and whether any of it is
-# lying over the middle of the viewport rather than sitting inside a form.
-_CHALLENGE_WIDGET_SCRIPT = """
-const WIDGETS = [
-  'iframe[src*="recaptcha/api2"]', 'iframe[src*="recaptcha/enterprise"]',
-  'iframe[src*="hcaptcha.com"]', 'iframe[src*="challenges.cloudflare.com"]',
-  'iframe[src*="captcha-api.yandex"]', 'iframe[src*="captcha-delivery.com"]',
-  'iframe[src*="captcha.awswaf.com"]', 'iframe[title*="captcha" i]',
-  'div.g-recaptcha', 'div.h-captcha', 'div.cf-turnstile', 'div#cf-challenge-running',
-  'form#challenge-form', '#px-captcha', '.smart-captcha', '.datadome-captcha',
-  'awswaf-captcha', '[data-sitekey]'
-];
-// A script tag has no box of its own, so these are counted by presence. Both
-// hosts only serve the SDK that asks a human to solve something; the tags that
-// merely score a request quietly are deliberately not here.
-const MARKERS = [
-  'script[src*="captcha-sdk.awswaf.com"]', 'script[src*="captcha.awswaf.com"]'
-];
-// A widget of one of these kinds is a real gate even with no box on the screen:
-// the invisible modes of Turnstile, reCAPTCHA and Smart CAPTCHA render exactly
-// this markup and nothing else, and the page's own submit handler waits on the
-// token they are going to mint. The rest of WIDGETS is left out on purpose -
-// a hidden challenge-form or a display:none article widget says nothing.
-const INVISIBLE_CAPABLE = [
-  'div.cf-turnstile', 'iframe[src*="challenges.cloudflare.com"]',
-  'div.g-recaptcha', 'iframe[src*="recaptcha/api2"]',
-  'iframe[src*="recaptcha/enterprise"]',
-  'div.h-captcha', 'iframe[src*="hcaptcha.com"]',
-  '.smart-captcha', 'iframe[src*="captcha-api.yandex"]'
-];
-// The hidden field every vendor mints its token into. It exists only because the
-// widget script ran, and while it is empty the challenge is unsolved - which is
-// the whole state an invisible widget ever shows.
-const TOKEN_FIELDS = [
-  {selector: 'input[name="cf-turnstile-response"]', vendor: 'turnstile'},
-  {selector: 'textarea[name="g-recaptcha-response"], textarea#g-recaptcha-response', vendor: 'recaptcha'},
-  {selector: 'textarea[name="h-captcha-response"], textarea#h-captcha-response', vendor: 'hcaptcha'},
-  {selector: 'input[name="smart-token"], input[name="smartToken"]', vendor: 'smartcaptcha'}
-];
-const found = [];
-const markers = [];
-const hidden = [];
-const tokens = [];
-// The walk used to stop after 8000 nodes, which a marketplace listing page eats
-// before the first shadow root is entered - and nothing said it had stopped, so
-// "no captcha here" and "gave up looking" read the same. Walking 60000 elements
-// costs 10ms, and the pages most likely to gate are the ones with that many.
-const NODE_BUDGET = 50000;
-const DEPTH_LIMIT = 8;
-// A widget over the middle of the viewport is only in the way when the layer it
-// sits in seals off enough of the page that there is nothing else to read.
-const BLOCKING_COVER = 0.5;
-const budget = {nodes: 0, truncated: false};
-let blocking = false;
-
-function isVisible(element) {
-  const rect = element.getBoundingClientRect();
-  if (rect.width < 20 || rect.height < 20) return false;
-  const view = (element.ownerDocument && element.ownerDocument.defaultView) || window;
-  const style = view.getComputedStyle(element);
-  return style.visibility !== 'hidden' && style.opacity !== '0';
-}
-
-// data-sitekey alone says nothing: chat, payment and analytics widgets mint one
-// too, and treating every one of them as a gate stopped the agent on pages that
-// were never blocking it.
-function isCaptchaSitekey(element) {
-  const name = String(element.getAttribute('class') || '') + ' ' + String(element.id || '');
-  if (/captcha|turnstile|challenge/i.test(name)) return true;
-  return !!element.querySelector('iframe[src*="captcha"], iframe[src*="turnstile"]');
-}
-
-function matchedSelector(element, selectors) {
-  for (const selector of selectors) {
-    try { if (element.matches(selector)) return selector; } catch (error) { continue; }
-  }
-  return null;
-}
-
-function viewOf(node) {
-  const doc = node.ownerDocument;
-  return (doc && doc.defaultView) || null;
-}
-
-function coverOfRect(rect, view) {
-  const area = view.innerWidth * view.innerHeight;
-  if (area <= 0) return 0;
-  const width = Math.min(rect.right, view.innerWidth) - Math.max(rect.left, 0);
-  const height = Math.min(rect.bottom, view.innerHeight) - Math.max(rect.top, 0);
-  return width <= 0 || height <= 0 ? 0 : (width * height) / area;
-}
-
-function overPoint(rect, x, y) {
-  return rect.left <= x && rect.right >= x && rect.top <= y && rect.bottom >= y;
-}
-
-// Zero unless the widget is over the centre of its own viewport; otherwise the
-// share of that viewport the widget - or the positioned layer it is painted in -
-// covers. It is that layer, the scrim of a modal, that actually stops the page
-// being used; the widget itself is far too small to.
-//
-// Boxes, not a hit test: elementFromPoint retargets shadow content to its host,
-// so a widget inside a web component could never be the node at the centre, and
-// the veil a provider paints over its own widget while it verifies wins that hit
-// test while blocking the page just as thoroughly.
-function coverOverCenter(element) {
-  const view = viewOf(element);
-  if (!view) return 0;
-  const x = view.innerWidth / 2;
-  const y = view.innerHeight / 2;
-  const rect = element.getBoundingClientRect();
-  if (!overPoint(rect, x, y)) return 0;
-  let cover = coverOfRect(rect, view);
-  let node = element;
-  for (let step = 0; step < 40 && node; step += 1) {
-    // parentNode.host is the step out of a shadow tree, which parentElement -
-    // and every hit test - stops dead at.
-    const parent = node.parentElement || (node.parentNode && node.parentNode.host) || null;
-    if (!parent) break;
-    node = parent;
-    let position = '';
-    let ancestorView = null;
-    try {
-      ancestorView = viewOf(node);
-      position = ancestorView.getComputedStyle(node).position;
-    } catch (error) { position = ''; }
-    if (!ancestorView) break;
-    if (position !== 'fixed' && position !== 'absolute' && position !== 'sticky') continue;
-    const box = node.getBoundingClientRect();
-    if (overPoint(box, x, y)) cover = Math.max(cover, coverOfRect(box, ancestorView));
-  }
-  return cover;
-}
-
-function scan(root, where, atCenter, depth, outerCover) {
-  if (found.length >= 3) return;
-  if (depth > DEPTH_LIMIT || budget.nodes > NODE_BUDGET) { budget.truncated = true; return; }
-  const doc = root.ownerDocument || root;
-  let matches = [];
-  try { matches = Array.from(root.querySelectorAll(WIDGETS.join(','))); } catch (error) { matches = []; }
-  for (const element of matches) {
-    const selector = matchedSelector(element, WIDGETS);
-    if (!selector) continue;
-    if (selector === '[data-sitekey]' && !isCaptchaSitekey(element)) continue;
-    if (!isVisible(element)) {
-      // An invisible widget used to be dropped here, and with it the only trace
-      // of the challenge holding a submit: no box, no error, no report.
-      if (INVISIBLE_CAPABLE.indexOf(selector) >= 0 && hidden.indexOf(selector + where) < 0) {
-        hidden.push(selector + where);
-      }
-      continue;
-    }
-    found.push(selector + where);
-    const cover = atCenter ? coverOverCenter(element) : 0;
-    if (cover > 0 && Math.max(cover, outerCover) >= BLOCKING_COVER) blocking = true;
-    if (found.length >= 3) break;
-  }
-  for (const spec of TOKEN_FIELDS) {
-    let fields = [];
-    try { fields = Array.from(root.querySelectorAll(spec.selector)); } catch (error) { fields = []; }
-    for (const field of fields) {
-      const key = spec.vendor + where;
-      if (tokens.some(token => token.key === key)) continue;
-      tokens.push({
-        key: key,
-        vendor: spec.vendor,
-        where: where.trim(),
-        field: String(field.getAttribute('name') || field.id || spec.vendor),
-        filled: String(field.value || '').trim().length > 0
-      });
-    }
-  }
-  try {
-    for (const element of root.querySelectorAll(MARKERS.join(','))) {
-      const selector = matchedSelector(element, MARKERS);
-      if (selector && markers.indexOf(selector + where) < 0) markers.push(selector + where);
-    }
-  } catch (error) { /* a root that cannot be queried has nothing to add */ }
-  if (found.length >= 3) return;
-  // Shadow roots and same-origin frames are where the rest of the challenges
-  // live: a top-level querySelector never looks inside either one. A TreeWalker
-  // stops the moment the budget runs out, where querySelectorAll('*') would have
-  // built the whole element list of a huge page before anyone could check.
-  let walker = null;
-  try { walker = doc.createTreeWalker(root, NodeFilter.SHOW_ELEMENT); } catch (error) { walker = null; }
-  while (walker) {
-    const element = walker.nextNode();
-    if (!element || found.length >= 3) return;
-    if (++budget.nodes > NODE_BUDGET) { budget.truncated = true; return; }
-    if (element.shadowRoot) {
-      // A shadow tree is painted in its host's layer, so it stands over the page
-      // exactly as far as the host does.
-      scan(element.shadowRoot, ' (in shadow DOM)', atCenter, depth + 1, outerCover);
-    } else if (element.tagName === 'IFRAME') {
-      let inner = null;
-      try { inner = element.contentDocument; } catch (error) { inner = null; }
-      if (!inner) continue;
-      const frameCover = atCenter ? coverOverCenter(element) : 0;
-      scan(inner, ' (in a frame)', frameCover > 0, depth + 1, Math.max(outerCover, frameCover));
-    }
-  }
-}
-
-scan(document, '', true, 0, 0);
-const heading = (document.title || '') + ' ' +
-  Array.from(document.querySelectorAll('h1, h2')).slice(0, 3)
-    .map(node => node.innerText || '').join(' ');
-const body = (document.body && document.body.innerText) || '';
-return {
-  widgets: found,
-  markers: markers,
-  hidden_widgets: hidden,
-  tokens: tokens,
-  blocking: blocking,
-  truncated: budget.truncated,
-  heading: heading.slice(0, 400),
-  body: body.slice(0, 2000),
-  body_length: body.length
-};
-"""
+# The challenge probe lives in perception/challenge.py (re-exported for tests).
 
 # A challenge interstitial carries almost no content. Requiring a short page
 # before trusting body text keeps an article about CAPTCHAs from being mistaken
@@ -1508,6 +1650,7 @@ return {
   page_width: document.documentElement.scrollWidth,
   page_height: document.documentElement.scrollHeight,
   ready_state: document.readyState,
+  content_type: document.contentType || '',
   challenge: challenge
 };
 """
@@ -1704,6 +1847,7 @@ def _action_summary(
 def _page_summary(driver: webdriver.Chrome, session_id: str) -> dict[str, Any]:
     probe = driver.execute_script(_PAGE_SUMMARY_SCRIPT) or {}
     challenge = probe.pop("challenge", None) or {}
+    content_type = str(probe.pop("content_type", "") or "text/html")
     # Every observation passes through here, so this is the cheapest honest place
     # to remember where a session is: the status topic can then describe all of
     # them without waiting on a lock each one's own agent is holding.
@@ -1724,10 +1868,18 @@ def _page_summary(driver: webdriver.Chrome, session_id: str) -> dict[str, Any]:
         # Every observation already passes through here under the session lock,
         # so the badge ping rides along instead of costing its own round-trip.
         _ping_tab_activity(session)
+    notice = session.pending_notice if session is not None else None
+    if session is not None:
+        session.pending_notice = None
     return {
         "session_id": session_id,
         **probe,
+        # A script-set title can lag behind readyState=complete: an empty title
+        # here means "not set yet", which topic=page_text waits out.
+        **({"title_pending": True} if probe.get("title") == "" and "html" in content_type
+           and not str(probe.get("url") or "").startswith(("about:", "data:", "chrome")) else {}),
         **_classify_challenge(challenge),
+        **(notice or {}),
     }
 
 
@@ -1820,8 +1972,13 @@ def open_page(
     timezone: str | None = None,
     locale: str | None = None,
     geolocation: dict[str, Any] | None = None,
+    persist: bool = False,
 ) -> dict[str, Any]:
     """Open a URL in a reusable rendered browser session.
+
+    ``persist=True`` (current Chrome only) keeps the tab open when this MCP
+    client exits and lets a later client continue by the same ``session_id``;
+    an explicit close still closes it.
 
     In ``profile_mode="current"`` the tab is labelled for the tab strip
     (``[agent_label] ``, or ``[session_id] `` without a label) unless
@@ -1838,6 +1995,24 @@ def open_page(
     normalized = validate_http_url(url)
     session_id = _validate_session_id(session_id)
     width, height = _bounded_size(width, height)
+    parked_note: dict[str, Any] = {}
+    if persist:
+        if session_id == "default":
+            raise ValueError("persist=true needs an explicit session_id, not 'default'")
+        if _resolve_profile_mode(profile_mode, headless) != "current" or current_tab_id is not None:
+            raise ValueError(
+                "persist=true keeps a tab of the user's Chrome open across MCP clients, so it "
+                "needs profile_mode='current' with the companion connected (and no current_tab_id)."
+            )
+        with _sessions_lock:
+            known = session_id in _sessions
+        record = None if known else _parked_record(session_id)
+        if record:
+            try:
+                _adopt_parked_session(session_id, record)
+            except _ReattachRefused as exc:  # refused and dropped: open a fresh tab instead
+                parked_note = {"parked_refused": str(exc),
+                               **({"left_open_tab": exc.left_open_tab} if exc.left_open_tab else {})}
     session = _create_session(
         session_id,
         width,
@@ -1850,6 +2025,8 @@ def open_page(
         tab_group,
         agent_label,
     )
+    session.persist = session.persist or bool(persist)
+    session.label_tab = bool(label_tab)
     # Read before the lock: taking it first would wait the other caller out and
     # then report an empty room. This is the moment two agents that both took the
     # default session id collide, so it is the moment worth naming.
@@ -1913,8 +2090,12 @@ def open_page(
                         session.render_deterministic = True
                 else:
                     restored = False
+        summary = _page_summary(session.driver, session_id)
+        _remember_parked(session_id, session)
         return {
-            **_page_summary(session.driver, session_id),
+            **summary,
+            "persist": session.persist,
+            **parked_note,
             "render_mode": session.render_mode,
             "render_mode_restored": restored,
             "headless": session.headless,
@@ -2097,8 +2278,12 @@ def attach_current_tab(
     session_id: str = "default",
     agent_label: str | None = None,
     label_tab: bool = True,
+    persist: bool = False,
 ) -> dict[str, Any]:
     """Attach a named MCP session to an existing Chrome tab without navigating it.
+
+    ``persist=True`` records the session so a later MCP client re-attaches it by
+    ``session_id`` alone (the tab is the user's and stays open either way).
 
     Console and network recording starts at the attach, so the console and
     network topics report what the tab does from here on. What it did before -
@@ -2111,6 +2296,21 @@ def attach_current_tab(
     document immediately.
     """
     session_id = _validate_session_id(session_id)
+    if persist:
+        raise ValueError(
+            "persist=true is only for tabs the server opens (open with persist=true): a tab "
+            "claimed with attach_tab is the user's and is never parked. To continue a parked "
+            "session use web_action reattach {session_id}."
+        )
+    with _sessions_lock:
+        known = session_id in _sessions
+    record = None if known else _parked_record(session_id)
+    if record and record.get("tab_id") == int(tab_id):
+        # This session's own parked tab: attaching it is continuing it.
+        return reattach_session(session_id)
+    # Otherwise an explicit attach supersedes a parked record under this name: its
+    # tab is closed if it is provably the server's.
+    retired = _retire_parked(session_id, record, explicit=True) if record else None
     session = _create_session(
         session_id,
         1440,
@@ -2123,15 +2323,21 @@ def attach_current_tab(
         DEFAULT_TAB_GROUP,
         agent_label,
     )
+    session.persist = session.persist or bool(persist)
+    session.label_tab = bool(label_tab)
     try:
         with session.lock:
             _register_render_bootstrap(session)
             _apply_tab_label(session, session_id, label_tab=label_tab)
             _apply_tab_activity(session, session_id, label_tab=label_tab)
             _apply_agent_presence(session, session_id)
+            summary = _page_summary(session.driver, session_id)
+            _remember_parked(session_id, session)
             return {
-                **_page_summary(session.driver, session_id),
+                **summary,
                 "success": True,
+                "persist": session.persist,
+                **({"retired_parked": retired} if retired else {}),
                 "headless": False,
                 "window_mode": "visible",
                 "profile_mode": "current",
@@ -2243,131 +2449,7 @@ def reload_page(
         return answer
 
 
-# A tab-strip label so a human looking at the tab bar can tell which tab each
-# agent is driving. `agent_label` already names the owner to *readers* of
-# browser_status; this makes it visible where the user is actually looking.
-#
-# The label lives in the real `<title>` element - that is what the tab strip
-# shows - while page-side JavaScript keeps reading and writing the *unlabelled*
-# title through a shadow accessor on the document instance, so a page that
-# compares or derives from `document.title` never sees the prefix. Writes
-# through the shadow go out prefixed; direct rewrites of the `<title>` element
-# are caught by a MutationObserver and re-prefixed; statically parsed titles
-# are picked up again on DOMContentLoaded. The script is installed with
-# Page.addScriptToEvaluateOnNewDocument, so it runs before the page's own
-# scripts in every new document and survives navigations and reloads.
-_TAB_LABEL_SCRIPT_TEMPLATE = r"""
-(() => {
-  const PREFIX = __WSN_TAB_LABEL_PREFIX__;
-  const KEY = "__wsnTabLabel";
-  const previous = window[KEY];
-  if (previous && previous.prefix === PREFIX) return;
-  if (previous && typeof previous.restore === "function") {
-    try { previous.restore(); } catch (error) {}
-  }
-  const protoDesc = Object.getOwnPropertyDescriptor(Document.prototype, "title");
-  const state = { prefix: PREFIX, real: "", applying: false, observer: null };
-  window[KEY] = state;
-  function titleElement() {
-    return document.querySelector ? document.querySelector("title") : null;
-  }
-  function shownTitle() {
-    const el = titleElement();
-    return el && typeof el.textContent === "string" ? el.textContent : "";
-  }
-  function writeTitle(wanted) {
-    if (protoDesc && typeof protoDesc.set === "function") {
-      protoDesc.set.call(document, wanted);
-      return;
-    }
-    let el = titleElement();
-    if (!el && document.head && document.createElement) {
-      el = document.createElement("title");
-      document.head.appendChild(el);
-    }
-    if (el) el.textContent = wanted;
-  }
-  function render() {
-    const wanted = state.prefix + state.real;
-    if (shownTitle() === wanted) return;
-    state.applying = true;
-    try {
-      writeTitle(wanted);
-    } finally {
-      state.applying = false;
-    }
-  }
-  function adoptShown() {
-    const shown = shownTitle();
-    if (shown.indexOf(state.prefix) === 0) {
-      state.real = shown.slice(state.prefix.length);
-    } else {
-      state.real = shown;
-    }
-  }
-  function sync() {
-    if (state.applying) return;
-    if (shownTitle() === state.prefix + state.real) return;
-    adoptShown();
-    render();
-  }
-  try {
-    Object.defineProperty(document, "title", {
-      configurable: true,
-      enumerable: true,
-      get() { return state.real; },
-      set(value) {
-        const text = value === null || value === undefined ? "" : String(value);
-        state.real = text.indexOf(state.prefix) === 0
-          ? text.slice(state.prefix.length)
-          : text;
-        render();
-      },
-    });
-  } catch (error) {
-    // A page that froze its own document.title keeps working unlabelled to
-    // its scripts; the observer below still prefixes what the tab strip shows.
-  }
-  try {
-    state.observer = new MutationObserver(sync);
-    state.observer.observe(document, {
-      childList: true,
-      subtree: true,
-      characterData: true,
-    });
-  } catch (error) {}
-  if (document.addEventListener) {
-    document.addEventListener("DOMContentLoaded", sync);
-  }
-  adoptShown();
-  render();
-  state.restore = function () {
-    try {
-      if (state.observer) state.observer.disconnect();
-    } catch (error) {}
-    try {
-      delete document.title;
-    } catch (error) {}
-    try {
-      if (Object.getOwnPropertyDescriptor(document, "title")) {
-        const el = titleElement();
-        if (el) el.textContent = state.real;
-      } else {
-        document.title = state.real;
-      }
-    } catch (error) {}
-    try {
-      delete window[KEY];
-    } catch (error) {}
-  };
-})();
-"""
-
-_TAB_LABEL_RESTORE_SCRIPT = (
-    "(() => { const labelled = window.__wsnTabLabel;"
-    " if (labelled && typeof labelled.restore === 'function') labelled.restore();"
-    " return true; })()"
-)
+# The tab-label page script lives in sessions/tab_label_source.py.
 
 _TAB_LABEL_ENV = "WEB_SEARCH_NEO_LABEL_TABS"
 _TAB_LABEL_LIMIT = 24
@@ -2731,8 +2813,12 @@ def wait_for_element(
     frame_selector: str | None = None,
     script: str | None = None,
     poll_ms: int = 150,
+    seconds: float | None = None,
 ) -> dict[str, Any]:
     """Wait for a dynamic element to be present, visible, or clickable.
+
+    ``seconds`` is a plain delay (capped at 300 s) that needs no selector, no
+    script and not even an open session; it cannot be combined with either.
 
     ``selector`` accepts the same three locator forms as ``fill``: CSS, a ref
     handle, and a piercing path. ``frame_selector`` names the frame a CSS
@@ -2746,6 +2832,19 @@ def wait_for_element(
     when) and the result names the wait really made. The session lock is taken
     per poll only, so other calls on the session are not queued behind the wait.
     """
+    if seconds is not None:
+        if str(selector or "").strip() or (script is not None and str(script).strip()):
+            raise ValueError("seconds is a plain delay; pass it without selector or script")
+        delay, note = _clamp_wait(max(0.0, float(seconds)))
+        time.sleep(delay)
+        with _sessions_lock:
+            session = _sessions.get(session_id)
+        summary: dict[str, Any] = {"session_id": session_id}
+        if session is not None:
+            with session.lock:
+                summary = _page_summary(session.driver, session_id)
+        return {**summary, "success": True, "state": "sleep", "slept_seconds": delay,
+                **({"timeout_note": note} if note else {})}
     if script is not None and str(script).strip():
         if str(selector or "").strip():
             raise ValueError("Pass either selector or script, not both")
@@ -2955,31 +3054,6 @@ _VALUE_FORMATS = {
     "color": "#rrggbb, for example #ff8800",
 }
 
-# The write is rehearsed on a throwaway control of the same type first, because
-# these controls do not refuse a value they cannot parse - they replace it. A
-# range takes its midpoint, a colour takes black and a date empties itself, so a
-# failed fill used to leave the form holding a plausible wrong answer.
-_SET_VALUE_SCRIPT = """
-const element = arguments[0];
-const wanted = String(arguments[1]);
-const doc = element.ownerDocument || document;
-const probe = doc.createElement('input');
-probe.type = element.type;
-if (element.min) probe.min = element.min;
-if (element.max) probe.max = element.max;
-if (element.step) probe.step = element.step;
-probe.value = wanted;
-const outcome = String(probe.value || '');
-// A control may shorten what it is given - a datetime-local drops the seconds it
-// does not carry - but not answer with something else entirely.
-const usable = outcome !== '' &&
-  wanted.toLowerCase().indexOf(outcome.toLowerCase()) === 0;
-if (!usable) return {taken: false, value: String(element.value || ''), expected: outcome};
-element.value = wanted;
-element.dispatchEvent(new Event('input', {bubbles: true}));
-element.dispatchEvent(new Event('change', {bubbles: true}));
-return {taken: true, value: String(element.value || ''), expected: outcome};
-"""
 
 # A contenteditable editor (TipTap, ProseMirror, Slate, Quill) does not listen to
 # value sets or DOM patches: its document model only moves on real editing
@@ -3207,16 +3281,6 @@ def _brief_error(exc: Exception) -> str:
     return f"{type(exc).__name__}: {first}" if first else type(exc).__name__
 
 
-_FILE_INPUT_STATE_SCRIPT = """
-const element = arguments[0];
-return {
-  type: String(element.type || '').toLowerCase(),
-  multiple: !!element.multiple,
-  names: Array.from(element.files || []).map(file => file.name)
-};
-"""
-
-
 def _attach_files(driver: Any, element: Any, paths: list[str]) -> list[str]:
     """Leave the input holding exactly ``paths``, and report what it holds.
 
@@ -3236,28 +3300,6 @@ def _attach_files(driver: Any, element: Any, paths: list[str]) -> list[str]:
     after = driver.execute_script(_FILE_INPUT_STATE_SCRIPT, element) or {}
     return [str(name) for name in (after.get("names") or [])]
 
-
-# A Dropzone-style widget takes the file off the input the instant it gets it and
-# uploads it itself, so the input is empty a millisecond later. Reading the input
-# back is still the right first question - it is exact when it answers - but an
-# empty one is not an answer at all, and calling it a failure sent a resume that
-# was already on S3 back round the loop as "upload failed".
-_UPLOAD_TRACE_SCRIPT = """
-const names = arguments[0];
-const text = ((document.body && document.body.innerText) || '');
-const values = Array.from(document.querySelectorAll('input, textarea'))
-  .map(node => String(node.value || '')).join(' ');
-const attributes = Array.from(document.querySelectorAll('[title], [data-filename], [aria-label]'))
-  .slice(0, 400)
-  .map(node => [node.getAttribute('title'), node.getAttribute('data-filename'),
-                node.getAttribute('aria-label')].join(' ')).join(' ');
-const haystack = text + ' ' + values + ' ' + attributes;
-const seen = [];
-for (const name of names) {
-  if (name && haystack.indexOf(name) >= 0) seen.push(name);
-}
-return seen;
-"""
 
 # How long the widget is given to show the file it has just swallowed. A dropzone
 # renders its chip in one frame; the network request behind it can take longer,
@@ -3468,6 +3510,7 @@ def fill_fields(
     upload_notes: dict[str, str] = {}
     values: dict[str, Any] = {}
     errors: dict[str, str] = {}
+    resynced: list[str] = []
     with session.lock:
         driver = session.driver
         _enter_action_frame(driver, frame_selector, *fields, *(files or {}))
@@ -3516,12 +3559,16 @@ def fill_fields(
                     expected = _write_by_script(driver, element, input_type, value)
                 elif control.get("editable"):
                     expected = _write_contenteditable(driver, element, str(value))
-                elif typing:
-                    element.clear()
-                    _type_text_like_typing(driver, element, str(value))
                 else:
                     element.clear()
-                    element.send_keys(str(value))
+                    if typing:
+                        _type_text_like_typing(driver, element, str(value))
+                    else:
+                        element.send_keys(str(value))
+                    # A React-controlled input whose tracker missed the edit is
+                    # nudged with one input event, so onChange runs without typing=true.
+                    if _verification.sync_framework_value(driver, element):
+                        resynced.append(selector)
                 read_script = _FIELD_STATE_SCRIPT if blur_after else _FIELD_STATE_KEEP_FOCUS_SCRIPT
                 state = driver.execute_script(read_script, element) or {}
                 if state.get("kind") == "detached":
@@ -3577,6 +3624,7 @@ def fill_fields(
             "frame_selector": frame_selector,
             "blur_after": bool(blur_after),
             "typing": bool(typing),
+            **({"framework_resynced": resynced} if resynced else {}),
         }
         if upload_states:
             # Only when an input did not simply keep its files: the ordinary
@@ -3597,11 +3645,6 @@ def _wait_after_action(driver: webdriver.Chrome, wait_seconds: float) -> None:
         _wait_until_ready(driver, max(1.0, delay))
     except Exception:
         pass
-
-
-# The cheapest observable-change signal for click(): the full page summary runs
-# after the click anyway, so only the before-state needs a read of its own.
-_PRE_CLICK_STATE_SCRIPT = "return {url: String(location.href), title: String(document.title)};"
 
 
 def click(
@@ -3635,11 +3678,13 @@ def click(
     ``frame_selector`` names the frame a CSS selector or coordinate pair is
     looked up in, exactly as it does for ``find`` and ``page_text``.
 
-    The answer carries the page before/after the click: ``page_changed`` is true
-    when the URL or title moved, and ``no_observable_change`` says the click
-    reported success while both stayed put - a menu, dialog, or in-place update
-    does that legitimately, so confirm the effect with page_text/page_elements
-    rather than clicking again.
+    The answer says what the click did: ``page_changed`` (URL or title moved),
+    ``verified``/``effect_detected`` (true when the page changed, the element's
+    subtree or ancestors mutated, focus moved, or the element left the document;
+    false only when a top-document target showed none of that; null when it
+    cannot be measured - frame or shadow targets) and ``post_state`` with the
+    raw evidence. Neither false nor null is a reason to click again: read the
+    page first, because the first click may already have submitted something.
     """
     if text is not None:
         if selector_must_be_unique:
@@ -3685,10 +3730,14 @@ def click(
         # The URL/title before the click, read cheaply: a click that reports
         # success while the page sits still is the oldest automation lie there
         # is, and the summary below already reads the after-state.
-        try:
-            pre_click = session.driver.execute_script(_PRE_CLICK_STATE_SCRIPT) or {}
-        except Exception:
-            pre_click = {}
+        # A frame or a ref/piercing (shadow) target cannot be measured from the top
+        # document; its probe only records URL/title, armed before entering it. A
+        # top-level target is armed right before the click itself, so nothing the
+        # lookup and scrolling did is counted, and any failure disarms it.
+        top_level = not frame_selector and page_perception.resolve_locator_expression(selector) is None
+        pre_click = {} if top_level else _verification.arm_click_probe(session.driver)
+        element = None
+        clicked = False
         _enter_action_frame(session.driver, frame_selector, selector)
         try:
             if selector_must_be_unique:
@@ -3723,20 +3772,26 @@ def click(
             session.driver.execute_script(
                 "arguments[0].scrollIntoView({block: 'center'});", element
             )
-            if trusted:
-                _click_trusted(session, element, frame_selector)
-            else:
+            if not trusted:
                 _remember_presence_click_target(
                     session, element, enabled=_presence_applies(session),
                     frame_selector=frame_selector,
                     map_frame=lambda: _pointer_context(session.driver, frame_selector)[0],
                     restore_frame=lambda: _enter_action_frame(session.driver, frame_selector, selector),
                 )
+            if top_level:
+                pre_click = _verification.arm_click_probe(session.driver)
+            if trusted:
+                _click_trusted(session, element, frame_selector)
+            else:
                 element.click()
+            clicked = True
         finally:
             # The click may have happened inside a frame; everything after it -
             # the settle, the page summary - is about the page as a whole.
             _release_action_frame(session.driver, frame_selector, selector)
+            if not clicked:
+                _verification.disarm_click_probe(session.driver)
         _wait_after_action(session.driver, wait_seconds)
         post = {
             **_page_summary(session.driver, session_id),
@@ -3746,21 +3801,10 @@ def click(
             "trusted": trusted,
             "selector_must_be_unique": selector_must_be_unique,
         }
-        if pre_click:
-            changed = (post.get("url") != pre_click.get("url")) or (
-                post.get("title") != pre_click.get("title")
-            )
-            post["page_changed"] = changed
-            if not changed:
-                post["no_observable_change"] = True
-                post["change_note"] = (
-                    "URL and title are unchanged after the click. That is "
-                    "normal for a menu, dialog, checkbox, or in-place update - "
-                    "confirm the effect with page_text/page_elements instead "
-                    "of clicking again."
-                )
-        else:
-            post["page_changed"] = None
+        # Elements inside a frame are not re-read from the top document.
+        post.update(_verification.collect_click_effects(
+            session.driver, element if top_level else None, pre_click, post, measurable=top_level
+        ))
         return _note_stalled_submit(session, post, started_ms)
 
 
@@ -3797,14 +3841,25 @@ def _click_trusted(
     )
 
 
+_CROSS_ORIGIN_FRAMES_SCRIPT = (
+    "let n=0;for(const f of document.querySelectorAll('iframe,frame')){"
+    "try{if(!f.contentDocument)n++;}catch(e){n++;}}return n;"
+)
+
+
 def execute_js(
     script: str, args: list[Any] | None = None, session_id: str = "default",
     await_promise: bool = False, user_gesture: bool = False,
     retry_on_uncaught: bool = False, retries: int = 2,
     retry_delay_ms: int = 300, wait_ready: bool = False, timeout_seconds: float | None = None,
     frame_selector: str | None = None,
+    report_frames: bool = False,
 ) -> dict[str, Any]:
-    """Run page JS once; retry only when explicitly safe. timeout_seconds extends the CDP await."""
+    """Run page JS once; retry only when explicitly safe. timeout_seconds extends the CDP await.
+
+    ``report_frames`` (the public tools set it) adds cross_origin_frames to an
+    empty answer on a framed page; internal callers skip that round trip.
+    """
     session = _get_session(session_id)
     with session.lock:
         # A top-document script cannot see inside a cross-origin frame - the
@@ -3814,7 +3869,16 @@ def execute_js(
         # back at the top document whatever happens, so the page summary below
         # always reads the page, not the frame.
         if frame_selector:
-            _select_frame(session.driver, frame_selector)
+            try:
+                _select_frame(session.driver, frame_selector)
+            except (ChromeBridgeError, WebDriverException) as exc:
+                raise ValueError(
+                    f"frame_selector '{frame_selector}' could not be entered: {_brief_error(exc)}. "
+                    "A cross-origin frame is reachable only after it has loaded and Chrome "
+                    "created its target - wait for it (wait selector=<the iframe>) and retry; "
+                    "web_info(topic='page_elements', params={'category': 'iframes'}) lists "
+                    "frames with same_origin."
+                ) from exc
 
         def _top_summary() -> dict[str, Any]:
             if frame_selector:
@@ -3825,96 +3889,36 @@ def execute_js(
             return _page_summary(session.driver, session_id)
 
         try:
-            return _execute_script(
+            answer = _execute_script(
                 session.driver, script, args, await_promise=await_promise,
                 user_gesture=user_gesture, retry_on_uncaught=retry_on_uncaught,
                 retries=retries, retry_delay_ms=retry_delay_ms, wait_ready=wait_ready,
                 timeout_seconds=timeout_seconds, page_summary=_top_summary,
                 wait_until_ready=_wait_until_ready, describe_error=_brief_error,
             )
+            # An empty answer on a framed page may be a script that looked for
+            # something living in a cross-origin frame; say so (and only then,
+            # so an ordinary call pays no extra round trip).
+            if report_frames and not frame_selector and answer.get("success") and (
+                answer.get("value") in (None, "", [], {})
+            ):
+                try:
+                    hidden = int(session.driver.execute_script(_CROSS_ORIGIN_FRAMES_SCRIPT) or 0)
+                except Exception:
+                    hidden = 0
+                if hidden:
+                    answer["cross_origin_frames"] = hidden
+                    answer["frames_note"] = (
+                        f"{hidden} cross-origin frame(s) on this page are invisible to a "
+                        "top-document script; pass frame_selector to run inside one."
+                    )
+            return answer
         finally:
             if frame_selector:
                 try:
                     session.driver.switch_to.default_content()
                 except Exception:
                     pass
-
-
-_CLICK_TEXT_SCRIPT = page_perception.JS_LIBRARY + r"""
-const wanted = String(arguments[0] || '');
-const exact = !!arguments[1];
-const wantedRole = String(arguments[2] || '').trim().toLowerCase();
-const candidateSelector = String(arguments[3] || '').trim() ||
-  'button, a[href], label, [role="button"], [role="link"], [role="option"], ' +
-  '[role="checkbox"], [role="radio"], [role="tab"], [role="menuitem"]';
-const norm = value => String(value || '').replace(/\s+/g, ' ').trim();
-const needle = norm(wanted);
-if (!needle) throw new Error('text must not be empty');
-let nodes;
-try { nodes = Array.from(document.querySelectorAll(candidateSelector)); }
-catch (error) { throw new Error('Invalid selector: ' + candidateSelector); }
-const implicitRole = el => {
-  const tag = el.tagName.toLowerCase();
-  if (tag === 'button') return 'button';
-  if (tag === 'a' && el.hasAttribute('href')) return 'link';
-  if (tag === 'input') {
-    const type = (el.type || '').toLowerCase();
-    if (type === 'checkbox') return 'checkbox';
-    if (type === 'radio') return 'radio';
-    if (['button', 'submit', 'reset', 'image'].includes(type)) return 'button';
-  }
-  return '';
-};
-const visible = el => {
-  const style = getComputedStyle(el);
-  const rect = el.getBoundingClientRect();
-  return !!(rect.width && rect.height && style.display !== 'none' &&
-    style.visibility !== 'hidden' && style.opacity !== '0' &&
-    !el.closest('[aria-hidden="true"]'));
-};
-const name = el => norm(
-  el.getAttribute('aria-label') || el.innerText || el.value ||
-  el.getAttribute('title') || el.textContent || ''
-);
-const matches = nodes.filter(el => {
-  if (!visible(el)) return false;
-  const role = (el.getAttribute('role') || implicitRole(el)).toLowerCase();
-  if (wantedRole && role !== wantedRole) return false;
-  const label = name(el);
-  return exact ? label === needle : label.includes(needle);
-});
-if (matches.length !== 1) {
-  return {
-    ok: false,
-    count: matches.length,
-    samples: matches.slice(0, 8).map(el => ({
-      text: name(el), role: (el.getAttribute('role') || implicitRole(el)).toLowerCase(),
-      selector: wsnSelector(el)
-    }))
-  };
-}
-const el = matches[0];
-let rect = el.getBoundingClientRect();
-if (rect.left < 0 || rect.top < 0 || rect.right > window.innerWidth || rect.bottom > window.innerHeight) {
-  el.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
-  rect = el.getBoundingClientRect();
-}
-const x = rect.left + rect.width / 2;
-const y = rect.top + rect.height / 2;
-const top = document.elementFromPoint(x, y);
-if (top && !(top === el || el.contains(top))) {
-  return {
-    ok: false, count: 1, occluded: true,
-    blocker: name(top) || top.tagName.toLowerCase(),
-    samples: [{text: name(el), role: (el.getAttribute('role') || implicitRole(el)).toLowerCase(), selector: wsnSelector(el)}]
-  };
-}
-return {
-  ok: true, count: 1, x, y, text: name(el),
-  role: (el.getAttribute('role') || implicitRole(el)).toLowerCase(),
-  selector: wsnSelector(el), hit_test_unavailable: !top
-};
-"""
 
 
 def click_text(
@@ -4206,37 +4210,97 @@ def _commit_held_keys(
             session.fresh_keys.discard(key_id)
 
 
+def _keys_target_ok(focused: dict[str, Any]) -> bool:
+    """Keys go to an editable control, a canvas, an explicit tabindex surface, a
+    frame, or an element whose focus cannot be seen into - never a button or link
+    (Enter/Space would activate it) and never the bare page."""
+    if focused.get("editable") is None or focused.get("editable") or focused.get("canvas"):
+        return True
+    if focused.get("control"):
+        return False
+    if focused.get("in_frame"):
+        return True  # an iframe game with its document body focused
+    return bool(focused.get("focused") and focused.get("tabindex") and not focused.get("control"))
+
+
 def type_text(
     text: str,
     session_id: str = "default",
     selector: str | None = None,
+    mode: str = "insert",
 ) -> dict[str, Any]:
-    """Type ``text`` into the focused control via CDP Input.insertText.
+    """Type ``text`` into the focused control (or ``selector``'s) as one edit or as keys.
 
-    Without ``selector`` the characters land in whatever element currently has
-    focus (fill and click leave their target focused). With a selector that
-    control is located first so the call works from any page state. The bridge
-    driver routes one insert-text command per call instead of a per-key event
-    storm, which is what React controlled inputs need to see as a real edit.
+    ``mode="insert"`` (default) sends one CDP ``Input.insertText``, which React
+    controlled inputs see as a real edit. ``mode="keys"`` presses one key per
+    character (keydown/keypress/keyup carrying the character, Cyrillic and other
+    non-Latin text included) for canvas apps - Unity WebGL and other engines -
+    that build text from key events and never see an insertText. A focused
+    ``<canvas>`` switches to keys on its own and says so in ``mode_used``.
+    Focus is looked up through shadow roots and same-origin frames; nothing
+    focused (the bare body) or a read-only control is refused instead of losing
+    the text, while a cross-origin frame is "unknown" and the text is sent.
     """
     if not isinstance(text, str) or not text:
         raise ValueError("text must be a non-empty string")
+    wanted = str(mode or "insert").strip().lower()
+    if wanted not in {"insert", "keys"}:
+        raise ValueError("mode must be 'insert' or 'keys'")
+    if wanted == "keys" and len(text) > _verification.MAX_KEY_TEXT:
+        raise ValueError(f"mode='keys' types at most {_verification.MAX_KEY_TEXT} characters per call")
     session = _get_session(session_id)
     with session.lock:
         driver = session.driver
         started_ms = time.time() * 1000
         target = str(selector or "").strip()
+        focused = None if target else _verification.focused_editable(driver)
+        if wanted == "keys":
+            if target:
+                _focus_target(driver, target, "focus")
+            elif focused is not None and not _keys_target_ok(focused):
+                raise ValueError(
+                    "Keys typed now would land on "
+                    + (f"a <{focused.get('tag')}> control (a button or link reacts to Enter/Space)"
+                       if focused.get("focused") else "the bare page")
+                    + ". Click the canvas or text field first, or pass selector."
+                )
+            _perform_key_events(driver, _verification.text_key_events(text))
+            return _note_stalled_submit(session, {
+                **_page_summary(driver, session_id), "success": True,
+                "typed_into": target or "focused_element", "inserted": len(text),
+                "mode_used": "keys",
+            }, started_ms)
         element = (
             _wait_for_locator(driver, target, "clickable", 10.0)
             if target
             else driver.execute_script("return document.activeElement")
         )
+        if focused is not None and focused.get("canvas"):
+            _perform_key_events(driver, _verification.text_key_events(text))
+            return _note_stalled_submit(session, {
+                **_page_summary(driver, session_id), "success": True,
+                "typed_into": "focused_element", "inserted": len(text), "mode_used": "keys",
+                "mode_note": "A <canvas> has focus and never receives insertText, so the text was pressed as keys.",
+            }, started_ms)
+        if focused is not None and focused.get("readonly"):
+            raise ValueError(
+                f"The focused <{focused.get('tag')}> is read-only or disabled, so the text would be dropped."
+            )
+        if focused is not None and focused.get("editable") is False:
+            raise ValueError(
+                "Nothing editable has focus (focused: "
+                f"<{focused.get('tag') or 'none'}>), so the text would be dropped. Pass "
+                "selector for the field, click it first, or use mode='keys' for a canvas game."
+            )
         # The companion bridge serialises document.activeElement to a plain
-        # dict (CDP returnByValue has no element handle to hand back), so the
-        # focused control arrives without send_keys and the call used to die
-        # with AttributeError. Typing is still possible: focus what is focused
-        # and send the text through the input pipeline both drivers share.
+        # dict (CDP returnByValue has no element handle), so the focused control
+        # has no send_keys: type through CDP insertText, which both drivers share.
         send_keys = getattr(element, "send_keys", None)
+        nested = bool(focused and (focused.get("in_frame") or focused.get("in_shadow")))
+        if nested and hasattr(driver, "execute_cdp_cmd"):
+            # activeElement is only the frame or shadow host; sending keys to it
+            # would move focus off the real field. insertText types where focus is.
+            send_keys = None
         if send_keys is None:
             cdp = getattr(driver, "execute_cdp_cmd", None)
             if cdp is None:
@@ -4245,12 +4309,11 @@ def type_text(
                     f"{type(element).__name__} instead of a typable element. "
                     "Pass a selector for the field to type into."
                 )
-            try:
-                driver.execute_script(
-                    "(document.activeElement || document.body).focus();"
-                )
-            except Exception:
-                pass
+            if not nested:
+                try:
+                    driver.execute_script("(document.activeElement || document.body).focus();")
+                except Exception:
+                    pass
             cdp("Input.insertText", {"text": text})
         else:
             send_keys(text)
@@ -4261,6 +4324,7 @@ def type_text(
                 "success": True,
                 "typed_into": target or "focused_element",
                 "inserted": len(text),
+                "mode_used": "insert",
             },
             started_ms,
         )
@@ -5304,6 +5368,18 @@ def inject_script(
     raise ValueError(f"inject_script op must be add, list, or remove, not '{op}'")
 
 
+def _cookie_in_domain(cookie: dict[str, Any], domain: str) -> bool:
+    """The domain itself or a subdomain of it - never a mere substring."""
+    wanted = str(domain or "").lstrip(".").lower()
+    have = str(cookie.get("domain") or "").lstrip(".").lower()
+    return have == wanted or have.endswith("." + wanted)
+
+
+def _cookie_identity(cookie: dict[str, Any]) -> tuple[Any, ...]:
+    return (cookie.get("name"), cookie.get("domain"), cookie.get("path"),
+            json.dumps(cookie.get("partitionKey"), sort_keys=True))
+
+
 def cookies(
     op: str = "get",
     session_id: str = "default",
@@ -5312,14 +5388,16 @@ def cookies(
     set_cookies: list[dict[str, Any]] | None = None,
     limit: int = 100,
     offset: int = 0,
+    confirm_clear_all: bool = False,
 ) -> dict[str, Any]:
     """Read, write, or clear cookies as full objects - flags included, so defenses read too.
 
     ``get`` returns every field Chrome keeps (name, value, domain, path, secure,
-    httpOnly, sameSite, expires), filtered client-side by ``domain`` substring and
-    exact ``name``; a session or HttpOnly flag is as auditable as the value. ``set``
-    installs the list in ``set_cookies``; ``clear`` wipes everything, or just the
-    ``name``/``domain`` given.
+    httpOnly, sameSite, expires), filtered client-side by ``domain`` - the domain
+    and its subdomains, the same rule ``clear`` uses - and exact ``name``; a session
+    or HttpOnly flag is as auditable as the value. ``set`` installs the list in
+    ``set_cookies``; ``clear`` deletes exactly what a ``domain`` (optionally with a
+    ``name``) matches, and wiping everything needs ``confirm_clear_all``.
 
     A real profile holds thousands of cookies, so ``get`` reports ``count`` for
     everything that matched and returns at most ``limit`` of them starting at
@@ -5335,19 +5413,23 @@ def cookies(
             payload = driver.execute_cdp_cmd("Storage.getCookies", {})
             found = payload.get("cookies") or []
             if domain:
-                found = [c for c in found if domain in (c.get("domain") or "")]
+                found = [c for c in found if _cookie_in_domain(c, domain)]
             if name:
                 found = [c for c in found if c.get("name") == name]
             kept = max(1, min(int(limit), 1000))
             start = max(0, int(offset))
             window = found[start:start + kept]
+            more = len(found) > start + kept
             return {
                 "success": True,
                 "session_id": session_id,
                 "count": len(found),
+                "total": len(found),
                 "offset": start,
+                "limit": kept,
                 "returned": len(window),
-                "truncated": len(found) > start + kept,
+                "truncated": more,
+                "next_offset": start + len(window) if more else None,
                 "cookies": window,
             }
         if op == "set":
@@ -5356,13 +5438,39 @@ def cookies(
             driver.execute_cdp_cmd("Storage.setCookies", {"cookies": set_cookies})
             return {"success": True, "session_id": session_id, "count": len(set_cookies)}
         if op == "clear":
-            params: dict[str, Any] = {}
-            if name:
-                params["name"] = name
-            if domain:
-                params["domain"] = domain
-            driver.execute_cdp_cmd("Storage.clearCookies", params)
-            return {"success": True, "session_id": session_id}
+            # Storage.clearCookies takes no filter at all: it wipes every cookie of
+            # the browser profile - in current Chrome, the user's logins everywhere.
+            # So a filtered clear deletes exactly the matching cookies one by one,
+            # and the unfiltered one needs its own explicit confirmation.
+            if not domain and not confirm_clear_all:
+                # A name alone ("sid", "session") exists on hundreds of sites.
+                raise ValueError(
+                    "cookies clear needs a domain: without one it would delete "
+                    + (f"every '{name}' cookie of every site" if name else
+                       "every cookie of this browser profile (every site's login)")
+                    + ". Pass domain, or confirm_clear_all=true if that is really what is wanted."
+                )
+            if not domain and not name:
+                driver.execute_cdp_cmd("Storage.clearCookies", {})
+                return {"success": True, "session_id": session_id, "cleared": "all"}
+            jar = (driver.execute_cdp_cmd("Storage.getCookies", {}) or {}).get("cookies") or []
+            matched = [c for c in jar if (not name or c.get("name") == name)
+                       and (not domain or _cookie_in_domain(c, domain))]
+            for c in matched:
+                # A partitioned (CHIPS) cookie is only deleted with its partition.
+                driver.execute_cdp_cmd("Network.deleteCookies", {
+                    "name": c.get("name"), "domain": c.get("domain"), "path": c.get("path") or "/",
+                    **({"partitionKey": c["partitionKey"]} if c.get("partitionKey") else {}),
+                })
+            # Counted from a fresh read, not from what was asked for.
+            left = {_cookie_identity(c) for c in
+                    (driver.execute_cdp_cmd("Storage.getCookies", {}) or {}).get("cookies") or []}
+            gone = [c for c in matched if _cookie_identity(c) not in left]
+            stayed = [c for c in matched if _cookie_identity(c) in left]
+            return {"success": not stayed, "session_id": session_id, "deleted": len(gone),
+                    "deleted_cookies": [{k: c.get(k) for k in ("name", "domain", "path")} for c in gone],
+                    **({"not_deleted": [{k: c.get(k) for k in ("name", "domain", "path", "partitionKey")}
+                                        for c in stayed]} if stayed else {})}
     raise ValueError(f"cookies op must be get, set, or clear, not '{op}'")
 
 
@@ -5555,48 +5663,6 @@ def stealth(
             removed = inject_script(op="remove", identifier=identifier, session_id=session_id)["removed"]
         return {"success": True, "session_id": session_id, "enabled": False, "removed": removed}
     raise ValueError(f"stealth op must be on or off, not '{op}'")
-
-
-# Re-issue a captured request from inside the page, so its cookies and origin are
-# the page's own. Returning status, headers and a clipped body is what makes it a
-# probe - resend the login POST, see whether the token still works - rather than
-# a blind fire-and-forget.
-_REPLAY_SCRIPT = """
-// Returns a Promise, which execute_js(await_promise=True) resolves at the CDP
-// layer. The script runs in a plain (non-async) function wrapper, so a top-level
-// `await` here would be a sloppy-mode identifier, not a keyword - the await lives
-// inside this async IIFE instead, and its result is what the caller receives.
-const spec = arguments[0];
-const started = performance.now();
-return (async () => {
-  try {
-    const noBody = spec.method === 'GET' || spec.method === 'HEAD';
-    const response = await fetch(spec.url, {
-      method: spec.method || 'GET',
-      headers: spec.headers || {},
-      body: (spec.body != null && !noBody) ? spec.body : undefined,
-      credentials: spec.credentials || 'include',
-      redirect: 'follow',
-    });
-    const text = await response.text();
-    const headers = {};
-    response.headers.forEach((value, key) => { headers[key] = value; });
-    return {
-      ok: response.ok,
-      status: response.status,
-      url: response.url,
-      redirected: response.redirected,
-      headers: headers,
-      body: text.length > 20000 ? text.slice(0, 20000) : text,
-      truncated: text.length > 20000,
-      ms: Math.round(performance.now() - started),
-      body_ignored: spec.body != null && noBody,
-    };
-  } catch (error) {
-    return {ok: false, status: 0, error: String(error && error.message || error)};
-  }
-})();
-"""
 
 
 def replay_request(
@@ -6040,27 +6106,6 @@ def pointer_action(
         }
 
 
-_SCROLL_METRICS_SCRIPT = """
-const root = document.scrollingElement || document.documentElement;
-const width = window.innerWidth;
-const height = window.innerHeight;
-const pageWidth = Math.max(root ? root.scrollWidth : 0, document.documentElement.scrollWidth);
-const pageHeight = Math.max(root ? root.scrollHeight : 0, document.documentElement.scrollHeight);
-return {
-  scroll_x: window.scrollX,
-  scroll_y: window.scrollY,
-  max_scroll_x: Math.max(0, pageWidth - width),
-  max_scroll_y: Math.max(0, pageHeight - height),
-  viewport_width: width,
-  viewport_height: height,
-  page_width: pageWidth,
-  page_height: pageHeight,
-  at_top: window.scrollY <= 0,
-  at_bottom: window.scrollY >= Math.max(0, pageHeight - height) - 1
-};
-"""
-
-
 def _scroll_metrics(driver: Any, frame_selector: str | None) -> dict[str, Any]:
     """Read the selected document's page scroll position and always leave the top selected."""
     try:
@@ -6068,33 +6113,6 @@ def _scroll_metrics(driver: Any, frame_selector: str | None) -> dict[str, Any]:
         return dict(driver.execute_script(_SCROLL_METRICS_SCRIPT) or {})
     finally:
         driver.switch_to.default_content()
-
-
-# ``scrollIntoView`` brings the target into view first, so the wheel point below
-# is reachable even when the element lives inside a tall scroll container. The
-# call runs in the element's own document (``_resolve_element`` left the driver
-# there); ``wsnFrameMap`` then reports where the element's centre lands on the
-# top-level page, the same mapping outline and find boxes go through.
-_SCROLL_INTO_VIEW_SCRIPT = page_perception.JS_LIBRARY + """
-const element = arguments[0];
-if (!element || element.scrollIntoView !== undefined) {
-  element.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
-}
-const rect = element.getBoundingClientRect();
-const local_x = rect.x + rect.width / 2;
-const local_y = rect.y + rect.height / 2;
-const mapped = wsnFrameMap(element);
-return {
-  cx: local_x,
-  cy: local_y,
-  frame: {
-    x: mapped.x, y: mapped.y,
-    ax: mapped.ax, ay: mapped.ay,
-    bx: mapped.bx, by: mapped.by,
-    page_width: window.innerWidth, page_height: window.innerHeight
-  }
-};
-"""
 
 
 def scroll_page(
@@ -6177,43 +6195,6 @@ def scroll_page(
             "before": before,
             "after": after,
         }
-
-
-# CDP input is addressed in top-level page pixels, so a point inside a frame has
-# to be carried through everything that stands between the two: the origin of the
-# frame's *content* box - the border box misses by exactly the border and padding
-# - and any CSS transform, individual `rotate`/`scale`/`translate` property or
-# `zoom` on the frame or on an ancestor. `wsnFrameMap` in the shared page-side
-# library is that map, and the outline and find report their boxes through the
-# very same function: two implementations of "where is this frame-local point on
-# the page" drift apart, and then the centre a caller is told to click is not the
-# pixel this module aims at.
-_FRAME_MAP_SCRIPT = page_perception.JS_LIBRARY + """
-const mapped = wsnFrameMap(arguments[0]);
-return {
-  x: mapped.x, y: mapped.y,
-  ax: mapped.ax, ay: mapped.ay,
-  bx: mapped.bx, by: mapped.by,
-  flat: mapped.flat,
-  page_width: window.innerWidth, page_height: window.innerHeight
-};
-"""
-
-
-# Being inside the window is not the same as being reachable. A frame clipped by
-# an `overflow: hidden` ancestor, or with a fixed header painted over it, answers
-# every question about its own viewport as if it were whole, and the mapped point
-# is a perfectly ordinary page coordinate - it just belongs to something else.
-# Chrome hit-tests the top document before it delivers, so the same question is
-# asked here, and the answer names what is in the way.
-_FRAME_HIT_SCRIPT = """
-const frame = arguments[0];
-const hit = document.elementFromPoint(arguments[1], arguments[2]);
-if (hit && (hit === frame || frame.contains(hit))) return null;
-if (!hit) return 'nothing this document paints';
-const classes = Array.from(hit.classList).map(name => '.' + name).join('');
-return hit.tagName.toLowerCase() + (hit.id ? '#' + hit.id : '') + classes;
-"""
 
 
 @dataclass(frozen=True)
@@ -6595,31 +6576,6 @@ def touch_action(
         }
 
 
-_POINTER_LOCK_SCRIPT = """
-const selector = arguments[0];
-const wanted = arguments[1];
-const target = selector ? document.querySelector(selector)
-                        : (document.querySelector('canvas') || document.body);
-if (!target) return {success: false, error: 'No pointer lock target on this page'};
-if (wanted === 'release') {
-  document.exitPointerLock();
-  return {success: true, locked: false, element: null};
-}
-try { target.requestPointerLock(); } catch (error) {
-  return {success: false, error: String(error)};
-}
-return {success: true, requested: true};
-"""
-
-_POINTER_LOCK_STATUS_SCRIPT = """
-const locked = document.pointerLockElement;
-return {
-  locked: !!locked,
-  element: locked ? (locked.id || locked.tagName.toLowerCase()) : null
-};
-"""
-
-
 def pointer_lock(
     action: str = "status",
     session_id: str = "default",
@@ -6882,44 +6838,6 @@ def input_batch(
         }
 
 
-_GAME_PROBE_SCRIPT = r"""
-function selector(el) {
-  if (el.id) return '#' + CSS.escape(el.id);
-  const nodes = Array.from(document.querySelectorAll(el.tagName.toLowerCase()));
-  return el.tagName.toLowerCase() + ':nth-of-type(' + (nodes.indexOf(el) + 1) + ')';
-}
-const canvases = Array.from(document.querySelectorAll('canvas')).map(canvas => {
-  const rect = canvas.getBoundingClientRect();
-  let context = 'unknown';
-  for (const kind of ['webgl2', 'webgl', '2d']) {
-    try {
-      if (canvas.getContext(kind)) { context = kind; break; }
-    } catch (_) {}
-  }
-  return {
-    selector: selector(canvas), context,
-    width: canvas.width, height: canvas.height,
-    client_width: canvas.clientWidth, client_height: canvas.clientHeight,
-    rect: {x: rect.x, y: rect.y, width: rect.width, height: rect.height},
-    visible: !!(rect.width && rect.height)
-  };
-});
-const navigation = performance.getEntriesByType('navigation')[0];
-return {
-  ready_state: document.readyState,
-  visibility_state: document.visibilityState,
-  document_has_focus: document.hasFocus(),
-  canvas_count: canvases.length,
-  canvases,
-  iframe_count: document.querySelectorAll('iframe').length,
-  iframes: Array.from(document.querySelectorAll('iframe')).map(frame => ({
-    selector: selector(frame), src: frame.src || '', title: frame.title || ''
-  })),
-  navigation_ms: navigation ? Math.round(navigation.duration) : null
-};
-"""
-
-
 def _unreported_console(
     session: BrowserSession, entries: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -7067,22 +6985,6 @@ def _register_render_bootstrap(session: BrowserSession) -> None:
             "Page.addScriptToEvaluateOnNewDocument", {"source": source}
         )
     session.render_bootstrap_registered = True
-
-
-_RENDER_STEP_SCRIPT = r"""
-const count = arguments[0];
-const done = arguments[arguments.length - 1];
-const state = window.__webSearchNeoRenderControl;
-if (!state) {
-  done({success: false, error: 'missing_bootstrap'});
-  return;
-}
-if (state.mode !== 'step') {
-  done({success: false, error: 'not_step_mode', mode: state.mode});
-  return;
-}
-state.step(count, done);
-"""
 
 
 _FRAME_COUNT_SCRIPT = "return document.querySelectorAll(arguments[0]).length;"
@@ -7497,61 +7399,6 @@ def release_inputs(session_id: str = "default") -> dict[str, Any]:
         }
 
 
-# The submit event is dispatched, and then the navigation it starts throws the
-# whole window away - counter included. sessionStorage survives a same-origin
-# load, and the token on the window says whether this is still the document the
-# form was submitted from, which is the only way a POST back onto the same URL
-# under the same title can be told apart from nothing happening at all.
-#
-# The listener goes on in the capture phase, because a framework that owns the
-# form calls stopImmediatePropagation in its own handler: every listener added to
-# the form after it was invisible, so a submit that had worked came back as one
-# that never happened, and the caller sent it a second time.
-#
-# Nothing branded is left behind either. The key is this call's own token, read
-# once and removed again, so a site that goes looking for an automation
-# fingerprint finds a random string that is already gone; anything an earlier
-# call could not clean up - its document was replaced before the read - is swept
-# away here.
-_SUBMIT_WATCH_SCRIPT = """
-const form = arguments[0];
-const token = arguments[1];
-const state = {token: token, fired: 0, prevented: false};
-window[token] = state;
-try {
-  for (const key of Object.keys(sessionStorage)) {
-    if (key !== token && /^sf-[0-9]+$/.test(key)) sessionStorage.removeItem(key);
-  }
-} catch (error) { /* denied */ }
-form.addEventListener('submit', (event) => {
-  state.fired += 1;
-  try { sessionStorage.setItem(token, '1'); } catch (error) { /* denied */ }
-  // defaultPrevented is only final once every listener has run.
-  queueMicrotask(() => { state.prevented = event.defaultPrevented; });
-}, {capture: true, once: true});
-// A form that delivers its result somewhere else leaves this document with
-// nothing to say about what happened.
-return String(form.target || '');
-"""
-
-_SUBMIT_RESULT_SCRIPT = """
-const token = arguments[0];
-const state = window[token];
-let stored = false;
-try {
-  stored = sessionStorage.getItem(token) !== null;
-  sessionStorage.removeItem(token);
-} catch (error) { stored = false; }
-try { delete window[token]; } catch (error) { window[token] = undefined; }
-return {
-  same_document: !!state && state.token === token,
-  fired: !!state && state.fired > 0,
-  prevented: !!state && !!state.prevented,
-  stored: stored
-};
-"""
-
-
 def _window_handle_count(driver: Any) -> int | None:
     """How many tabs this browser has open, or None when it will not say.
 
@@ -7842,6 +7689,39 @@ def screenshot(
             _hide_presence_overlays(driver, False)
 
 
+def save_screenshot(
+    session_id: str = "default",
+    mode: str = "viewport",
+    x: float | None = None,
+    y: float | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    path: str | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """The web_action form of a screenshot: the PNG goes to a file, the answer names it.
+
+    A JSON action result cannot carry an image, so the bytes are written under
+    the download directory (``WEB_SEARCH_NEO_DOWNLOAD_DIR``, default ./downloads);
+    ``web_info(topic='screenshot')`` is the call that returns the image itself.
+    """
+    stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}"
+    target = str(path or f"screenshots/{session_id}-{stamp}.png")
+    if not target.lower().endswith(".png"):
+        raise ValueError("screenshot path must end in .png")
+    # Checked before the capture, so a refused path costs no screenshot.
+    if resolve_save_path(target).exists() and not overwrite:
+        raise ValueError(f"{target} already exists; pass overwrite=true to replace it")
+    png = screenshot(session_id, width, height, False, mode, x, y)
+    saved = write_download(target, png, overwrite=bool(overwrite))
+    size = [int.from_bytes(png[i:i + 4], "big") if len(png) >= 24 else None for i in (16, 20)]
+    return {
+        "success": True, "session_id": session_id, "mode": mode, "saved_to": str(saved),
+        "size_bytes": len(png), "image_width": size[0], "image_height": size[1],
+        "image_note": "web_info(topic='screenshot') returns the image inline instead of a file.",
+    }
+
+
 def show_session(session_id: str = "default") -> dict[str, Any]:
     """Explicitly put a session in front without changing its window state.
 
@@ -7946,8 +7826,21 @@ def sessions_overview() -> dict[str, Any]:
                 }
             )
     busy = [row["session_id"] for row in rows if row["busy"]]
+    live = {row["session_id"] for row in rows}
+    expired = _reap_expired_parked()
+    try:
+        parked = [
+            {key: record.get(key) for key in ("session_id", "tab_id", "agent_label")}
+            | {"url": redact_url(record["url"]) if record.get("url") else None,
+               "parked_at": _iso_local(record.get("updated_at"))}
+            for record in _parking.list_records() if record.get("session_id") not in live
+        ]
+    except Exception:
+        parked = []
     return {
         "sessions": rows,
+        **({"parked_sessions": parked} if parked else {}),
+        **({"parked_expired": expired} if expired else {}),
         "sessions_open": len(rows),
         "max_sessions": cap,
         "max_sessions_source": cap_source,
@@ -8379,6 +8272,10 @@ def close_session(session_id: str = "default", close_tab: bool | None = None) ->
     with _sessions_lock:
         session = _sessions.pop(session_id, None)
         remaining = sorted(_sessions)
+    # An explicit close ends a persist=true session for good, parked or live.
+    retired = _retire_parked(session_id, explicit=True) if session is None else None
+    if session is not None:
+        _forget_parked(session_id)
     closed = session is not None
     outcome: dict[str, Any] = {"tab_closed": False, "browser_gone": False, "problem": None}
     if session is not None:
@@ -8395,6 +8292,7 @@ def close_session(session_id: str = "default", close_tab: bool | None = None) ->
         **(
             {}
             if closed
+            else {"retired_parked": retired} if retired
             else {"note": f"No session named '{session_id}' was open, so nothing was closed."}
         ),
         # Nor may "the browser it was opened in is gone" read as a clean close:
@@ -8419,6 +8317,7 @@ def close_all_sessions(
     agent_label: str | None = None,
     scope: str = "mine",
     include_foreign: bool = False,
+    idle_for_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Close this caller's sessions - or, asked explicitly, everybody's.
 
@@ -8445,6 +8344,10 @@ def close_all_sessions(
     if include_foreign:
         wanted = "all"
     owner = _normalize_agent_label(agent_label)
+    idle_cutoff = (
+        time.monotonic() - max(0.0, float(idle_for_seconds))
+        if idle_for_seconds is not None else None
+    )
     with _sessions_lock:
         everything = sorted(_sessions.items())
         if wanted == "all":
@@ -8455,6 +8358,15 @@ def close_all_sessions(
                 item for item in everything if (item[1].agent_label or None) == owner
             ]
             kept = [item for item in everything if (item[1].agent_label or None) != owner]
+        if idle_cutoff is not None:
+            # Orphan release: only sessions untouched that long, and never one a
+            # thread is inside right now, whoever owns them.
+            recent = [
+                item for item in sessions
+                if item[1].last_used >= idle_cutoff or item[1].lock.busy
+            ]
+            sessions = [item for item in sessions if item not in recent]
+            kept = sorted(kept + recent)
         for session_id, _ in sessions:
             _sessions.pop(session_id, None)
     tabs_closed = 0
@@ -8463,6 +8375,8 @@ def close_all_sessions(
     for session_id, session in sessions:
         with session.lock:
             outcome = _shutdown_session(session, None, session_id)
+        if session.persist:
+            _forget_parked(session_id)
         tabs_closed += int(bool(outcome["tab_closed"]))
         if outcome["browser_gone"]:
             browsers_gone.append(session_id)
@@ -8474,6 +8388,7 @@ def close_all_sessions(
         "closed_all": not problems,
         "scope": wanted,
         "agent_label": owner,
+        **({"idle_for_seconds": float(idle_for_seconds)} if idle_for_seconds is not None else {}),
         "closed_sessions": [session_id for session_id, _ in sessions],
         "tabs_closed": tabs_closed,
         "active_sessions": remaining,
@@ -8521,9 +8436,33 @@ def _close_everything_at_exit() -> dict[str, Any]:
     """Process exit is the one place where "everybody's" is the right scope.
 
     Nobody is left to own a session once the interpreter is going down, and a
-    tab kept open on ownership grounds would simply be a leak with a rationale.
+    tab kept open on ownership grounds would simply be a leak with a rationale -
+    except a session opened with ``persist=true``, which asked for exactly that:
+    its tab is detached and left open, and its record lets the next MCP client
+    re-attach it by ``session_id``.
     """
-    return close_all_sessions(scope="all")
+    with _sessions_lock:
+        parked = [
+            (name, item) for name, item in _sessions.items()
+            if item.persist and item.profile_mode == "current"
+        ]
+        for name, _ in parked:
+            _sessions.pop(name, None)
+    kept: list[str] = []
+    for name, item in parked:
+        if not item.lock.acquire(timeout=5.0):
+            continue
+        try:
+            outcome = _shutdown_session(item, False, name)
+        finally:
+            item.lock.release()
+        if not outcome["browser_gone"]:
+            _remember_parked(name, item)
+            kept.append(name)
+    result = close_all_sessions(scope="all")
+    if kept:
+        result["parked_sessions"] = kept
+    return result
 
 
 atexit.register(_close_everything_at_exit)

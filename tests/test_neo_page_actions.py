@@ -341,8 +341,11 @@ def test_cookies_get_filters_by_domain_and_name():
     by_name = browser_tools.cookies(op="get", name="theme")
     assert by_name["count"] == 1
     assert by_name["cookies"][0]["name"] == "theme"
-    assert browser_tools.cookies(op="get", domain="tracker", name="tracking")["count"] == 1
+    assert browser_tools.cookies(op="get", domain="tracker.net", name="tracking")["count"] == 1
     assert browser_tools.cookies(op="get", domain="example", name="tracking")["count"] == 0
+    # A domain filter means the domain and its subdomains - never a substring.
+    assert browser_tools.cookies(op="get", domain="tracker")["count"] == 0
+    assert browser_tools.cookies(op="get", domain="le.com")["count"] == 0
 
 
 def test_cookies_set_passes_list_through_and_requires_it():
@@ -357,14 +360,43 @@ def test_cookies_set_passes_list_through_and_requires_it():
         browser_tools.cookies(op="set")
 
 
-def test_cookies_clear_passes_filters():
+def test_cookies_clear_deletes_only_the_matching_cookies():
+    # Storage.clearCookies has no filter: it used to receive name/domain it
+    # ignores and wiped every cookie of the user's profile. A filtered clear now
+    # deletes exactly the matches, and never calls clearCookies at all.
+    jar = [dict(c) for c in COOKIE_SAMPLE]
+
+    def delete(_command, params):
+        jar[:] = [c for c in jar if (c["name"], c["domain"]) != (params["name"], params["domain"])]
+        return {}
+
+    driver = _CannedDriver({
+        "Storage.getCookies": lambda *_: {"cookies": [dict(c) for c in jar]},
+        "Network.deleteCookies": delete,
+    })
+    _register_session(driver)
+    result = browser_tools.cookies(op="clear", name="theme", domain="example.com")
+    assert result["deleted"] == 1 and result["success"] is True
+    assert ("Network.deleteCookies", {"name": "theme", "domain": "example.com", "path": "/"}) in driver.calls
+    assert not any(command == "Storage.clearCookies" for command, _ in driver.calls)
+
+    by_domain = browser_tools.cookies(op="clear", domain="example.com")
+    assert [c["name"] for c in by_domain["deleted_cookies"]] == ["session"]
+    # A domain is matched as a domain, not a substring: "le.com" names nobody here.
+    assert browser_tools.cookies(op="clear", domain="le.com")["deleted"] == 0
+
+
+def test_an_unfiltered_cookie_clear_needs_explicit_confirmation():
     driver = _CannedDriver({})
     _register_session(driver)
-    browser_tools.cookies(op="clear")
+    with pytest.raises(ValueError, match="confirm_clear_all"):
+        browser_tools.cookies(op="clear")
+    # A name alone would hit that cookie name on every site.
+    with pytest.raises(ValueError, match="every 'sid' cookie of every site"):
+        browser_tools.cookies(op="clear", name="sid")
+    assert driver.calls == []
+    assert browser_tools.cookies(op="clear", confirm_clear_all=True)["cleared"] == "all"
     assert _last_call(driver) == ("Storage.clearCookies", {})
-
-    browser_tools.cookies(op="clear", name="theme", domain="example.com")
-    assert _last_call(driver) == ("Storage.clearCookies", {"name": "theme", "domain": "example.com"})
 
 
 def test_cookies_get_is_capped_but_still_counts_everything():
@@ -479,3 +511,23 @@ def test_local_storage_requires_arguments_and_rejects_unknown_op():
         browser_tools.local_storage(op="delete")
     with pytest.raises(ValueError):
         browser_tools.local_storage(op="bogus")
+
+
+def test_a_partitioned_cookie_is_deleted_with_its_partition_or_reported_kept():
+    partition = {"topLevelSite": "https://shop.test", "hasCrossSiteAncestor": False}
+    jar = [{"name": "chips", "domain": "widget.test", "path": "/", "partitionKey": partition},
+           {"name": "stubborn", "domain": "widget.test", "path": "/"}]
+
+    def delete(_command, params):
+        if params["name"] == "chips" and params.get("partitionKey") == partition:
+            jar[:] = [c for c in jar if c["name"] != "chips"]
+        return {}
+
+    driver = _CannedDriver({
+        "Storage.getCookies": lambda *_: {"cookies": [dict(c) for c in jar]},
+        "Network.deleteCookies": delete,
+    })
+    _register_session(driver)
+    result = browser_tools.cookies(op="clear", domain="widget.test")
+    assert [c["name"] for c in result["deleted_cookies"]] == ["chips"]
+    assert result["success"] is False and result["not_deleted"][0]["name"] == "stubborn"

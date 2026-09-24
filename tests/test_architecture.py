@@ -65,13 +65,20 @@ def test_allowed_dependencies_and_own_modules(source):
 # offset, click page_changed, idle reap, css[N] occurrence, SPA flag, stable
 # selectors, title settle): feature work in legacy files, reviewed line by
 # line, no new cross-package imports.
+# 1.18.4 (field-report follow-up: tab following, parked sessions, click
+# verification, type_text keys mode, screenshot action, wait seconds, filtered
+# cookie clear): main.py and chrome_bridge.py raised for the new wrappers, the --stop link wait and
+# the tab_followed report. browser_tools.py went down after pure page scripts
+# moved to perception/challenge.py, perception/action_scripts.py and
+# sessions/tab_label_source.py unchanged; service-worker.js went down after its
+# code hash moved to code-hash.js.
 _RATCHET_CEILINGS = {
-    "web_search_neo/browser_tools.py": 8529,
-    "web_search_neo/main.py": 2724,
+    "web_search_neo/browser_tools.py": 8468,
+    "web_search_neo/main.py": 2822,
     "web_search_neo/page_perception.py": 2720,
-    "web_search_neo/chrome_bridge.py": 2056,
-    "chrome-extension/service-worker.js": 1741,
-    "web_search_neo/bridge_daemon.py": 1169,
+    "web_search_neo/chrome_bridge.py": 2092,
+    "chrome-extension/service-worker.js": 1734,
+    "web_search_neo/bridge_daemon.py": 1166,
     "web_search_neo/macros.py": 849,
 }
 

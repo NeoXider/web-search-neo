@@ -26,7 +26,7 @@ from web_search_neo.fetch import api as fetch_api
 from web_search_neo.fetch import content as fetch_content
 
 
-__version__ = "1.18.3"
+__version__ = "1.18.4"
 
 log = configure_server_log()  # per-user state dir; see log_setup.py
 
@@ -384,12 +384,14 @@ async def browser_open_page(
     timezone: str | None = None,
     locale: str | None = None,
     geolocation: dict[str, Any] | None = None,
+    persist: bool = False,
 ) -> dict[str, Any]:
     """Open in the current Chrome's agent tab group by default; auto falls back to Selenium.
 
     profile_mode='isolated' opens a disposable separate browser profile;
     user_agent/timezone/locale/geolocation override per session
-    (owned browsers only, refused on current/attach).
+    (owned browsers only, refused on current/attach). persist=true keeps the tab
+    open after this MCP client exits so a later client continues by session_id.
     """
     return await asyncio.to_thread(
         functools.partial(
@@ -411,6 +413,7 @@ async def browser_open_page(
             timezone=timezone,
             locale=locale,
             geolocation=geolocation,
+            persist=persist,
         )
     )
 
@@ -540,11 +543,21 @@ async def browser_attach_tab(
     session_id: str = "default",
     agent_label: str | None = None,
     label_tab: bool = True,
+    persist: bool = False,
 ) -> dict[str, Any]:
-    """Attach a reusable MCP session to one existing Chrome tab without navigating it."""
+    """Attach a reusable MCP session to one existing Chrome tab without navigating it.
+
+    persist=true is refused: a user's tab is never parked (open persist=true instead).
+    """
     return await asyncio.to_thread(
-        browser_tools.attach_current_tab, tab_id, session_id, agent_label, label_tab
+        browser_tools.attach_current_tab, tab_id, session_id, agent_label, label_tab, persist
     )
+
+
+@mcp.tool()
+async def browser_reattach(session_id: str) -> dict[str, Any]:
+    """Continue a persist=true session an earlier MCP client left parked, by session_id."""
+    return await asyncio.to_thread(browser_tools.reattach_session, session_id)
 
 
 @mcp.tool()
@@ -755,12 +768,13 @@ async def browser_wait_for(
     frame_selector: str | None = None,
     script: str | None = None,
     poll_ms: int = 150,
+    seconds: float | None = None,
 ) -> dict[str, Any]:
-    """Wait for dynamic content: an element state, or a JS condition.
+    """Wait for dynamic content: an element state, a JS condition, or plain seconds.
 
     Pass selector for present/visible/clickable, or script (a JS expression,
-    e.g. "window.__hydrated === true") to poll atomically server-side.
-    Selector and script are mutually exclusive.
+    e.g. "window.__hydrated === true") to poll atomically server-side, or
+    seconds for a plain delay (no session needed). They are mutually exclusive.
     """
     return await asyncio.to_thread(
         functools.partial(
@@ -772,6 +786,7 @@ async def browser_wait_for(
             frame_selector=frame_selector,
             script=script,
             poll_ms=poll_ms,
+            seconds=seconds,
         )
     )
 
@@ -902,7 +917,7 @@ async def browser_run_script(
             retry_on_uncaught=retry_on_uncaught,
             retries=retries,
             retry_delay_ms=retry_delay_ms, wait_ready=wait_ready, timeout_seconds=timeout_seconds,
-            frame_selector=frame_selector,
+            frame_selector=frame_selector, report_frames=True,
         )
     )
 
@@ -921,7 +936,7 @@ async def browser_execute_js(
             script,
             args=args,
             session_id=session_id, await_promise=await_promise, timeout_seconds=timeout_seconds,
-            frame_selector=frame_selector,
+            frame_selector=frame_selector, report_frames=True,
         )
     )
 
@@ -954,9 +969,14 @@ async def browser_type_text(
     text: str,
     session_id: str = "default",
     selector: str | None = None,
+    mode: Literal["insert", "keys"] = "insert",
 ) -> dict[str, Any]:
-    """Type text into the focused element or a CSS target via CDP insert-text."""
-    return await asyncio.to_thread(browser_tools.type_text, text, session_id, selector)
+    """Type text into the focused element or a CSS target.
+
+    mode='insert' sends one CDP insert-text edit (React inputs); mode='keys'
+    presses one key per character, any script, for canvas games (Unity WebGL).
+    """
+    return await asyncio.to_thread(browser_tools.type_text, text, session_id, selector, mode)
 
 
 @mcp.tool()
@@ -1296,6 +1316,23 @@ async def browser_screenshot(
 
 
 @mcp.tool()
+async def browser_save_screenshot(
+    session_id: str = "default",
+    mode: Literal["viewport", "full_page", "region"] = "viewport",
+    x: float | None = None,
+    y: float | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    path: str | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Capture a PNG to a file (web_action form); web_info topic=screenshot returns the image."""
+    return await asyncio.to_thread(
+        browser_tools.save_screenshot, session_id, mode, x, y, width, height, path, overwrite
+    )
+
+
+@mcp.tool()
 async def browser_automation_skill(section: str | None = None) -> dict[str, Any]:
     """Return the built-in automation playbook, or one detailed section of it."""
     if section is None or not str(section).strip():
@@ -1376,10 +1413,14 @@ async def browser_close_all(
     agent_label: str | None = None,
     scope: Literal["mine", "all"] = "mine",
     include_foreign: bool = False,
+    idle_for_seconds: float | None = None,
 ) -> dict[str, Any]:
-    """Close the sessions this agent_label owns; scope='all' closes every agent's."""
+    """Close the sessions this agent_label owns; scope='all' closes every agent's.
+
+    idle_for_seconds closes only sessions untouched that long (orphan release).
+    """
     return await asyncio.to_thread(
-        browser_tools.close_all_sessions, agent_label, scope, include_foreign
+        browser_tools.close_all_sessions, agent_label, scope, include_foreign, idle_for_seconds
     )
 
 
@@ -1979,10 +2020,16 @@ async def browser_cookies(
     set_cookies: list[dict[str, Any]] | None = None,
     limit: int = 100,
     offset: int = 0,
+    confirm_clear_all: bool = False,
 ) -> dict[str, Any]:
-    """Read, write, or clear cookies as full objects with flags (secure, httpOnly, sameSite)."""
+    """Read, write, or clear cookies as full objects with flags (secure, httpOnly, sameSite).
+
+    clear deletes only cookies matching name/domain; an unfiltered clear wipes the
+    whole profile and requires confirm_clear_all=true.
+    """
     return await asyncio.to_thread(
-        browser_tools.cookies, op, session_id, domain, name, set_cookies, limit, offset
+        browser_tools.cookies, op, session_id, domain, name, set_cookies, limit, offset,
+        confirm_clear_all,
     )
 
 
@@ -2049,6 +2096,12 @@ _ACTIONS: dict[str, ActionSpec] = {
             browser_attach_tab,
             "session",
             "Claim an existing Chrome tab by id without navigating or moving it.",
+        ),
+        _action(
+            "reattach",
+            browser_reattach,
+            "session",
+            "Continue a parked persist=true session.",
         ),
         _action(
             "setup_current_chrome",
@@ -2134,6 +2187,7 @@ _ACTIONS: dict[str, ActionSpec] = {
             "Acquire, release, or read pointer lock for first-person games.",
         ),
         _action("render", browser_render_control, "game", "Set the animation gate: normal, throttled, or step."),
+        _action("screenshot", browser_save_screenshot, "page", "Save a PNG to a file; topic screenshot returns the image."),
         _action("step", browser_render_step, "game", "Release an explicit number of animation frames."),
         _action(
             "release_inputs", browser_release_inputs, "game", "Release every held key and pointer button."
@@ -2214,6 +2268,18 @@ def _parameter_names(tool_name: str) -> tuple[list[str], list[str]]:
 
 
 _ACTION_KEY_ALIASES = ("type", "name", "tool", "command", "op", "operation", "method")
+# Natural spellings of an action, accepted as the action itself.
+_ACTION_NAME_ALIASES = {"attach": "attach_tab"}
+# Repeated once after the session followed a tab Chrome replaced, because they
+# only observe: a wait and a screenshot change nothing. Nothing that writes -
+# reload, cookies (set/clear), scripts, input - is ever repeated on its own.
+_RETRY_AFTER_TAB_FOLLOW = frozenset({"wait", "screenshot"})
+# The web_info topics that are pure reads of the page. execute_js runs arbitrary
+# page code and game_probe drains the console cursor, so neither is repeated.
+_READ_TOPICS_AFTER_TAB_FOLLOW = frozenset({
+    "page_outline", "page_text", "element_text", "find", "page_elements",
+    "console", "network", "network_body", "screenshot",
+})
 
 
 def _unsupported_action_error(action_name: str, arguments: dict[str, Any]) -> str:
@@ -2351,6 +2417,7 @@ def _capabilities(action_name: str | None = None, full_schemas: bool = False) ->
     """Return the whole agent-facing contract, one action's schema, or one topic's."""
     if action_name is not None:
         selected = action_name.strip().lower()
+        selected = _ACTION_NAME_ALIASES.get(selected, selected)
         spec = _ACTIONS.get(selected)
         if spec is None:
             return _topic_schema(selected)
@@ -2376,6 +2443,11 @@ def _capabilities(action_name: str | None = None, full_schemas: bool = False) ->
         example = _EXAMPLES.get(selected)
         if example is not None:
             response["example"] = example
+        if selected in _TOPIC_HANDLERS:
+            # A name that is both (screenshot): the topic schema, as before, plus
+            # the web_action form beside it.
+            return {**_topic_schema(selected), "action_form": {
+                "input_schema": input_schema, "summary": spec.summary}}
         return response
 
     groups: dict[str, list[str]] = {}
@@ -2429,7 +2501,10 @@ def _capabilities(action_name: str | None = None, full_schemas: bool = False) ->
     }
     if full_schemas:
         document["schemas"] = {
-            name: _capabilities(name)["input_schema"] for name in _ACTIONS
+            name: (lambda doc: doc.get("input_schema") or doc["action_form"]["input_schema"])(
+                _capabilities(name)
+            )
+            for name in _ACTIONS
         }
     return document
 
@@ -2535,9 +2610,16 @@ async def web_info(
         # the navigation that dropped the tab), so they get the same translation
         # from a Chrome target id to a session-lost error with a way to recover.
         sid = validated.get("session_id") if isinstance(validated, dict) else None
-        raise browser_tools.translate_stale_tab_error(
-            sid if isinstance(sid, str) and sid.strip() else None, exc
-        ) from exc
+        sid = sid if isinstance(sid, str) and sid.strip() else None
+        # Off the event loop: the translation may ask the companion about the tab.
+        translated = await asyncio.to_thread(browser_tools.translate_stale_tab_error, sid, exc)
+        if not (isinstance(translated, browser_tools.SessionTabFollowed)
+                and topic in _READ_TOPICS_AFTER_TAB_FOLLOW):
+            raise translated from exc
+    try:  # a pure read cannot double an effect: answer from the tab that took over
+        return _stamp_now(await handler(**validated))
+    except Exception as again:
+        raise (await asyncio.to_thread(browser_tools.translate_stale_tab_error, sid, again)) from again
 
 
 @mcp.tool()
@@ -2581,6 +2663,23 @@ async def _mark_agent_presence(
         pass
 
 
+async def _run_following_tab(spec: ActionSpec, action_name: str, validated: dict[str, Any]) -> Any:
+    """Run one handler; after Chrome replaced the session's tab, repeat a safe step once."""
+    session_id = _step_session(spec.tool_name, validated)
+    try:
+        return await spec.handler(**validated)
+    except Exception as exc:
+        # Off the event loop: the translation may ask the companion about the tab.
+        followed = await asyncio.to_thread(browser_tools.translate_stale_tab_error, session_id, exc)
+        if not (isinstance(followed, browser_tools.SessionTabFollowed)
+                and action_name in _RETRY_AFTER_TAB_FOLLOW):
+            raise followed from exc
+    try:
+        return await spec.handler(**validated)
+    except Exception as again:
+        raise (await asyncio.to_thread(browser_tools.translate_stale_tab_error, session_id, again)) from again
+
+
 async def _execute_actions(
     actions: list[dict[str, Any]],
     continue_on_error: bool = False,
@@ -2598,6 +2697,7 @@ async def _execute_actions(
             raise ValueError(f"Action {index} must be an object")
         arguments = dict(raw_action)
         action_name = str(arguments.pop("action", "")).strip().lower()
+        action_name = _ACTION_NAME_ALIASES.get(action_name, action_name)
         spec = _ACTIONS.get(action_name)
         if spec is None:
             error = {
@@ -2615,7 +2715,7 @@ async def _execute_actions(
             continue
         try:
             validated = _validate_arguments(spec.tool_name, f"action '{action_name}'", arguments)
-            data = await spec.handler(**validated)
+            data = await _run_following_tab(spec, action_name, validated)
             reported_failure = (
                 isinstance(data, dict) and data.get("success") is False
             )
@@ -2641,10 +2741,8 @@ async def _execute_actions(
             # A refused step is worth showing too, in the failure colour: a
             # burst where one click never landed is exactly what a watching
             # human wants to catch.
+            # Dead-tab errors were already translated in _run_following_tab.
             await _mark_agent_presence(spec.tool_name, action_name, arguments, ok=False)
-            exc = browser_tools.translate_stale_tab_error(
-                _step_session(spec.tool_name, arguments), exc
-            )
             results.append(
                 {
                     "index": index,

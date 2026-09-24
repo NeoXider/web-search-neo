@@ -235,3 +235,13 @@ class BrowserSession:
     # is reported is the last thing seen, labelled as such.
     last_url: str | None = None
     last_title: str | None = None
+    # Opened with persist=true: at process exit the tab is detached and parked in
+    # sessions/parking.py instead of closed, so a later client re-attaches it.
+    persist: bool = False
+    # Whether the tab-strip label is wanted; followed/re-attached tabs honour it too.
+    label_tab: bool = True
+    # When the persist record was last written, so use can refresh it (throttled).
+    parked_at: float = 0.0
+    # One-shot fields for the next page summary (a re-attach, a followed tab), so
+    # the caller learns about a recovery on the very call that benefited from it.
+    pending_notice: dict[str, Any] | None = None

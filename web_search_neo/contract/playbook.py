@@ -338,6 +338,7 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
             "include_summary=false skips the post-action page read; step takes no wait_seconds and refuses one.",
             "Tapping a held key, pressing a touch id already down, or a point outside the window are refused before anything reaches the page: fix them, do not retry.",
             "After a failed input batch held_keys over-reports on purpose. Call release_inputs rather than reading it.",
+            "Text into a canvas (Unity WebGL): type_text mode='keys' presses one key per character, any script; insertText never reaches a canvas engine.",
         ],
         "avoid": [
             "Leaving render in step mode or keys held at the end of a task.",

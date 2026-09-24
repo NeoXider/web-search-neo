@@ -6,10 +6,10 @@ The first extraction stage keeps `browser_tools.py` and `main.py` as compatibili
 facades. Existing callers and session locks remain there; leaf modules accept a driver
 and explicit callbacks instead of importing either facade or accessing its globals.
 
-- `sessions/`: session models, activity badge lifecycle, owned-profile context overrides.
-- `actions/`: script execution, condition polling, render bootstrap source.
-- `perception/`: element collection and response budgets.
-- `cdp/`: request mock installation, navigation persistence, and teardown.
+- `sessions/`: session models, activity badge lifecycle, owned-profile context overrides, the tab-label page source, and the parked (`persist=true`) session registry.
+- `actions/`: script execution, condition polling, render bootstrap source, click/typing verification and text-as-keys input.
+- `perception/`: element collection, the challenge probe and action page-script sources, and response budgets.
+- `cdp/`: request mock installation, navigation persistence, teardown, and reading the replacement Chrome recorded for a session's lost tab.
 - `contract/`: domain-neutral action notes, examples, and built-in playbook.
 - `fetch/`: bounded HTTP source/text/link extraction.
 
@@ -66,7 +66,9 @@ be copied into the MCP repository.
 - Destructive session operations are owner-scoped by default. `close_all` closes the sessions
   matching the caller's `agent_label` (with no label, the unlabelled ones) and reports what it
   left standing; ending every agent's work requires the explicit `scope="all"`. Process exit
-  is the one place that closes everything unasked, because no owner outlives it.
+  is the one place that closes everything unasked, because no owner outlives it. The one
+  exception is a session opened with `persist=true`: its tab is detached and parked, and
+  only an explicit `reattach` that re-proves the tab's identity continues it.
 - The session cap is per process and shared by every agent in it. It is a setting in three
   places, in this order: the server's own environment, then the companion popup's value
   relayed through the bridge hello, then the built-in default. The refusal at the cap names

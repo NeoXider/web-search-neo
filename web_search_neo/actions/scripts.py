@@ -13,6 +13,11 @@ RETRYABLE_SCRIPT_ERRORS = (
     "execution context was destroyed", "cannot access before initialization",
 )
 
+UNSERIALISABLE_MARKERS = (
+    "reference chain is too long", "couldn't be returned by value",
+    "could not be serialized", "circular", "cyclic",
+)
+
 
 def clip_result(value: Any) -> Any:
     """Bound script strings while reporting their original size."""
@@ -51,6 +56,19 @@ def json_safe(value: Any, _depth: int = 0) -> Any:
 def value_json(value: Any) -> str:
     """The sanitised value as one JSON string, for callers that want text."""
     return json.dumps(json_safe(value), ensure_ascii=False, default=str)
+
+
+def value_type(value: Any) -> str:
+    """JSON type name of a sanitised value: null|boolean|number|string|array|object."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    return "array" if isinstance(value, list) else "object"
 
 
 def error_is_retryable(exc: Exception) -> bool:
@@ -141,10 +159,20 @@ def execute(
             if retry_on_uncaught and attempt < max_attempts and error_is_retryable(exc):
                 time.sleep(max(0.0, float(retry_delay_ms)) / 1000.0)
                 continue
+            error = describe_error(exc)
+            if any(marker in error.lower() for marker in UNSERIALISABLE_MARKERS):
+                error += (" - the returned value cannot cross as JSON (cyclic, or a "
+                          "window/DOM object); return a plain object of the fields you need.")
             return {**page_summary(), "success": False,
-                    "error": describe_error(exc), "attempts": attempt}
+                    "error": error, "attempts": attempt}
         safe = clip_result(json_safe(value))
-        return {**page_summary(), "success": True,
-                "value": safe, "value_json": value_json(safe),
-                "attempts": attempt}
+        answer = {**page_summary(), "success": True,
+                  "value": safe, "value_json": value_json(safe),
+                  "value_type": value_type(safe), "attempts": attempt}
+        if safe is None and "return" not in script:
+            answer["value_note"] = (
+                "The script returned nothing: it is a function body, so end it with "
+                "`return <value>;` (an expression alone yields null)."
+            )
+        return answer
     raise AssertionError("at least one script attempt must run")

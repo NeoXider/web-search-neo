@@ -2,7 +2,7 @@
 
 This guide installs the MCP server from source and connects it to LM Studio or another stdio-compatible MCP client.
 
-It describes version 1.18.3. The Python package, the server, and the bundled Chrome
+It describes version 1.18.4. The Python package, the server, and the bundled Chrome
 companion carry that same version, and the bridge only accepts a companion that speaks the
 current handshake (bridge protocol 2, since 1.15.0) — see [Updating](#updating) if an older one is already
 installed.
@@ -229,7 +229,7 @@ Earlier revisions tried to perform those clicks for you through Windows UI Autom
 code is gone. It depended on the interface language, on which window happened to have focus,
 and on a folder picker that the automation backend does not even enumerate.
 
-The bundled companion is version 1.18.3 and declares five permissions: `alarms`, `debugger`,
+The bundled companion is version 1.18.4 and declares five permissions: `alarms`, `debugger`,
 `storage`, `tabs`, and `tabGroups`. There are no content scripts and no `host_permissions`;
 page access comes from `debugger`, which attaches the Chrome DevTools Protocol to the tabs
 the agent drives. `alarms` exists because Chrome suspends an idle MV3 service worker after
@@ -658,7 +658,7 @@ or when `setup_current_chrome` answered `self_update: "unsupported"` or `"timeou
    very directory **Load unpacked** points at, then reload the extension. Restarting the
    daemon does not help and never did after the daemon learned to re-read the token file:
    it already fetches the current secret from disk before calling anything a mismatch.
-3. Check the card's version. It must read 1.18.3; anything older speaks bridge protocol 1
+3. Check the card's version. It must read 1.18.4; anything older speaks bridge protocol 1
    and is refused with `Expected Web Search Neo bridge protocol 2; update and reload the
    companion`, and Chrome only picks up the new manifest on reload.
 4. `%LOCALAPPDATA%\WebSearchNeo\bridge-daemon.log` records the bridge's side: `Rejected a

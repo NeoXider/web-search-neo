@@ -8,7 +8,7 @@ _INFO_TOPICS = {
     "action_schema": "Full JSON Schema for one action or topic; pass params.action.",
     "page_outline": "Roles, names, states, refs, and boxes - start looking here.",
     "page_text": "Readable text of the rendered page; params.mode=main|full.",
-    "element_text": "One element's whole content: params.selector (CSS/ref/piercing), params.mode=text|html|outer|both, params.full_text for overflow-unclipped text.",
+    "element_text": "One element's whole content: params.selector, params.mode=text|html|outer|both, params.full_text for unclipped text.",
     "find": "Find an element by meaning: params.query='submit request'.",
     "page_elements": "Links, forms, fields, buttons by selector: CSS, '#host >>> #leaf' in a shadow root or frame, or '' when none is unique.",
     "console": "console.log/warn/error and uncaught errors; params.levels, params.contains.",
@@ -17,7 +17,7 @@ _INFO_TOPICS = {
     "execute_js": "Run a JavaScript snippet in a session's page and read its return value.",
     "screenshot": "PNG viewport, full-page, or exact page-region image.",
     "game_probe": "Canvas/WebGL/iframe surfaces, FPS, focus, console, held input.",
-    "browser_status": "Chrome availability, one session's state, and the roster of every session this server holds: owner label, tab, last page, idle time, busy flag, N of M in use.",
+    "browser_status": "Chrome availability, one session's state, and every session here: owner, tab, last page, idle, busy, N of M in use.",
     "browser_tabs": "Tabs open in the user's Chrome, with ids and groups.",
     "search_status": "Search providers, live availability, latency, cooldowns.",
 }
@@ -93,7 +93,7 @@ _ACTION_NOTES = {
     "fill": {
         "arguments": "fields is a map from fresh CSS selectors to values, e.g. fields={'#email': 'a@example.test'}, not a list or separate selector/value parameters.",
         "occurrence": "A selector matching several controls fills the first; append [N] (0-based document order, e.g. 'input.qty[1]' for the second match) to choose explicitly. An N beyond the match count is refused naming how many matched.",
-        "typing_react": "typing=true is required for React-controlled, masked, or autocomplete inputs: without it the value is set but no keystroke/input stream fires, so the app never reacts (onChange never runs) and the write reads back as refused. Default false: plain inputs do not need the slower path.",
+        "typing_react": "The default write is React-compatible: text goes in through the browser's input channel, and a React-controlled input whose value tracker still missed it gets one bubbling input+change event so onChange runs - listed in framework_resynced. typing=true (one input event per character, focus kept) is for masked inputs, autocomplete and handlers that only react per keystroke; use it when field_values shows your value but the app still did not react.",
         "results": "filled took your value, field_values answers for every selector you sent including the failures, errors maps selector to the driver's own message, success=false if errors is non-empty.",
         "field_values": "null means nothing could be read back - the selector matched nothing, or the control is gone. A refused control reports what it still holds, so you can see the write did not land.",
         "checkbox": "1|yes|y|on|check|checked or 0|no|n|off|uncheck|unchecked|''; anything else is refused, and field_values reports a JSON boolean.",
@@ -105,6 +105,9 @@ _ACTION_NOTES = {
         "files": "A file input is refused in fields; pass files={selector: path}, which replaces the input's selection rather than adding to it. upload_states/upload_notes appear when a widget emptied the input; they mean what upload's upload_state means.",
         "blur": "By default every control written is blurred (blur_after=true), which is how the last field fires its change event - so focus ends on the body and a following press_keys needs target_selector to reach a field. Pass blur_after=false to leave focus in the last control, and typing=true to emulate keystroke-by-keystroke input for masked/autocomplete fields.",
         "frame_selector": _FRAME_ANY,
+    },
+    "cookies": {
+        "paging": "get returns one window in Chrome's own order: total (= count) matched, limit/offset, returned, truncated and next_offset. Follow next_offset until it is null to read every cookie. domain means the domain and its subdomains (never a substring) for get and clear alike. clear needs a domain (a name alone exists on every site) and deletes exactly the matches - partitioned (CHIPS) cookies with their partition - reporting deleted_cookies from a fresh read and anything still there as not_deleted (success=false). Clearing without a domain wipes the whole profile - every login of the user in current Chrome - and is refused unless confirm_clear_all=true.",
     },
     "local_storage": {
         "ops": "op is read (whole store without key, one value with key), write (needs key and value), or delete (needs key); kind is local (localStorage) or session (sessionStorage, cleared when the tab closes).",
@@ -127,6 +130,7 @@ _ACTION_NOTES = {
         "frame_selector": _FRAME_ANY,
     },
     "click": {
+        "verification": "Every selector click reports verified/effect_detected: true when the URL/title changed, the clicked element's subtree or ancestors mutated (the agent's own overlays excluded), focus moved, or the element left the document; false only for a top-document target that showed none of that (no_observable_change, change_note); null when it cannot be measured - a frame_selector, ref or '>>>' (shadow) target, or a probe that did not survive. post_state carries the raw counts (dom_mutations, dom_mutations_near_target), focus, target_still_attached and dialog_open. Neither false nor null means 'click again': read the page first - a submit, order or payment may already be on its way.",
         "choice": "Provide exactly one target: selector (CSS, ref handle, or 'a >>> b' piercing path) for the element, text with role for a strict rendered-text match that refuses ambiguity, or x+y for a viewport CSS-pixel point. In current Chrome a CSS selector must be plain CSS, never ref: or >>>.",
         "text": "text clicks the one visible interactive element whose rendered text matches; role narrows by ARIA role and exact=false switches to substring matching. Zero or several matches are refused with samples, so narrow with role or selector rather than retrying.",
         "coords": "x/y click the viewport point in CSS pixels, useful for image-guided clicks from a fresh screenshot. Scale image pixels to reported viewport width/height and recapture after any layout change.",
@@ -158,7 +162,7 @@ _ACTION_NOTES = {
     "wait": {
         "state": "present|visible|clickable; timeout_seconds defaults to 10 and is capped at 300 s (timeout_note says when).",
         "script": "Pass script (a JS expression, e.g. \"window.__hydrated === true\") instead of selector to poll a hydration/framework condition atomically server-side; selector and script are mutually exclusive. poll_ms sets the poll interval.",
-        "sleep": "With neither selector nor script the call is a plain sleep for timeout_seconds and returns success.",
+        "sleep": "seconds=N is a plain delay (capped at 300 s) that needs no selector, no script and no open session; it cannot be combined with either. With neither selector, script nor seconds the call sleeps timeout_seconds (legacy form).",
         "frame_selector": _FRAME_ANY,
     },
     "find": {
@@ -175,11 +179,13 @@ _ACTION_NOTES = {
         "captcha_scan_incomplete": "true means the captcha walk stopped early, so an empty captcha_widgets is not proof there is none. Every page summary carries this key.",
         "invisible_challenge_pending": "true means a captcha with no box - an invisible Turnstile and the like - is on the page with an empty token field. It blocks the form, not the page, so challenge_detected stays false; invisible_challenge names the vendor and the evidence. Clear it with the captcha action before submitting. Every page summary carries this key too.",
         "contenteditable": "The legacy fields list includes [contenteditable=\"true\"]; category='interactive' also includes bare contenteditable and plaintext-only editors.",
+        "stable_locators": "A row whose selector is fragile (an nth-of-type chain or a generated React id) carries stable_selector=false and suggested_locator={text, role} - pass those to click instead. A testing hook is reported as testid with suggested_locator={selector}. Rows with a plain stable selector carry neither.",
         "pagination": "The whole existing DOM is counted before each category is sliced. Use offset plus limit, then follow range.<category>.next_offset until null; reread after scrolling a lazy/infinite page.",
         "limits": "limit is clamped to 1000 per top-level category and offset to 0-20000. collector_truncated.<category>=true means the 20000-item safety cap was hit and found is only the collected prefix. include_forms=false also omits fields.",
     },
     "page_text": {
-        "fallback": "mode='main' on a page that is one big form would be empty, so it re-reads the whole body and says so with fallback_used=true and mode_used='full'.",
+        "fallback": "mode='main' on a page that is one big form would be empty, so it re-reads the whole body and says so with fallback_used=true and mode_used='full'. It does the same when main keeps only a sliver of what the page renders.",
+        "title": "A title set by script after load is waited for up to 2.5 s; if it never came, title is null and title_pending=true (not an error). Action summaries carry title_pending=true while an HTML page's title is still empty (never for about:blank, JSON or images).",
     },
     "network": {
         "id": "The default output='text' carries no ids. Pass output='json' and hand that row's id to network_body as request_id.",
@@ -187,7 +193,8 @@ _ACTION_NOTES = {
     "execute_js": {
         "arguments": "params.script is a JavaScript function body, not code or an expression: use script='return document.title;' to read a result. Do not omit return.",
         "scope": "Top document of the session's current tab by default; frame_selector enters one frame first (same- or cross-origin - the bridge attaches to it, Selenium switches target) and the driver is left back at the top document. A top-document script cannot read a cross-origin frame - the browser refuses, not us - so a framed page needs frame_selector instead of a deeper querySelector.",
-        "result": "value is the JSON-serialisable return value, promise-awaited on the Chrome bridge driver; DOM elements arrive as {element: tag} descriptors, never live handles. value_json is the same value as one JSON string - read it whenever value is an object. Strings over 200k characters come back as {clipped, length, head}.",
+        "result": "One contract, always a JSON object: {success, value, value_json, value_type, attempts, ...page summary}. value is plain JSON (objects and arrays arrive as JSON, never '[object Object]' and never MCP content parts), promise-awaited on the Chrome bridge driver; DOM elements arrive as {element: tag} descriptors. value_json is the same value as one JSON string; value_type is null|boolean|number|string|array|object. A script with no return reports value_note. A cyclic or window object fails with a note to return a plain object. Strings over 200k characters come back as {clipped, length, head}.",
+        "frames": "Without frame_selector an empty value (null, '', [], {}) on a page with frames a top-document script cannot see comes with cross_origin_frames (count) and frames_note. With frame_selector, a frame that cannot be entered (cross-origin and not yet loaded, not a frame, ambiguous) is a clear ValueError naming why - never a silently partial result.",
         "prefer_actions": "Use fill/click/pointer for anything a user gesture should do; a script cannot simulate a trusted interaction.",
     },
     "game_probe": {
@@ -205,6 +212,8 @@ _ACTION_NOTES = {
         },
         "headless": "temporary/persistent default headless; headless=false explicitly opens a visible window. attach preserves the launcher's window mode when omitted. headless=true is refused with current and makes auto resolve straight to temporary.",
         "claimed_tab": "open on a session claimed by attach_tab does not navigate the user's tab: it takes a new one and reports the released id as left_claimed_tab.",
+        "persist": "persist=true (current Chrome only, explicit session_id, never 'default'; only for tabs the server opens) keeps the tab open when this MCP client process exits: it is detached and recorded. A later client continues it only explicitly, with web_action reattach {session_id} (or open with persist=true and the same session_id); nothing picks it up implicitly. Re-attaching is refused - the record dropped, the tab left alone - unless it is provably the same tab: the same Chrome run, still in the agent tab group, still on the recorded origin, not driven by another client; a server tab that only shows another site now is named in left_open_tab. A live session keeps its record fresh while used and is never touched by expiry. An explicit close closes a parked server tab (retired_parked); records expire after WEB_SEARCH_NEO_PARKED_SESSION_TTL (default 24 h, minimum 60 s) and their tabs are closed the same way. browser_status lists parked_sessions.",
+        "tab_followed": "If Chrome itself replaces the session's tab (chrome.tabs.onReplaced: a prerendered/instant navigation, a restored discarded tab), the companion redirects commands to the new tab and the session moves to it (tab_followed in the next answer), keeping its ownership - it is the same page. If the new tab is driven by another session or agent, the session is dropped instead. Only that record is followed: a tab the lost one opened (a popup, a payment window) or a tab on the same URL never is. Read-only topics and wait/screenshot are repeated once; every other step fails with SessionTabFollowed - read the page before re-issuing it. A tab that is really gone still drops the session with the exact open call to redo.",
     },
     "show": {
         "only_foreground": "This is the only action allowed to request browser or OS foreground focus; never call it unless foreground was explicitly requested.",
@@ -215,6 +224,11 @@ _ACTION_NOTES = {
         "ownership": "Refused, naming the holder, when another agent is already driving that tab. Pick another tab or open your own; do not retry. A tab claimed by another session in this server is refused the same way: it is busy, so observe it read-only through its own session or open your own tab.",
         "capture": "Console and network are recorded from the claim onwards; whatever the tab did before it was claimed is unrecoverable.",
         "badge": "The tab gets the agent-activity favicon dot while driven (gone after 5 quiet minutes); a dotted tab in the strip is agent-held - do not act on it from another session.",
+        "alias": "action 'attach' is accepted as attach_tab. Attaching the tab a parked session of the same session_id holds continues it (like reattach); attaching another tab under a parked name retires that record first (retired_parked says what happened to its tab).",
+        "persist": "persist=true is refused: a tab claimed with attach_tab is the user's and is never parked. Open your own tab with open persist=true instead.",
+    },
+    "reattach": {
+        "what": "Continues a persist=true session an earlier MCP client left parked, by session_id. Refused with success=false (record dropped, tab untouched) unless the tab is provably the server's parked tab: same Chrome run, agent tab group, recorded origin, and no other client driving it; a server tab that now shows another site comes back as left_open_tab for you to close.",
     },
     "close_tabs": {
         "ids": "tab_ids are the ids from web_info(topic='browser_tabs'). There is no close-everything switch on purpose: closing a tab cannot be undone, so each one is named.",
@@ -229,6 +243,7 @@ _ACTION_NOTES = {
     "close_all": {
         "browser_gone": "A list of session ids left alone because their Chrome is gone; closed_all stays true, since nothing of ours was left to leak.",
         "scope": "Defaults to scope='mine': only the sessions opened with your agent_label (or, with no label, the unlabelled ones). kept_sessions names what was left running and who owns it. scope='all' closes every agent's sessions in this MCP server - that is the old behaviour, and it ends other subagents' work.",
+        "orphans": "idle_for_seconds=N closes only sessions untouched for N seconds and never one a thread is inside; with scope='all' it releases orphaned slots whoever owns them. The session-cap error lists every holder (session, agent, tab, age, idle, busy, url); sessions idle past WEB_SEARCH_NEO_SESSION_IDLE_TTL (default 30m) are also reaped automatically at the cap, and WEB_SEARCH_NEO_MAX_SESSIONS (or the companion popup) raises the cap up to 64.",
     },
     "mock": {
         "pattern": "url_pattern is a CDP-style wildcard ('*' matches anything) matched against the full request URL; the first matching stub wins and everything else reaches the network untouched.",
@@ -239,6 +254,7 @@ _ACTION_NOTES = {
         "fallback": "When the installed companion predates Page.reload it refuses the method; the call then serves the reload via same-URL navigation and says so with reload_fallback=navigate plus a companion_note telling the user to press Reload at chrome://extensions. browser_status always carries the shipped allowlist size/hash (allowed_cdp_methods_size/hash) so the skew is visible before the call.",
     },
     "browser_status": {
+        "parked": "parked_sessions lists persist=true sessions left open by an earlier MCP client (URLs redacted, no titles); continue one with reattach {session_id}. parked_expired lists records that just expired and what happened to their tabs.",
         "roster": "sessions lists every session in this server with agent_label, current_tab_id, tab_group, last_url/last_title, created_at, last_used_at, idle_seconds and busy; sessions_open/max_sessions/sessions_free are the occupancy, and max_sessions_source says whether the cap came from the environment, the companion popup, or the default. last_url/last_title are where a session was last seen, not a fresh read - another agent's tab is never touched to answer this.",
         "browser_gone": "session_open=false with browser_gone=true means the session was dropped because its Chrome restarted; follow the 'next' field and open the page again.",
         "co_tenants": "sessions_in_use names the sessions another caller of this server is inside right now; shared_session=true means this very session is one of them. current_chrome.daemon.clients counts the MCP servers sharing the browser and .claims lists every tab any of them drives, with mine telling ours apart.",
@@ -261,9 +277,9 @@ _ACTION_NOTES = {
         "speed": _HOT_PATH_SPEED,
     },
     "type_text": {
-        "text": "Non-empty string; inserted whole in one command instead of key by key.",
-        "selector": "Optional CSS target, located and focused first. Omit it to type into whatever already has focus - fill and click leave their target there.",
-        "note": "The bridge driver sends CDP Input.insertText per call, so controlled inputs (React) see one composed edit instead of a key event storm.",
+        "text": "Non-empty string, any script (Cyrillic and other non-Latin text arrive unchanged).",
+        "selector": "Optional CSS target, located and focused first. Omit it to type into whatever already has focus - fill and click leave their target there. Focus is found through open shadow roots and same-origin frames; a cross-origin frame counts as unknown and the text is sent. With nothing focused, or a read-only/disabled control, the call is refused instead of dropping the text.",
+        "mode": "mode='insert' (default) sends one CDP Input.insertText, so controlled inputs (React) see one composed edit. mode='keys' presses one key per character (keydown/keypress/keyup carrying the character, at most 500) for canvas games such as Unity WebGL, which never see insertText. Without selector keys go only to an editable control, a canvas, an element with an explicit tabindex, or a frame - a focused button or link (Enter/Space would activate it) or the bare page is refused; a custom element that hides its focus is unknown and allowed. A focused <canvas> switches to keys automatically (mode_used says which ran).",
         "speed": _HOT_PATH_SPEED,
     },
     "press_keys": {
@@ -303,6 +319,7 @@ _ACTION_NOTES = {
         "frame_selector": _FRAME_CSS,
     },
     "screenshot": {
+        "action": "web_action screenshot saves the PNG under the download directory and returns saved_to, size_bytes and image_width/height. path=... must end in .png and stay inside that directory; an existing file is refused unless overwrite=true, and the path is checked before the capture. web_info topic=screenshot returns the image itself.",
         "modes": "viewport (default), full_page, region; full_page=true remains an alias for mode='full_page'",
         "viewport": "omit width/height to preserve the actual viewport. An explicit pair resizes Selenium sessions exactly and is refused in current Chrome.",
         "region": "requires x/y/width/height in page CSS pixels, captures without resizing, and works in current Chrome and Selenium",

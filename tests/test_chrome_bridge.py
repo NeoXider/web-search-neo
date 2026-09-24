@@ -841,7 +841,11 @@ def test_hello_carries_the_hash_of_the_code_this_worker_is_running() -> None:
     )
     assert outcome["type"] == "hello"
     token_source = f'export const BRIDGE_TOKEN = "{TEST_TOKEN}";'
-    expected_hash = hashlib.sha256(token_source.encode("utf-8")).hexdigest()
+    # The stub fetch serves that same body for every URL, and the hash covers
+    # every module the worker runs (chrome_bootstrap.CODE_FILES), in order.
+    from web_search_neo.chrome_bootstrap import CODE_FILES
+
+    expected_hash = hashlib.sha256(token_source.encode("utf-8") * len(CODE_FILES)).hexdigest()
     assert outcome["browser"]["code_hash"] == expected_hash
 
 

@@ -398,6 +398,27 @@ object reads `fps: null`, `animation_suspended: true`, and a `reason` naming the
 gated frame, instead of reporting the host's healthy frame rate for a frozen
 game.
 
+## Typing text into a canvas game
+
+A canvas engine such as Unity WebGL builds its text fields from key events. CDP
+`Input.insertText` - what `type_text` sends by default, and what React inputs
+need - produces no keydown or keypress at all, so the game receives nothing.
+Type into a canvas one key per character instead:
+
+```json
+{"actions": [{"action": "type_text", "session_id": "game", "text": "Привет, мир", "mode": "keys"}]}
+```
+
+Every character becomes its own keydown/keypress/keyup carrying the character,
+so Cyrillic and other non-Latin text arrives unchanged; an upper-case Latin
+letter is pressed under Shift, `
+` is Enter and `	` is Tab. When the focused
+element is a `<canvas>`, `type_text` switches to keys by itself and says so in
+`mode_used`. `press_keys` with one character per key is the same mechanism for a
+few keys at a time. Give the canvas focus first (a click on it, or
+`target_selector` on `press_keys`), and check the result with `screenshot` or
+`game_probe`.
+
 ## Pointer lock and first-person controls
 
 ```json

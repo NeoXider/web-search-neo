@@ -280,7 +280,7 @@ is no automatic substitute. If you would rather not install an extension at all,
 `profile_mode="temporary"` and `profile_mode="persistent"` drive a Selenium
 browser that needs no companion.
 
-The bundled companion is version 1.18.3. Chrome does not refresh an unpacked
+The bundled companion is version 1.18.4. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. That only works for
@@ -592,7 +592,84 @@ uses positive `delta_y` for down and negative for up, and returns before/after p
 scroll metrics. Screenshots are returned by the `screenshot` info topic: its default
 is the actual current viewport, `mode="full_page"` captures the document, and
 `mode="region"` captures an exact `x`/`y`/`width`/`height` CSS-pixel rectangle
-without resizing Chrome.
+without resizing Chrome. The `screenshot` action takes the same modes inside a
+`web_action` batch and writes the PNG under the download directory
+(`WEB_SEARCH_NEO_DOWNLOAD_DIR`, default `./downloads`), answering with
+`saved_to`, `size_bytes` and the image size; a `path` must end in `.png`, stay
+inside that directory, and replaces an existing file only with `overwrite: true`
+(all checked before the capture). `wait` with `seconds` is a plain delay that
+needs no selector and no open session.
+
+`type_text` has two modes. The default `mode="insert"` sends one CDP
+`Input.insertText`, which React-controlled inputs see as a real edit. The focused
+element is found through open shadow roots and same-origin frames (web-component
+editors, TinyMCE, a game inside an iframe); a cross-origin frame counts as
+unknown and the text is sent, while nothing focused or a read-only control is
+refused instead of dropping the text. `mode="keys"` presses one key per
+character (any script, Cyrillic included, at most 500) for canvas apps such as
+Unity WebGL, which build text from key events and never receive an insertText.
+Without a selector the keys go only to an editable control, a canvas, an element
+with an explicit `tabindex`, or a frame; a focused button or link (Enter or Space
+would activate it) or the bare page is refused, and a custom element that hides
+its focus in a closed shadow root counts as unknown and is allowed. A focused
+`<canvas>` switches to keys by itself. `fill` writes text through the browser's input channel and,
+when a React-style controlled input's value tracker still missed the edit,
+raises one input/change event so `onChange` runs (`framework_resynced`);
+`typing=true` stays for masked and per-keystroke inputs.
+
+Every selector click reports what it did. `verified` is true when the URL or
+title changed, the clicked element's own subtree or its ancestors mutated (a
+ticking clock elsewhere on the page does not count, nor do the agent's own
+overlays), focus moved somewhere other than the clicked element, or the element
+left the document; false only for a top-document target that showed none of
+that; null when it cannot be measured - a `frame_selector`, ref or `>>>`
+(shadow) target. `post_state` carries the raw counts. Neither false nor null is
+a reason to click again: the first click may already have sent a form or a
+payment, so read the page first. `page_elements` marks a fragile selector (an
+`nth-of-type` chain or a generated React id) with `stable_selector: false` and a
+`suggested_locator` of role and accessible name for `click`, and surfaces
+`data-testid` hooks.
+
+Chrome sometimes replaces the tab under a page itself - a prerendered or
+instant navigation, a restored discarded tab - and hands it a new id
+(`chrome.tabs.onReplaced`). Companion 1.18.4 records exactly those replacements,
+redirects commands addressed to the old id, and says so on the answer; the
+server then moves the session (and its tab claim) to the new tab and keeps its
+ownership, since it is the same page. If another session or agent already drives
+the new tab, the session is dropped instead. Nothing looser is ever followed: a
+tab the lost one opened (a popup, a payment window) or a tab on the same URL is
+not the agent's. Read-only
+topics and `wait`/`screenshot` are repeated once on the new tab; every other
+step fails with a `SessionTabFollowed` error that says so, and a tab that is
+really gone still drops the session.
+
+`open` accepts `persist: true` (current Chrome only, with an explicit
+`session_id` - never `default`). Only tabs the server opens can be parked: a tab
+claimed with `attach_tab` is the user's, and `persist` there is refused. Such a
+session survives the MCP client process: at exit its tab is detached and left
+open, and a record in the per-user state directory keeps its tab id, Chrome run,
+agent group and redacted URL; while the session is in use the record is kept
+fresh, and expiry never touches a live session. A later client continues it only
+explicitly, with `{"action": "reattach", "session_id": ...}` (or `open` with
+`persist: true`, or `attach_tab` on that same tab); a plain call never picks it
+up. Re-attaching is refused with `success: false` - the record dropped, the tab
+left alone - unless the tab is provably the same one: the same Chrome run, still
+in the agent tab group, still on the recorded origin, and not driven by another
+client. A server tab whose only change is the site it shows comes back as
+`left_open_tab`, so it can be closed rather than forgotten. An explicit `close`
+of a parked session closes its tab and reports it under `retired_parked`;
+records expire after `WEB_SEARCH_NEO_PARKED_SESSION_TTL` (default 24 hours, at
+least 60 seconds) and their tabs are closed the same way. `browser_status` lists
+`parked_sessions`. `attach` is accepted as an alias of `attach_tab`.
+
+A `domain` filter on `cookies` means that domain and its subdomains, never a
+substring, for `get` and `clear` alike. `op: "clear"` needs a domain - a cookie
+name alone exists on every site - and deletes exactly the matching cookies
+(partitioned CHIPS cookies with their partition), reporting what a fresh read
+shows as gone and anything left as `not_deleted`. Chrome's own clear has no
+filter at all and wipes every cookie of the profile - in current Chrome, every
+login of the user - so clearing without a domain is refused unless
+`confirm_clear_all: true` says that is really meant.
 
 A session tracks whether it owns its tab, and never navigates one it borrowed.
 An `open` on a session that claimed a tab through `attach_tab` opens the agent's
@@ -691,7 +768,7 @@ visible while it is not, and stops believing it the moment the debugger detaches
 
 Two consequences worth knowing. A targeted keyboard action can change DOM focus
 inside the controlled background page, but it does not take OS focus or change the
-active user tab. In Companion 1.18.3, viewport screenshots capture one fresh PNG
+active user tab. In Companion 1.18.4, viewport screenshots capture one fresh PNG
 video frame with an 8-second frame deadline, then stop the owned recording. This
 does not activate tabs, restore windows, resize the viewport, or alter emulation.
 An existing recording or overlapping capture is refused. Full-page and region
@@ -728,7 +805,11 @@ this session is one of them. Give each agent its own `session_id` and they get a
 tab each. The session cap is per process, so parallel agents share it too; it
 defaults to eight, the companion popup carries a user's own number to the server,
 and `WEB_SEARCH_NEO_MAX_SESSIONS` in the server's environment overrides both. The
-refusal at the cap names the setting and the agents holding the slots.
+refusal at the cap names the setting and lists every holder - session, agent, tab,
+age, idle time, busy flag and last URL. Sessions idle past
+`WEB_SEARCH_NEO_SESSION_IDLE_TTL` (default 30 minutes) are reaped when the cap is
+hit, and `close_all` with `scope="all"` and `idle_for_seconds` releases orphaned
+slots explicitly without touching anything in use.
 
 Pass `agent_label` on `open` or `attach_tab` and the session records who opened
 it. Nothing is refused without one — it is a courtesy, not a credential — but two

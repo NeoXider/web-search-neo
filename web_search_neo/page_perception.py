@@ -448,12 +448,12 @@ function wsnCssString(value) {
 }
 
 function wsnGeneratedId(id) {
-  // React's useId() spells its handles ':r0:' (':R1:' in some builds) and
+  // React's useId() spells its handles ':r0:' (':R1:', React 19 '«r1»'/'_r_1_') and
   // several toolchains emit '_R_mf5_'-style suffixes; every one of them is
   // re-minted on re-render, so a path built on one names a different element
   // next time - or none. A hand-written id never looks like this.
   const value = String(id || '');
-  return /:r[0-9]/i.test(value) || value.indexOf('_R_') >= 0;
+  return /:r[0-9a-z]+:|«r[0-9a-z]+»|_r_[0-9a-z]+_/i.test(value) || value.indexOf('_R_') >= 0;
 }
 
 function wsnUnique(root, path, el) {

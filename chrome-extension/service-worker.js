@@ -20,6 +20,8 @@ import {
 } from "./events.js";
 import {agentMessage, applyGlobalBadge, noteAgentCommand} from "./agent-badges.js";
 import {createBackgroundCapture} from "./background-capture.js";
+import {createTabFollower} from "./tab-follow.js";
+import {selfCodeHash} from "./code-hash.js";
 import {PROTOCOL_VERSION, advanceHandshake, bytesToHex, loadBridgeToken, newNonce} from "./bridge-auth.js";
 
 export {loadBridgeToken, parseBridgeToken} from "./bridge-auth.js";
@@ -445,6 +447,7 @@ export const ALLOWED_CDP_METHODS = new Set([
   "Input.dispatchMouseEvent",
   "Input.dispatchTouchEvent",
   "Input.insertText",
+  "Network.deleteCookies",
   "Network.enable",
   "Network.getResponseBody",
   "Network.setExtraHTTPHeaders",
@@ -657,7 +660,12 @@ async function resolveFrame(tabId, selector) {
 }
 
 const captureBackground = createBackgroundCapture(chrome.debugger);
+const tabFollower = createTabFollower(chrome.tabs, chrome.storage?.session);
 const commands = {
+  async "tabs.resolve"({tabId}) {
+    return tabFollower.resolve(tabId);
+  },
+
   async "capture.viewport"({tabId}) {
     await ensureDebugger(Number(tabId));
     return captureBackground(Number(tabId));
@@ -1112,14 +1120,18 @@ function sendResult(connection, id, payload) {
 
 export async function handleCommand(connection, message) {
   const {id, method} = message;
-  const params = message.params && typeof message.params === "object" ? message.params : {};
+  const raw = message.params && typeof message.params === "object" ? message.params : {};
   if (!isLiveConnection(connection)) return;
   let payload;
+  let params = raw;
   try {
     await restoreState();
+    params = method === "tabs.resolve" ? raw : await tabFollower.redirect(raw);
     const handler = commands[method];
     if (!handler) throw new Error(`Unknown bridge method: ${method}`);
     payload = {result: await handler(params)};
+    // Said on the answer, so the server moves its session and claim to the new id.
+    if (params !== raw) payload.tab_followed = {from: Number(raw.tabId), to: params.tabId};
   } catch (error) {
     payload = {error: `${error?.name || "Error"}: ${error?.message || error}`};
   }
@@ -1527,25 +1539,6 @@ async function startBrowserRun() {
   if (socket) socket.close();
 }
 
-// The manifest version is a promise about the folder; this hash is a promise
-// about what Chrome actually executed. An unpacked extension keeps running the
-// worker it loaded until someone presses Reload, so a folder that gained new
-// commands can sit behind an old worker whose version string still matches -
-// and only comparing code, not versions, sees it.
-async function selfCodeHash() {
-  try {
-    const response = await fetch(chrome.runtime.getURL("service-worker.js"));
-    const digest = await crypto.subtle.digest(
-      "SHA-256",
-      new Uint8Array(await response.arrayBuffer()),
-    );
-    return bytesToHex(new Uint8Array(digest));
-  } catch (error) {
-    console.warn("bridge: could not hash the companion code", error);
-    return null;
-  }
-}
-
 export async function connect() {
   if (!(await loadEnabled())) {
     connecting = false;
@@ -1563,7 +1556,7 @@ export async function connect() {
     token = await loadBridgeToken();
     // Read last, and before the socket exists, because onopen cannot await.
     run = await browserRun();
-    codeHash = await selfCodeHash();
+    codeHash = await selfCodeHash(fetch, chrome.runtime.getURL, bytesToHex);
     if (!enabled) {
       connecting = false;
       setBadge(false);

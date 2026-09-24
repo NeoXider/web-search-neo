@@ -177,7 +177,7 @@ def test_type_text_registered_in_contract():
     assert spec.group == "page"
     schema = asyncio.run(main.web_info("action_schema", {"action": "type_text"}))
     props = set(schema["input_schema"]["properties"])
-    assert props == {"action", "text", "session_id", "selector"}
+    assert props == {"action", "text", "session_id", "selector", "mode"}
 
 
 def test_type_text_notes_document_the_single_insert_command():

@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import socket
 import threading
 import time
 from typing import Any
@@ -123,6 +124,7 @@ class _PendingRequest:
     # Set when the error was written by this side because the link ended, rather
     # than read off an answer the companion sent. See ChromeBridgeUnavailable.
     transport_failure: bool = False
+    followed: Any = None  # {"from", "to"} when the companion redirected to a replacing tab
 
 
 def _daemon_interpreter(environment: dict[str, str]) -> str:
@@ -287,6 +289,8 @@ class ChromeBridge:
         self._state_lock = threading.RLock()
         self._send_lock = threading.Lock()
         self._pending: dict[str, _PendingRequest] = {}
+        # Old tab id -> the id Chrome replaced it with, as the companion reported.
+        self._followed: dict[int, int] = {}
         self._daemon: Any = None
         self._daemon_version = ""
         self._daemon_pid: int | None = None
@@ -871,6 +875,7 @@ class ChromeBridge:
                 return
             pending.result = frame.get("result")
             pending.error = frame.get("error")
+            pending.followed = frame.get("tab_followed")
             pending.event.set()
         elif kind == "extension":
             self._apply_state(frame)
@@ -1050,10 +1055,26 @@ class ChromeBridge:
                 if pending.transport_failure:
                     raise ChromeBridgeUnavailable(pending.error)
                 raise ChromeBridgeError(pending.error)
+            if isinstance(pending.followed, dict):
+                self._note_followed(pending.followed)
             return pending.result
         finally:
             with self._state_lock:
                 self._pending.pop(request_id, None)
+
+    def _note_followed(self, followed: dict[str, Any]) -> None:
+        try:
+            with self._state_lock:
+                self._followed[int(followed["from"])] = int(followed["to"])
+        except (KeyError, TypeError, ValueError):
+            pass
+
+    def take_followed(self, tab_id: int | None) -> int | None:
+        """The replacing tab the companion redirected ``tab_id`` to, once; else None."""
+        if tab_id is None:
+            return None
+        with self._state_lock:
+            return self._followed.pop(int(tab_id), None)
 
     def status(self, wait_seconds: float = 0.0) -> dict[str, Any]:
         """The bridge as a caller sees it; ``browser`` is :attr:`browser_info`.
@@ -1246,10 +1267,25 @@ class ChromeBridge:
         }
 
     def stop_daemon(self, reason: str = "requested") -> bool:
-        """Ask the daemon to exit. Only a caller replacing it should want this."""
+        """Ask the daemon to exit. Only a caller replacing it should want this.
+
+        ``start`` gives up waiting after the start timeout, which a cold process
+        (interpreter start, token ACL check) can outlast while the handshake is
+        still under way (the client keeps retrying a handshake that timed out); so
+        while something accepts on the port, wait for the link itself.
+        """
         self.start()
-        with self._state_lock:
-            connection = self._daemon
+        try:  # nothing accepting on the port: there is no daemon to wait for
+            socket.create_connection((self.host, self.port), timeout=1.0).close()
+        except OSError:
+            return False
+        deadline = time.monotonic() + max(self._connect_timeout, 15.0)
+        while True:
+            with self._state_lock:
+                connection = self._daemon
+            if connection is not None or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
         if connection is None:
             return False
         self._closing = True

@@ -51,8 +51,16 @@ def expected_extension_version() -> str:
         return ""
 
 
+# Every module the worker runs, in the order chrome-extension/code-hash.js hashes
+# them; a changed helper is changed code as much as a changed worker.
+CODE_FILES = (
+    "service-worker.js", "events.js", "agent-badges.js", "agent-activity.js",
+    "background-capture.js", "tab-follow.js", "bridge-auth.js", "code-hash.js",
+)
+
+
 def expected_code_hash() -> str | None:
-    """SHA-256 of the service worker this clone ships, or None when unreadable.
+    """SHA-256 of the worker's code files this clone ships, or None when unreadable.
 
     The manifest version is a promise about the folder; the hash is a promise
     about what Chrome actually executed. An unpacked extension keeps running
@@ -61,7 +69,7 @@ def expected_code_hash() -> str | None:
     matches - and only this comparison sees it.
     """
     try:
-        return hashlib.sha256((EXTENSION_DIR / "service-worker.js").read_bytes()).hexdigest()
+        return hashlib.sha256(b"".join((EXTENSION_DIR / name).read_bytes() for name in CODE_FILES)).hexdigest()
     except Exception:
         return None
 
