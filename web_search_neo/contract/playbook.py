@@ -29,7 +29,7 @@ _AUTOMATION_SKILL = {
     "current_chrome": {
         "setup": "Call setup_current_chrome if the companion is unavailable; show manual_steps verbatim.",
         "existing_tab": "browser_tabs -> attach_tab(tab_id, session_id) claims without navigating.",
-        "new_tab": "open defaults to profile_mode=current and creates a background AI-group tab.",
+        "new_tab": "open with profile_mode=current creates a background AI-group tab (a new session without it opens isolated).",
         "session_rule": "Reusing session_id navigates that controlled page; use a different session_id when a second reference page must stay open.",
         "parallel_agents": "One session_id is one tab, and it is the only thing separating agents inside this MCP server: parallel agents must each choose their own, or they drive the same tab. Across servers the bridge refuses a tab another agent holds; inside one server nothing does.",
         "action_locators": "In current Chrome every action locator is plain CSS. Never send ref: or >>> to click, fill, wait, upload, submit.form_selector, or input; they are observation-only there.",
@@ -362,57 +362,55 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
         },
     },
     "audit": {
-        "summary": "Site audit and security review: headers, cookies, console, network, third parties.",
-        "when": "Checking a site you own or may test for defects, misconfiguration or leaks.",
+        "summary": "Check your own site before a release: security grade, performance, third parties.",
+        "when": "A site, API or dev server you own or may test; passive reads only, within the hosts you name.",
         "steps": [
-            "open {url, profile_mode: 'isolated'} - a clean profile: no owner logins, no stale cache.",
-            "http_request {url} for the raw answer: status, redirects, headers and set_cookies (every Set-Cookie, unmerged).",
-            "Check the security headers in it: content-security-policy, strict-transport-security, x-frame-options or CSP frame-ancestors, x-content-type-options, referrer-policy, cross-origin-opener-policy, permissions-policy.",
-            "cookies {op: 'get'}: every cookie with Secure, HttpOnly, SameSite, domain, expiry - a session cookie without HttpOnly/Secure is a finding.",
-            "console {levels: ['error', 'warn']} and network {only_errors: true}: failed requests (in-flight ones too), CSP violations, mixed content; page through with since_seq / next_offset.",
-            "network: hosts that are not the site's own are the third parties; network_body reads one response.",
-            "page_text / page_outline for content and accessibility; execute_js with performance.getEntriesByType('navigation'|'resource') for timings and sizes.",
+            "security_report {url}: grade A+..F with Mozilla Observatory's tests and modifiers, score_explanation, extended (plus this report's own checks), priority[] (fix first), findings[] each with fix; summary='min' for the verdict alone.",
+            "scope='site' crawls your site (links + sitemap, max_pages <= 50, robots.txt), scope='hosts' checks several origins (<= 10, e.g. localhost:3000 and localhost:8000), paths lists your own routes; the weakest page decides the grade.",
+            "Fix priority[] top-down and rerun; localhost and private addresses are graded in local_development mode (https/HSTS/redirect/certificate not applicable) with a production_forecast.",
+            "perf_report {url}: TTFB/FCP/LCP/CLS rated good|needs-improvement|poor, resources, render_blocking, recommendations.",
+            "network {third_party_only: true} and har_export {session_id} for the requests of an open session (HAR 1.2 file).",
+            "console {levels: ['error']} and network {only_errors: true} for runtime defects.",
         ],
         "rules": [
-            "Every cut is flagged (truncated, has_more, next_offset); an audit reads to the end.",
-            "Test only what you are allowed to test; the server never bypasses a login or a CAPTCHA.",
-            "http_request carries no cookies between calls: send a Cookie header when you need a session.",
+            "security_report sends only the GETs in requests_made (pages, http://host/, security.txt, robots.txt, sitemap.xml, one TLS handshake per https host), only to hosts in scope; browser_requests is the ordinary page load. No path guessing, port scanning, probing or fuzzing.",
+            "It opens its own isolated session and closes it (keep_open=true to inspect further).",
+            "Test only sites you own or may test; the server never bypasses a login or a CAPTCHA.",
         ],
         "avoid": [
             "Auditing in profile_mode='current': the owner's logins and extensions change what the site sends.",
         ],
         "example": {
             "actions": [
-                {"action": "open", "url": "https://example.com", "session_id": "audit", "profile_mode": "isolated"},
-                {"action": "http_request", "url": "https://example.com"},
-                {"action": "cookies", "op": "get", "session_id": "audit"},
+                {"action": "security_report", "url": "https://example.com", "summary": "min"},
+                {"action": "perf_report", "url": "https://example.com"},
             ]
         },
     },
     "testing": {
-        "summary": "A test scenario: act, then assert page state, console and network per step.",
-        "when": "Verifying that a flow works (sign-up, cart, a game level) and reporting pass/fail.",
+        "summary": "A regression test: steps of action + expect, reported pass/fail per step.",
+        "when": "Verifying that a flow works (sign-up, cart, a form) before or after a change.",
         "steps": [
-            "open in an isolated session; dialogs {policy: 'accept'} when the flow confirms with confirm()/prompt().",
-            "Per step: the action (click/fill/press_keys/...), then assert with wait {selector|script} or page_text/find.",
-            "After each step: console {since_seq} for new errors and network {only_errors: true} for failed requests.",
-            "Files a step downloads land in the session's own folder: downloads lists them.",
-            "On a failure: screenshot (it reports frame_id and scale) and page_text for the report.",
+            "test_run {url, session_id, steps}: url opens the session first (isolated when new) and closes it after.",
+            "A step is an ordinary action plus optional step_name and expect: {selector, absent, text, no_text, url_contains, title_contains, script, no_console_errors, no_failed_requests, action_fails, timeout_seconds}; the action keeps all its other keys (cookies clear name=...).",
+            "An expect-only step {expect: {...}} just checks; action_fails=true is a negative test (validation must refuse).",
+            "The whole plan is validated first - every action's arguments and every expect key - before any step runs.",
+            "Read failed_steps and summary_line; screenshot_on_failure=true saves a PNG per failed step.",
         ],
         "rules": [
-            "click reports dialogs and downloads it caused; effect_confidence='low' means the page changed elsewhere - assert, do not assume.",
-            "run_script / execute_js / wait.script share one semantics: async body, top-level await, return; a one-line expression returns itself; a syntax error fails at once.",
-            "web_action continue_on_error=true runs every step and reports each; each result has duration_ms.",
-            "A persistent CLI client for scripts: scripts/mcp_cli.py serve, then send/repl - sessions survive between calls.",
+            "stop_on_failure (default true) skips the rest after a failure; each step reports its checks and duration_ms.",
+            "run_script / execute_js / wait.script / expect.script share one semantics: async body, top-level await, return.",
+            "Files a step downloads land in the session's own folder: downloads lists them; dialogs {policy} answers confirm().",
         ],
         "avoid": [
             "Retrying a consequential step after a timeout: read the page first.",
         ],
         "example": {
-            "actions": [
-                {"action": "click", "selector": "#buy", "session_id": "test"},
-                {"action": "wait", "script": "return document.querySelector('#total').textContent === '42'", "session_id": "test"},
-            ]
+            "actions": [{"action": "test_run", "url": "http://127.0.0.1:8000/signup", "session_id": "reg", "steps": [
+                {"action": "fill", "fields": {"#email": "qa@example.com"}},
+                {"step_name": "submit", "action": "click", "selector": "#send",
+                 "expect": {"text": "Thanks", "no_console_errors": True}},
+            ]}]
         },
     },
     "troubleshooting": {

@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import ctypes
 import os
 import subprocess
 import sys
-from typing import Any
+from typing import Any, Iterator
+
+# Start stamps and the child listing live in sessions/process_tree.py, where the
+# action layer can reach them too; they are re-exported here under their old names.
+from web_search_neo.sessions.process_tree import _ProcessEntry, children, started_at  # noqa: F401
 
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _STILL_ACTIVE = 259
@@ -86,3 +92,90 @@ def popen_detached(
         )
     except OSError:
         return subprocess.Popen(command, creationflags=windows_flags, **kwargs)  # noqa: S603
+
+
+# ---------------------------------------------------------------- identity
+# A process id alone proves nothing once its process is gone: Windows and POSIX
+# both hand the number to the next program. Before anything is killed by a
+# recorded pid, the start stamp recorded with it has to match again.
+
+def same_process(pid: Any, stamp: Any) -> bool:
+    """True only when ``pid`` runs and is provably the process recorded with ``stamp``."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or not stamp or not process_alive(pid):
+        return False
+    return started_at(pid) == stamp
+
+
+# ---------------------------------------------------------------- outliving the server
+# A browser parked with persist=true must outlive this process. On Windows the
+# MCP client may have put the server into a job object that kills every process
+# in it when the client goes; a child may leave the job only if the job allows it.
+
+class _BasicLimits(ctypes.Structure):
+    _fields_ = [("process_time", ctypes.c_longlong), ("job_time", ctypes.c_longlong),
+                ("flags", ctypes.c_ulong), ("min_ws", ctypes.c_size_t), ("max_ws", ctypes.c_size_t),
+                ("active", ctypes.c_ulong), ("affinity", ctypes.c_size_t), ("priority", ctypes.c_ulong),
+                ("scheduling", ctypes.c_ulong)]
+
+
+_JOB_KILL_ON_CLOSE, _JOB_BREAKAWAY_OK, _JOB_SILENT_BREAKAWAY_OK = 0x2000, 0x800, 0x1000
+
+
+def job_breakaway() -> str:
+    """How a child of this process relates to its job (Windows; "none" elsewhere).
+
+    ``none``: no job, or one that does not kill on close - children outlive us.
+    ``silent``: the job lets children out by itself. ``allowed``: a child started
+    with CREATE_BREAKAWAY_FROM_JOB leaves it. ``forbidden``: the job ends every
+    child when the MCP client goes and lets none out.
+    """
+    if sys.platform != "win32":
+        return "none"
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        kernel32.IsProcessInJob.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int))
+        kernel32.QueryInformationJobObject.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+                                                       ctypes.c_ulong, ctypes.c_void_p)
+        inside = ctypes.c_int(0)
+        if not kernel32.IsProcessInJob(kernel32.GetCurrentProcess(), None, ctypes.byref(inside)) or not inside:
+            return "none"
+        limits = _BasicLimits()
+        if not kernel32.QueryInformationJobObject(None, 2, ctypes.byref(limits), ctypes.sizeof(limits), None):
+            return "forbidden"
+    except (OSError, AttributeError):
+        return "none"
+    if limits.flags & _JOB_SILENT_BREAKAWAY_OK:
+        return "silent"
+    if limits.flags & _JOB_BREAKAWAY_OK:
+        return "allowed"
+    return "forbidden" if limits.flags & _JOB_KILL_ON_CLOSE else "none"
+
+
+_DETACHED_LAUNCH: contextvars.ContextVar[bool] = contextvars.ContextVar("wsn_detached_launch", default=False)
+
+
+@contextlib.contextmanager
+def detached_launch() -> Iterator[None]:
+    """Inside this block chromedriver (and so Chrome) is started to outlive the server."""
+    token = _DETACHED_LAUNCH.set(True)
+    try:
+        yield
+    finally:
+        _DETACHED_LAUNCH.reset(token)
+
+
+def driver_popen_kwargs() -> dict[str, Any]:
+    """Selenium's ``popen_kw`` for chromedriver; Selenium owns the startupinfo argument.
+
+    No console window on Windows. Inside :func:`detached_launch` the process also
+    leaves the MCP client's job where that is allowed (Windows) or starts its own
+    session (POSIX), so neither the client's job nor its process-group signal ends it.
+    """
+    detached = _DETACHED_LAUNCH.get()
+    if os.name != "nt":
+        return {"start_new_session": True} if detached else {}
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    if detached and job_breakaway() == "allowed":
+        flags |= _CREATE_BREAKAWAY_FROM_JOB
+    return {"creation_flags": flags}

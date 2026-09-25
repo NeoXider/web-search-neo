@@ -1,0 +1,14 @@
+<!doctype html>
+<html><head><title>Strong fixture</title>
+<script src="/fixtures/security/app.js"></script>
+<script>window.blockedInline = true;</script>
+</head><body>
+<h1 id="ready">Account</h1>
+<form id="signin" action="/session" method="post">
+  <input name="email" autocomplete="email">
+  <input name="password" type="password" autocomplete="current-password">
+  <button type="submit">Sign in</button>
+</form>
+<a href="/help" target="_blank" rel="noopener noreferrer">Help</a>
+<button id="legacy" onclick="alert(1)">Legacy</button>
+</body></html>

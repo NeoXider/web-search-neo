@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import copy
 import ipaddress
 import os
 import secrets
 import socket
 import threading
 import time
+from http.cookiejar import CookieJar
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
@@ -346,12 +348,17 @@ def _follow_redirects(
     method: str,
     timeout: tuple[float, float],
     origin_class: str = DESTINATION_PRIVATE,
+    plain_http_hosts: Any = frozenset(),
+    follow: Any = None,
     **kwargs: Any,
 ) -> requests.Response:
     """Follow redirects manually so every hop is validated before it is requested.
 
     ``origin_class`` classifies the first URL: once a chain started on a public
-    host, no hop may land on a private or loopback one.
+    host, no hop may land on a private or loopback one. ``plain_http_hosts`` may
+    be reached over http:// even when the process refuses public plain http;
+    ``follow(url) -> bool`` can stop the chain before a hop, which is then left
+    unrequested and named in ``response.wsn_not_followed``.
     """
     history: list[requests.Response] = []
     # The hop URL already carries the query the server chose. Passing ``params``
@@ -363,12 +370,34 @@ def _follow_redirects(
         if not response.is_redirect or not response.headers.get("location"):
             break
         try:
-            target = validate_http_url(urljoin(response.url, response.headers["location"]))
-            hop_class = classify_destination(target)
-            if origin_class == DESTINATION_PUBLIC and hop_class != DESTINATION_PUBLIC:
-                raise ValueError(
-                    f"Redirect from a public host to the private address {target!r} is blocked"
-                )
+            location = urljoin(response.url, response.headers["location"])
+            plain_ok = (plain_http_hosts(location) if callable(plain_http_hosts)
+                        else (urlparse(location).hostname or "").lower() in plain_http_hosts)
+            try:
+                target = validate_http_url(location, allow_plain_http=True if plain_ok else None)
+            except ValueError as refused:
+                if follow is None:
+                    raise
+                # A caller that decides hop by hop (the security report) keeps the chain
+                # so far and learns where it would have gone, instead of losing it all.
+                response.wsn_not_followed = location
+                response.wsn_not_followed_reason = str(refused)
+                break
+            if follow is not None and not follow(target):
+                response.wsn_not_followed = target
+                break
+            try:
+                hop_class = classify_destination(target)
+                if origin_class == DESTINATION_PUBLIC and hop_class != DESTINATION_PUBLIC:
+                    raise ValueError(
+                        f"Redirect from a public host to the private address {target!r} is blocked"
+                    )
+            except ValueError as refused:
+                if follow is None:
+                    raise
+                response.wsn_not_followed = target
+                response.wsn_not_followed_reason = str(refused)
+                break
             cross_origin = _origin(response.url) != _origin(target)
         except Exception:
             response.close()
@@ -443,12 +472,42 @@ def _body_chunks(response: requests.Response, chunk_size: int = 65_536):
         raise requests.exceptions.SSLError(exc) from exc
 
 
+def _seed_cookies(target: CookieJar, jar: CookieJar | None) -> dict[tuple, Any]:
+    """Copy a caller's jar into the call's jar; the copies tell unchanged cookies apart."""
+    seeded: dict[tuple, Any] = {}
+    for cookie in jar if jar is not None else ():
+        clone = copy.copy(cookie)
+        target.set_cookie(clone)
+        seeded[(cookie.domain, cookie.path, cookie.name)] = clone
+    return seeded
+
+
+def _merge_cookies_back(source: CookieJar, jar: CookieJar | None, seeded: dict) -> None:
+    """Store what this call set or deleted in the caller's jar, then empty the call's jar."""
+    if jar is None:
+        return
+    current = {(cookie.domain, cookie.path, cookie.name): cookie for cookie in source}
+    for key in seeded.keys() - current.keys():
+        try:
+            jar.clear(*key)
+        except KeyError:
+            pass
+    for key, cookie in current.items():
+        if seeded.get(key) is not cookie:
+            jar.set_cookie(copy.copy(cookie))
+    source.clear()
+
+
 def request(
     url: str,
     *,
     method: str = "GET",
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     max_response_bytes: int | None = None,
+    allow_plain_http: bool | None = None,
+    plain_http_hosts: Any = frozenset(),
+    follow: Any = None,
+    cookie_jar: CookieJar | None = None,
     **kwargs: Any,
 ) -> requests.Response:
     """Send a bounded HTTP request and raise a useful error for bad responses.
@@ -457,8 +516,16 @@ def request(
     checked, so an HTTPError still carries the server's error payload on
     ``exc.response``. Explicit loopback/private URLs are allowed (local API
     testing); metadata/link-local hosts and public-to-private redirects are not.
+    ``allow_plain_http=True`` admits a public http:// start URL for this one call
+    (the security report reads how a site answers plain http); redirect hops are
+    still validated with the process-wide rule, except hops to ``plain_http_hosts``
+    (a set of host names, or a predicate on the hop URL such as a scope's ``allows``).
+    ``follow(url) -> bool`` stops the redirect chain before a hop it refuses.
+    ``cookie_jar`` opts into a caller-owned jar (http_request's http_session): it
+    seeds this call, still under cookie matching and cross-origin redirect
+    stripping, and what the responses set or deleted is merged back into it.
     """
-    normalized = validate_http_url(url)
+    normalized = validate_http_url(url, allow_plain_http=allow_plain_http)
     origin_class = classify_destination(normalized)
     timeout = clamp_timeout(timeout_seconds)
     total_budget = timeout * TOTAL_DEADLINE_FACTOR
@@ -471,17 +538,22 @@ def request(
     # another path, another agent - depending on which thread picked it up.
     # Redirect hops within this call still carry the cookies set along the way.
     session.cookies.clear()
+    seeded = _seed_cookies(session.cookies, cookie_jar)
     timeouts = (min(5.0, timeout), timeout)
-    response = session.request(
-        method=method,
-        url=normalized,
-        timeout=timeouts,
-        allow_redirects=False,
-        **kwargs,
-    )
-    response = _follow_redirects(
-        session, response, method=method, timeout=timeouts, origin_class=origin_class, **kwargs
-    )
+    try:
+        response = session.request(
+            method=method,
+            url=normalized,
+            timeout=timeouts,
+            allow_redirects=False,
+            **kwargs,
+        )
+        response = _follow_redirects(
+            session, response, method=method, timeout=timeouts, origin_class=origin_class,
+            plain_http_hosts=plain_http_hosts, follow=follow, **kwargs
+        )
+    finally:
+        _merge_cookies_back(session.cookies, cookie_jar, seeded)
     try:
         if max_response_bytes is not None:
             limit = max(1024, min(int(max_response_bytes), 20_000_000))

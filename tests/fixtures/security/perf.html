@@ -1,0 +1,14 @@
+<!doctype html>
+<html><head><title>Perf fixture</title>
+<link rel="stylesheet" href="/fixtures/security/widget.css">
+<script src="/fixtures/security/app.js"></script>
+</head><body>
+<h1 id="hero">Performance fixture</h1>
+<p>Some text so the page paints content.</p>
+<div id="late"></div>
+<script>
+setTimeout(() => { const box = document.createElement('div'); box.style.height = '120px';
+  box.textContent = 'inserted above'; document.body.insertBefore(box, document.body.firstChild); }, 50);
+fetch('/fixtures/security/widget.js');
+</script>
+</body></html>

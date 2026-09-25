@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Click text in shadow roots and frames</title>
+<link rel="icon" href="data:,">
+<style>
+  body { font-family: sans-serif; margin: 16px; }
+  button, [role="button"] { display: block; margin: 8px; padding: 8px 12px; }
+  iframe { display: block; width: 420px; height: 150px; margin: 12px 0 12px 60px;
+           border: 6px solid #888; padding: 4px; }
+</style>
+</head>
+<body>
+<p id="log">idle</p>
+<button id="top-twin" onclick="window.wsnLog('top-twin')">Twin</button>
+<div id="host"></div>
+<div id="outer-host"></div>
+<projected-button id="projected">Projected go</projected-button>
+<div id="aria-host" aria-hidden="true"></div>
+<iframe id="frame" title="same origin" srcdoc="
+  <!doctype html><html><body style='margin:8px'>
+  <button id='frame-save' onclick='parent.wsnLog(&quot;frame-save&quot;)'>Frame save</button>
+  <button onclick='parent.wsnLog(&quot;frame-echo&quot;)'>Echo</button>
+  <div id='frame-host'></div>
+  <script>
+    document.getElementById('frame-host').attachShadow({mode: 'open'}).innerHTML =
+      '<button id=&quot;frame-shadow-save&quot;>Frame shadow save</button>';
+    document.getElementById('frame-host').shadowRoot.getElementById('frame-shadow-save')
+      .addEventListener('click', () => parent.wsnLog('frame-shadow-save'));
+  </script>
+  </body></html>"></iframe>
+<iframe id="remote" title="cross origin"></iframe>
+<script>
+  window.wsnClicks = [];
+  window.wsnLog = what => {
+    window.wsnClicks.push(what);
+    document.getElementById('log').textContent = what;
+  };
+  const host = document.getElementById('host').attachShadow({mode: 'open'});
+  host.innerHTML =
+    '<button id="shadow-save">Shadow save</button>' +
+    '<button id="shadow-twin">Twin</button>' +
+    '<button id="shadow-echo">Echo</button>';
+  host.getElementById('shadow-save').addEventListener('click', () => wsnLog('shadow-save'));
+  host.getElementById('shadow-twin').addEventListener('click', () => wsnLog('shadow-twin'));
+  host.getElementById('shadow-echo').addEventListener('click', () => wsnLog('shadow-echo'));
+
+  const outer = document.getElementById('outer-host').attachShadow({mode: 'open'});
+  outer.innerHTML = '<section><div id="inner-host"></div></section>';
+  const inner = outer.getElementById('inner-host').attachShadow({mode: 'open'});
+  inner.innerHTML = '<button id="nested-save">Nested shadow save</button>';
+  inner.getElementById('nested-save').addEventListener('click', () => wsnLog('nested-save'));
+
+  customElements.define('projected-button', class extends HTMLElement {
+    constructor() {
+      super();
+      const root = this.attachShadow({mode: 'open'});
+      root.innerHTML = '<button id="projected-inner"><slot></slot></button>';
+      root.getElementById('projected-inner').addEventListener('click', () => wsnLog('projected'));
+    }
+  });
+
+  document.getElementById('aria-host').attachShadow({mode: 'open'}).innerHTML =
+    '<button onclick="wsnLog(\'hidden\')">Hidden save</button>';
+
+  // localhost and 127.0.0.1 are different origins, so this frame is cross-origin
+  // whichever of the two the fixture server was reached by.
+  const other = location.hostname === 'localhost' ? '127.0.0.1' : 'localhost';
+  document.getElementById('remote').src =
+    location.protocol + '//' + other + ':' + location.port + '/fixtures/perception/shadow_click_remote.html';
+</script>
+</body>
+</html>

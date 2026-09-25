@@ -2,7 +2,7 @@
 
 This guide installs the MCP server from source and connects it to LM Studio or another stdio-compatible MCP client.
 
-It describes version 1.19.0. The Python package, the server, and the bundled Chrome
+It describes version 1.20.0. The Python package, the server, and the bundled Chrome
 companion carry that same version, and the bridge only accepts a companion that speaks the
 current handshake (bridge protocol 2, since 1.15.0) — see [Updating](#updating) if an older one is already
 installed.
@@ -157,9 +157,13 @@ Some clients do not support a separate working-directory field. In that case kee
 }
 ```
 
-## 6. Connect the current signed-in Chrome (default)
+## 6. Connect the current signed-in Chrome (`profile_mode="current"`)
 
-`profile_mode="current"` is the default. It controls tabs in the Chrome you already
+`profile_mode="current"` controls tabs in the Chrome you already use. Since 1.20 it is
+chosen explicitly: a new session opened without `profile_mode` gets a fresh isolated
+headless browser (section 7), and `current` is what an agent asks for when it needs your
+logins or your open tabs (`current_tab_id` implies it). In `current` mode it controls tabs
+in the Chrome you already
 use, preserves the page's existing login, and opens new tabs into a visible group named
 `🟢 AI` — purple, when the companion is the one creating it. It cleans up after itself: a
 tab the agent opened is closed when its session closes, and so is any still open when the
@@ -229,7 +233,7 @@ Earlier revisions tried to perform those clicks for you through Windows UI Autom
 code is gone. It depended on the interface language, on which window happened to have focus,
 and on a folder picker that the automation backend does not even enumerate.
 
-The bundled companion is version 1.19.0 and declares five permissions: `alarms`, `debugger`,
+The bundled companion is version 1.20.0 and declares five permissions: `alarms`, `debugger`,
 `storage`, `tabs`, and `tabGroups`. There are no content scripts and no `host_permissions`;
 page access comes from `debugger`, which attaches the Chrome DevTools Protocol to the tabs
 the agent drives. `alarms` exists because Chrome suspends an idle MV3 service worker after
@@ -392,6 +396,13 @@ work; it is documented because the file exists on your disk.
 
 ## 7. Choose an isolated or managed browser mode
 
+### Isolated browser (the default for a new session)
+
+`profile_mode="isolated"` is what `open` uses when a new session names no mode (1.20). It
+is a disposable, headless Chrome with its own profile and storage: no logins of yours, no
+extensions, no cache from earlier runs, and it closes with its session. It needs no
+companion. Per-session `user_agent`, `timezone`, `locale` and `geolocation` apply here.
+
 ### Disposable browser
 
 Use `profile_mode="temporary"`, which is headless by default. Cookies are discarded when the session closes. Set `headless=false` only when you intentionally want a visible Chrome window.
@@ -447,7 +458,7 @@ powershell -ExecutionPolicy Bypass -File scripts\start_managed_chrome.ps1 -Profi
 All newly created MCP-owned `temporary` and `persistent` sessions are headless when `headless` is omitted. Set `headless=false` only for an intentionally visible session. For `attach`, the launcher's `-WindowMode` controls the already-running Chrome; attach cannot change its visibility afterward.
 
 Use `profile_mode="auto"` to prefer the current Chrome but fall back to a separate
-headless temporary session. The default `current` mode does not fall back silently.
+headless temporary session. `current` itself does not fall back silently.
 
 Chrome 136+ requires remote debugging to use a non-default data directory. You cannot safely retrofit attach mode onto an arbitrary normal Chrome window that was started without a DevTools port. The launcher handles both requirements with a separate durable profile.
 
@@ -522,6 +533,21 @@ Two cases still need the human:
 
 Confirm with `web_info(topic="browser_status")` that `current_chrome.connected` is `true`
 before continuing.
+
+### Migrating to 1.20: new sessions open isolated
+
+Breaking change. Up to 1.19 an `open` without `profile_mode` drove the user's own Chrome
+(`current`). From 1.20 it opens a fresh isolated headless browser, and `open_many` defaults
+to `isolated` too. Agents and macros that relied on the old default - to reach a signed-in
+site or to open a tab the user can watch - add `"profile_mode": "current"` to their first
+`open` of a session. An `open` of an existing session keeps that session's mode as before,
+and an option only one mode has names that mode: `current_tab_id` means `current`,
+`debugger_address` means `attach`, `profile_id` means `persistent`. `persist=true` on a new
+session needs `profile_mode` (`current` to keep a tab of the user's Chrome, `isolated` or
+`temporary` to keep the server's browser); an open or parked session keeps its own. The
+reason is the one behind every other safety rule here: driving the user's real browser,
+with their logins, should be something an agent asks for, not something it gets by leaving
+a parameter out.
 
 ### Plugins
 
@@ -658,7 +684,7 @@ or when `setup_current_chrome` answered `self_update: "unsupported"` or `"timeou
    very directory **Load unpacked** points at, then reload the extension. Restarting the
    daemon does not help and never did after the daemon learned to re-read the token file:
    it already fetches the current secret from disk before calling anything a mismatch.
-3. Check the card's version. It must read 1.19.0; anything older speaks bridge protocol 1
+3. Check the card's version. It must read 1.20.0; anything older speaks bridge protocol 1
    and is refused with `Expected Web Search Neo bridge protocol 2; update and reload the
    companion`, and Chrome only picks up the new manifest on reload.
 4. `%LOCALAPPDATA%\WebSearchNeo\bridge-daemon.log` records the bridge's side: `Rejected a

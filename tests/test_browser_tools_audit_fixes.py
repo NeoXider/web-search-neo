@@ -248,28 +248,38 @@ def test_reload_companion_poll_sleeps(monkeypatch):
 # --- item 7: cross-process ledger ---------------------------------------------
 
 
-def _reserve_many(project: str, prefix: str, count: int) -> None:
-    for index in range(count):
-        path = macros._guarded_ledger_path(project)
-        with file_lock.exclusive(path):
-            ledger = macros._load_guarded_ledger(project)
-            time.sleep(0.001)
-            ledger["tokens"][f"{prefix}-{index}"] = {"state": "staged"}
-            macros._write_guarded_ledger(ledger, project)
+def _reserve_many(project: str, prefix: str, count: int, errors=None) -> None:
+    try:
+        for index in range(count):
+            path = macros._guarded_ledger_path(project)
+            with file_lock.exclusive(path):
+                ledger = macros._load_guarded_ledger(project)
+                time.sleep(0.001)
+                ledger["tokens"][f"{prefix}-{index}"] = {"state": "staged"}
+                macros._write_guarded_ledger(ledger, project)
+    except BaseException as exc:  # hand the real reason to the test instead of a bare exit code 1
+        if errors is not None:
+            import traceback
+            errors.put(f"{prefix}: {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+        raise
 
 
 def test_ledger_updates_are_not_lost_across_processes(tmp_path):
     project = tmp_path / "proj"
     project.mkdir()
     context = multiprocessing.get_context("spawn")
+    errors = context.Queue()
     workers = [
-        context.Process(target=_reserve_many, args=(str(project), f"p{n}", 15)) for n in range(3)
+        context.Process(target=_reserve_many, args=(str(project), f"p{n}", 15, errors)) for n in range(3)
     ]
     for worker in workers:
         worker.start()
     for worker in workers:
         worker.join(60)
-        assert worker.exitcode == 0
+    reasons = []
+    while not errors.empty():
+        reasons.append(errors.get())
+    assert all(worker.exitcode == 0 for worker in workers), reasons
     ledger = macros._load_guarded_ledger(str(project))
     assert len(ledger["tokens"]) == 45
 

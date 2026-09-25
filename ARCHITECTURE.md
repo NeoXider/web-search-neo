@@ -12,6 +12,17 @@ and explicit callbacks instead of importing either facade or accessing its globa
 - `cdp/`: request mock installation, navigation persistence, teardown, and reading the replacement Chrome recorded for a session's lost tab.
 - `contract/`: domain-neutral action notes, examples, and built-in playbook.
 - `fetch/`: bounded HTTP source/text/link extraction.
+- `audit/`: passive site checks - CSP/header/cookie/transport/page analysis, Mozilla HTTP
+  Observatory's grade plus the extended score, the scope (`scope.py`: validated hosts, the
+  request budget) and the page/site/hosts runner (`site.py`), HAR building, Performance API
+  shaping and the test_run plan. Pure analysis over dicts plus plain GETs through `web_client`; the
+  session-handling MCP wrappers live in the top-level `audit_actions.py`, which main hands its
+  own module to (`extra_actions.register`).
+
+Top-level helpers extracted from the facades: `dispatch.py` is the ordered-action loop behind
+`web_action`, macro replays and test_run (main keeps a thin `_execute_actions` that passes
+itself as the facade, so the loop reads main's registry and validator at call time), and
+`actions/injected_scripts.py` holds the `inject_script` operations.
 
 `scripts/architecture_policy.py` is the executable dependency allowlist. The AST checker
 resolves absolute and relative imports; a leaf may not import `main` or `browser_tools`.

@@ -26,7 +26,8 @@ _BY_ACTION: dict[str, dict[str, str]] = {
     "press_keys": {
         "keys": ("1-8 key names pressed together as a chord (all down, then all up) - send "
                  "separate calls for a sequence. Names: a-z, 0-9, ENTER, TAB, SPACE, BACKSPACE, "
-                 "DELETE, ESCAPE, ARROW_LEFT/LEFT, HOME, END, F1-F12, NUMPAD0-9, NUMPAD_ENTER; DOM "
+                 "DELETE, ESCAPE, ARROW_LEFT/LEFT, HOME, END, F1-F12, NUMPAD0-9, NUMPAD_ENTER, "
+                 "CapsLock/NumLock/ScrollLock (sent through CDP; the session tracks the lock state); DOM "
                  "spellings too (ArrowLeft, KeyW, Digit1, ShiftLeft) and 'Control+Shift+K' chords."),
         "key_action": "tap (down and up), hold (stays down until release), release.",
     },
@@ -70,8 +71,30 @@ _BY_ACTION: dict[str, dict[str, str]] = {
         "duration_ms": "Time the whole turn takes.",
     },
     "wait": {"script": "Same semantics as run_script; the wait ends when it returns a truthy value."},
-    "open": {"profile_mode": ("current (the user's Chrome) | isolated/temporary (a clean separate "
-                              "browser) | persistent | attach | auto. Omitted: an existing session keeps its own.")},
+    "http_request": {
+        "http_session": "Name of a cookie jar kept across calls, per (agent_label, name); omitted = no cookies carry over.",
+        "agent_label": "Namespace of http_session: another label never sees this jar.",
+        "http_session_clear": "Empty the named jar before this request is sent.",
+        "show_values": "With http_session: show cookie values (in http_session, set_cookies, headers), redacted otherwise.",
+        "timeout_seconds": "Capped at 120; bounds each read, the whole body gets twice that.",
+        "save_to": "Path inside the download folder for the raw bytes; overwrite=true replaces a file.",
+    },
+    "open": {"profile_mode": ("isolated (default for a new session: a clean separate headless browser) | "
+                              "current (the user's Chrome, explicit) | temporary | persistent | attach | auto. "
+                              "Omitted: an existing session keeps its own; current_tab_id or persist implies current.")},
+    "test_run": {
+        "steps": ("[{action..., step_name?, expect?}] - ordinary actions; expect: {selector, absent, text, no_text, "
+                  "url_contains, title_contains, script, no_console_errors, no_failed_requests, action_fails, "
+                  "timeout_seconds}. An expect-only step just checks."),
+        "url": "Opened first in session_id (isolated when the session is new, closed after unless keep_open).",
+    },
+    "security_report": {
+        "url": "The start page (http or https); optional with scope='hosts'.",
+        "scope": "page (url + paths), site (crawl of links and sitemap), hosts (each named origin).",
+        "hosts": "Exact hosts in scope, <= 10: example.com, localhost:3000, http://127.0.0.1:8080. No wildcards.",
+        "paths": "Your own routes to check too: /login, /api/health; <= 50, GET only.",
+        "browser": "false: read the served HTML instead of rendering (no Chrome needed).",
+    },
 }
 
 

@@ -22,7 +22,7 @@ import json
 import os
 from pathlib import Path
 import time
-from typing import Any
+from typing import Any, Callable
 
 from web_search_neo.sessions.file_lock import atomic_write_text, exclusive
 
@@ -138,6 +138,28 @@ def take_expired() -> list[dict[str, Any]]:
                 ensure_ascii=False, indent=1,
             ))
     return expired
+
+
+def is_fresh(record: dict[str, Any], now: float | None = None) -> bool:
+    """Whether ``record`` is inside the TTL (an unreadable or future stamp is not)."""
+    return _is_fresh(record, time.time() if now is None else now)
+
+
+def transact(mutate: Callable[[dict[str, dict[str, Any]]], Any], path: Path | None = None) -> Any:
+    """Read, change and write a registry under the cross-process lock in one step.
+
+    ``mutate`` edits the records in place and returns what the caller wants back;
+    the file is rewritten only when something changed. ``path`` names another
+    registry file (parked owned browsers keep theirs next to this one).
+    """
+    path = path or registry_path()
+    with exclusive(path):
+        records = _read(path)
+        before = json.dumps(records, sort_keys=True)
+        result = mutate(records)
+        if json.dumps(records, sort_keys=True) != before:
+            atomic_write_text(path, json.dumps(records, ensure_ascii=False, indent=1))
+    return result
 
 
 def list_records() -> list[dict[str, Any]]:

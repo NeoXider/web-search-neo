@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "web-search-neo"
-version = "1.19.0"
+version = "1.20.0"
 description = "Free API-keyless web search and visible Chrome automation for AI agents over MCP."
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
@@ -33,6 +33,7 @@ Homepage = "https://github.com/NeoXider/web-search-neo"
 packages = [
     "web_search_neo",
     "web_search_neo.actions",
+    "web_search_neo.audit",
     "web_search_neo.cdp",
     "web_search_neo.contract",
     "web_search_neo.fetch",

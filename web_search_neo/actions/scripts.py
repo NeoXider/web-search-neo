@@ -15,6 +15,7 @@ from collections.abc import Callable
 from typing import Any
 
 from web_search_neo.actions import repl
+from web_search_neo.sessions import process_tree
 
 logger = logging.getLogger(__name__)
 MAX_SCRIPT_RESULT_CHARS = 200_000
@@ -463,7 +464,12 @@ def _has_exited(process: Any) -> bool:
 def _kill_tree(pid: int, process: Any) -> str | None:
     """Kill chromedriver and everything it started (Chrome, its renderers, the frozen tab).
 
-    Windows: ``taskkill /T``. POSIX: the descendants are collected first (a killed
+    Windows: the tree is collected first from one process snapshot, keeping only
+    real descendants (a process older than its listed parent sits behind a reused
+    pid and is somebody else's - the owner's Chrome, say), and exactly those pids
+    are given to ``taskkill /F``, deepest first; ``taskkill /T`` would follow the
+    stale parent ids too. Only when no snapshot can be read at all is ``/T`` the
+    fallback. POSIX: the descendants are collected first (a killed
     parent orphans them, and they could no longer be found) - with ``pgrep -P``,
     or from ``/proc`` where there is no pgrep - then every one is killed; a
     process group is not used, because chromedriver shares the server's own group.
@@ -472,9 +478,15 @@ def _kill_tree(pid: int, process: Any) -> str | None:
     problem: str | None = None
     try:
         if os.name == "nt":
-            done = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True,
+            members = process_tree.family(int(pid))
+            targets = [str(member) for member, _stamp in reversed(members)] if members else [str(pid)]
+            command = ["taskkill", "/F"] + [part for target in targets for part in ("/PID", target)]
+            if members is None:
+                command.append("/T")  # no snapshot: nothing to tell children from strangers by
+            done = subprocess.run(command, capture_output=True, text=True,
                                   timeout=15, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            if done.returncode != 0:
+            survivors = [member for member, stamp in members or [] if process_tree.still_running(member, stamp)]
+            if done.returncode != 0 and (survivors or not members):
                 problem = (f"taskkill exited with {done.returncode} for chromedriver {pid}: "
                            f"{(done.stderr or done.stdout or '').strip()[:300]}")
         else:
@@ -580,3 +592,17 @@ def _remove_scoped_profile(profile_dir: str, profile_mode: str = "temporary") ->
             return None
         time.sleep(0.3)
     return profile_dir
+
+
+def kill_process_tree(pid: int) -> str | None:
+    """Kill ``pid`` and every process it started; what could not be done, or None.
+
+    For a browser parked with persist=true that is being retired: the caller has
+    already proven that ``pid`` is still the process it recorded.
+    """
+    return _kill_tree(pid, None)
+
+
+def remove_scoped_profile(profile_dir: str, profile_mode: str = "temporary") -> str | None:
+    """Delete chromedriver's temporary profile (same guards as a forced stop); None when gone."""
+    return _remove_scoped_profile(profile_dir, profile_mode)

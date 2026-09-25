@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from web_search_neo.fetch import sessions as http_sessions
 from web_search_neo.fetch.decoding import decode_response
 from web_search_neo.fetch.safety import redact_url, write_download
 from web_search_neo.web_client import clamp_timeout, request, validate_http_url
@@ -25,6 +26,10 @@ def http_request(
     max_chars: int = 20_000,
     save_to: str | None = None,
     overwrite: bool = False,
+    http_session: str | None = None,
+    agent_label: str | None = None,
+    http_session_clear: bool = False,
+    show_values: bool = False,
     *,
     request_client: Any | None = None,
 ) -> dict[str, Any]:
@@ -36,8 +41,12 @@ def http_request(
     status, while transport failures (DNS, timeout) raise like fetch_text.
     ``save_to`` is confined to the download directory (see fetch.safety) and
     refuses to replace an existing file unless ``overwrite`` is true.
-    No cookies carry over between calls: send a Cookie header yourself; every
-    Set-Cookie of the response is listed in ``set_cookies``.
+    No cookies carry over between calls unless ``http_session`` names a jar
+    (see fetch.sessions): kept per ``(agent_label, name)``, sent on the request,
+    fed by every Set-Cookie of the response and its redirect hops, and reported
+    as ``http_session`` - names and flags, values only with ``show_values``.
+    ``http_session_clear`` empties that jar before this request is sent.
+    Every Set-Cookie of the final response is listed in ``set_cookies``.
     """
     normalized_method = "GET" if method is None else str(method).strip().upper()
     if normalized_method not in _METHODS:
@@ -61,6 +70,17 @@ def http_request(
         if not any(str(name).lower() == "content-type" for name in sent):
             extra["headers"] = {**sent, "Content-Type": "application/json"}
     normalized_url = validate_http_url(url)
+    session_jar = session_info = None
+    if http_session is not None or http_session_clear:
+        if http_session is None:
+            raise ValueError("http_session_clear needs http_session: the name of the jar to empty")
+        if any(str(name).lower() == "cookie" for name in extra.get("headers", {})):
+            raise ValueError("A Cookie header replaces the http_session jar; send one or the other")
+        session_jar, session_info = http_sessions.open_jar(
+            http_session, agent_label, clear=bool(http_session_clear)
+        )
+        extra["cookie_jar"] = session_jar
+    before = list(session_jar) if session_jar is not None else []
     log.info("HTTP %s %s", normalized_method, redact_url(normalized_url))
     byte_budget = min(max(1_000_000, int(max_chars) * 8), 10_000_000)
     client = request if request_client is None else request_client
@@ -84,10 +104,16 @@ def http_request(
     resp_headers = dict(getattr(response, "headers", None) or {})
     # requests folds repeated Set-Cookie headers into one ", "-joined string,
     # which the commas inside Expires make unparseable: keep them apart too.
-    raw_headers = getattr(getattr(response, "raw", None), "headers", None)
-    listed = raw_headers.getlist("Set-Cookie") if hasattr(raw_headers, "getlist") else None
-    set_cookies = [str(item) for item in listed] if isinstance(listed, (list, tuple)) else []
+    set_cookies = http_sessions.set_cookie_values(response)
+    if session_jar is not None:
+        session_field = {"http_session": http_sessions.report(
+            session_info, session_jar, before, response, bool(show_values))}
+        if not show_values:
+            http_sessions.redact_headers(resp_headers, set_cookies)
+    else:
+        session_field = {}
     cookie_field = {"set_cookies": set_cookies} if set_cookies else {}
+    cookie_field.update(session_field)
     text_value, _charset = decode_response(response)
     raw = getattr(response, "content", None)
     if isinstance(raw, (bytes, bytearray)):

@@ -39,3 +39,16 @@ def get_current_time_and_region() -> dict:
         "second": now.second,
         "region": region_str
     }
+
+
+def stamp_now(payload):
+    """Attach the current local time to a web_info result (dicts only).
+
+    Every web_info answer carries the current local date/time and UTC-offset
+    region string under the top-level ``now`` key, so a model never needs a
+    separate time call. Non-dict payloads (e.g. screenshot images) pass through.
+    """
+    if isinstance(payload, dict):
+        payload = dict(payload)
+        payload["now"] = get_current_time_and_region()
+    return payload

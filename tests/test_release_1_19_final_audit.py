@@ -188,10 +188,31 @@ def test_windows_taskkill_failure_is_a_problem_and_cleanup_still_runs(monkeypatc
 
 
 def test_windows_taskkill_exit_code_is_reported(monkeypatch):
+    from web_search_neo.sessions import process_tree
     monkeypatch.setattr(script_guard.os, "name", "nt")
+    monkeypatch.setattr(process_tree, "family", lambda pid: [(777, "win:1")])
+    monkeypatch.setattr(process_tree, "still_running", lambda pid, stamp: True)  # taskkill did not stop it
     monkeypatch.setattr(script_guard.subprocess, "run", lambda args, **k: subprocess.CompletedProcess(
         args, 128, stdout="", stderr="ERROR: The process \"777\" not found."))
     assert "taskkill exited with 128" in script_guard._kill_tree(777, _Process(777))
+
+
+def test_windows_kill_names_only_real_descendants(monkeypatch):
+    """A process older than its listed parent sits behind a reused pid: it is not killed."""
+    from web_search_neo.sessions import process_tree
+    table = {100: (1, "chromedriver.exe"), 200: (100, "chrome.exe"), 300: (200, "chrome.exe"),
+             999: (100, "chrome.exe")}  # 999: the owner's Chrome, whose dead parent's pid 100 was reused
+    stamps = {100: "win:500", 200: "win:600", 300: "win:700", 999: "win:10"}
+    monkeypatch.setattr(process_tree, "windows_table", lambda: table)
+    monkeypatch.setattr(process_tree, "started_at", lambda pid: stamps.get(pid))
+    monkeypatch.setattr(process_tree.sys, "platform", "win32")
+    monkeypatch.setattr(script_guard.os, "name", "nt")
+    sent = []
+    monkeypatch.setattr(script_guard.subprocess, "run",
+                        lambda args, **k: sent.append(args) or subprocess.CompletedProcess(args, 0, "", ""))
+    assert script_guard._kill_tree(100, _Process(100)) is None
+    assert sent == [["taskkill", "/F", "/PID", "300", "/PID", "200", "/PID", "100"]]
+    assert "/T" not in sent[0] and "999" not in sent[0]
 
 
 def test_an_exited_chromedriver_is_not_killed_only_its_profile_removed(monkeypatch, tmp_path):

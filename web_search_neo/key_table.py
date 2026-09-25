@@ -155,7 +155,7 @@ def resolve_key(raw: str, *, shifted: bool = False) -> tuple[str, str, int, int]
     reported the way a real browser reports it: ``key='w'`` with ``code='KeyW'``
     when Shift is up, ``key='W'`` when it is down.
     """
-    special = _SPECIAL_KEYS.get(raw)
+    special = _SPECIAL_KEYS.get(raw) or LOCK_KEYS.get(raw)
     if special is not None:
         return special
     if len(raw) != 1:
@@ -212,12 +212,57 @@ DOM_KEY_NAMES = {
     **{f"NUMPAD{digit}": f"NUMPAD{digit}" for digit in range(10)},
 }
 
-# Keys a real keyboard has and WebDriver cannot send; named in the refusal.
-UNSENDABLE_KEYS = {
-    "CAPSLOCK": "CapsLock has no WebDriver or CDP key event that toggles it; send Shift+<letter> for capitals",
-    "NUMLOCK": "NumLock cannot be toggled through WebDriver; the NUMPAD0-9 names always send digits",
-    "SCROLLLOCK": "ScrollLock cannot be sent through WebDriver",
+# The lock keys, sent only as CDP key events: WebDriver has no code point for them.
+# Chrome keeps no lock state for synthetic input, so the session tracks it (actions/lock_keys).
+LOCK_KEYS: dict[str, tuple[str, str, int, int]] = {
+    "CapsLock": ("CapsLock", "CapsLock", 20, 0),
+    "NumLock": ("NumLock", "NumLock", 144, 0),
+    "ScrollLock": ("ScrollLock", "ScrollLock", 145, 0),
 }
+_LOCK_NAMES = {name.upper(): name for name in LOCK_KEYS}
+
+# The refusal for a driver with no CDP to send a lock key through.
+UNSENDABLE_KEYS = {
+    "CAPSLOCK": "CapsLock is sent as a CDP key event and this driver has no CDP; send Shift+<letter> for capitals",
+    "NUMLOCK": "NumLock is sent as a CDP key event and this driver has no CDP; the NUMPAD0-9 names always send digits",
+    "SCROLLLOCK": "ScrollLock is sent as a CDP key event and this driver has no CDP",
+}
+
+
+def lock_key(name: str) -> str | None:
+    """``caps_lock``/``CAPSLOCK``/``Caps Lock`` -> ``CapsLock``; None for any other key."""
+    compact = str(name).replace("-", "").replace("_", "").replace(" ", "").upper()
+    return _LOCK_NAMES.get(compact)
+
+
+def cdp_key_event(event: dict, modifiers: int) -> tuple[dict, int]:
+    """CDP ``Input.dispatchKeyEvent`` params for one down/up event, and the modifier mask after it.
+
+    An event marked ``caps`` (CapsLock on) reports a letter with its case flipped
+    against Shift, as a keyboard with CapsLock on does; ``code`` and keyCode stay.
+    """
+    shifted = bool(modifiers & MODIFIER_BITS["Shift"]) != bool(event.get("caps"))
+    key, code, key_code, location = resolve_key(str(event["key"]), shifted=shifted)
+    down = event["type"] == "down"
+    bit = MODIFIER_BITS.get(key, 0)
+    if down:
+        modifiers |= bit
+    params = {
+        "type": "keyDown" if down else "keyUp",
+        "key": key,
+        "code": code,
+        "windowsVirtualKeyCode": key_code,
+        "nativeVirtualKeyCode": key_code,
+        "modifiers": modifiers,
+        "location": location,
+        "autoRepeat": bool(event.get("repeat", False)),
+    }
+    text = key_text(key)  # a printable key, or Enter's CR (keypress, insertLineBreak)
+    if down and text and not (modifiers & 3):  # never on Ctrl/Alt chords
+        params.update(text=text, unmodifiedText=text)
+    if not down:
+        modifiers &= ~bit
+    return params, modifiers
 
 
 def dom_key_name(name: str) -> str | None:

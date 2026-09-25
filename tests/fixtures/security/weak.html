@@ -1,0 +1,17 @@
+<!doctype html>
+<html><head><title>Weak fixture</title>
+<script>window.inlineRan = true;</script>
+<script src="{third_party}/fixtures/security/widget.js"></script>
+<link rel="stylesheet" href="{third_party}/fixtures/security/widget.css">
+</head><body>
+<h1>Sign in</h1>
+<form id="login" action="/login" method="get">
+  <input name="user" autocomplete="username">
+  <input name="password" type="password" autocomplete="off">
+  <button type="submit" onclick="window.clicked = true">Sign in</button>
+</form>
+<a id="partner" href="{third_party}/partner" target="_blank">Partner</a>
+<a id="own" href="/about" target="_blank">About</a>
+<iframe src="{third_party}/fixtures/security/frame.html" title="widget"></iframe>
+<script>document.cookie = "tracker=1; path=/";</script>
+</body></html>

@@ -3732,6 +3732,8 @@ OWNED_BROWSER_ONLY_CDP_METHODS = {
     "Browser.grantPermissions": "sessions/context.py: context overrides are refused on current/attach",
     "Browser.setDownloadBehavior": "page_guards.setup_owned: downloads rerouted only in owned browsers",
     "Page.setDownloadBehavior": "page_guards.setup_owned: the fallback of the line above",
+    "Target.getTargets": ("sessions/windows.py: window handles of server-launched Selenium browsers only; "
+                          "tab_actions gates every call on windows.uses_windows (never the companion)"),
 }
 
 # Every DevTools domain, so a method of a domain nobody expected is still seen.

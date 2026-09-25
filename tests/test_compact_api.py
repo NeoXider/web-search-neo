@@ -325,7 +325,7 @@ def test_compact_web_info_discovers_one_action_at_a_time():
 
     open_schema = asyncio.run(main.web_info("action_schema", {"action": "open"}))
     assert open_schema["input_schema"]["properties"]["headless"]["default"] is None
-    # 1.19: omitted keeps an existing session's mode; a new session still opens in current.
+    # Omitted keeps an existing session's mode; since 1.20 a new session opens isolated.
     profile_mode = open_schema["input_schema"]["properties"]["profile_mode"]
     assert profile_mode["default"] is None and "current" in profile_mode["description"]
     assert open_schema["input_schema"]["properties"]["tab_group"]["default"] == "🟢 AI"
@@ -334,7 +334,7 @@ def test_compact_web_info_discovers_one_action_at_a_time():
         main.web_info("action_schema", {"action": "open_many"})
     )
     assert open_many_schema["input_schema"]["properties"]["headless"]["default"] is None
-    assert open_many_schema["input_schema"]["properties"]["profile_mode"]["default"] == "current"
+    assert open_many_schema["input_schema"]["properties"]["profile_mode"]["default"] == "isolated"  # 1.20
     assert open_many_schema["input_schema"]["properties"]["tab_group"]["default"] == "🟢 AI"
 
     setup_schema = asyncio.run(

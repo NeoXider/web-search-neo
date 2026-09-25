@@ -8,16 +8,16 @@ _INFO_TOPICS = {
     "action_schema": "Full JSON Schema for one action or topic; pass params.action.",
     "page_outline": "Roles, names, states, refs, and boxes - start looking here.",
     "page_text": "Readable text of the rendered page; params.mode=main|full.",
-    "element_text": "One element's whole content: params.selector, params.mode=text|html|outer|both, params.full_text for unclipped text.",
+    "element_text": "One element's content: params.selector, params.mode=text|html|outer|both.",
     "find": "Find an element by meaning: params.query='submit request'.",
-    "page_elements": "Links, forms, fields, buttons by selector: CSS, '#host >>> #leaf' in a shadow root or frame, or '' when none is unique.",
+    "page_elements": "Links, forms, fields, buttons with selectors (CSS or '#host >>> #leaf'; '' when none is unique).",
     "console": "console.log/warn/error and uncaught errors; params.levels, params.contains.",
-    "network": "HTTP requests with status, type, ms, size; params.only_errors=true.",
+    "network": "HTTP requests with status, type, ms, size; params.only_errors, third_party_only.",
     "network_body": "One response body; params.request_id is the id from a network read with output='json'.",
     "execute_js": "Run page JavaScript (async body) and read its value.",
     "screenshot": "PNG viewport, full-page, or exact page-region image.",
     "game_probe": "Canvas/WebGL surfaces, FPS, frame_health (throttling), focus, console, held input.",
-    "browser_status": "Chrome availability, one session's state, and every session: owner, tab, last page, idle, busy, cap.",
+    "browser_status": "Chrome availability and every session: owner, tab, last page, idle, busy, cap.",
     "browser_tabs": "Tabs open in the user's Chrome, with ids and groups.",
     "search_status": "Search providers, live availability, latency, cooldowns.",
 }
@@ -153,6 +153,7 @@ _ACTION_NOTES = {
         "strict": "Clicks only when exactly one visible interactive candidate matches. Zero or multiple matches are refused with samples; narrow using role or selector.",
         "matching": "exact=true compares whitespace-normalized rendered text. exact=false is substring matching and should normally be paired with role.",
         "selector": "Optional CSS candidate filter, not the click target. Omit it to search buttons, links, labels, options, checkboxes, radios, tabs, and menu items.",
+        "reach": "The search covers open shadow roots and same-origin frames; frame/shadow_path in the answer say where the match was. Cross-origin frames cannot be read by a page script: they are counted (cross_origin_frames, frames_note); pass frame_selector naming one to match inside it.",
         "background": "hit_test_unavailable=true can occur in an unpainted background tab; the unique DOM target is still clicked and must be verified from fresh state.",
         "frame_selector": _FRAME_CSS,
     },
@@ -190,6 +191,28 @@ _ACTION_NOTES = {
     },
     "network": {
         "id": "The default output='text' carries no ids. Pass output='json' and hand that row's id to network_body as request_id.",
+        "third_party_only": "Keeps requests to other registrable domains than the page's (cdn.example.com is the same site as www.example.com); the answer names first_party_site and third_party_sites.",
+    },
+    "security_report": {
+        "scope": "Passive and bounded to the hosts you name. scope='page' (default) checks url plus your paths (<= 50 routes, GET); 'site' crawls links and the sitemap of the scope hosts (max_pages 10, <= 50; max_depth 2; delay_ms 500; robots.txt unless respect_robots=false); 'hosts' checks each named origin (<= 10: example.com, localhost:3000, http://127.0.0.1:8080), a section each. include_subdomains widens each domain. Wildcards, public suffixes, bare LAN words, paths and credentials in hosts are refused before any request; a host without a port covers ports 80/443 only. Redirects, links and sitemap entries outside the scope are named (not_crawled, redirect-out-of-scope), never requested. requests_made lists every request (redacted, budget 200): pages, http://host/ (redirect check), the https read for HSTS, security.txt, robots.txt, sitemap.xml, one TLS handshake per https host. No path guessing, port scanning, Origin probing or fuzzing. browser_requests summarises the page load in the isolated browser (scope='page' only; browser=false reads the served HTML).",
+        "checks": "headers (CSP directives, HSTS, X-Content-Type-Options, Referrer-Policy, Permissions-Policy, X-Frame-Options, COOP/COEP/CORP, Server/X-Powered-By versions), cookies (Secure, HttpOnly, SameSite, __Host-/__Secure-, wide Domain; values never reported), transport (https, http->https redirect, certificate issuer/expiry), CORS on the page response (no Origin sent), page (third-party scripts and SRI, mixed content, forms, password autocomplete, target=_blank without noopener, inline code under a strict CSP), security.txt, robots.txt.",
+        "grade": "Mozilla HTTP Observatory v1.7.1's tests and modifiers, reimplemented (one result per test, the worst): CSP, cookies, redirection, Referrer-Policy, HSTS, SRI, X-Content-Type-Options, X-Frame-Options, COOP, COEP, Cross-Origin-Resource-Policy; 100 minus penalties, bonuses only from a 90+ base, A+ >= 100 ... F < 25, 165 at most. Only 2xx/3xx/401/403 are graded. Not awarded: the HSTS preload bonus (needs a preload-list lookup) and Observatory's CORS -50 (needs an Origin request), so 160 is the highest here. This report's own penalties (mixed content, insecure forms, CORS as served, broken cookie prefixes) are extra_points and move only extended.score. score_explanation lists every modifier; priority[] orders the fixes. Aggregates (site, hosts, paths) take the weakest page's grade, list sections and dedupe priority with the pages each problem is on.",
+        "local": "localhost, private IPs and .local/.lan/.internal names are graded in local_development mode: https, HSTS, the redirect, the certificate (self-signed is fine), cookie Secure, mixed content and http forms are skip (not applicable in dev); the headline grade covers the rest, as_served keeps the plain numbers and production_forecast predicts the grade over https.",
+        "certificate": "An untrusted certificate: the page is read once more without verification (as Observatory) and graded in full; tls-invalid plus Observatory's -20 for redirection and -20 for HSTS.",
+    },
+    "perf_report": {
+        "source": "The page's own Performance API: navigation timing (TTFB, DOMContentLoaded, load), paint (FCP), buffered largest-contentful-paint and layout-shift observers (LCP, CLS as the largest session window), resource timing (count, transfer, by type, third-party share, renderBlockingStatus).",
+        "lab": "Lab numbers from the automation browser: compare runs of the same page, do not read them as real-visitor field data.",
+        "modes": "url alone: a cold load in a fresh isolated session, closed afterwards unless keep_open. session_id alone: the page open there. Both: that session navigates to url (warm cache).",
+    },
+    "har_export": {
+        "content": "HAR 1.2 from the session's network journal (the newest 500 finished requests plus in-flight ones): method, URL, status, type, timing, transfer size, the security-relevant response headers, post data. Request headers and bodies are not recorded - the file's comment says so; _dropped counts what fell out of the history.",
+        "file": "Written under the download folder (WEB_SEARCH_NEO_DOWNLOAD_DIR); save_to names it, an existing file needs overwrite. HAR files can hold tokens from URLs and post data: treat them as secrets.",
+    },
+    "test_run": {
+        "step": "An ordinary web_action object plus optional step_name and expect, or an expect-only step. Every other key belongs to the action (cookies and macro take a name of their own). session_id is filled in from the run for every action that takes one. The whole plan - every action's arguments against its schema, every expectation - is validated before the first step runs; a test_run cannot run inside another, directly or through a macro.",
+        "expect": "selector (+selector_state), absent, text / no_text (string or list), url_contains, title_contains, script (truthy), no_console_errors, no_failed_requests (since the step began), action_fails (negative test), timeout_seconds per check. Each check runs as a wait, so it waits up to its timeout.",
+        "result": "success, passed/failed/skipped/total, summary_line, failed_steps first, then steps[] with every check's verdict and duration_ms. stop_on_failure=false runs every step; include_data adds each action's short result.",
     },
     "execute_js": {
         "arguments": "params.script is the body of an async function: script='return document.title;' - or the bare one-line expression 'document.title', which returns itself. Top-level await works. Same semantics as run_script.",
@@ -204,16 +227,16 @@ _ACTION_NOTES = {
     },
     "open": {
         "profile_mode": {
-            "current": "the user's signed-in Chrome through the companion extension (default)",
+            "current": "the user's signed-in Chrome through the companion extension (explicit only since 1.20)",
             "auto": "current, falling back to a headless temporary profile",
             "temporary": "clean disposable profile",
-            "isolated": "disposable separate browser profile and storage, with per-session user_agent/timezone/locale/geolocation; does not guarantee an unlinkable hardware or network fingerprint",
+            "isolated": "the default for a new session (1.20): disposable separate headless browser profile and storage, with per-session user_agent/timezone/locale/geolocation; does not guarantee an unlinkable hardware or network fingerprint",
             "persistent": "durable server-owned profile, keeps logins",
             "attach": "a Chrome you started with a DevTools port",
         },
         "headless": "temporary/persistent default headless; headless=false explicitly opens a visible window. attach preserves the launcher's window mode when omitted. headless=true is refused with current and makes auto resolve straight to temporary.",
         "claimed_tab": "open on a session claimed by attach_tab does not navigate the user's tab: it takes a new one and reports the released id as left_claimed_tab.",
-        "persist": "persist=true (current Chrome only, explicit session_id, never 'default'; only for tabs the server opens) keeps the tab open when this MCP client process exits: it is detached and recorded. A later client continues it only explicitly, with web_action reattach {session_id} (or open with persist=true and the same session_id); nothing picks it up implicitly. Re-attaching is refused - the record dropped, the tab left alone - unless it is provably the same tab: the same Chrome run, still in the agent tab group, still on the recorded origin, not driven by another client; a server tab that only shows another site now is named in left_open_tab. A live session keeps its record fresh while used and is never touched by expiry. An explicit close closes a parked server tab (retired_parked); records expire after WEB_SEARCH_NEO_PARKED_SESSION_TTL (default 24 h, minimum 60 s) and their tabs are closed the same way. browser_status lists parked_sessions.",
+        "persist": "persist=true (explicit session_id, never 'default'; a new session must name profile_mode current or isolated/temporary, an open or parked one keeps its own) with profile_mode temporary/isolated parks the whole browser the server launched: at exit it is recorded instead of quit, a later server continues it with reattach or open+persist, and a watchdog retires it when WEB_SEARCH_NEO_PARKED_SESSION_TTL runs out or its server died unparked; persist_warning says when the MCP client's job object will end it anyway; persistent/attach are never parked. In current Chrome (only for tabs the server opens) it keeps the tab open when this MCP client process exits: it is detached and recorded. A later client continues it only explicitly, with web_action reattach {session_id} (or open with persist=true and the same session_id); nothing picks it up implicitly. Re-attaching is refused - the record dropped, the tab left alone - unless it is provably the same tab: the same Chrome run, still in the agent tab group, still on the recorded origin, not driven by another client; a server tab that only shows another site now is named in left_open_tab. A live session keeps its record fresh while used and is never touched by expiry. An explicit close closes a parked server tab (retired_parked); records expire after WEB_SEARCH_NEO_PARKED_SESSION_TTL (default 24 h, minimum 60 s) and their tabs are closed the same way. browser_status lists parked_sessions.",
         "tab_followed": "If Chrome itself replaces the session's tab (chrome.tabs.onReplaced: a prerendered/instant navigation, a restored discarded tab), the companion redirects commands to the new tab and the session moves to it (tab_followed in the next answer), keeping its ownership - it is the same page. If the new tab is driven by another session or agent, the session is dropped instead. Only that record is followed: a tab the lost one opened (a popup, a payment window) or a tab on the same URL never is. Read-only topics and wait/screenshot are repeated once; every other step fails with SessionTabFollowed - read the page before re-issuing it. A tab that is really gone still drops the session with the exact open call to redo.",
     },
     "show": {
@@ -374,6 +397,7 @@ _ACTION_NOTES = {
         "save_to": "Writes raw bytes to a path inside WEB_SEARCH_NEO_DOWNLOAD_DIR (default ./downloads; relative paths resolve there, escapes are refused); an existing file needs overwrite=true. The answer carries saved_to and size_bytes instead of body.",
         "network": "Explicit localhost/private URLs are allowed; cloud metadata and link-local hosts are always refused, as is a redirect from a public host to a private one. A cross-origin redirect keeps only non-credential headers (Accept*, User-Agent, Content-Type...).",
         "response": "Always {success, url, status, headers, body/size}: 4xx/5xx return success True with their status and the server's error body, not an error. fetch_text is GET-only and returns str; replay_request re-sends inside the page with cookies/CORS, this one never touches a browser.",
+        "http_session": "Opt-in cookie jar: http_session='login' keeps cookies per (agent_label, name) in this server process (idle TTL WEB_SEARCH_NEO_HTTP_SESSION_TTL, default 1800 s; 32 jars, least recently used dropped). Cookies match by domain/path/secure/expiry, redirect hops feed the jar and a cross-origin hop still strips credentials. The answer's http_session block lists sent_cookies/received_cookies per hop with flags; values only with show_values=true (Set-Cookie values are redacted otherwise). A Cookie header and http_session are mutually exclusive; http_session_clear empties the jar first.",
     },
 }
 
@@ -385,7 +409,8 @@ _SERVER_INSTRUCTIONS = (
         "after validation failure fix the call from that schema, never guess aliases. "
         "execute_js takes script (an async function body: return a value, or send a one-line expression), not code; "
         "fill takes fields={CSS_selector: value}. Give each task/agent a unique session_id "
-        "and agent_label on open; reuse only that task's session. Never close or take over "
+        "and agent_label on open; reuse only that task's session. A new session opens isolated "
+        "(profile_mode='current', the user's own Chrome, only when asked). Never close or take over "
         "another agent's tab. After a zero-match click inspect fresh page_elements/find "
         "and frame context before retrying; React portals alone do not explain missing text. In step render "
         "mode an input action applies all mixed keyboard and pointer changes before "

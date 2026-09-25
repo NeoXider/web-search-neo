@@ -39,7 +39,7 @@ from web_search_neo.bridge_daemon import (
     TOKEN_MISMATCH_REASON,
     close_quietly,
 )
-from web_search_neo.key_table import MODIFIER_BITS, key_text, resolve_key
+from web_search_neo.key_table import cdp_key_event
 from web_search_neo.process_probe import popen_detached
 
 
@@ -1593,7 +1593,7 @@ class ChromeBridgeDriver:
         if self._same_origin_frame_selector:
             selector = json.dumps(self._same_origin_frame_selector)
             frame_prefix = (
-                f"const __frame=document.querySelector({selector});"
+                f"const __frame=globalThis.document.querySelector({selector});"
                 "if(!__frame||!__frame.contentWindow) throw new Error('Frame is unavailable');"
                 "const window=__frame.contentWindow, document=window.document, "
                 "performance=window.performance, requestAnimationFrame=window.requestAnimationFrame.bind(window), "
@@ -1753,28 +1753,8 @@ class ChromeBridgeDriver:
             if event["type"] == "pause":
                 time.sleep(max(0.0, float(event.get("seconds", 0.0))))
                 continue
-            shifted = bool(modifiers & MODIFIER_BITS["Shift"])
-            key, code, key_code, location = resolve_key(str(event["key"]), shifted=shifted)
-            event_type = "keyDown" if event["type"] == "down" else "keyUp"
-            bit = MODIFIER_BITS.get(key, 0)
-            if event_type == "keyDown":
-                modifiers |= bit
-            params = {
-                "type": event_type,
-                "key": key,
-                "code": code,
-                "windowsVirtualKeyCode": key_code,
-                "nativeVirtualKeyCode": key_code,
-                "modifiers": modifiers,
-                "location": location,
-                "autoRepeat": bool(event.get("repeat", False)),
-            }
-            text = key_text(key)  # a printable key, or Enter's CR (keypress, insertLineBreak)
-            if event_type == "keyDown" and text and not (modifiers & 3):  # never on Ctrl/Alt chords
-                params.update(text=text, unmodifiedText=text)
+            params, modifiers = cdp_key_event(event, modifiers)
             self.execute_cdp_cmd("Input.dispatchKeyEvent", params)
-            if event_type == "keyUp":
-                modifiers &= ~bit
         self._modifier_mask = modifiers
 
     def get_screenshot_as_png(self) -> bytes:

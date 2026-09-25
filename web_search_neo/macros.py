@@ -199,7 +199,7 @@ def macro_root(
             except ValueError:
                 raise ValueError("project macro storage escapes project_root; refusing it") from None
         elif create:
-            container.mkdir()
+            container.mkdir(exist_ok=True)  # a concurrent creator may win; the root check below still holds
         root = container / "macros"
         if root.exists():
             try:

@@ -6,7 +6,6 @@ import functools
 import json
 import os
 import sys
-import time
 from typing import Any, Literal
 from mcp.server.fastmcp import FastMCP, Image
 from pydantic import ValidationError
@@ -15,7 +14,7 @@ from web_search_neo.contract.notes import _SERVER_INSTRUCTIONS, _ARGUMENT_RECOVE
 from web_search_neo.contract.param_docs import annotate as annotate_params
 from web_search_neo import bridge_daemon
 from web_search_neo import browser_tools
-from web_search_neo import chrome_bridge, extra_actions
+from web_search_neo import chrome_bridge, extra_actions, persist_actions, tab_actions
 from web_search_neo import macros
 from web_search_neo import msp_date_time
 from web_search_neo import msp_search
@@ -26,9 +25,10 @@ from web_search_neo.mcp_compat import ReportingFastMCP, registered_tool
 from web_search_neo.web_client import clamp_timeout, request
 from web_search_neo.fetch import api as fetch_api
 from web_search_neo.fetch import content as fetch_content
+from web_search_neo import dispatch
 
 
-__version__ = "1.19.0"
+__version__ = "1.20.0"
 
 log = configure_server_log()  # per-user state dir; see log_setup.py
 
@@ -151,24 +151,20 @@ async def http_request(
     max_chars: int = 20_000,
     save_to: str | None = None,
     overwrite: bool = False,
+    http_session: str | None = None,
+    agent_label: str | None = None,
+    http_session_clear: bool = False,
+    show_values: bool = False,
 ) -> dict[str, Any]:
     """Send any HTTP request without a browser; 4xx/5xx return status and body, not errors.
 
     save_to is confined to WEB_SEARCH_NEO_DOWNLOAD_DIR (default ./downloads) and
     needs overwrite=true to replace a file; timeout_seconds is capped at 120.
+    http_session keeps cookies across calls in a jar per (agent_label, name).
     """
     return await asyncio.to_thread(
-        fetch_api.http_request,
-        url,
-        method,
-        headers,
-        query,
-        body,
-        body_json,
-        timeout_seconds,
-        max_chars,
-        save_to,
-        overwrite,
+        fetch_api.http_request, url, method, headers, query, body, body_json, timeout_seconds,
+        max_chars, save_to, overwrite, http_session, agent_label, http_session_clear, show_values,
     )
 
 
@@ -396,25 +392,28 @@ async def browser_open_page(
     geolocation: dict[str, Any] | None = None,
     persist: bool = False,
 ) -> dict[str, Any]:
-    """Open in the current Chrome's agent tab group by default; auto falls back to Selenium.
+    """Open a URL; a new session defaults to an isolated headless browser (1.20).
 
-    Without profile_mode an existing session keeps its own mode (and profile).
+    Without profile_mode an existing session keeps its own mode; 'current' is explicit.
 
     profile_mode='isolated' opens a disposable separate browser profile;
     user_agent/timezone/locale/geolocation override per session
     (owned browsers only, refused on current/attach). persist=true keeps the tab
-    open after this MCP client exits so a later client continues by session_id.
+    (current) or the whole browser (temporary/isolated) open after this MCP server
+    exits, so a later one continues it by session_id (reattach, or open with persist=true).
     """
     return await asyncio.to_thread(
         functools.partial(
-            browser_tools.open_page,
+            persist_actions.open_page,
             url,
             session_id=session_id,
             width=width,
             height=height,
             timeout_seconds=timeout_seconds,
             headless=headless,
-            **extra_actions.inherited_open_options(session_id, profile_mode, profile_id, debugger_address),
+            **extra_actions.inherited_open_options(
+                session_id, profile_mode, profile_id, debugger_address, current_tab_id, persist,
+            ),
             current_tab_id=current_tab_id,
             tab_group=tab_group,
             agent_label=agent_label,
@@ -467,11 +466,11 @@ async def browser_open_pages(
     headless: bool | None = None,
     profile_mode: Literal[
         "auto", "current", "temporary", "isolated", "persistent", "attach"
-    ] = "current",
+    ] = "isolated",
     tab_group: str = chrome_bridge.DEFAULT_TAB_GROUP,
     label_tab: bool = True,
 ) -> dict[str, Any]:
-    """Open up to four pages, using the current Chrome's agent tab group by default."""
+    """Open several pages, each in its own isolated browser by default (current is explicit)."""
     cap = browser_tools.max_sessions()
     if not urls or len(urls) > cap:
         raise ValueError(f"Provide 1-{cap} URLs")
@@ -563,7 +562,7 @@ async def browser_attach_tab(
 @mcp.tool()
 async def browser_reattach(session_id: str) -> dict[str, Any]:
     """Continue a persist=true session an earlier MCP client left parked, by session_id."""
-    return await asyncio.to_thread(browser_tools.reattach_session, session_id)
+    return await asyncio.to_thread(persist_actions.reattach, session_id)
 
 
 @mcp.tool()
@@ -722,12 +721,13 @@ async def browser_network(
     limit: int = 50,
     output: Literal["text", "json"] = "text",
     include_pending: bool = True,
+    third_party_only: bool = False,
 ) -> dict[str, Any]:
-    """HTTP requests with status, type, ms, size; unfinished ones too (done=false)."""
+    """HTTP requests with status, type, ms, size; unfinished ones too (done=false); third_party_only keeps other sites'."""
     return await asyncio.to_thread(functools.partial(
         browser_tools.get_network, session_id=session_id, url_pattern=url_pattern, types=types,
         status_min=status_min, status_max=status_max, only_errors=only_errors, limit=limit,
-        output=output, include_pending=include_pending,
+        output=output, include_pending=include_pending, third_party_only=third_party_only,
     ))
 
 
@@ -846,6 +846,7 @@ async def browser_click(
     x: float | None = None,
     y: float | None = None,
     selector_must_be_unique: bool = False,
+    follow_new_tab: bool = False,
 ) -> dict[str, Any]:
     """Click one thing: a button/element, text, or a viewport point.
 
@@ -856,8 +857,9 @@ async def browser_click(
     point in CSS pixels. ``trusted=true`` dispatches a real trusted mouse
     sequence for the selector form. ``selector_must_be_unique=true`` accepts
     plain CSS only and refuses zero or multiple matches immediately before click.
+    A tab or popup the click opened is listed in ``new_tabs``; ``follow_new_tab=true`` moves the session to it.
     """
-    return await asyncio.to_thread(
+    return await tab_actions.observed(session_id, follow_new_tab, asyncio.to_thread(
         functools.partial(
             browser_tools.click,
             selector,
@@ -872,7 +874,7 @@ async def browser_click(
             y=y,
             selector_must_be_unique=selector_must_be_unique,
         )
-    )
+    ))
 
 
 @mcp.tool()
@@ -900,7 +902,7 @@ async def browser_run_script(
     a thrown exception may follow an already completed mutation. With await_promise=true pass timeout_seconds (capped at 600) when the promise may outlive the ~15 s default - e.g. while a human solves a captcha or a long network round-trip completes.
     frame_selector runs the script inside one frame (same- or cross-origin); without it the script runs in the top document and cannot see cross-origin frames.
     """
-    return await asyncio.to_thread(
+    return await tab_actions.observed(session_id, False, asyncio.to_thread(
         functools.partial(
             browser_tools.execute_js,
             script,
@@ -913,7 +915,7 @@ async def browser_run_script(
             retry_delay_ms=retry_delay_ms, wait_ready=wait_ready, timeout_seconds=timeout_seconds,
             frame_selector=frame_selector, report_frames=True, max_chars=max_chars, offset=offset, save_to=save_to,
         )
-    )
+    ))
 
 
 @mcp.tool()
@@ -940,9 +942,10 @@ async def browser_click_text(
     selector: str | None = None,
     wait_seconds: float = 0.5,
     frame_selector: str | None = None,
+    follow_new_tab: bool = False,
 ) -> dict[str, Any]:
     """Click one visible interactive element by rendered text and optional role."""
-    return await asyncio.to_thread(
+    return await tab_actions.observed(session_id, follow_new_tab, asyncio.to_thread(
         browser_tools.click_text,
         text,
         session_id,
@@ -951,7 +954,7 @@ async def browser_click_text(
         selector,
         wait_seconds,
         frame_selector,
-    )
+    ))
 
 
 @mcp.tool()
@@ -1034,11 +1037,11 @@ async def browser_pointer(
     """
     if coordinate_space == "image":
         x, y, end_x, end_y = await asyncio.to_thread(extra_actions.image_to_viewport, session_id, x, y, end_x, end_y, frame_selector)
-    return await asyncio.to_thread(functools.partial(
+    return await tab_actions.observed(session_id, False, asyncio.to_thread(functools.partial(
         browser_tools.pointer_action, pointer_action, x, y, session_id=session_id, end_x=end_x,
         end_y=end_y, button=button, duration_seconds=duration_seconds, frame_selector=frame_selector,
         wait_seconds=wait_seconds, coordinate_mode=coordinate_mode, delta_x=delta_x, delta_y=delta_y,
-        include_summary=include_summary))
+        include_summary=include_summary)))
 
 
 @mcp.tool()
@@ -1269,14 +1272,14 @@ async def browser_submit_form(
     frame_selector: str | None = None,
 ) -> dict[str, Any]:
     """Submit a rendered form, preserving browser validation and submit events."""
-    return await asyncio.to_thread(
+    return await tab_actions.observed(session_id, False, asyncio.to_thread(
         browser_tools.submit_form,
         form_selector,
         session_id,
         submit_selector,
         wait_seconds,
         frame_selector,
-    )
+    ))
 
 
 @mcp.tool()
@@ -1376,7 +1379,7 @@ async def browser_show(session_id: str = "default") -> dict[str, Any]:
 @mcp.tool()
 async def browser_get_status(session_id: str = "default") -> dict[str, Any]:
     """Check Chrome support and whether a named browser session is open."""
-    return await asyncio.to_thread(browser_tools.get_status, session_id)
+    return await asyncio.to_thread(persist_actions.get_status, session_id)
 
 
 @mcp.tool()
@@ -1391,7 +1394,7 @@ async def browser_close(
     for the tab itself to go - the capability was already in browser_tools and
     simply had no route out through the action.
     """
-    return await asyncio.to_thread(browser_tools.close_session, session_id, close_tab)
+    return await asyncio.to_thread(persist_actions.close_session, session_id, close_tab)
 
 
 @mcp.tool()
@@ -1406,7 +1409,7 @@ async def browser_close_all(
     idle_for_seconds closes only sessions untouched that long (orphan release).
     """
     return await asyncio.to_thread(
-        browser_tools.close_all_sessions, agent_label, scope, include_foreign, idle_for_seconds
+        persist_actions.close_all_sessions, agent_label, scope, include_foreign, idle_for_seconds
     )
 
 
@@ -2041,7 +2044,7 @@ def get_current_time_and_region() -> dict:
 
 # Keep the narrow Python wrappers above for compatibility and direct testing, but expose
 # only a compact self-documenting MCP surface to models.
-extra_actions.register(mcp)  # dialogs, downloads, navigate
+extra_actions.register(mcp, sys.modules[__name__])  # dialogs, downloads, navigate, audit
 legacy_mcp = mcp
 mcp = ReportingFastMCP(  # failed web_action batches come back with isError=true
     "Web Search Neo",
@@ -2094,13 +2097,13 @@ _ACTIONS: dict[str, ActionSpec] = {
             "setup_current_chrome",
             browser_setup_current_chrome,
             "session",
-            "Publish the bridge secret and return the manual steps Chrome still requires.",
+            "Publish the bridge secret; return the manual steps Chrome needs.",
         ),
         _action(
             "show",
             browser_show,
             "session",
-            "Explicitly bring one session to the foreground; this may interrupt the user.",
+            "Bring one session to the foreground; this may interrupt the user.",
         ),
         _action(
             "context",
@@ -2113,7 +2116,7 @@ _ACTIONS: dict[str, ActionSpec] = {
             "wait_challenge",
             browser_wait_for_challenge,
             "page",
-            "Hand the visible browser to the user so they can solve a challenge.",
+            "Hand the visible browser to the user to solve a challenge.",
         ),
         _action("fill", browser_fill_fields, "page", "Set values on form fields by CSS selector."),
         _action("upload", browser_upload_file, "page", "Attach local files to a file input."),
@@ -2122,9 +2125,9 @@ _ACTIONS: dict[str, ActionSpec] = {
             "run_script",
             browser_run_script,
             "page",
-            "Execute a JavaScript snippet in a session's page and return its value.",
+            "Run JavaScript in a session's page and return its value.",
         ),
-        _action("type_text", browser_type_text, "page", "Type text into the focused control or a CSS target via CDP insert-text."),
+        _action("type_text", browser_type_text, "page", "Type text into the focused control or a CSS target."),
         _action(
             "click_text",
             browser_click_text,
@@ -2153,7 +2156,7 @@ _ACTIONS: dict[str, ActionSpec] = {
             "scroll",
             browser_scroll,
             "page",
-            "Scroll the page or the container under a viewport point; positive delta_y moves down.",
+            "Scroll the page or the container under a point; positive delta_y moves down.",
         ),
         _action(
             "touch",
@@ -2258,10 +2261,6 @@ def _parameter_names(tool_name: str) -> tuple[list[str], list[str]]:
 _ACTION_KEY_ALIASES = ("type", "name", "tool", "command", "op", "operation", "method")
 # Natural spellings of an action, accepted as the action itself.
 _ACTION_NAME_ALIASES = {"attach": "attach_tab"}
-# Repeated once after the session followed a tab Chrome replaced, because they
-# only observe: a wait and a screenshot change nothing. Nothing that writes -
-# reload, cookies (set/clear), scripts, input - is ever repeated on its own.
-_RETRY_AFTER_TAB_FOLLOW = frozenset({"wait", "screenshot"})
 # The web_info topics that are pure reads of the page. execute_js runs arbitrary
 # page code and game_probe drains the console cursor, so neither is repeated.
 _READ_TOPICS_AFTER_TAB_FOLLOW = frozenset({
@@ -2478,7 +2477,7 @@ def _capabilities(action_name: str | None = None, full_schemas: bool = False) ->
             "topic": "action_schema",
             "params_example": {"action": "input"},
             "list_actions": "web_info(topic='actions') is the action index alone; params.group narrows it.",
-            "playbook": "web_info(topic='skill') is the loop plus a section index; params.section='<name>' opens one in full (start, loop, locators, forms, macros, guarded, parallel, search, diagnostics, games, audit, testing, troubleshooting).",
+            "playbook": "web_info(topic='skill') is the loop plus a section index; params.section='<name>' opens one in full (forms, games, audit, testing, ...); site checks: docs/site-checks.md.",
             "note": "params.action names an action or an info topic; a topic's parameters are published nowhere else, and any key it does not list is refused.",
             "parameters": (
                 "actions[name].required lists parameters you must always send; "
@@ -2518,17 +2517,7 @@ _TOPIC_HANDLERS = {
 }
 
 
-def _stamp_now(payload: Any) -> Any:
-    """Attach the current local time to a web_info result (dicts only).
-
-    Every web_info answer carries the current local date/time and UTC-offset
-    region string under the top-level ``now`` key, so a model never needs a
-    separate time call. Non-dict payloads (e.g. screenshot images) pass through.
-    """
-    if isinstance(payload, dict):
-        payload = dict(payload)
-        payload["now"] = msp_date_time.get_current_time_and_region()
-    return payload
+_stamp_now = msp_date_time.stamp_now  # every web_info answer carries the local time as "now"
 
 
 @mcp.tool()
@@ -2615,157 +2604,34 @@ async def web_info(
 async def web_action(
     actions: list[dict[str, Any]],
     continue_on_error: bool = False,
+    summary: Literal["full", "min"] = "full",
 ) -> dict[str, Any]:
     """Execute 1-32 ordered actions. Read web_info action_schema before unfamiliar
     actions or after validation errors. fill uses fields={CSS_selector: value}.
     Use a unique session_id per task/agent; never close another agent's tabs.
+    summary='min' (or "summary": "min" in one action) returns short results.
     """
     if not actions or len(actions) > 32:
         raise ValueError("Provide 1-32 actions")
-    return await _execute_actions(actions, continue_on_error)
-
-
-async def _mark_agent_presence(
-    tool_name: str,
-    action_name: str,
-    arguments: dict[str, Any],
-    *,
-    ok: bool,
-) -> None:
-    """Let the human watching the tab see that this step happened.
-    Hooked here rather than inside each handler for one reason: there are
-    dozens of handlers and one dispatcher, and a signal that is only as
-    complete as the last action someone remembered to instrument is worse
-    than none - the tab would look idle precisely during the actions nobody
-    thought about.
-    Never raises and never blocks the result. A step that has no session, or
-    whose session the step itself just closed, is simply not marked.
-    """
-    session_id = _step_session(tool_name, arguments)
-    if not session_id:
-        return
-    try:
-        await asyncio.to_thread(
-            browser_tools.note_agent_activity, session_id, action_name, arguments, ok
-        )
-    except Exception:
-        pass
-
-
-async def _run_following_tab(spec: ActionSpec, action_name: str, validated: dict[str, Any]) -> Any:
-    """Run one handler; after Chrome replaced the session's tab, repeat a safe step once."""
-    session_id = _step_session(spec.tool_name, validated)
-    try:
-        return await spec.handler(**validated)
-    except Exception as exc:
-        # Off the event loop: the translation may ask the companion about the tab.
-        followed = await asyncio.to_thread(browser_tools.translate_stale_tab_error, session_id, exc)
-        if not (isinstance(followed, browser_tools.SessionTabFollowed)
-                and action_name in _RETRY_AFTER_TAB_FOLLOW):
-            raise followed from exc
-    try:
-        return await spec.handler(**validated)
-    except Exception as again:
-        raise (await asyncio.to_thread(browser_tools.translate_stale_tab_error, session_id, again)) from again
+    return await _execute_actions(actions, continue_on_error, summary)
 
 
 async def _execute_actions(
     actions: list[dict[str, Any]],
     continue_on_error: bool = False,
+    summary: str = "full",
 ) -> dict[str, Any]:
     """Run an ordered action list, validating each against its published schema.
 
-    ``web_action`` and a macro replay share this loop rather than each having
-    their own: a macro that ran its steps down a second, laxer path would drift
-    from the calls its file was validated against, which is the one thing a
-    saved click path cannot afford.
+    ``web_action``, a macro replay and ``test_run`` share this one loop (in
+    ``dispatch.py``); it reads this module's registry and validator at call time.
     """
-    results: list[dict[str, Any]] = []
-    for index, raw_action in enumerate(actions):
-        if not isinstance(raw_action, dict):
-            raise ValueError(f"Action {index} must be an object")
-        arguments = dict(raw_action)
-        action_name = str(arguments.pop("action", "")).strip().lower()
-        action_name = _ACTION_NAME_ALIASES.get(action_name, action_name)
-        spec = _ACTIONS.get(action_name)
-        if spec is None:
-            error = {
-                "index": index,
-                "action": action_name or None,
-                "success": False,
-                "error": _unsupported_action_error(action_name, arguments),
-                "example": {
-                    "actions": [{"action": "open", "url": "https://example.com", "session_id": "s"}]
-                },
-            }
-            results.append(error)
-            if not continue_on_error:
-                break
-            continue
-        started = time.monotonic()  # duration_ms: every step says what it cost
-        try:
-            validated = _validate_arguments(spec.tool_name, f"action '{action_name}'", arguments)
-            data = await _run_following_tab(spec, action_name, validated)
-            reported_failure = (
-                isinstance(data, dict) and data.get("success") is False
-            )
-            await _mark_agent_presence(
-                spec.tool_name, action_name, validated, ok=not reported_failure
-            )
-            results.append(
-                {
-                    "index": index,
-                    "action": action_name,
-                    "success": not reported_failure, "duration_ms": round((time.monotonic() - started) * 1000),
-                    "data": data,
-                    **(
-                        {"error": str(data.get("error") or "Action reported success=false")}
-                        if reported_failure
-                        else {}
-                    ),
-                }
-            )
-            if reported_failure and not continue_on_error:
-                break
-        except Exception as exc:
-            # A refused step shows too, in the failure colour (dead-tab errors are translated already).
-            await _mark_agent_presence(spec.tool_name, action_name, arguments, ok=False)
-            results.append(
-                {
-                    "index": index,
-                    "action": action_name,
-                    "success": False, "duration_ms": round((time.monotonic() - started) * 1000),
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
-            )
-            if not continue_on_error:
-                break
-    failures = sum(not item["success"] for item in results)
-    return {
-        "success": failures == 0 and len(results) == len(actions),
-        "requested_count": len(actions),
-        "completed_count": len(results),
-        "failure_count": failures,
-        "stopped_early": len(results) < len(actions),
-        "results": results,
-    }
+    return await dispatch.execute_actions(sys.modules[__name__], actions, continue_on_error, summary)
 
 
 def _step_session(tool_name: str, arguments: dict[str, Any]) -> str | None:
-    """The session an action actually acted on, its schema default included.
-
-    ``exclude_unset`` keeps a default out of the recorded step, which is right -
-    but the action still ran against that default tab, and attributing it to
-    "no session" would hand it to whichever recording happened to be open.
-    """
-    fields = _argument_model(tool_name).model_fields
-    if "session_id" not in fields:
-        return None
-    value = arguments.get("session_id")
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    default = fields["session_id"].default
-    return default if isinstance(default, str) and default else None
+    """The session an action actually acted on, its schema default included."""
+    return dispatch.step_session(sys.modules[__name__], tool_name, arguments)
 
 
 def stop_bridge_daemon() -> int:

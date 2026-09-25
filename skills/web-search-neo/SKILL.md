@@ -79,8 +79,8 @@ outcome happened. After navigation or rerender, discard old selectors, refs, and
 - Every `web_info` result (dict payloads) also carries the current local date/time and
   UTC-offset region under the top-level `now` key — there is no separate time topic.
 
-The outline and `find` cross open shadow roots and same-origin iframes; a cross-origin frame
-is a stub, so pass its selector as `frame_selector` to read it.
+The outline, `find` and (since 1.20) `click_text` cross open shadow roots and same-origin
+iframes; a cross-origin frame is a stub, so pass its selector as `frame_selector` to read it.
 
 ## Locators
 
@@ -117,13 +117,19 @@ Send a `search` action. Leave `engine` at its default (`brave`), keep `fallback=
 `challenge_mode="fallback"` unless the user asks otherwise. Use `challenge_mode="manual"`
 only when a visible three-minute human handoff is useful, and never claim the server solves
 CAPTCHA. Use `fetch_text`, `fetch_links`, or `fetch_many` when the URLs are already known.
+`http_request` sends any method without a browser and keeps no cookies between calls; give
+it `http_session: "<name>"` (with your `agent_label`) to keep a cookie jar across calls, e.g.
+log in once and call the API after. Values stay redacted unless `show_values=true`.
 
 Plain `http://` to public hosts is refused; use `https://`. Loopback and private addresses
 stay reachable, so local services work unchanged.
 
 ## Browser profiles
 
-- `current` (default) drives the user's signed-in Chrome through the companion extension.
+- A new session opened without `profile_mode` is `isolated` (since 1.20): a clean, headless,
+  disposable browser that sees none of the user's logins. Ask for `current` explicitly when
+  the task needs the user's own Chrome (`current_tab_id` implies it).
+- `current` drives the user's signed-in Chrome through the companion extension.
   New tabs enter group `🟢 AI`; `attach_tab` claims an existing `tab_id` without moving it.
   `open` on a claimed session does not navigate the user's tab - it takes a new one in the
   group and reports the tab it gave back as `left_claimed_tab`. `close` removes a tab the
@@ -133,6 +139,13 @@ stay reachable, so local services work unchanged.
   browser yourself, use an owned profile: `temporary`, `isolated`, or `persistent`
   starts its own Chrome and `close` quits it; `attach` only detaches from a Chrome
   the user started.
+- `persist: true` on `open` (explicit `session_id`) keeps a session past this MCP server:
+  a tab of `current`, or since 1.20 the whole `temporary`/`isolated` browser. A new session
+  must name that `profile_mode` (without one the call is refused). Continue it with
+  `reattach`; `close` ends it for good. Read `persist_warning` in the answer.
+- In Selenium sessions a page's new tab or popup comes back as `new_tabs` on the action
+  that opened it; the session stays on its tab. Move with `tabs {op:"switch", handle}` or
+  `follow_new_tab=true` on `click`/`click_text`; `tabs` also lists and closes them.
 - Another agent may be driving the same Chrome: `attach_tab` on a tab it already holds is
   refused with who holds it. Pick a different tab or open your own; do not retry.
 - Tabs open in the background and nothing steals the user's focus, so they keep working
@@ -528,7 +541,9 @@ Other input actions: `press_keys` for keyboard-only work — 1-8 `keys` plus `ke
 keeps a tap down across N released frames in step mode — so one tap call releases
 `hold_frames` frames per `repeat`, not one; `touch` for tap, swipe, and
 multi-finger press/move/release; `touch_emulation` so a game's mobile code path runs at all;
-`pointer_lock` for first-person controls. The keyboard verb is `key_action`, the pointer
+`pointer_lock` for first-person controls. `CapsLock`, `NumLock` and `ScrollLock` are sent
+through CDP since 1.20; the session tracks the lock (CapsLock upper-cases later letters,
+`type_text` always types as written). The keyboard verb is `key_action`, the pointer
 verb `pointer_action`, the touch verb `touch_action`, and pointer lock's is `operation`,
 because the dispatcher itself owns `action`.
 
@@ -568,6 +583,30 @@ A probe's `console_messages` holds only the warnings and errors new since the pr
 and its output never grows with the run. Each entry is delivered once: read
 `console_messages` on every probe you make, because a result you drop takes them with it.
 Use the `console` topic when you need history, `log`/`info` levels, or stack frames.
+
+## Checking your own site
+
+- `security_report {url}` grades a site's configuration A+-F with Mozilla HTTP
+  Observatory's tests and modifiers (own extra checks go to `extended`): headers (CSP, HSTS, framing, Referrer-Policy, Permissions-Policy, COOP/COEP/CORP,
+  version disclosure), cookies, https and its redirect, the certificate, CORS on the page
+  response, third-party scripts and SRI, mixed content, forms and password fields, and
+  security.txt / robots.txt. Every finding has a `fix`; `priority` is the order to fix them.
+  `scope: "site"` crawls links and the sitemap (`max_pages` <= 50, `robots.txt` honoured),
+  `scope: "hosts"` checks up to 10 named origins, `paths` adds the user's own routes; the
+  weakest page decides the grade. localhost and private addresses are graded in development
+  mode (https/HSTS/redirect/certificate not applicable) with a `production_forecast`.
+  It is passive - `requests_made` lists what the report sends (only to hosts in scope; no path
+  guessing, port scanning or fuzzing), `browser_requests` the ordinary page load - and only
+  for sites the user owns or may test.
+- `perf_report {url}` reads the Performance API after a cold isolated load: TTFB, FCP, LCP,
+  CLS with Web Vitals ratings, resources, render-blocking files, recommendations.
+- `har_export {session_id}` saves the network journal as a HAR file; `network
+  {third_party_only: true}` lists the other sites a page talks to.
+- `test_run {url, steps}` runs a regression scenario: each step is an ordinary action plus
+  optional `step_name` and `expect` (`selector`, `text`, `url_contains`, `script`, `no_console_errors`, ...), and the
+  answer says which step failed and why. Details: `docs/site-checks.md`.
+- `summary: "min"` on `web_action` (or in one action) returns the short form of every
+  result; `summary_omitted` names what it left out.
 
 ## Batch results
 

@@ -11,7 +11,13 @@ import asyncio
 import time
 from typing import Any, Literal
 
-from web_search_neo import browser_tools, frame_capture, frame_health, page_guards
+from web_search_neo import audit_actions, browser_tools, frame_capture, frame_health, page_guards
+from web_search_neo import owned_parking, tab_actions
+from web_search_neo.sessions import parking as current_parking
+
+
+# The mode of a session opened without profile_mode (1.20: isolated, was current).
+DEFAULT_NEW_SESSION_MODE = "isolated"
 
 
 def _owned_session(session_id: str) -> Any:
@@ -46,11 +52,19 @@ async def browser_downloads(session_id: str = "default", wait_seconds: float = 0
 
 
 def inherited_open_options(session_id: str, profile_mode: str | None, profile_id: str | None,
-                           debugger_address: str | None) -> dict[str, Any]:
-    """``open`` without profile_mode keeps an existing session's browser (else current).
+                           debugger_address: str | None, current_tab_id: int | None = None,
+                           persist: bool = False) -> dict[str, Any]:
+    """``open`` without profile_mode keeps an existing session's browser (else isolated).
 
     Before, the wrapper's default 'current' made a second open of a temporary or
-    isolated session fail with "different browser/profile options".
+    isolated session fail with "different browser/profile options". Since 1.20 a
+    new session opens ``isolated``: driving the user's own Chrome is opt-in.
+    ``persist=true`` without a mode continues what is parked under the session_id
+    in its own mode (a parked tab of the user's Chrome: ``current``; a parked
+    temporary/isolated browser: that mode). With nothing parked, a new session
+    must name its mode - ``current`` keeps a tab of the user's Chrome,
+    ``isolated``/``temporary`` keeps the server's browser - because guessing the
+    user's Chrome is exactly what 1.20 stopped doing.
     """
     with browser_tools._sessions_lock:
         session = browser_tools._sessions.get(session_id)
@@ -58,7 +72,22 @@ def inherited_open_options(session_id: str, profile_mode: str | None, profile_id
         return {"profile_mode": session.profile_mode,
                 "profile_id": profile_id if profile_id is not None else session.profile_id,
                 "debugger_address": debugger_address if debugger_address is not None else session.debugger_address}
-    return {"profile_mode": profile_mode or "current", "profile_id": profile_id,
+    if profile_mode is None and persist and current_tab_id is None:
+        parked = owned_parking.read(session_id)  # a parked owned browser keeps its own mode
+        if parked and parked.get("profile_mode") in owned_parking.OWNED_MODES:
+            profile_mode = str(parked["profile_mode"])
+        elif current_parking.lookup(session_id):  # a parked tab of the user's Chrome
+            profile_mode = "current"
+        elif not debugger_address and not profile_id:
+            raise ValueError(
+                f"persist=true on the new session '{session_id}' needs profile_mode: 'current' keeps a tab of "
+                "the user's Chrome open after this server exits, 'isolated' (or 'temporary') keeps the "
+                "server's own browser. Nothing is parked under this session_id to continue.")
+    if profile_mode is None:  # an option that only one mode has names that mode
+        # current_tab_id exists only for the user's Chrome.
+        profile_mode = ("current" if current_tab_id is not None else "attach" if debugger_address
+                        else "persistent" if profile_id else DEFAULT_NEW_SESSION_MODE)
+    return {"profile_mode": profile_mode, "profile_id": profile_id,
             "debugger_address": debugger_address}
 
 
@@ -169,13 +198,19 @@ ACTION_SPECS = (
     ("wait_frames", browser_wait_frames, "game", "Let N animation frames render, e.g. between a click and keys."),
     ("unthrottle", browser_unthrottle, "game", "Un-throttle a background tab; reports raf_fps before/after."),
     ("look", browser_look, "game", "Turn a pointer-locked camera smoothly by dx/dy in steps."),
-)
+) + audit_actions.ACTION_SPECS + tab_actions.ACTION_SPECS  # 1.20: site checks; tabs of Selenium sessions
 
 
-def register(server: Any) -> None:
-    """Register the wrappers as tools on ``server`` (main's legacy FastMCP)."""
+def register(server: Any, facade: Any = None) -> None:
+    """Register the wrappers as tools on ``server`` (main's legacy FastMCP).
+
+    ``facade`` is main's own module: test_run replays its steps through that
+    module's dispatcher, and main may be running as ``__main__``.
+    """
     for _name, wrapper, _group, _summary in ACTION_SPECS:
         server.tool()(wrapper)
+    if facade is not None:
+        audit_actions.bind(facade)
 
 
 __all__ = ["ACTION_SPECS", "browser_dialogs", "browser_downloads", "browser_look", "browser_navigate",

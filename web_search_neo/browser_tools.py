@@ -10,7 +10,6 @@ import json
 import logging
 import os
 from pathlib import Path
-import subprocess
 import re
 import threading
 import time
@@ -55,6 +54,7 @@ from web_search_neo.chrome_bootstrap import (
     setup_current_chrome,
 )
 from web_search_neo import captcha
+from web_search_neo import process_probe as _process_probe
 from web_search_neo import diagnostics
 from web_search_neo import network_log as _network_log
 from web_search_neo import console_log as _console_log
@@ -73,8 +73,11 @@ from web_search_neo.actions import scripts as _script_guard
 from web_search_neo.actions.stealth import stealth_source
 from web_search_neo.actions import verification as _verification
 from web_search_neo.actions import cookie_scope as _cookie_scope
+from web_search_neo.actions import injected_scripts as _injected_scripts
+from web_search_neo.actions import lock_keys as _lock_keys
 from web_search_neo.cdp.tab_follow import find_successor as _find_successor_tab
 from web_search_neo.sessions import parking as _parking
+from web_search_neo.sessions import windows as _windows
 from web_search_neo.actions.waits import (
     clamp_wait as _clamp_wait,
     poll_under_lock as _poll_under_lock,
@@ -87,8 +90,9 @@ from web_search_neo.cdp.request_mocks import (  # noqa: F401
     _MOCK_BODY_LIMIT, _MOCK_STUB_SOURCE, _validate_mock,
 )
 from web_search_neo.perception.challenge import _CHALLENGE_WIDGET_SCRIPT
+from web_search_neo.perception import text_targets as _text_targets
 from web_search_neo.perception.action_scripts import (  # noqa: F401
-    _CLICK_TEXT_SCRIPT, _FRAME_HIT_SCRIPT, _FRAME_MAP_SCRIPT, _GAME_PROBE_SCRIPT, _RENDER_STEP_SCRIPT,
+    _FRAME_HIT_SCRIPT, _FRAME_MAP_SCRIPT, _GAME_PROBE_SCRIPT, _RENDER_STEP_SCRIPT,
     _REPLAY_SCRIPT, _replay_window_note, _SCROLL_INTO_VIEW_SCRIPT, _SUBMIT_RESULT_SCRIPT, _SUBMIT_WATCH_SCRIPT,
     _SET_VALUE_SCRIPT, _FILE_INPUT_STATE_SCRIPT, _UPLOAD_TRACE_SCRIPT, _SCROLL_METRICS_SCRIPT, _POINTER_LOCK_SCRIPT, _POINTER_LOCK_STATUS_SCRIPT,
 )
@@ -317,11 +321,11 @@ def _profile_configuration(
 
 
 # Set this and no session can drive the user's everyday Chrome, whatever it
-# asks for. It exists because "current" is the default: an agent that never
-# mentions profile_mode lands in the browser its user is working in, and a
-# benchmark or a batch job then fills that browser with tabs and tab groups.
-# Asking the agent nicely does not hold - a weaker model ignores it - so the
-# rule belongs on this side of the boundary.
+# asks for. A new session defaults to "isolated" since 1.20, but an agent can
+# still ask for "current" explicitly, and a benchmark or a batch job that does
+# would fill the user's browser with tabs and tab groups. Asking the agent
+# nicely does not hold - a weaker model ignores it - so the rule belongs on
+# this side of the boundary.
 _FORBID_CURRENT_ENV = "WSN_FORBID_CURRENT_PROFILE"
 
 
@@ -431,12 +435,8 @@ def _latest_cached_chromedriver() -> Path | None:
 
 
 def _driver_popen_kwargs() -> dict[str, Any]:
-    """Use Selenium's creation-flags hook; it owns the startupinfo argument."""
-    if os.name != "nt":
-        return {}
-    return {
-        "creation_flags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
-    }
+    """Selenium's popen_kw for chromedriver: no window; outlives the server in a persist launch."""
+    return _process_probe.driver_popen_kwargs()
 
 
 def create_driver(
@@ -1990,9 +1990,9 @@ def open_page(
 ) -> dict[str, Any]:
     """Open a URL in a reusable rendered browser session.
 
-    ``persist=True`` (current Chrome only) keeps the tab open when this MCP
-    client exits and lets a later client continue by the same ``session_id``;
-    an explicit close still closes it.
+    ``persist=True`` here parks a current-Chrome tab: kept open when this MCP
+    client exits, continued later by the same ``session_id``; an explicit close
+    still closes it. Temporary/isolated browsers persist via persist_actions.
 
     In ``profile_mode="current"`` the tab is labelled for the tab strip
     (``[agent_label] ``, or ``[session_id] `` without a label) unless
@@ -2021,8 +2021,9 @@ def open_page(
             raise ValueError("persist=true needs an explicit session_id, not 'default'")
         if _resolve_profile_mode(profile_mode, headless) != "current" or current_tab_id is not None:
             raise ValueError(
-                "persist=true keeps a tab of the user's Chrome open across MCP clients, so it "
-                "needs profile_mode='current' with the companion connected (and no current_tab_id)."
+                "persist=true parks a tab of the user's Chrome (profile_mode='current', companion "
+                "connected, no current_tab_id) or, through the open action, a whole temporary/isolated "
+                "browser; persistent and attach browsers are never parked."
             )
         with _sessions_lock:
             known = session_id in _sessions
@@ -3966,7 +3967,10 @@ def click_text(
     This is deliberately strict: zero or several matches are returned as a
     refusal instead of clicking whichever DOM node happened to come first.
     ``role`` and ``selector`` narrow the candidate set without requiring the
-    caller to manufacture a fragile nth-of-type path.
+    caller to manufacture a fragile nth-of-type path. The search covers open
+    shadow roots and same-origin frames (``perception/text_targets.py``); the
+    answer's ``frame``/``shadow_path`` say where the match was, and cross-origin
+    frames, which no page script can read, are counted in a note instead.
     """
     if not str(text).strip():
         raise ValueError("text must not be empty")
@@ -3979,24 +3983,12 @@ def click_text(
         try:
             _select_frame(driver, frame_selector, css_only=True)
             match = driver.execute_script(
-                _CLICK_TEXT_SCRIPT,
-                text,
-                exact,
-                role or "",
-                selector or "",
+                _text_targets.CLICK_TEXT_SCRIPT, text, exact, role or "", selector or ""
             ) or {}
         finally:
             driver.switch_to.default_content()
         if not match.get("ok"):
-            if match.get("occluded"):
-                raise ValueError(
-                    f"The unique text match is covered by {match.get('blocker')!r}; "
-                    "inspect the page again before clicking."
-                )
-            raise ValueError(
-                f"Expected exactly one visible text match, found {int(match.get('count', 0))}. "
-                f"Matches: {match.get('samples') or []}. Narrow with role or selector."
-            )
+            raise _text_targets.refusal(match)
         result = _pointer_dispatch(
             session,
             "click",
@@ -4013,12 +4005,8 @@ def click_text(
                 **_page_summary(driver, session_id),
                 **result,
                 "success": True,
-                "matched_text": match.get("text", ""),
-                "matched_role": match.get("role", ""),
-                "matched_selector": match.get("selector", ""),
-                "hit_test_unavailable": bool(match.get("hit_test_unavailable")),
+                **_text_targets.answer_fields(match, frame_selector),
                 "exact": bool(exact),
-                "frame_selector": frame_selector,
             },
             started_ms,
         )
@@ -4069,20 +4057,8 @@ _KEY_ALIASES = {
 
 
 def _perform_key_events(driver: Any, events: list[dict[str, Any]]) -> None:
-    """Dispatch an ordered key event stream through CDP or Selenium ActionChains."""
-    if hasattr(driver, "perform_key_events"):
-        driver.perform_key_events(events)
-        return
-    actions = ActionChains(driver)
-    for event in events:
-        event_type = event["type"]
-        if event_type == "down":
-            actions.key_down(event["key"])
-        elif event_type == "up":
-            actions.key_up(event["key"])
-        elif event_type == "pause":
-            actions.pause(float(event.get("seconds", 0.0)))
-    actions.perform()
+    """Dispatch an ordered key event stream: the companion's CDP, or ActionChains plus CDP for the locks."""
+    _lock_keys.perform(driver, events, ActionChains)
 
 
 def _normalize_game_key(key: str) -> str:
@@ -4093,6 +4069,9 @@ def _normalize_game_key(key: str) -> str:
     value = raw.strip()
     if len(value) == 1 and value.isprintable():
         return value
+    lock = key_table.lock_key(value)
+    if lock is not None:
+        return lock
     alias = value.upper().replace("-", "_").replace(" ", "_")
     alias = alias if alias in _KEY_ALIASES else (key_table.dom_key_name(value) or alias)
     if alias in _KEY_ALIASES or len(alias) == 1:
@@ -5239,6 +5218,7 @@ def get_network(
     limit: int = 50,
     output: str = "text",
     include_pending: bool = True,
+    third_party_only: bool = False,
 ) -> dict[str, Any]:
     """List the page's HTTP requests: finished ones and, by default, those still open.
 
@@ -5248,6 +5228,7 @@ def get_network(
     page never read, a fire-and-forget POST, a long poll, an ignored 5xx - is
     listed with ``done: false``. The newest ``limit`` rows are returned;
     ``matched``/``omitted_older`` say what the window left out.
+    ``third_party_only`` keeps requests to other registrable domains than the page's.
     """
     session = _get_session(session_id)
     with session.lock:
@@ -5255,6 +5236,7 @@ def get_network(
             session, session_id, url_pattern=url_pattern, types=types, status_min=status_min,
             status_max=status_max, only_errors=only_errors, limit=limit, output=output,
             include_pending=include_pending,
+            third_party_only=third_party_only,
         )
 
 
@@ -5286,44 +5268,7 @@ def inject_script(
     """
     session = _get_session(session_id)
     with session.lock:
-        if op == "add":
-            if not source:
-                raise ValueError("inject_script op 'add' requires source")
-            result = session.driver.execute_cdp_cmd(
-                "Page.addScriptToEvaluateOnNewDocument", {"source": source}
-            )
-            script_id = str(result.get("identifier") or "")
-            session.injected_scripts.append(script_id)
-            return {"success": True, "session_id": session_id, "identifier": script_id}
-        if op == "list":
-            return {
-                "success": True,
-                "session_id": session_id,
-                "identifiers": list(session.injected_scripts),
-            }
-        if op == "remove":
-            removed = identifier in session.injected_scripts
-            if removed:
-                session.injected_scripts.remove(identifier)
-                # Actually stop it in Chrome, not just forget the id: the CDP
-                # removal exists, so a "removed" that left the script running on
-                # every future document would be a lie the caller acts on.
-                try:
-                    session.driver.execute_cdp_cmd(
-                        "Page.removeScriptToEvaluateOnNewDocument",
-                        {"identifier": identifier},
-                    )
-                except Exception:
-                    # A backend without the removal still forgets the id; the
-                    # script lapses on the next navigation rather than at once.
-                    pass
-            return {
-                "success": True,
-                "session_id": session_id,
-                "identifier": identifier,
-                "removed": removed,
-            }
-    raise ValueError(f"inject_script op must be add, list, or remove, not '{op}'")
+        return _injected_scripts.run(session, session_id, op, source, identifier)
 
 
 def cookies(
@@ -8137,7 +8082,8 @@ def _shutdown_session(
                 f"the debugger may still be attached to tab {session.current_tab_id} "
                 f"({detach_error})"
             )
-    else:
+    else:  # a browser that is not ours keeps running: the windows its pages opened close now
+        problems.extend(attempt("closing the windows its pages opened", lambda: _windows.close_opened(session)) or [])
         attempt("stopping the driver service", session.driver.service.stop)
     if session.profile_mode == "current":
         # Let another agent have the tab even if the teardown above went badly:

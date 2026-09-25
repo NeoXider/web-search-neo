@@ -7,10 +7,10 @@ architecture review. New production files always use the ordinary hard limit.
 SOFT_LIMIT = 600
 HARD_LIMIT = 800
 LEGACY_MAX_LINES = {
-    "web_search_neo/browser_tools.py": 8359,
-    "web_search_neo/main.py": 2813,
+    "web_search_neo/browser_tools.py": 8305,
+    "web_search_neo/main.py": 2679,
     "web_search_neo/page_perception.py": 2681,
-    "web_search_neo/chrome_bridge.py": 2090,
+    "web_search_neo/chrome_bridge.py": 2070,
     "chrome-extension/service-worker.js": 1734,
     "web_search_neo/bridge_daemon.py": 1163,
     "web_search_neo/macros.py": 849,
@@ -25,6 +25,8 @@ PACKAGE_DEPENDENCIES = {
     "cdp": ("chrome_bridge", "chrome_bootstrap", "sessions"),
     "contract": (),
     "fetch": ("web_client",),
+    # Passive site checks: pure analysis plus plain GETs through the shared client.
+    "audit": ("web_client", "fetch", "actions.cookie_scope"),
 }
 
 # Third-party imports are separate so a leaf cannot silently acquire a new

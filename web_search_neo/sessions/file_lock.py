@@ -23,7 +23,10 @@ else:  # pragma: no cover - platform branch
     import fcntl
 
 _LOCK_TIMEOUT_SECONDS = 30.0
-_REPLACE_RETRY_SECONDS = 2.0
+# A reader without delete sharing (an antivirus scan, an indexer, another process
+# that opened the ledger just to read it) blocks os.replace on Windows until it
+# closes the file; under load that took longer than two seconds.
+_REPLACE_RETRY_SECONDS = 10.0
 # A process-local gate in front of the OS lock: msvcrt byte locks are per
 # handle, so two threads here must not both open one. A thread that already
 # holds a path's lock re-enters without touching the OS lock again (a second

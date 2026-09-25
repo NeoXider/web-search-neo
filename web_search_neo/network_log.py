@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Any
 
 from web_search_neo import diagnostics
+from web_search_neo.audit import sites
 
 HISTORY_LIMIT = 500
 
@@ -49,14 +50,42 @@ def requests_since(session: Any, started_ms: float) -> list[dict[str, Any]]:
     return [row for row in rows + pending if float(row.get("ts") or 0) >= started_ms]
 
 
+def page_url(session: Any) -> str:
+    """Where the session's page is, from the last observation or the driver itself."""
+    url = str(getattr(session, "last_url", "") or "")
+    if not url.startswith(("http:", "https:")):
+        try:
+            url = str(session.driver.current_url or "")
+        except Exception:
+            url = ""
+    return url
+
+
+def third_party_rows(rows: list[dict[str, Any]], url: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Requests to other registrable domains than the page at ``url`` (data:/blob: never are).
+
+    The caller reads ``url`` with ``page_url`` under the session lock; this part
+    touches no driver.
+    """
+    if not url.startswith(("http:", "https:")):
+        return [], {"third_party_only": True, "third_party_note": (
+            "The page address is not http(s), so no request can be told first- from third-party.")}
+    kept = [row for row in rows if sites.is_third_party(str(row.get("url") or ""), url)]
+    return kept, {"third_party_only": True, "first_party_site": sites.site_of(sites.host_of(url)),
+                  "third_party_sites": sorted({sites.site_of(sites.host_of(str(r.get("url")))) for r in kept})[:50]}
+
+
 def report(
     session: Any, session_id: str, *, url_pattern: str | None, types: list[str] | None,
     status_min: int | None, status_max: int | None, only_errors: bool, limit: int,
-    output: str, include_pending: bool,
+    output: str, include_pending: bool, third_party_only: bool = False,
 ) -> dict[str, Any]:
     """The network topic's answer (lock held)."""
     rows, dropped, pending = drain(session)
     candidates = rows + (pending if include_pending else [])
+    party: dict[str, Any] = {}
+    if third_party_only:
+        candidates, party = third_party_rows(candidates, page_url(session))
     matched = diagnostics.filter_network(
         candidates, url_pattern, types, status_min, status_max, only_errors, len(candidates) + 1
     )
@@ -69,7 +98,7 @@ def report(
         "matched": len(matched),
         "in_flight": sum(1 for row in selected if row.get("done") is False),
         "only_errors": bool(only_errors),
-        "dropped": dropped,
+        "dropped": dropped, **party,
     }
     if len(matched) > len(selected):
         response["omitted_older"] = len(matched) - len(selected)

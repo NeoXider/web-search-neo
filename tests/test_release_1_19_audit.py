@@ -406,8 +406,10 @@ def test_dom_codes_of_punctuation_and_the_plus_chord():
         assert browser_tools._normalize_game_key(code) == key
     assert browser_tools._normalize_game_key("NumpadAdd") == browser_tools._normalize_game_key("ADD")
     assert key_table.expand_chords(["Shift++"]) == ["Shift", "+"]
+    # 1.20: the lock keys are sent through CDP; only a driver without CDP refuses them.
+    assert browser_tools._normalize_game_key("CapsLock") == "CapsLock"
     with pytest.raises(ValueError, match="CapsLock"):
-        browser_tools._normalize_game_key("CapsLock")
+        browser_tools._perform_key_events(object(), [{"type": "down", "key": "CapsLock"}])
 
 
 def test_quoted_semicolons_and_returns_do_not_make_a_statement():

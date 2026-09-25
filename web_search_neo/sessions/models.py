@@ -261,3 +261,11 @@ class BrowserSession:
     # One-shot fields for the next page summary (a re-attach, a followed tab), so
     # the caller learns about a recovery on the very call that benefited from it.
     pending_notice: dict[str, Any] | None = None
+    # sessions/windows.py (Selenium modes): the window handles this session has
+    # already reported, which window opened which, the ones pages opened during
+    # the session (closed with it in attach mode), and each window's own
+    # new-document scripts, so switching back to a tab does not register them twice.
+    known_windows: set[str] | None = None
+    window_openers: dict[str, str] = field(default_factory=dict)
+    opened_windows: list[str] = field(default_factory=list)
+    window_state: dict[str, dict[str, Any]] = field(default_factory=dict)

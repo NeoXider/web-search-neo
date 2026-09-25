@@ -362,4 +362,5 @@ def text_key_events(text: str) -> list[dict[str, Any]]:
             ]
             continue
         events += [{"type": "down", "key": char}, {"type": "up", "key": char}]
-    return events
+    # Text is typed as written: a CapsLock the session toggled on must not flip it.
+    return [{**event, "exact": True} for event in events]

@@ -23,7 +23,8 @@ look, `web_action` to act — and behind them four capabilities:
 | **Search** | Text search with automatic fallback across independent engines. No paid API, no provider key. |
 | **Your own Chrome** | The already-open, signed-in browser you are looking at, driven through a local companion extension: tabs, forms, uploads, games, screenshots. |
 | **Perception** | An accessibility outline, readable text, semantic element lookup, the page console, and its HTTP traffic. |
-| **Isolation** | Separate Selenium profiles — temporary, persistent, or attached — when a clean or headless browser is preferable. |
+| **Isolation** | Separate Selenium profiles — isolated (the default for a new session), temporary, persistent, or attached. |
+| **Site checks** | For your own site: a passive security report graded A–F, load metrics, HAR export, and step-by-step regression tests. |
 
 Brave is the default search route. DuckDuckGo, Yahoo, Bing, Mojeek, and
 Startpage are available as fallbacks; an engine that keeps answering "nothing"
@@ -32,12 +33,13 @@ where another finds hits is tried last and named in `unreliable_engines`.
 ## Contents
 
 - [Quick start](#quick-start) · [Connect to LM Studio](#connect-to-lm-studio)
-- [**Examples**](#examples) — copy-paste calls for the six things people do most
+- [**Examples**](#examples) — copy-paste calls for the seven things people do most
+- [**Check your own site**](#check-your-own-site) — `security_report`, `perf_report`, `har_export`, `test_run` · [the long version](docs/site-checks.md)
 - [Deep dives: playing games](docs/playing-games.md) · [complex forms](docs/complex-forms.md)
 - [Extending Web Search Neo](docs/extending.md) — plugin actions, observation topics, and search providers
 - [Why Web Search Neo](#why-web-search-neo) — the capability table
 - [Connect your already-open Chrome](#connect-your-already-open-chrome) · [The bridge daemon](#the-bridge-daemon) · [Bridge authentication](#bridge-authentication)
-- [Search behavior](#search-behavior) · [CAPTCHA and challenge modes](#captcha-and-challenge-modes)
+- [Search behavior](#search-behavior) · [HTTP requests without a browser](#http-requests-without-a-browser) · [CAPTCHA and challenge modes](#captcha-and-challenge-modes)
 - [Current Chrome automation](#current-chrome-automation) · [Chrome profile modes](#chrome-profile-modes)
 - [Reading a page](#reading-a-page) · [Locators](#locators)
 - [Console and network diagnostics](#console-and-network-diagnostics)
@@ -113,7 +115,9 @@ all; `fetch_many` reads up to 16 URLs concurrently.
 {"actions":[{"action":"open","url":"https://example.com","session_id":"demo"}]}
 ```
 
-Opens a tab in your own Chrome, in the visible `🟢 AI` tab group.
+Opens the page in a fresh isolated, headless browser — the default for a new
+session since 1.20. Add `"profile_mode": "current"` to open it as a tab of your
+own Chrome instead, in the visible `🟢 AI` tab group, with your logins.
 
 ```json
 {"topic":"page_outline","params":{"session_id":"demo","limit":60}}
@@ -209,6 +213,18 @@ Lists the tabs in your Chrome with their ids and group names, then claims one
 without navigating or moving it. `close` later releases the session and leaves
 that tab exactly where it was.
 
+### 7. Check your own site before a release
+
+```json
+{"actions":[{"action":"security_report","url":"https://staging.example.com/","summary":"min"}]}
+```
+
+Returns the grade computed with Mozilla HTTP Observatory's tests and modifiers, and the
+things to fix first. Without `summary` the answer carries every finding with its fix, the
+arithmetic behind the score, the cookies' flags and the third parties the page
+loads. `scope: "site"` crawls the site, `scope: "hosts"` checks several origins (a front end and
+an API on `localhost`, graded in development mode). → [Check your own site](#check-your-own-site)
+
 ### Where to go next
 
 ```json
@@ -226,7 +242,7 @@ limits, and worked examples. `web_info(topic="action_schema", params={"action":
 | --- | --- |
 | Free search | Uses public search routes through the maintained [DDGS](https://github.com/deedy5/ddgs) library; no paid search plan or API key. |
 | Resilient fallback | Provider health, cooldowns, bounded retries, caching, and an overall deadline prevent one challenged engine from stalling the agent. |
-| Your current Chrome by default | New tabs open in the `🟢 AI` tab group of the Chrome you already use, so existing logins remain available while automation stays in the background unless `show` is explicitly requested. |
+| Your current Chrome on request | With `profile_mode="current"` tabs open in the `🟢 AI` tab group of the Chrome you already use, so existing logins remain available while automation stays in the background unless `show` is explicitly requested. A new session without a mode opens isolated. |
 | Reusable authorization | List and claim existing tabs, use the current signed-in Chrome, a persistent MCP-owned profile, or a DevTools attach window. |
 | Authenticated companion | Server and extension prove knowledge of a machine-local secret to each other before a single command crosses the loopback bridge. |
 | One bridge, many clients | The companion port belongs to a standalone bridge process, not to whichever agent happens to be running, so Claude Code and LM Studio can drive the same Chrome at the same time and the badge stays `ON` between calls. |
@@ -239,8 +255,11 @@ limits, and worked examples. `web_info(topic="action_schema", params={"action":
 
 ## Connect your already-open Chrome
 
-The default browser mode is `current`. It fails with a clear setup error when the
-companion isn't connected; it does not silently open a different browser.
+`profile_mode="current"` drives this Chrome. Since 1.20 it is chosen explicitly
+(or implied by `current_tab_id`); a new session opened without a mode gets an
+isolated headless browser instead — see [the migration note](INSTALL.md#migrating-to-120-new-sessions-open-isolated).
+`current` fails with a clear setup error when the companion isn't connected; it
+does not silently open a different browser.
 
 An agent prepares the bundled companion through the compact MCP contract:
 
@@ -297,7 +316,7 @@ companion popup's Reconnect (Restart companion when its service worker has
 stopped) is the one action; Reload on its card at chrome://extensions is the
 fallback.
 
-The bundled companion is version 1.19.0. Chrome does not refresh an unpacked
+The bundled companion is version 1.20.0. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. That only works for
@@ -585,6 +604,33 @@ engine is listed in `engines_off_topic`, and off-topic rows are returned only
 when nothing better exists, with a `note`. Bing's `bing.com/ck/a` tracking
 links are unwrapped to the real page URL.
 
+### HTTP requests without a browser
+
+`http_request` sends any method with `headers`, `query`, `body` or `body_json` and
+never opens a browser; a 4xx/5xx comes back with its status and the server's error
+body, and every `Set-Cookie` is listed apart in `set_cookies`. By default no cookie
+rides from one call to the next. Since 1.20 `http_session` names a cookie jar that
+does:
+
+```json
+{"actions":[
+  {"action":"http_request","method":"POST","url":"http://127.0.0.1:8000/login",
+   "body_json":{"user":"demo","password":"demo"},"http_session":"api","agent_label":"qa"},
+  {"action":"http_request","url":"http://127.0.0.1:8000/me","http_session":"api","agent_label":"qa"}
+]}
+```
+
+- The jar belongs to `(agent_label, http_session)`: another agent using the same name
+  never sees it. Jars live in the server process only, expire after an idle
+  `WEB_SEARCH_NEO_HTTP_SESSION_TTL` (default 1800 s, at least 60) and are capped at 32,
+  the least recently used dropped first.
+- Cookies are matched by domain, path, `Secure` and expiry; cookies set on redirect hops
+  are kept, a cross-origin hop still strips credentials, and a cookie the server deletes
+  leaves the jar. `http_session_clear: true` empties the jar before the request.
+- The answer's `http_session` block lists `sent_cookies` and `received_cookies` per hop
+  with their flags. Values are redacted there and in `set_cookies`/`headers` unless
+  `show_values: true`. A `Cookie` header and `http_session` in one call are refused.
+
 ### CAPTCHA and challenge modes
 
 - `challenge_mode="fallback"` is the default. A challenged provider is skipped immediately and the search continues through another route.
@@ -671,8 +717,11 @@ topics and `wait`/`screenshot` are repeated once on the new tab; every other
 step fails with a `SessionTabFollowed` error that says so, and a tab that is
 really gone still drops the session.
 
-`open` accepts `persist: true` (current Chrome only, with an explicit
-`session_id` - never `default`). Only tabs the server opens can be parked: a tab
+`open` accepts `persist: true` (with an explicit `session_id` - never `default`).
+A new session must name its mode with it: `profile_mode: "current"` parks one tab of
+the user's Chrome, `"isolated"` or `"temporary"` the server's own browser (below);
+without a mode the call is refused, and a session already open or parked keeps its
+own mode. In current Chrome it parks one tab. Only tabs the server opens can be parked: a tab
 claimed with `attach_tab` is the user's, and `attach_tab` has no `persist`. Such a
 session survives the MCP client process: at exit its tab is detached and left
 open, and a record in the per-user state directory keeps its tab id, Chrome run,
@@ -689,6 +738,37 @@ of a parked session closes its tab and reports it under `retired_parked`;
 records expire after `WEB_SEARCH_NEO_PARKED_SESSION_TTL` (default 24 hours, at
 least 60 seconds) and their tabs are closed the same way. `browser_status` lists
 `parked_sessions`. `attach` is accepted as an alias of `attach_tab`.
+
+Since 1.20 `persist: true` also works with `profile_mode: "temporary"` or `"isolated"`:
+the whole browser the server launched is parked instead of one tab. Chrome and
+chromedriver are started so they can outlive the server; at exit the session is
+recorded (chromedriver's URL and session, the pids with their start stamps, the
+profile, the window it drove) instead of quit, and a later server continues it
+with `reattach` or `open` + `persist: true`, on the same page and cookies. A record
+is never taken over while another server holds that session live, and nothing is
+killed on a pid whose start stamp no longer matches. Every record has a small
+detached watchdog that retires the browser (quits it, removes the profile) when
+`WEB_SEARCH_NEO_PARKED_SESSION_TTL` runs out while it is parked, or when the
+server that held it died without parking it; `close` retires it at once. When the
+MCP client runs the server inside a Windows job object that ends every child with
+the client, the `open` answer carries `persist_warning`: the browser then survives
+a server restart under the same client but not the client itself. Persistent and
+attach browsers are never parked.
+
+New tabs and popups of a Selenium session (temporary, isolated, persistent,
+attach) are visible since 1.20. When a click, `click_text`, `submit`, `pointer`,
+`run_script`, `input`, `press_keys`, `type_text`, `fill`, `scroll` or `wait` makes
+the page open a window (`target="_blank"`, `window.open`), the answer carries
+`new_tabs` with each window's handle, URL, title and opener; the session keeps
+driving the tab it was on. `follow_new_tab: true` on `click` or `click_text` moves it
+to the new window, and the `tabs` action lists (`op: "list"`), switches to (`"switch"`,
+`handle` or `index`) or closes (`"close"`) the session's windows. A popup that
+closes itself hands the session back to the window that opened it
+(`tab_closed_by_page`). The last window is never closed by `tabs` - close the
+session - and in an attached browser only windows its pages opened during this
+session can be closed; closing the session closes them too. In the user's own
+Chrome (`current`) new tabs stay the user's: `browser_tabs`, `attach_tab`,
+`close_tabs`.
 
 A `domain` filter on `cookies` means that domain and its subdomains, never a
 substring, for `get` and `clear` alike. `op: "clear"` needs a domain - a cookie
@@ -760,7 +840,8 @@ back to a separate headless Selenium session, so it does not raise another windo
 
 | Mode | Authorization and lifetime | Best for |
 | --- | --- | --- |
-| `current` (default) | Companion extension controls the user's open Chrome. New tabs enter the `🟢 AI` group in the background; claimed tabs stay where they are. | Authorized sites, work alongside the user, existing tabs. |
+| `isolated` (default for a new session) | Disposable separate Selenium browser with its own profile and storage, headless by default; per-session `user_agent`, `timezone`, `locale`, `geolocation`. | Tests, audits, anything that should not see the user's logins. |
+| `current` | Companion extension controls the user's open Chrome; chosen explicitly (or by `current_tab_id`). New tabs enter the `🟢 AI` group in the background; claimed tabs stay where they are. | Authorized sites, work alongside the user, existing tabs. |
 | `auto` | Prefer `current`; fall back to a headless temporary Selenium profile if the companion is unavailable. | Portable background clients. |
 | `temporary` | Clean disposable profile, headless by default; cookies disappear when the session closes. | Search, scraping, isolated tests. |
 | `persistent` | MCP owns a durable profile under `%LOCALAPPDATA%\WebSearchNeo\profiles\<profile_id>`, headless by default. | Repeated automation with a separate signed-in profile. |
@@ -798,7 +879,7 @@ visible while it is not, and stops believing it the moment the debugger detaches
 
 Two consequences worth knowing. A targeted keyboard action can change DOM focus
 inside the controlled background page, but it does not take OS focus or change the
-active user tab. In Companion 1.19.0, viewport screenshots capture one fresh PNG
+active user tab. Since Companion 1.19.0, viewport screenshots capture one fresh PNG
 video frame with an 8-second frame deadline, then stop the owned recording. This
 does not activate tabs, restore windows, resize the viewport, or alter emulation.
 An existing recording or overlapping capture is refused. Full-page and region
@@ -1072,7 +1153,7 @@ The page's own console and HTTP traffic are readable without leaving the MCP con
 | Topic | Returns |
 | --- | --- |
 | `console` | `console.log/info/warn/error`, uncaught exceptions and rejections with stack frames, and browser log entries. Filter with `levels`, `kinds`, `contains`; page through with `since_seq` and `limit=50`. |
-| `network` | One compact line per request in the documented `method status type ms size url` order. Filter with `url_pattern` (a case-insensitive regex), `types`, `status_min`/`status_max`, or `only_errors=true`. |
+| `network` | One compact line per request in the documented `method status type ms size url` order. Filter with `url_pattern` (a case-insensitive regex), `types`, `status_min`/`status_max`, `only_errors=true`, or `third_party_only=true` (other registrable domains than the page's). |
 | `network_body` | One response body, by `request_id`, capped at `max_chars=20000`. |
 
 ```json
@@ -1089,6 +1170,11 @@ POST 422 Document       4ms 0.5KB https://example.com/submit
 post the server accepted is filtered out and an empty list is itself an answer.
 
 Use `output="json"` on the `network` topic when you need the per-request `id` that `network_body` expects; the default text lines omit it.
+
+`har_export {session_id}` writes the same journal as a HAR 1.2 file into the download folder,
+for DevTools, a proxy or a bug report. It carries method, URL, status, type, timing, transfer
+size, the security-relevant response headers and post data; request headers and bodies are
+not recorded, and the file's `comment` says so.
 
 Capture is armed when the session takes its tab, not when a topic is first read. In `current` mode the subscription is the last step of opening the tab, while it is still `about:blank`, so the requests and logs of the very first navigation are in the buffer — a single `open` reports the document, its subresources, and a 404 favicon without anyone reloading anything. This is a fix, not a nicety: network capture used to be armed by the first `network` read, so an agent that opened a page, saw it fail, and then asked which requests failed was told there were none.
 
@@ -1347,6 +1433,37 @@ projects and are not bundled in this repository.
 the single attempt, use ordinary read-only inspection actions (for example fresh page text or a
 screenshot) to collect destination-specific proof.
 
+## Check your own site
+
+Four actions for a developer reviewing a site they own before a release. The full
+reference, the scoring table and a worked example are in
+[docs/site-checks.md](docs/site-checks.md).
+
+| Action | What it answers |
+| --- | --- |
+| `security_report {url}` | What is configured unsafely and how to fix it: CSP directives, HSTS, framing, `X-Content-Type-Options`, `Referrer-Policy`, `Permissions-Policy`, COOP/COEP/CORP, version disclosure, cookie flags and prefixes, https and the http→https redirect, the certificate, CORS on the page response, third-party scripts with or without SRI, mixed content, forms and password fields, `security.txt` and `robots.txt`. Graded A+–F like Mozilla HTTP Observatory v1.7.1 (its tests and modifiers reimplemented, pinned case by case; `score_explanation`); the report's extra checks never move that letter and feed a stricter `extended` score instead; `priority` lists the fixes in order. `scope`: `page` (plus your `paths`), `site` (a crawl of links and the sitemap, at most 50 pages, `robots.txt` honoured) or `hosts` (up to 10 origins); localhost and private addresses get a development mode with a production forecast. |
+| `perf_report {url}` | TTFB, FCP, LCP and CLS with Web Vitals ratings, resources by type, the largest files, render-blocking files and what to change, from the page's own Performance API after a cold isolated load. |
+| `har_export {session_id}` | The session's network journal as a HAR 1.2 file; `network {third_party_only: true}` shows only other sites' requests. |
+| `test_run {url, steps}` | A regression scenario: every step is an ordinary action plus `expect` (`selector`, `text`, `url_contains`, `script`, `no_console_errors`, `no_failed_requests`, `action_fails`, ...), answered pass/fail per step with the failing check named. |
+
+`security_report` is passive and stays inside the scope you give it: exact hosts (with
+optional scheme and port) only — wildcards and public suffixes are refused, and a redirect,
+link or sitemap entry leaving the scope is named, never followed. It sends ordinary GETs of
+the pages, of `http://host/` (no path or query), of `security.txt`, `robots.txt` and the
+sitemap, and one ordinary TLS handshake per https host — at most 200 requests, all listed,
+redacted, in `requests_made`. With `scope: "page"` the page also loads once in a fresh
+isolated browser, as any visit does; `browser_requests` summarises that traffic. It guesses
+no paths, scans no ports, tries no origins, fuzzes nothing and never gets past a login or a
+CAPTCHA; point it only at sites you own or may test. Cookie values never appear in the
+answer.
+
+```json
+{"actions":[{"action":"test_run","url":"http://127.0.0.1:8000/signup","session_id":"reg","steps":[
+  {"action":"fill","fields":{"#email":"qa@example.com"}},
+  {"step_name":"submit","action":"click","selector":"#send",
+   "expect":{"text":"Check your inbox","no_console_errors":true}}]}]}
+```
+
 ## Dialogs, downloads, navigation
 
 | Action | What it does |
@@ -1505,11 +1622,11 @@ round trip can be told apart from a slow page.
 | Tool | Responsibility |
 | --- | --- |
 | `web_info` | Return the whole contract, the built-in automation skill, or one action schema on demand; read search, current Chrome tabs, browser, page outline/text/find, console, network, game, screenshot, or time state. |
-| `web_action` | Execute one or up to 32 ordered setup, search, fetch, tab attach/open, form, input, render, and close actions. Supports fail-fast or `continue_on_error=true`. |
+| `web_action` | Execute one or up to 32 ordered setup, search, fetch, tab attach/open, form, input, render, audit, and close actions. Supports fail-fast or `continue_on_error=true`, and `summary="min"` (or `"summary": "min"` in one action) for short results that name everything they left out in `summary_omitted`. |
 
 Start with `web_info()`. With no arguments it returns `actions` with each action's summary and its required parameter names, `action_groups`, `info_topics`, `recipes`, `pitfalls`, `limits`, and worked `examples`. Optional names, types, and defaults are deliberately left out of it. Request only the needed, generated JSON Schema with `web_info(topic="action_schema", params={"action": "input"})`, then invoke it through `web_action`. Two narrower entry points exist for a model that does not want the whole contract at once: `web_info(topic="actions")` is the action index alone, with `params={"group": "macro"}` to narrow it, and `web_info(topic="skill")` is the runtime playbook. The same call describes an observation topic — `params={"action": "find"}` returns `find`'s parameters — which matters because a topic refuses any argument it does not list, and that list appears nowhere else. This follows the on-demand Tool Search principle used by [official Unreal MCP](https://dev.epicgames.com/documentation/unreal-engine/unreal-mcp-in-unreal-editor): keep the eager tool list small, disclose schemas only when needed, and dispatch actions through a meta-tool. Web Search Neo combines Unreal's list/describe discovery tools into one `web_info`, so only two tools are advertised.
 
-Measured on the current build, summing each advertised tool's `name`, `description`, and serialized `inputSchema`: the compact surface is 1,278 characters across two tools, against 34,720 characters across the 56 tools of legacy mode. The self-describing contract behind `web_info()` is 12,571 characters, and it is fetched only when an agent asks for it. Each action in it lists its required parameter names; optional names, types, and defaults stay in `action_schema`, where they cost nothing until needed — and where an observation topic's parameters live too, since a topic accepts exactly the list it publishes and nothing else.
+Measured on the current build, summing each advertised tool's `name`, `description`, and serialized `inputSchema`: the compact surface is 1,605 characters across two tools, against the tens of thousands of the legacy tool list. The self-describing contract behind `web_info()` is about 13,900 characters (a test keeps it under 14,000), and it is fetched only when an agent asks for it. Each action in it lists its required parameter names; optional names, types, and defaults stay in `action_schema`, where they cost nothing until needed — and where an observation topic's parameters live too, since a topic accepts exactly the list it publishes and nothing else.
 
 Every action is declared once in a single registry that also generates its published schema, and arguments are validated against that same model before the handler runs. An unknown or malformed field returns the offending names and the list of allowed parameters instead of an internal `TypeError`:
 
@@ -1666,6 +1783,7 @@ The deterministic suite is 576 tests, grouped by what they protect:
 | Forms | Multipart upload, form filling, native validation, values read back off the control so a refused write is not a success, exact PNG viewport size, a guarded terminal click that counts its matches in the page and so works in the user's own Chrome as well as a Selenium one, and guarded refusals that name the ledger they refuse from. |
 | Challenges | A captcha that blocks told apart from one merely present on the page, and the providers a top-level query walked past — DataDome, AWS WAF, a challenge one frame down, and one in a shadow root. |
 | Games and input | Canvas probing, normal/throttled/step rendering, atomic mixed input, held modifiers across a batch, gate and held-input reset on navigation, coordinates that follow a frame's CSS transforms, key spellings that release each other, and a virtual clock whose intervals keep their period. |
+| Site checks | CSP parsing and the browser's nonce/hash/`strict-dynamic` rules, every Observatory v1.7.1 result and modifier (CSP, cookies, COOP, COEP, redirection, HSTS, framing, Referrer-Policy, SRI, CORP) pinned case by case with whole-report scores, the extended score, scope validation, the crawl, `paths`, `hosts` and the development mode (a self-signed localhost certificate included) against local route servers that prove what was and was not requested, and `security_report`, `perf_report`, `har_export` and `test_run` end to end against a local `http.server` serving a weak and a strong configuration - no internet. |
 | Sessions | Sessions that close the tabs they own, concurrent sessions, persistent storage, a session dropped when the browser it was opened in is gone, a borrowed tab handed back instead of navigated, a real managed-Chrome attach/detach that leaves Chrome running, a second caller inside one session reported rather than swallowed (and a reentrant one not mistaken for it), and a full session cap that names the setting which lifts it. |
 
 Public search engines may rate-limit an IP or region, so live internet smoke checks are kept separate from deterministic tests. `scripts/live_smoke.py` runs a search, opens two pages concurrently, fills and submits a public Selenium test form, uploads a file, and verifies exact screenshot dimensions; it does not cover games. `scripts/companion_live_smoke.py` reaches the network too, though its subject is the extension: it starts a disposable Chromium with the companion loaded and drives whatever `--url` names, which defaults to `https://example.com`. Public game sites change without notice, so the frame gate, input atomicity, and held-input recovery are verified by the deterministic local suite instead.
