@@ -106,6 +106,12 @@ _BY_ACTION: dict[str, dict[str, str]] = {
     "secret_scan": {
         "url": "The page to scan: a cold load in a fresh isolated session (closed unless keep_open).",
         "hosts": "Your other hosts, <= 10 (same rules as scope): their scripts count as own too.",
+        "scope": "page (url + paths, browser optional), site (crawl of links and sitemap, served HTML only), hosts (each named origin, served HTML only).",
+        "paths": "Your own routes to scan too: /login, /api/health; <= 50, GET only.",
+        "max_pages": "Site crawl: at most this many pages (default 10, at most 50).",
+    },
+    "active_probe": {
+        "scope": "page (url) or hosts (each named origin's front page); no site crawl - active probes multiply requests.",
     },
     "active_probe": {
         "url": "The page to probe: ordinary GETs plus OPTIONS/TRACE, all in scope and budget.",

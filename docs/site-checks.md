@@ -371,11 +371,17 @@ password field). `token_names` lists the session's token names without values.
 | --- | --- |
 | Secrets | Cloud keys (AWS, GitHub, Slack, Google, Stripe), private keys, secret-looking assignments, JWT values and high-entropy literals - every sample masked, with the file and line. |
 | Source maps | A referenced `sourceMappingURL` is opened the same way: shipped original sources fail high, names alone warn. |
+| Agent files | `llms.txt`, skills, MCP cards and API descriptions the page references (Link headers included): fetched when same-scope, scanned for secrets, code never quoted. |
 | Endpoints | Routes from `fetch`/`axios` calls and `/api/` literals, own scope only. |
 | API description | A referenced OpenAPI/Swagger document served without auth: version and path count. |
 | Sign-in forms | A form posting a password over http fails; password fields without a password `autocomplete` token warn. |
 
 `summary: "min"` keeps `counts`, `priority` and `summary_line` as usual.
+
+`scope` widens the read without a browser: `site` crawls links and the sitemap
+from `url` (served HTML, `robots.txt` honoured, `max_pages`/`max_depth`/
+`delay_ms` bound it), `hosts` reads each named origin's front page; sections
+merge into one `priority[]`. `paths` scans your own routes too.
 
 ### SARIF and baselines
 
@@ -417,6 +423,10 @@ takes a payload, so reflection is a warning with the contexts, never a verdict.
 | `save_to`, `sarif_to`, `baseline`, `overwrite` | As usual: JSON, SARIF 2.1.0, regression against a saved report. |
 
 `summary: "min"` keeps `counts`, `priority` and `summary_line` as usual.
+
+`scope='hosts'` probes each named origin's front page instead (no site crawl:
+active probing multiplies requests - discover routes with a `site` crawl first,
+then probe them through `paths`).
 
 ## `perf_report`
 

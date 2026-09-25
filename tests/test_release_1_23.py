@@ -170,14 +170,14 @@ def test_sourcemap_findings_mask_code():
         "https://h.test/", "<html></html>", [], [],
         [{"url": "https://h.test/a.js.map", "sources": 1, "names": ["a.ts"],
           "names_omitted": 0, "has_content": True}],
-        [], {}, None, [])
+        [], [], {}, None, [])
     found = {item["id"]: item for item in report["findings"]}
     assert found["secret-sourcemap-sources"]["severity"] == "high"
     calm = secret_checks.build(
         "https://h.test/", "<html></html>", [], [],
         [{"url": "https://h.test/a.js.map", "sources": 1, "names": ["a.ts"],
           "names_omitted": 0, "has_content": False}],
-        [], {}, None, [])
+        [], [], {}, None, [])
     assert {item["id"] for item in calm["findings"]} == {"secret-sourcemap-exposed"}
 
 

@@ -20,9 +20,10 @@ from typing import Any, Literal
 from urllib.parse import urljoin, urlsplit
 
 from web_search_neo import __version__, browser_tools, macros, network_log
-from web_search_neo.audit import active, api, api_parts, diff, har, page as page_checks, perf, report
-from web_search_neo.audit import sarif, scenario, scope, secrets as secret_checks, site
-from web_search_neo.audit.findings import info as info_finding
+from web_search_neo.audit import active, api, api_parts, diff, har, multipage, page as page_checks
+from web_search_neo.audit import perf, report, sarif, scenario, secrets as secret_checks, site
+from web_search_neo.audit import scope as scope_mod
+from web_search_neo.audit import transport as transport_mod
 from web_search_neo.fetch.safety import resolve_save_path, write_download
 from web_search_neo.perception import min_summary
 
@@ -234,7 +235,7 @@ async def browser_api_report(
     if url is None and not session_id:
         raise ValueError("api_report needs url (a fresh isolated load) or the session_id of an open page")
     if hosts:
-        scope.Scope.build(hosts)  # отказ до открытия браузера: wildcards/суффиксы/ >10 хостов
+        scope_mod.Scope.build(hosts)  # отказ до открытия браузера: wildcards/суффиксы/ >10 хостов
     sid = session_id or f"api-report-{secrets.token_hex(3)}"
 
     def run() -> dict[str, Any]:
@@ -310,7 +311,14 @@ def _write_outputs(result: dict[str, Any], save_to: str | None, sarif_to: str | 
 async def browser_secret_scan(
     url: str | None = None,
     session_id: str | None = None,
+    scope: str = "page",
     hosts: list[str] | None = None,
+    paths: list[str] | None = None,
+    include_subdomains: bool = False,
+    max_pages: int = 10,
+    max_depth: int = 2,
+    delay_ms: int = 500,
+    respect_robots: bool = True,
     keep_open: bool = False,
     wait_seconds: float = 2.0,
     timeout_seconds: float = 20.0,
@@ -319,21 +327,56 @@ async def browser_secret_scan(
     baseline: str | None = None,
     overwrite: bool = False,
 ) -> dict[str, Any]:
-    """Секреты и эндпоинты в коде страницы: ключи, токены, openapi, формы входа.
+    """Секреты и эндпоинты в коде: ключи, токены, openapi, sourcemaps, agent-файлы, формы входа.
 
-    Пассивно: страница (обычный GET), её скрипты из своей области (обычные
-    GET, все в requests_made) и описание API, на которое страница ссылается.
-    Чужие скрипты только называются. Своих запросов, кроме чтения, нет.
+    scope='page' (default): url в свежей изолированной сессии или session_id
+    открытой страницы. 'site': обход ссылок и sitemap от url (только served
+    HTML, без браузера). 'hosts': первые страницы именованных origins.
+    Везде пассивно: обычные GET в своей области, все в requests_made.
     """
+    if scope not in {"page", "site", "hosts"}:
+        raise ValueError(f"secret_scan scope must be one of ['page', 'site', 'hosts'], not {scope!r}")
+    if scope != "page" and session_id:
+        raise ValueError("secret_scan session_id is page mode only: site/hosts read served HTML")
     if url is None and not session_id:
         raise ValueError("secret_scan needs url (a fresh isolated load) or the session_id of an open page")
     if hosts:
-        scope.Scope.build(hosts)  # отказ до открытия браузера: wildcards/суффиксы/ >10 хостов
+        scope_mod.Scope.build(hosts)  # отказ до открытия браузера: wildcards/суффиксы/ >10 хостов
+    routes = site.validate_paths(paths) if paths else []
     sid = session_id or f"secret-scan-{secrets.token_hex(3)}"
 
     def run() -> dict[str, Any]:
-        opened = False
         timeout = max(1.0, min(float(timeout_seconds), 120.0))
+        if scope != "page":
+            own_scope = site._scope_for(url, hosts, include_subdomains, scope)
+            checker = report.Checker(own_scope, scope_mod.Budget(), timeout)
+            if scope == "site":
+                assert url is not None
+                crawled, crawl_info = multipage.crawl_pages(
+                    url, checker, own_scope, routes, max_pages, max_depth, delay_ms, respect_robots)
+                sections = [multipage.secret_page(checker, own_scope, target, hosts, view=view)
+                            for target, view in crawled]
+                result = multipage.merge("secret", url, scope, sections, checker.budget.made,
+                                         {"crawl": crawl_info})
+            else:
+                sections = []
+                for index, target in enumerate(own_scope.targets):
+                    start = url if url is not None and index == 0 else target.root("https")
+                    view = checker.get(start)
+                    if view.get("error") and (url is None or index > 0) \
+                            and target.scheme is None \
+                            and not transport_mod.is_certificate_error(str(view.get("error"))):
+                        start = "http" + start[len("https"):]
+                        view = checker.get(start)
+                    sections.append(multipage.secret_page(
+                        checker, own_scope, start, hosts, view=None if view.get("error") else view))
+                    for path in routes if index == 0 else []:
+                        stop = urljoin(report.origin_of(start), path)
+                        sections.append(multipage.secret_page(checker, own_scope, stop, hosts))
+                result = multipage.merge("secret", url or own_scope.targets[0].root("https"),
+                                         scope, sections, checker.budget.made)
+            return _write_outputs(result, save_to, sarif_to, baseline, bool(overwrite))
+        opened = False
         if url is not None:
             with browser_tools._sessions_lock:
                 live = browser_tools._sessions.get(sid)
@@ -363,59 +406,17 @@ async def browser_secret_scan(
             scope_url = url or page_url
             if not scope_url:
                 raise ValueError("secret_scan found no page URL: open a page in the session first")
-            own_scope = site._scope_for(scope_url, hosts, False, "page")
-            checker = report.Checker(own_scope, scope.Budget(), timeout)
-            page_view = checker.get(scope_url)
-            html = page_view.get("body") if isinstance(page_view.get("body"), str) else ""
+            own_scope = site._scope_for(scope_url, hosts, include_subdomains, "page")
+            checker = report.Checker(own_scope, scope_mod.Budget(), timeout)
             journal_urls = [str(row.get("url") or "") for row in rows + pending]
-            own = api_parts.own_sites(page_url or scope_url, hosts)
-            snapshot = page_checks.snapshot_from_html(html, scope_url)
-            script_urls = secret_checks.script_urls(snapshot.get("scripts"), journal_urls,
-                                                    page_url or scope_url, own)
-            scripts: list[dict[str, Any]] = []
-            for script_url in script_urls:
-                view = checker.get(script_url)
-                text = view.get("body") if 200 <= int(view.get("status") or 0) < 300 \
-                    and isinstance(view.get("body"), str) else ""
-                if text:
-                    scripts.append({"url": script_url, "text": text, "bytes": len(text.encode("utf-8"))})
-                else:
-                    scripts.append({"url": script_url, "text": "",
-                                    "bytes": 0, "error": str(view.get("error") or view.get("status"))})
-            refs = secret_checks.openapi_refs(html, [item["text"] for item in scripts], journal_urls)
-            openapi_docs: list[dict[str, Any]] = []
-            for ref in refs[: secret_checks.MAX_OPENAPI * 3]:
-                if len(openapi_docs) >= secret_checks.MAX_OPENAPI:
-                    break
-                target = urljoin(scope_url, ref)
-                if not own_scope.allows(target):
-                    continue
-                view = checker.get(target)
-                if 200 <= int(view.get("status") or 0) < 300 and isinstance(view.get("body"), str):
-                    seen = secret_checks.openapi_view(target, view["body"])
-                    if seen:
-                        openapi_docs.append(seen)
-            maps: list[dict[str, Any]] = []
-            done: set[str] = set()
-            for item in scripts:
-                for ref in secret_checks.sourcemap_refs(item["text"]):
-                    if len(maps) >= secret_checks.MAX_SOURCEMAPS:
-                        break
-                    target = urljoin(item["url"], ref)
-                    if target in done or not own_scope.allows(target):
-                        continue
-                    done.add(target)
-                    view = checker.get(target)
-                    if 200 <= int(view.get("status") or 0) < 300 and isinstance(view.get("body"), str):
-                        seen = secret_checks.sourcemap_view(target, view["body"])
-                        if seen:
-                            maps.append(seen)
-                if len(maps) >= secret_checks.MAX_SOURCEMAPS:
-                    break
-            result = secret_checks.build(page_url or scope_url, html, scripts, openapi_docs, maps,
-                                         jar, storage, hosts, checker.budget.made)
-            result["third_party_scripts"] = secret_checks.third_party_scripts(
-                snapshot.get("scripts"), page_url or scope_url, hosts, journal_urls)
+            page_view = checker.get(scope_url)
+            sections = [multipage.secret_page(checker, own_scope, scope_url, hosts, jar, storage,
+                                              journal_urls, view=None if page_view.get("error")
+                                              else page_view)]
+            for path in routes:
+                stop = urljoin(report.origin_of(scope_url), path)
+                sections.append(multipage.secret_page(checker, own_scope, stop, hosts))
+            result = multipage.merge("secret", scope_url, scope, sections, checker.budget.made)
             result = {**result, "session_id": sid if not opened or keep_open else None,
                       "fresh_isolated_load": opened, "dropped": int(dropped)}
             failed = False
@@ -428,10 +429,12 @@ async def browser_secret_scan(
 
 async def browser_active_probe(
     url: str | None = None,
+    scope: str = "page",
     hosts: list[str] | None = None,
     paths: list[str] | None = None,
     checks: list[str] | None = None,
     origin: str | None = None,
+    include_subdomains: bool = False,
     timeout_seconds: float = 20.0,
     save_to: str | None = None,
     sarif_to: str | None = None,
@@ -442,11 +445,15 @@ async def browser_active_probe(
 
     Вызов и есть согласие: только OPTIONS, TRACE и обычные GET своих страниц,
     ссылок и одного инертного query-токена ([a-z0-9]+, исполниться нигде не
-    может). Всё в своей области (Scope), в общем бюджете и в requests_made.
-    Никаких POST/PUT/DELETE, пейлоадов, авторизации, фаззинга и чужих хостов.
+    может). scope='page' (default) проверяет url; 'hosts' - первые страницы
+    именованных origins. Всё в своей области (Scope), в общем бюджете и в
+    requests_made. Никаких POST/PUT/DELETE, пейлоадов, авторизации, фаззинга
+    и чужих хостов.
     """
     if not url:
         raise ValueError("active_probe needs url (http or https, in scope)")
+    if scope not in {"page", "hosts"}:
+        raise ValueError(f"active_probe scope must be one of ['page', 'hosts'], not {scope!r}")
     known = ("cors", "methods", "redirects", "canary")
     wanted = list(checks) if checks else list(known)
     unknown = [name for name in wanted if name not in known]
@@ -462,8 +469,26 @@ async def browser_active_probe(
 
     def run() -> dict[str, Any]:
         timeout = max(1.0, min(float(timeout_seconds), 120.0))
-        own_scope = site._scope_for(url, hosts, False, "page")
-        checker = report.Checker(own_scope, scope.Budget(), timeout)
+        own_scope = site._scope_for(url, hosts, include_subdomains, scope)
+        checker = report.Checker(own_scope, scope_mod.Budget(), timeout)
+        if scope == "hosts":
+            sections = []
+            for index, target in enumerate(own_scope.targets):
+                root = url if index == 0 else target.root("https")
+                view = checker.get(root)
+                if view.get("error") and index > 0 and target.scheme is None \
+                        and not transport_mod.is_certificate_error(str(view.get("error"))):
+                    root = "http" + root[len("https"):]
+                    view = checker.get(root)
+                if view.get("error"):
+                    sections.append({"url": root, "error": str(view.get("error"))[:300]})
+                    continue
+                sections.append(multipage.active_page(
+                    checker, own_scope, root, root, hosts, wanted, probe_origin,
+                    routes if index == 0 else [],
+                    html=view.get("body") if isinstance(view.get("body"), str) else ""))
+            result = multipage.merge("active", url, scope, sections, checker.budget.made)
+            return _write_outputs(result, save_to, sarif_to, baseline, bool(overwrite))
         findings: list[dict[str, Any]] = []
         page_view = checker.get(url)
         if page_view.get("error"):
@@ -471,56 +496,9 @@ async def browser_active_probe(
                     "error": f"active_probe could not read the page: {page_view.get('error')}",
                     "requests_made": checker.budget.made}
         html = page_view.get("body") if isinstance(page_view.get("body"), str) else ""
-        snapshot = page_checks.snapshot_from_html(html, url)
-        targets = [urljoin(report.origin_of(url), path) for path in routes]
-        if "cors" in wanted:
-            for target in [url, *targets]:
-                answer = checker.request("OPTIONS", target, {
-                    "Origin": probe_origin, "Access-Control-Request-Method": "GET"})
-                if answer.get("error"):
-                    findings.append(info_finding(
-                        "active-check-unreachable", "cors", "The preflight could not be sent",
-                        evidence={"url": api_parts.safe_url(target),
-                                  "error": str(answer.get("error"))[:200]}))
-                else:
-                    findings += active.preflight_findings(target, probe_origin, answer.get("headers"))
-        if "methods" in wanted:
-            for target in [url, *targets]:
-                answer = checker.request("OPTIONS", target)
-                if answer.get("error"):
-                    continue
-                headers = answer.get("headers") or {}
-                findings += active.methods_findings(
-                    target, answer.get("status"),
-                    str(headers.get("allow") or ""), None)
-            trace = checker.request("TRACE", url)
-            if not trace.get("error"):
-                findings += active.methods_findings(
-                    url, None, "", trace.get("status"))
-        if "redirects" in wanted:
-            links = [link for link in secret_checks.link_urls(snapshot)
-                     if own_scope.allows(link)][: active.MAX_LINKS]
-            for link in links:
-                view = checker.get(link)
-                if view.get("error"):
-                    continue
-                findings += active.redirect_findings(
-                    link, view.get("route") or [], view.get("final_url") or link, url,
-                    view.get("not_followed"))
-        if "canary" in wanted:
-            token = active.new_canary()
-            candidates = [url] + [link for link in secret_checks.link_urls(snapshot)
-                                  if "?" in link and own_scope.allows(link)][: active.MAX_CANARY - 1]
-            for candidate in candidates[: active.MAX_CANARY]:
-                base = candidate.split("#", 1)[0]
-                sep = "&" if "?" in base else "?"
-                probe_url = f"{base}{sep}{active.CANARY_PARAM}={token}"
-                view = checker.get(probe_url)
-                body = view.get("body")
-                if view.get("error") or not isinstance(body, str):
-                    continue
-                findings += active.reflection_findings(probe_url, token, body)
-        result = active.build(url, wanted, findings, checker.budget.made)
+        section = multipage.active_page(checker, own_scope, url, url, hosts, wanted,
+                                        probe_origin, routes, html=html)
+        result = multipage.merge("active", url, scope, [section], checker.budget.made)
         return _write_outputs(result, save_to, sarif_to, baseline, bool(overwrite))
     return await asyncio.to_thread(run)
 

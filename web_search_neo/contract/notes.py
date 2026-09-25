@@ -206,7 +206,7 @@ _ACTION_NOTES = {
         "modes": "summary='min' keeps counts, priority and summary_line. save_to writes the report as JSON; har_to writes the journal as HAR 1.2 - a HAR can carry what its URLs carried, treat it as a secret.",
     },
     "secret_scan": {
-        "scope": "Passive: the page, its same-scope scripts and a referenced API description over ordinary GETs (all in requests_made). Third-party scripts are named, never fetched.",
+        "scope": "Passive: the page, its same-scope scripts, a referenced API description and agent files (llms.txt, skills, MCP cards by reference) over ordinary GETs (all in requests_made). Third-party scripts are named, never fetched. scope='site' crawls links and sitemap (served HTML, robots.txt honoured), 'hosts' reads each named origin; both aggregate sections with merged findings.",
         "checks": "secrets in code (cloud keys, tokens, JWT, private keys, high-entropy literals - values masked), endpoints from fetch/axios literals, openapi/swagger when referenced, sign-in forms (http post, autocomplete).",
         "modes": "summary='min' keeps counts, priority and summary_line. save_to writes JSON, sarif_to SARIF 2.1.0; baseline adds regression {fixed, added}.",
     },

@@ -359,10 +359,14 @@ def test_secret_scan_reads_a_cold_isolated_load(secret_site):
                                    "sources": 2, "names": ["src/app.ts", "src/secret.ts"],
                                    "names_omitted": 0, "has_content": True}]
     assert found["secret-sourcemap-sources"]["severity"] == "high"
+    assert data["agent_docs"] == [{"url": secret_site.base_url + "/llms.txt",
+                                     "bytes": len(secret_fixture_site.LLMS_TXT.encode("utf-8"))}]
+    assert found["secret-agent-docs"]["status"] == "info"
     assert data["requests_made"] == [f"GET {secret_site.base_url}/",
                                      f"GET {secret_site.base_url}/static/app.js",
                                      f"GET {secret_site.base_url}/openapi.json",
-                                     f"GET {secret_site.base_url}/static/app.js.map"]
+                                     f"GET {secret_site.base_url}/static/app.js.map",
+                                     f"GET {secret_site.base_url}/llms.txt"]
     assert data["fresh_isolated_load"] is True and data["session_id"] is None
     assert not browser_tools._sessions
     dump = json.dumps(data)

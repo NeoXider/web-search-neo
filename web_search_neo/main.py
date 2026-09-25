@@ -28,7 +28,7 @@ from web_search_neo.fetch import content as fetch_content
 from web_search_neo import dispatch
 
 
-__version__ = "1.23.0"
+__version__ = "1.24.0"
 
 log = configure_server_log()  # per-user state dir; see log_setup.py
 

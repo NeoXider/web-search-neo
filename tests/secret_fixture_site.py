@@ -39,10 +39,14 @@ PAGE = """<!doctype html>
 <script src="/static/app.js"></script>
 <script src="{third_party}/static/vendor.js"></script>
 <link rel="openapi" href="/openapi.json">
+<link rel="alternate" type="text/markdown" href="/llms.txt">
 </head><body><h1>secret fixture</h1>
+<a id="p2" href="/page2">two</a>
 <form action="/login" method="post"><input type="password" name="pw"><button type="submit" id="go">go</button></form>
 </body></html>
 """
+
+LLMS_TXT = "# Fixture docs\n\nPublic agent notes with no secrets.\n"
 
 
 @dataclass
@@ -98,6 +102,12 @@ def start() -> FixtureSite:
                 self._send(200, b"", "image/x-icon")
             elif path == "/static/app.js.map":
                 self._send(200, json.dumps(APP_MAP).encode("utf-8"), "application/json")
+            elif path == "/llms.txt":
+                self._send(200, LLMS_TXT.encode("utf-8"), "text/markdown; charset=utf-8")
+            elif path == "/page2":
+                self._send(200, (b"<html><head><title>two</title></head><body>"
+                                  b'<a id="home" href="/">home</a></body></html>'),
+                            "text/html; charset=utf-8")
             else:
                 self._send(404, b"<html><body>not found</body></html>", "text/html; charset=utf-8")
 

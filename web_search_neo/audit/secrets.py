@@ -19,7 +19,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from web_search_neo.audit import api_parts, grading, page as page_checks, sites
-from web_search_neo.audit.findings import clip_list, finding
+from web_search_neo.audit.findings import clip_list, finding, info
 from web_search_neo.fetch.safety import REDACTED
 
 # How many script files one report fetches, and how many API descriptions and
@@ -88,6 +88,40 @@ _METHOD_NEARBY = re.compile(r"method\s*:\s*['\"`](GET|POST|PUT|PATCH|DELETE|HEAD
 _API_LITERAL = re.compile(r"['\"`]((?:/[^'\"`\n]*api[^'\"`\n]*|[^'\"`\n]*api[^'\"`\n]*/[^'\"`\n]*))['\"`]")
 _OPENAPI_REF = re.compile(r"(openapi\.json|swagger\.json|swagger/v\d+/swagger\.json|api-docs(?:\.json)?)"
                           r"|(['\"`])((?:https?://[^\s'\"`]+|/)[^\s'\"`]*?(?:openapi|swagger)[^\s'\"`]*\.json)\2")
+# Agent-facing files: served for AI callers (llms.txt, skills, MCP cards). Found by
+# reference only - Link headers, page text, code literals, loaded URLs - never guessed.
+_AGENT_URL = re.compile(r"((?:https?://[^\s'\"`]+|/)[^\s'\"`]*?(?:llms\.txt|agents?\.md"
+                        r"|skills(?:\.json|/[^\s'\"`]*)?|mcp\.json|agent-card[^\s'\"`]*))",
+                        re.IGNORECASE)
+_AGENT_REL_FRAGS = ("service", "agent", "mcp", "skill", "author", "alternate")
+_LINK_URI = re.compile(r"<([^<>\s]+)>\s*([^,]*)")
+
+
+def agent_refs(html: str, texts: list[str], journal_urls: list[str],
+               link_header: str | None = None) -> list[str]:
+    """Agent-surface references: Link headers plus name matches in page, code and traffic."""
+    refs: list[str] = []
+
+    def _take(ref: str | None) -> None:
+        if ref and ref not in refs:
+            refs.append(ref)
+
+    for match in _LINK_URI.finditer(link_header or ""):
+        uri, params = match.group(1), (match.group(2) or "").lower()
+        rel = re.search(r'rel="([^"]+)"', params)
+        typ = re.search(r'type="([^"]+)"', params)
+        rel_text = rel.group(1) if rel else ""
+        type_text = typ.group(1) if typ else ""
+        if _OPENAPI_LIKE.search(uri):
+            # An API description belongs to openapi[], not here.
+            continue
+        if any(frag in rel_text for frag in _AGENT_REL_FRAGS) or "markdown" in type_text \
+                or _AGENT_URL.search(uri):
+            _take(uri)
+    for source in [html or "", *(texts or []), *(journal_urls or [])]:
+        for match in _AGENT_URL.finditer(source):
+            _take(match.group(1))
+    return refs
 _LITERAL = re.compile(r"['\"`]([^'\"`\n]{1,400})['\"`]")
 _SOURCEMAP = re.compile(r"//# sourceMappingURL=(\S+)|/\*# sourceMappingURL=(\S+?)\s*\*/")
 
@@ -236,8 +270,17 @@ def _add_call(found: dict[tuple[str, str], dict[str, Any]], method: str, target:
         entry["sources"].append(source)
 
 
-def openapi_refs(html: str, texts: list[str], journal_urls: list[str]) -> list[str]:
-    """API descriptions the page itself references: links, code literals, loaded URLs."""
+_OPENAPI_LIKE = re.compile(r"openapi|swagger|api-docs", re.IGNORECASE)
+
+
+def _link_uris(link_header: str | None) -> list[str]:
+    """URIs advertised in Link headers (rel/service descriptors live here)."""
+    return [match.group(1) for match in _LINK_URI.finditer(link_header or "")]
+
+
+def openapi_refs(html: str, texts: list[str], journal_urls: list[str],
+                 link_header: str | None = None) -> list[str]:
+    """API descriptions the page itself references: links, Link headers, code literals, URLs."""
     refs: list[str] = []
     for match in _OPENAPI_REF.finditer(html or ""):
         refs.append(match.group(1) or match.group(3))
@@ -245,6 +288,7 @@ def openapi_refs(html: str, texts: list[str], journal_urls: list[str]) -> list[s
         for match in _OPENAPI_REF.finditer(text or ""):
             refs.append(match.group(1) or match.group(3))
     refs.extend(url for url in journal_urls if _OPENAPI_REF.search(url or ""))
+    refs.extend(uri for uri in _link_uris(link_header) if _OPENAPI_LIKE.search(uri))
     seen: list[str] = []
     for ref in refs:
         if ref and ref not in seen:
@@ -333,7 +377,8 @@ def script_urls(snapshot_scripts: Any, journal_urls: list[str],
 
 def build(page_url: str, html: str, scripts: list[dict[str, Any]],
           openapi_docs: list[dict[str, Any]], sourcemaps: list[dict[str, Any]],
-          jar: list[Any] | None, storage: Any, hosts: list[str] | None,
+          agent_docs: list[dict[str, Any]] | None, jar: list[Any] | None,
+          storage: Any, hosts: list[str] | None,
           requests_made: list[str]) -> dict[str, Any]:
     """The assembled secret_scan report: findings with priority and fixes."""
     parts = api_parts
@@ -341,6 +386,16 @@ def build(page_url: str, html: str, scripts: list[dict[str, Any]],
     findings: list[dict[str, Any]] = []
     for script in scripts:
         findings += scan_text(str(script.get("text") or ""), str(script.get("url") or "inline"))
+    agent_views = []
+    for doc in agent_docs or []:
+        agent_views.append({"url": doc.get("url"), "bytes": int(doc.get("bytes") or 0)})
+        findings += scan_text(str(doc.get("text") or ""), str(doc.get("url") or "agent-doc"))
+    if agent_views:
+        findings.append(info(
+            "secret-agent-docs", "surface", "Agent-facing files served",
+            detail="Files addressed to AI callers (llms.txt, skills, MCP cards): public by "
+                   "design, but worth reading for internal URLs and secrets - scanned above.",
+            evidence=clip_list([view["url"] for view in agent_views], parts.EVIDENCE_LIMIT)))
     endpoints: dict[tuple[str, str], dict[str, Any]] = {}
     for script in scripts:
         for item in code_endpoints(str(script.get("text") or ""), str(script.get("url") or "inline"), own):
@@ -396,6 +451,7 @@ def build(page_url: str, html: str, scripts: list[dict[str, Any]],
         "code_endpoints": sorted(endpoints.values(), key=lambda item: (-item["count"], item["path"])),
         "openapi": openapi_docs,
         "sourcemaps": list(sourcemaps or []),
+        "agent_docs": agent_views,
         "auth_forms": facts,
         "token_names": token_names,
         **({"storage_note": storage_error} if storage_error else {}),

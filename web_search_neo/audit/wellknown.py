@@ -92,6 +92,38 @@ def analyze_security_txt(result: dict[str, Any] | None) -> tuple[list[dict[str, 
     return out, view
 
 
+# Crawlers that feed AI training and agentic retrieval: naming one in robots.txt
+# is currently the only polite opt-out, and not naming it leaves it to `*`.
+_AI_BOTS = ("gptbot", "chatgpt-user", "claudebot", "anthropic-ai", "ccbot", "perplexitybot",
+            "google-extended", "bytespider", "cohere-ai", "meta-ai", "applebot-extended",
+            "amazonbot", "youbot", "diffbot", "omgilibot", "facebookbot")
+
+
+def ai_crawler_policy(body: str) -> dict[str, list[str]]:
+    """AI crawlers named in robots.txt, split into blocked (Disallow: /) and open."""
+    groups: dict[str, list[str]] = {}
+    group: list[str] = []
+    had_rule = False
+    for line in body.splitlines():
+        key, _, value = line.split("#", 1)[0].partition(":")
+        key, value = key.strip().lower(), value.strip()
+        if key == "user-agent" and value:
+            if had_rule:
+                group = []
+                had_rule = False
+            if value.lower() not in group:
+                group.append(value.lower())
+        elif key == "disallow" and group:
+            had_rule = True
+            for agent in group:
+                groups.setdefault(agent, []).append(value)
+    named = sorted({agent for agent in groups for token in _AI_BOTS if token in agent})
+    blocked = sorted(agent for agent in named
+                     if any(rule == "/" for rule in groups.get(agent, [])))
+    return {"named": named, "blocked": blocked,
+            "open": sorted(agent for agent in named if agent not in blocked)}
+
+
 def analyze_robots(result: dict[str, Any] | None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     body = _text_file(result or {})
     if body is None:
@@ -109,10 +141,23 @@ def analyze_robots(result: dict[str, Any] | None) -> tuple[list[dict[str, Any]],
             agents.add(value)
     view = {"present": True, "lines": len(body.splitlines()), "user_agents": sorted(agents)[:20],
             "disallow": disallow[:20], "disallow_total": len(disallow), "sitemaps": sitemaps[:10]}
-    return [info("robots-present", "files", f"robots.txt disallows {len(disallow)} path(s)",
-                 detail="robots.txt is public and only a request to polite crawlers: it hides nothing.",
-                 fix="Never rely on Disallow to protect admin or private URLs; protect them with authentication.",
-                 evidence={"disallow": disallow[:20], "sitemaps": sitemaps[:10]})], view
+    findings = [info("robots-present", "files", f"robots.txt disallows {len(disallow)} path(s)",
+                     detail="robots.txt is public and only a request to polite crawlers: it hides nothing.",
+                     fix="Never rely on Disallow to protect admin or private URLs; protect them with authentication.",
+                     evidence={"disallow": disallow[:20], "sitemaps": sitemaps[:10]})]
+    policy = ai_crawler_policy(body)
+    view["ai_crawlers"] = policy
+    findings.append(info(
+        "robots-ai-policy", "files",
+        f"robots.txt names {len(policy['named'])} AI crawler(s): "
+        f"{len(policy['blocked'])} blocked" if policy["named"] else
+        "robots.txt names no AI crawler: they follow the '*' rules",
+        detail="AI training and agentic-retrieval bots obey robots.txt when they are named in it; "
+               "unnamed ones follow the '*' group. This says nothing about impolite scrapers.",
+        fix="Decide per crawler: 'Disallow: /' under its User-agent opts out, leaving it open "
+            "is a deliberate choice - record it.",
+        evidence=policy))
+    return findings, view
 
 
 def read(origin: str, fetch: Callable[[str], dict[str, Any]]) -> dict[str, Any]:

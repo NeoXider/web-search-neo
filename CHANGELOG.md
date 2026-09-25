@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### 1.24.0
+
+Fuller pentest coverage with the same safety contract: no new actions, so the capabilities budget is untouched.
+- `secret_scan` learned `scope`: `page` (as before, browser optional) plus `site` (a bounded crawl of links and sitemap from `url`, served HTML only, `robots.txt` honoured) and `hosts` (each named origin's front page); `paths` scans your own routes too. Sections merge into one `priority[]`.
+- `active_probe` learned `scope='hosts'`: every named origin's front page gets the full probe (no site crawl - active probing multiplies requests; discover routes with a `site` crawl first, then probe them through `paths`).
+- `secret_scan` reads the agent surface it is referenced to: `llms.txt`, skills, MCP cards and API descriptions from Link headers, page text, code and traffic (never guessed) - fetched when same-scope, scanned for secrets, code never quoted.
+- `security_report` names the AI-crawler policy of `robots.txt` (`robots-ai-policy`): which training/agentic bots are named, blocked or left open.
+- The authenticated-audit recipe (`test_run` login with `keep_open`, then `api_report {session_id}`) is documented in the playbook and pinned by a release test.
+
+Docs: `docs/site-checks.md` (secret_scan scope, agent files, active_probe hosts), README, TODO roadmap 1.24/1.25.
+
 ### 1.23.0
 
 `active_probe`: the opt-in active checks - the call itself is the consent. CORS preflight with a foreign `Origin` (reflection with credentials, `null`, `*` with credentials, open methods/headers), OPTIONS on the page and your `paths` plus a TRACE probe, plain GETs of the page's own links watching for chains that leave the site (open redirect), and one inert query token (`[a-z0-9]+`, can never execute) watching for reflection. Only own scope, shared budget, everything in `requests_made`; no POST/PUT/DELETE, payloads, auth or fuzzing; no browser needed. `summary: "min"` keeps `counts`, `priority` and `summary_line`.
