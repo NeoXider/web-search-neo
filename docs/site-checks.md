@@ -399,7 +399,7 @@ The numbers come from the page's own Performance API: navigation timing (`ttfb_m
 `dom_content_loaded_ms`, `load_ms`, document size, protocol, redirects), paint (`fcp_ms`),
 buffered `largest-contentful-paint` (`lcp_ms`, `lcp_element`) and `layout-shift` observers
 (`cls`, the largest session window, input-driven shifts excluded), and resource timing
-(count, transfer by type, the largest files, third-party share, `render_blocking` from
+(count, transfer by initiator - what loaded each file: script, css, link, img - the largest files, third-party share, `render_blocking` from
 `renderBlockingStatus`, or the head's synchronous scripts and stylesheets on an older
 Chrome). `ratings` uses the Web Vitals thresholds; `recommendations` names the fix for each
 problem (slow TTFB, slow LCP, layout shift, render-blocking files, uncompressed text, files

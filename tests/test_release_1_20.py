@@ -592,7 +592,7 @@ def test_perf_report_measures_a_cold_isolated_load(fixture_sites):
     assert data["fresh_isolated_load"] and data["session_id"] is None and not browser_tools._sessions
     assert isinstance(metrics["ttfb_ms"], int) and metrics["ttfb_ms"] >= 0
     assert isinstance(metrics["fcp_ms"], int) and metrics["load_ms"] is not None
-    assert data["resources"]["count"] >= 3 and "script" in data["resources"]["by_type"]
+    assert data["resources"]["count"] >= 3 and "script" in data["resources"]["by_initiator"]
     assert metrics["cls"] is not None and data["ratings"]["ttfb_ms"] == "good"
     assert data["render_blocking"]["count"] >= 1  # the head stylesheet and sync script
 

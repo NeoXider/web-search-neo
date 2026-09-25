@@ -211,7 +211,7 @@ _ACTION_NOTES = {
         "modes": "summary='min' keeps counts, priority and summary_line. save_to writes JSON, sarif_to SARIF 2.1.0; baseline adds regression {fixed, added}.",
     },
     "perf_report": {
-        "source": "The page's own Performance API: navigation timing (TTFB, DOMContentLoaded, load), paint (FCP), buffered largest-contentful-paint and layout-shift observers (LCP, CLS as the largest session window), resource timing (count, transfer, by type, third-party share, renderBlockingStatus).",
+        "source": "The page's own Performance API: navigation timing (TTFB, DOMContentLoaded, load), paint (FCP), buffered largest-contentful-paint and layout-shift observers (LCP, CLS as the largest session window), resource timing (count, transfer, by initiator, third-party share, renderBlockingStatus).",
         "lab": "Lab numbers from the automation browser: compare runs of the same page, do not read them as real-visitor field data.",
         "modes": "url alone: a cold load in a fresh isolated session, closed afterwards unless keep_open. session_id alone: the page open there. Both: that session navigates to url (warm cache).",
     },

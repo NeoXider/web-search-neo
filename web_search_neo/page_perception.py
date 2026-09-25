@@ -1862,6 +1862,11 @@ def _text_exclusions(
             )
         else:
             reasons.append("aria-hidden, [hidden] and off-layout subtrees are never read")
+    if missing and missing * 2 >= rendered:
+        reasons.append(
+            "most of the page is hidden - often a cookie banner or dialog marking the "
+            "background aria-hidden: dismiss it first, or read the hidden part with run_script"
+        )
     cross_origin = int(frames.get("cross_origin") or 0)
     if cross_origin:
         reasons.append(

@@ -155,9 +155,11 @@ def shape(raw: dict[str, Any]) -> dict[str, Any]:
     lcp_ms = round(lcp["time"]) if lcp and isinstance(lcp.get("time"), (int, float)) else None
     cls = cumulative_layout_shift(raw.get("shifts"))
     resources = list(raw.get("resources") or [])
-    by_type: dict[str, dict[str, float]] = {}
+    # Buckets are initiator types (what loaded each file: script, css, link,
+    # img, ...), not content types - a PNG loaded through CSS lands in "css".
+    by_initiator: dict[str, dict[str, float]] = {}
     for item in resources:
-        bucket = by_type.setdefault(str(item.get("type") or "other"), {"count": 0, "kb": 0.0})
+        bucket = by_initiator.setdefault(str(item.get("type") or "other"), {"count": 0, "kb": 0.0})
         bucket["count"] += 1
         bucket["kb"] = round(bucket["kb"] + _kb(item.get("transfer") or 0), 1)
     total_transfer = sum(item.get("transfer") or 0 for item in resources) + (nav.get("transfer") or 0)
@@ -183,10 +185,11 @@ def shape(raw: dict[str, Any]) -> dict[str, Any]:
         "lcp_element": lcp.get("element") if lcp else None, "lcp_url": lcp.get("url") if lcp else None,
         "resources": {
             "count": int(raw.get("resources_total") or len(resources)), "listed": len(resources),
-            "transfer_kb": _kb(total_transfer), "by_type": by_type,
+            "transfer_kb": _kb(total_transfer), "by_initiator": by_initiator,
             "third_party": {"count": len(third), "transfer_kb": _kb(sum(i.get("transfer") or 0 for i in third)),
                             "sites": sorted({site_of(host_of(i["url"])) for i in third})[:30]},
-            "largest": [{"url": i["url"], "kb": _kb(i.get("transfer") or 0), "type": i.get("type")} for i in heavy[:10]],
+            "largest": [{"url": i["url"], "kb": _kb(i.get("transfer") or 0),
+                         "initiator": i.get("type")} for i in heavy[:10]],
         },
         "render_blocking": {"count": len(blocking), "urls": blocking[:20]},
         "recommendations": _recommend(metrics, ratings, blocking, uncompressed, heavy, total_transfer, resources),

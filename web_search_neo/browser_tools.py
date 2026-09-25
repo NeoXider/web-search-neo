@@ -3886,6 +3886,18 @@ def click(
             post.update(_verification.collect_click_effects(
                 session.driver, element if top_level else None, pre_click, post, measurable=top_level
             ))
+            if top_level and element is not None and post.get("verified") is False:
+                try:
+                    is_link = bool(session.driver.execute_script(
+                        "return arguments[0].tagName === 'A' && !!arguments[0].href;", element))
+                except Exception:
+                    is_link = False
+                if is_link:
+                    post["navigation_hint"] = (
+                        "The link did not navigate under a synthetic click - client-side "
+                        "routers only answer trusted input: retry with trusted=true, then "
+                        "read the page to confirm where it went."
+                    )
         except Exception:
             # The click happened but its evidence was never collected (the settle or
             # the summary failed): the observer must not keep running on the page.

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### 1.22.1
+
+Field fixes from the novita.ai verification pass (all pinned with regression tests):
+- `secret_scan` evidence samples center on the redacted match with its line number, instead of the bundle head.
+- `secret_scan.third_party_scripts` also names scripts the browser loaded beyond the served HTML (consent managers, tag loaders).
+- `code_endpoints` ignores bare identifiers (`capitalize`): a literal needs a `/` to count as a route.
+- `secret-entropy` ignores minified code fragments split by quotes: a literal must be token-shaped (no braces, semicolons or spaces).
+- A click on a link that does not navigate reports `navigation_hint` (retry with `trusted=true`); `success` still means "dispatched".
+- A macro ending on `screenshot` counts as reading the result back; macro files with a UTF-8 BOM validate.
+- `network {only_errors: true}` skips aborted prefetches (2xx/3xx + abort); `page_text` names a hidden majority (cookie banner over `aria-hidden`).
+- `perf_report` resource `type` was the initiator type: renamed to `initiator` under `resources.by_initiator` and in `largest[]`.
+
 ### 1.22.0
 
 `secret_scan`: what secrets and routes the page's own code carries. The page is read as served HTML and its same-scope scripts (at most 10) over ordinary GETs - every one listed in `requests_made`; third-party scripts are named, never fetched. Findings with priority and fixes, like `security_report`: cloud keys (AWS, GitHub, Slack, Google, Stripe), private keys, secret-looking assignments, JWT values and high-entropy literals (every sample masked, with file and line), routes from `fetch`/`axios` calls and `/api/` literals, a referenced `openapi.json`/`swagger.json` (version and path count), and sign-in forms posting over http. `summary: "min"` keeps `counts`, `priority` and `summary_line`.

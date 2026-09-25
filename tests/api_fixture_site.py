@@ -129,6 +129,15 @@ def start() -> FixtureSite:
                     ("Cache-Control", "no-store"),
                     ("X-Content-Type-Options", "nosniff"),
                 ])
+            elif path == "/clickme":
+                self._send(200,
+                            b'<html><head><title>click</title></head><body>'
+                            b'<a id="nope" href="/target" onclick="event.preventDefault()">stay</a>'
+                            b'<a id="go" href="/target">go</a></body></html>',
+                            "text/html; charset=utf-8")
+            elif path == "/target":
+                self._send(200, b"<html><head><title>target</title></head><body>arrived</body></html>",
+                            "text/html; charset=utf-8")
             else:
                 self._send(404, b"<html><body>not found</body></html>", "text/html; charset=utf-8")
 

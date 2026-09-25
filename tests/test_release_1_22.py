@@ -20,7 +20,7 @@ import pytest
 
 import secret_fixture_site
 from web_search_neo import audit_actions, browser_tools, main
-from web_search_neo.audit import diff, sarif, secrets
+from web_search_neo.audit import diff, perf, sarif, secrets
 from web_search_neo.contract import notes, param_docs
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -234,6 +234,101 @@ def test_fixture_serves_bundles_openapi_and_login(secret_site):
     assert b'type="password"' in body
 
 
+# --- regression tests for the novita.ai field findings -------------------------------------------------
+
+def test_sample_centers_on_the_match_in_minified_bundles():
+    text = '"head:' + "p" * 500 + '";const k="AKIAIOSFODNN7EXAMPLE";trail'
+    found = ids(secrets.scan_text(text, "bundle.js"))
+    sample = found["secret-aws-key"]["evidence"]["items"][0]["sample"]
+    assert "REDACTED" in sample and FAKE_AWS not in sample
+    assert '"head:' not in sample  # centered on the match, not on the line start
+    assert found["secret-aws-key"]["evidence"]["items"][0]["line"] == 1
+    multi = 'line one\nline two\nkey = "ghp_fixturetoken0123456789abcdef"\nline four'
+    item = ids(secrets.scan_text(multi, "m.js"))["secret-github-token"]["evidence"]["items"][0]
+    assert item["line"] == 3
+
+
+def test_third_party_scripts_include_journal_loads():
+    named = secrets.third_party_scripts([{"src": "https://cdn.test/a.js"}],
+                                        "http://127.0.0.1:9/", None,
+                                        ["http://127.0.0.1:9/app.js",
+                                         "https://tags.test/t.js",
+                                         "https://cdn.test/a.js"])
+    assert named == ["https://cdn.test/a.js", "https://tags.test/t.js"]
+
+
+def test_code_endpoints_ignore_bare_identifiers():
+    assert secrets.code_endpoints("const c = capitalize(x); const m = mediapipe_face();",
+                                  "a.js", {"h.test"}) == []
+    got = secrets.code_endpoints('fetch("/api/health");', "a.js", {"h.test"})
+    assert [(item["method"], item["path"]) for item in got] == [("GET", "/api/health")]
+
+
+def test_entropy_ignores_minified_code_fragments():
+    code = "var a=';do t+=function(e){switch(e.tag){case 26:return eX(eT1pe);}}';"
+    assert secrets.scan_text(code, "min.js") == []
+
+
+def test_macro_ending_on_screenshot_reads_back(tmp_path):
+    store = tmp_path / ".web-search-neo" / "macros"
+    store.mkdir(parents=True)
+    shot = store / "shot.json"
+    shot.write_text(json.dumps({"steps": [
+        {"action": "open", "url": "https://h.test/"},
+        {"action": "screenshot", "session_id": "s"}]}), encoding="utf-8")
+    result = main._validate_macro_file("shot", str(tmp_path))
+    assert result["valid"] is True
+    assert not [w for w in result["warnings"] if "never reads the result back" in w["error"]]
+    clicky = store / "clicky.json"
+    clicky.write_text(json.dumps({"steps": [
+        {"action": "open", "url": "https://h.test/"},
+        {"action": "click", "selector": "#x", "session_id": "s"}]}), encoding="utf-8")
+    result = main._validate_macro_file("clicky", str(tmp_path))
+    assert any("never reads the result back" in w["error"] for w in result["warnings"])
+    bom = store / "bom.json"
+    bom.write_bytes(b"\xef\xbb\xbf" + json.dumps({"steps": [
+        {"action": "open", "url": "https://h.test/"}]}).encode("utf-8"))
+    assert main._validate_macro_file("bom", str(tmp_path))["valid"] is True
+
+
+def test_only_errors_skips_aborted_prefetches():
+    from web_search_neo import diagnostics
+
+    rows = [
+        {"id": "1", "method": "GET", "url": "http://h/a", "type": "Fetch",
+         "status": 200, "failed": True, "error": "net::ERR_ABORTED"},
+        {"id": "2", "method": "GET", "url": "http://h/b", "type": "XHR",
+         "status": 500},
+        {"id": "3", "method": "GET", "url": "http://h/c", "type": "Script",
+         "status": None, "failed": True, "error": "net::ERR_BLOCKED_BY_CLIENT"},
+    ]
+    assert [row["id"] for row in diagnostics.filter_network(rows, only_errors=True)] == ["2", "3"]
+
+
+def test_page_text_names_a_hidden_majority():
+    from web_search_neo import page_perception
+
+    missing, reasons = page_perception._text_exclusions(
+        {"body_chars": 1000}, "x" * 100, "main", False, False, {})
+    assert missing == 900 and any("aria-hidden" in reason for reason in reasons)
+    missing, reasons = page_perception._text_exclusions(
+        {"body_chars": 1000}, "x" * 900, "main", False, False, {})
+    assert not [reason for reason in reasons if "cookie banner" in reason]
+
+
+def test_perf_resource_types_are_initiators():
+    raw = {"url": "https://h.test/", "ready_state": "complete", "lcp_supported": False,
+           "navigation": {}, "resources": [
+               {"url": "https://h.test/banner.png", "type": "css", "transfer": 400_000},
+               {"url": "https://h.test/app.js", "type": "script", "transfer": 1000}],
+           "resources_total": 2}
+    shaped = perf.shape(raw)
+    assert shaped["resources"]["by_initiator"]["css"]["count"] == 1
+    assert shaped["resources"]["largest"][0]["initiator"] == "css"
+    assert "by_type" not in shaped["resources"]
+    assert all("type" not in item for item in shaped["resources"]["largest"])
+
+
 # --- Chrome-backed ---------------------------------------------------------------------------------
 
 def _skip_without_chrome(result):
@@ -293,6 +388,42 @@ def test_secret_scan_sarif_baseline_and_min_summary(secret_site, tmp_path, monke
     mdata = mini["results"][0]["data"]
     assert mdata["summary_mode"] == "min" and mdata["counts"] and mdata["summary_line"]
     assert len(mdata["priority"]) <= 5 and "findings" in mdata["summary_omitted"]
+
+
+@pytest.fixture(scope="module")
+def click_site():
+    import api_fixture_site
+
+    site = api_fixture_site.start()
+    try:
+        yield site
+    finally:
+        site.stop()
+
+
+def test_click_hints_trusted_when_a_link_does_not_navigate(click_site):
+    from selenium.common.exceptions import WebDriverException
+
+    try:
+        browser_tools.open_page(click_site.base_url + "/clickme", session_id="click-hint",
+                                headless=True, profile_mode="temporary")
+    except WebDriverException as exc:
+        pytest.skip(f"Chrome/Selenium is unavailable: {exc}")
+    try:
+        held = asyncio.run(main.web_action([{"action": "click", "selector": "#nope",
+                                             "session_id": "click-hint"}]))
+        assert held["success"], held
+        data = held["results"][0]["data"]
+        assert data["success"] is True and data["verified"] is False
+        assert "trusted=true" in data.get("navigation_hint", "")
+        went = asyncio.run(main.web_action([{"action": "click", "selector": "#go",
+                                             "session_id": "click-hint"}]))
+        assert went["success"], went
+        gdata = went["results"][0]["data"]
+        assert gdata["verified"] is True and "navigation_hint" not in gdata
+    finally:
+        browser_tools.close_session("click-hint")
+    assert "click-hint" not in browser_tools._sessions
 
 
 def test_secret_scan_reads_an_open_session(secret_site):

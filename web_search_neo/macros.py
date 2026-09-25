@@ -300,7 +300,7 @@ def raw_payload(name: str, project_root: str | os.PathLike[str] | None = None) -
     see what the author actually wrote, so it reads through this instead.
     """
     path = _macro_path(name, project_root, create=False)
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
 def _guarded_ledger_path(project_root: str | os.PathLike[str] | None = None) -> Path:
@@ -527,7 +527,7 @@ def _load_guarded_ledger(project_root: str | os.PathLike[str] | None = None) -> 
     if not path.exists():
         return {"tokens": {}, "resources": {}, "identities": {}}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"guarded macro ledger is unreadable; refusing submit: {exc}") from None
     if not isinstance(data, dict):
@@ -815,7 +815,7 @@ def load(name: str, project_root: str | os.PathLike[str] | None = None) -> dict[
             'project_root needs the same one to run it: pass that path, or "auto".'
         )
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"macro '{name}' is not readable JSON: {exc}") from None
     return record_from_payload(payload, validate_name(name), path)
@@ -832,7 +832,7 @@ def list_macros(project_root: str | os.PathLike[str] | None = None) -> list[dict
     for path in _macro_files(macro_root(project_root, create=False)):
         try:
             record = record_from_payload(
-                json.loads(path.read_text(encoding="utf-8")), path.stem, path
+                json.loads(path.read_text(encoding="utf-8-sig")), path.stem, path
             )
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             summaries.append({"name": path.stem, "broken": f"{type(exc).__name__}: {exc}"})

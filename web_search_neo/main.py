@@ -28,7 +28,7 @@ from web_search_neo.fetch import content as fetch_content
 from web_search_neo import dispatch
 
 
-__version__ = "1.22.0"
+__version__ = "1.22.1"
 
 log = configure_server_log()  # per-user state dir; see log_setup.py
 
@@ -1460,7 +1460,7 @@ _SCRIPT_FIELDS = ("script", "source")
 # submit reports whatever the dispatcher happened to return and calls it done;
 # one that ends by waiting for a success marker or reading state can be believed.
 _VERIFYING_ACTIONS = frozenset(
-    {"wait", "wait_challenge", "run_script", "fetch_text", "fetch_links", "search"}
+    {"wait", "wait_challenge", "run_script", "fetch_text", "fetch_links", "search", "screenshot"}
 )
 # Steps that end a macro without being its point, so the "does it check itself"
 # question is asked of what came before them.

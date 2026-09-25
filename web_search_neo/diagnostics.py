@@ -466,8 +466,11 @@ def filter_network(
             continue
         if status_max is not None and status > status_max:
             continue
-        if only_errors and not (row.get("failed") or status >= 400):
-            continue
+        if only_errors:
+            aborted_prefetch = (200 <= status < 400
+                                and "abort" in str(row.get("error") or "").lower())
+            if not ((row.get("failed") and not aborted_prefetch) or status >= 400):
+                continue
         selected.append(row)
     return selected[-max(1, limit):]
 

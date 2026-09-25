@@ -28,6 +28,16 @@ MAX_OPENAPI = 2
 # A string literal worth a second look: long, mixed-case alphanumerics.
 _ENTROPY_MIN_LEN = 24
 _ENTROPY_MIN_BITS = 4.0
+# Token-shaped only: code fragments split by quotes carry braces, semicolons
+# and spaces, while keys and tokens do not - that is what tells them apart.
+_TOKEN_CHARS = re.compile(r"^[A-Za-z0-9+/=_.-]+$")
+
+
+def _looks_like_token(value: str) -> bool:
+    return len(value) >= _ENTROPY_MIN_LEN and _entropy(value) >= _ENTROPY_MIN_BITS \
+        and _TOKEN_CHARS.match(value) is not None \
+        and re.search(r"[a-z]", value) and re.search(r"[A-Z]", value) \
+        and re.search(r"\d", value)
 
 _PATTERNS: list[tuple[str, str, str, str, str, str]] = [
     # (finding id, status, severity, title, fix, regex).
@@ -73,7 +83,7 @@ _CREDENTIAL_RES = [rx for fid, _s, _v, _t, _f, rx in _PATTERNS_COMPILED
 _FETCH_CALL = re.compile(r"fetch\(\s*['\"`]([^'\"`]+)['\"`]")
 _AXIOS_CALL = re.compile(r"axios\.(get|post|put|patch|delete)\(\s*['\"`]([^'\"`]+)['\"`]", re.IGNORECASE)
 _METHOD_NEARBY = re.compile(r"method\s*:\s*['\"`](GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)['\"`]", re.IGNORECASE)
-_API_LITERAL = re.compile(r"['\"`](/?[A-Za-z0-9_\-./{}]*api[A-Za-z0-9_\-./{}]*)['\"`]")
+_API_LITERAL = re.compile(r"['\"`]((?:/[^'\"`\n]*api[^'\"`\n]*|[^'\"`\n]*api[^'\"`\n]*/[^'\"`\n]*))['\"`]")
 _OPENAPI_REF = re.compile(r"(openapi\.json|swagger\.json|swagger/v\d+/swagger\.json|api-docs(?:\.json)?)"
                           r"|(['\"`])((?:https?://[^\s'\"`]+|/)[^\s'\"`]*?(?:openapi|swagger)[^\s'\"`]*\.json)\2")
 _LITERAL = re.compile(r"['\"`]([^'\"`\n]{1,400})['\"`]")
@@ -99,10 +109,7 @@ def _redact_match(match: re.Match[str]) -> str:
 
 
 def _redact_entropy(match: re.Match[str]) -> str:
-    value = match.group(1)
-    if len(value) >= _ENTROPY_MIN_LEN and _entropy(value) >= _ENTROPY_MIN_BITS \
-            and re.search(r"[a-z]", value) and re.search(r"[A-Z]", value) \
-            and re.search(r"\d", value):
+    if _looks_like_token(match.group(1)):
         return match.group(0)[:1] + REDACTED + match.group(0)[-1:]
     return match.group(0)
 
@@ -117,7 +124,13 @@ def _sample(text: str, pos: int) -> tuple[str, int]:
     line = _LITERAL.sub(_redact_entropy, line)
     line = api_parts.mask_text(line).strip()
     lineno = text.count("\n", 0, pos) + 1
-    return (line[:200] if len(line) > 200 else line), lineno
+    if len(line) > 200:
+        # Center on the redacted match, not on the line start: on a minified
+        # single-line bundle line[:200] would show an unrelated head of code.
+        hit = line.find(REDACTED)
+        start = max(0, hit - 80) if hit != -1 else 0
+        line = line[start: start + 200]
+    return line, lineno
 
 
 def scan_text(text: str, source: str) -> list[dict[str, Any]]:
@@ -132,10 +145,7 @@ def scan_text(text: str, source: str) -> list[dict[str, Any]]:
             if sample:
                 hits.setdefault(fid, []).append({"file": source, "line": lineno, "sample": sample})
     for match in _LITERAL.finditer(text or ""):
-        value = match.group(1)
-        if len(value) >= _ENTROPY_MIN_LEN and _entropy(value) >= _ENTROPY_MIN_BITS \
-                and re.search(r"[a-z]", value) and re.search(r"[A-Z]", value) \
-                and re.search(r"\d", value):
+        if _looks_like_token(match.group(1)):
             sample, lineno = _sample(text, match.start())
             if sample:
                 hits["secret-entropy"] = [{"file": source, "line": lineno, "sample": sample}]
@@ -335,13 +345,27 @@ def build(page_url: str, html: str, scripts: list[dict[str, Any]],
 
 
 def third_party_scripts(snapshot_scripts: Any, page_url: str,
-                        hosts: list[str] | None) -> list[str]:
-    """Script files outside the scope: named in the answer, never fetched."""
+                        hosts: list[str] | None,
+                        journal_urls: list[str] | None = None) -> list[str]:
+    """Script files outside the scope: named in the answer, never fetched.
+
+    Served HTML names the static ones; the journal adds what scripts injected
+    later (consent managers, tag loaders) - both are only named.
+    """
     parts = api_parts
     own = parts.own_sites(str(page_url or ""), hosts)
     out: list[str] = []
+    candidates: list[str] = []
     for entry in _entries(snapshot_scripts):
         src = entry.get("src") if isinstance(entry, dict) else None
-        if src and not parts.is_own(str(src), own) and str(src) not in out:
-            out.append(parts.safe_url(str(src)))
+        if src:
+            candidates.append(str(src))
+    for url in journal_urls or []:
+        if urlsplit(str(url)).path.lower().endswith(".js"):
+            candidates.append(str(url))
+    for candidate in candidates:
+        if not parts.is_own(candidate, own):
+            safe = parts.safe_url(candidate)
+            if safe not in out:
+                out.append(safe)
     return out

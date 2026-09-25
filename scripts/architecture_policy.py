@@ -9,9 +9,11 @@ HARD_LIMIT = 800
 LEGACY_MAX_LINES = {
     # Raised 8305 -> 8360 for the attach_current_tab feature (verified by
     # tests/test_attach_tab*.py); extraction of the parked-tab cluster is pending.
-    "web_search_neo/browser_tools.py": 8360,
+    # Raised 8360 -> 8372 for the click navigation_hint on unverified link clicks.
+    "web_search_neo/browser_tools.py": 8372,
     "web_search_neo/main.py": 2678,
-    "web_search_neo/page_perception.py": 2681,
+    # Raised 2681 -> 2686 for the aria-hidden majority hint in page_text exclusions.
+    "web_search_neo/page_perception.py": 2686,
     "web_search_neo/chrome_bridge.py": 2070,
     "chrome-extension/service-worker.js": 1734,
     "web_search_neo/bridge_daemon.py": 1163,

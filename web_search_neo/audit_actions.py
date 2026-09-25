@@ -397,7 +397,7 @@ async def browser_secret_scan(
             result = secret_checks.build(page_url or scope_url, html, scripts, openapi_docs,
                                          jar, storage, hosts, checker.budget.made)
             result["third_party_scripts"] = secret_checks.third_party_scripts(
-                snapshot.get("scripts"), page_url or scope_url, hosts)
+                snapshot.get("scripts"), page_url or scope_url, hosts, journal_urls)
             result = {**result, "session_id": sid if not opened or keep_open else None,
                       "fresh_isolated_load": opened, "dropped": int(dropped)}
             failed = False
