@@ -331,17 +331,22 @@ def test_security_headers_carry_the_api_set():
             "access-control-max-age"} <= set(diagnostics.SECURITY_HEADERS)
 
 
-def test_version_pins_say_1_21():
-    assert main.__version__ == "1.21.0"
+def test_version_pins_are_consistent():
+    import re
+
     import web_search_neo
-    assert web_search_neo.__version__ == "1.21.0"
-    assert 'version = "1.21.0"' in (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert '"version": "1.21.0"' in (PROJECT_ROOT / "chrome-extension" / "manifest.json").read_text(
+    version = main.__version__
+    assert re.fullmatch(r"\d+\.\d+\.\d+", version)
+    assert web_search_neo.__version__ == version
+    assert f'version = "{version}"' in (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert f'"version": "{version}"' in (PROJECT_ROOT / "chrome-extension" / "manifest.json").read_text(
         encoding="utf-8")
     popup = (PROJECT_ROOT / "chrome-extension" / "popup.js").read_text(encoding="utf-8")
-    assert popup.count('"1.21.0"') == 2 and '"1.20.0"' not in popup
+    assert popup.count(f'"{version}"') == 2
     install = (PROJECT_ROOT / "INSTALL.md").read_text(encoding="utf-8")
-    assert "1.20.0" not in install and install.count("1.21.0") == 3
+    assert f"It describes version {version}." in install
+    assert f"It must read {version}" in install
+    assert f"The bundled companion is version {version}" in install
 
 
 # --- against the local fixture server (no Chrome) -------------------------------------

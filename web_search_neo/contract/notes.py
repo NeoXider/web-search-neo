@@ -205,6 +205,11 @@ _ACTION_NOTES = {
         "checks": "endpoints[] in frequency order: method, path template (ids as {id}), count, origins, channels (xhr/fetch/websocket/sse/beacon). Per own API response: CORS (allow-origin vs credentials, preflight methods/headers, wildcard/null origins), caching (public vs no-store/private on JSON and cookie-setting responses), Content-Type + X-Content-Type-Options on JSON, error bodies (stack traces, server paths, framework versions, snippets masked). Transport: ws:// vs wss://, http requests from an https page, third-party API origins. Auth: token cookies (flags, HttpOnly/Secure/SameSite) and localStorage/sessionStorage by name and format; JWT alg, exp/iat and signature presence without any value. CSRF: SameSite, a visible token in state-changing requests, writes leaving your site. Sensitive query params (token, e-mail, session id) with values masked.",
         "modes": "summary='min' keeps counts, priority and summary_line. save_to writes the report as JSON; har_to writes the journal as HAR 1.2 - a HAR can carry what its URLs carried, treat it as a secret.",
     },
+    "secret_scan": {
+        "scope": "Passive: the page, its same-scope scripts and a referenced API description over ordinary GETs (all in requests_made). Third-party scripts are named, never fetched.",
+        "checks": "secrets in code (cloud keys, tokens, JWT, private keys, high-entropy literals - values masked), endpoints from fetch/axios literals, openapi/swagger when referenced, sign-in forms (http post, autocomplete).",
+        "modes": "summary='min' keeps counts, priority and summary_line. save_to writes JSON, sarif_to SARIF 2.1.0; baseline adds regression {fixed, added}.",
+    },
     "perf_report": {
         "source": "The page's own Performance API: navigation timing (TTFB, DOMContentLoaded, load), paint (FCP), buffered largest-contentful-paint and layout-shift observers (LCP, CLS as the largest session window), resource timing (count, transfer, by type, third-party share, renderBlockingStatus).",
         "lab": "Lab numbers from the automation browser: compare runs of the same page, do not read them as real-visitor field data.",

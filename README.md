@@ -316,7 +316,7 @@ companion popup's Reconnect (Restart companion when its service worker has
 stopped) is the one action; Reload on its card at chrome://extensions is the
 fallback.
 
-The bundled companion is version 1.21.0. Chrome does not refresh an unpacked
+The bundled companion is version 1.22.0. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. That only works for
@@ -1435,7 +1435,7 @@ screenshot) to collect destination-specific proof.
 
 ## Check your own site
 
-Five actions for a developer reviewing a site they own before a release. The full
+Six actions for a developer reviewing a site they own before a release. The full
 reference, the scoring table and a worked example are in
 [docs/site-checks.md](docs/site-checks.md).
 
@@ -1443,7 +1443,8 @@ reference, the scoring table and a worked example are in
 | --- | --- |
 | `security_report {url}` | What is configured unsafely and how to fix it: CSP directives, HSTS, framing, `X-Content-Type-Options`, `Referrer-Policy`, `Permissions-Policy`, COOP/COEP/CORP, version disclosure, cookie flags and prefixes, https and the http→https redirect, the certificate, CORS on the page response, third-party scripts with or without SRI, mixed content, forms and password fields, `security.txt` and `robots.txt`. Graded A+–F like Mozilla HTTP Observatory v1.7.1 (its tests and modifiers reimplemented, pinned case by case; `score_explanation`); the report's extra checks never move that letter and feed a stricter `extended` score instead; `priority` lists the fixes in order. `scope`: `page` (plus your `paths`), `site` (a crawl of links and the sitemap, at most 50 pages, `robots.txt` honoured) or `hosts` (up to 10 origins); localhost and private addresses get a development mode with a production forecast. |
 | `api_report {url}` | The map of the page's calls to its backend (method, path template, frequency, origins, XHR/fetch/WebSocket/SSE/beacon) and what every own-site API response says: CORS against credentials (wildcard+credentials and `null` refused), caching (a JSON or cookie-setting response cached as `public` is a finding, `no-store`/`private` pass), `Content-Type` and `nosniff` on JSON, error bodies (stack traces, server paths, framework versions - snippets and URLs masked, values never re-requested), transport (`ws://` vs `wss://`, `http://` from an https page, third-party origins), where tokens live (cookies by flags, localStorage/sessionStorage by name and format, JWT `alg`/`exp`/`signature` without any value), CSRF (`SameSite`, a visible token in state-changing requests) and secrets in query strings (values masked). Sends no requests of its own; `summary: "min"` gives the verdict alone. |
-| `perf_report {url}` | TTFB, FCP, LCP and CLS with Web Vitals ratings, resources by type, the largest files, render-blocking files and what to change, from the page's own Performance API after a cold isolated load. |
+ | `secret_scan {url}` | Secrets and endpoints in the page's own scripts (cloud keys, tokens, JWT, private keys, high-entropy literals - values masked), routes from fetch/axios literals, a referenced openapi.json and sign-in forms; third-party scripts named, never fetched. `sarif_to` writes SARIF 2.1.0 for CI, `baseline` compares with a saved report. |
+ | `perf_report {url}` | TTFB, FCP, LCP and CLS with Web Vitals ratings, resources by type, the largest files, render-blocking files and what to change, from the page's own Performance API after a cold isolated load. |
 | `har_export {session_id}` | The session's network journal as a HAR 1.2 file; `network {third_party_only: true}` shows only other sites' requests. |
 | `test_run {url, steps}` | A regression scenario: every step is an ordinary action plus `expect` (`selector`, `text`, `url_contains`, `script`, `no_console_errors`, `no_failed_requests`, `action_fails`, ...), answered pass/fail per step with the failing check named. |
 

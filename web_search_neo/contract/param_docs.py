@@ -19,6 +19,8 @@ _COMMON = {
     "max_chars": "Answer budget in characters. Anything cut is flagged (truncated) with next_offset.",
     "offset": "Where this window starts: the next_offset of the previous answer.",
     "save_to": "File name under the download folder; the whole value is written there instead.",
+    "sarif_to": "File name under the download folder for the findings as SARIF 2.1.0 (for CI).",
+    "baseline": "A saved report file to compare against; the answer gains regression {fixed, added}.",
     "timeout_seconds": "Upper bound for the wait; the call fails (does not hang) past it.",
 }
 
@@ -100,6 +102,10 @@ _BY_ACTION: dict[str, dict[str, str]] = {
         "hosts": "Your other API hosts, <= 10 (same rules as scope): their responses count as own too.",
         "har_to": "File name for the session journal as HAR 1.2 beside the JSON report (download folder).",
         "overwrite": "Replace an existing save_to/har_to file instead of refusing.",
+    },
+    "secret_scan": {
+        "url": "The page to scan: a cold load in a fresh isolated session (closed unless keep_open).",
+        "hosts": "Your other hosts, <= 10 (same rules as scope): their scripts count as own too.",
     },
 }
 

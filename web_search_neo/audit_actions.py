@@ -17,10 +17,12 @@ import json
 import secrets
 import time
 from typing import Any, Literal
+from urllib.parse import urljoin, urlsplit
 
 from web_search_neo import __version__, browser_tools, macros, network_log
-from web_search_neo.audit import api, har, page as page_checks, perf, report, scenario, site, scope
-from web_search_neo.fetch.safety import write_download
+from web_search_neo.audit import api, api_parts, diff, har, page as page_checks, perf, report, sarif
+from web_search_neo.audit import scenario, scope, secrets as secret_checks, site
+from web_search_neo.fetch.safety import resolve_save_path, write_download
 from web_search_neo.perception import min_summary
 
 _FACADE: Any = None
@@ -98,6 +100,8 @@ async def browser_security_report(
     keep_open: bool = False,
     timeout_seconds: float = 20.0,
     save_to: str | None = None,
+    sarif_to: str | None = None,
+    baseline: str | None = None,
     overwrite: bool = False,
 ) -> dict[str, Any]:
     """Grade your site's security configuration with Mozilla HTTP Observatory's tests, a fix per finding.
@@ -127,11 +131,7 @@ async def browser_security_report(
                           max_pages=max_pages, max_depth=max_depth, delay_ms=delay_ms,
                           respect_robots=respect_robots, timeout=timeout,
                           page_report=page_report if scope == "page" else None)
-        if save_to:
-            text = json.dumps(result, ensure_ascii=False, indent=1, default=str)
-            path = write_download(save_to, text.encode("utf-8"), overwrite=bool(overwrite))
-            result = {**result, "saved_to": str(path)}
-        return result
+        return _write_outputs(result, save_to, sarif_to, baseline, bool(overwrite))
     return await asyncio.to_thread(run)
 
 
@@ -213,6 +213,8 @@ async def browser_api_report(
     timeout_seconds: float = 20.0,
     save_to: str | None = None,
     har_to: str | None = None,
+    sarif_to: str | None = None,
+    baseline: str | None = None,
     overwrite: bool = False,
 ) -> dict[str, Any]:
     """Карта вызовов страницы к бэкенду: CORS, кэш, Content-Type, ошибки, транспорт, токены, CSRF.
@@ -266,10 +268,6 @@ async def browser_api_report(
                 bodies, unread = _api_error_bodies(session, sid, rows + pending, page_url, hosts)
             result = api.build(rows + pending, page_url=page_url, jar=jar, storage=storage,
                                bodies=bodies, unread=unread, hosts=hosts, dropped=dropped)
-            if save_to:
-                text = json.dumps(result, ensure_ascii=False, indent=1, default=str)
-                path = write_download(save_to, text.encode("utf-8"), overwrite=bool(overwrite))
-                result = {**result, "saved_to": str(path)}
             if har_to:
                 document = har.build(rows + pending, page_url=page_url,
                                      title=str(getattr(session, "last_title", "") or ""),
@@ -277,6 +275,7 @@ async def browser_api_report(
                 path = write_download(har_to, json.dumps(document, ensure_ascii=False, indent=1).encode("utf-8"),
                                       overwrite=bool(overwrite))
                 result = {**result, "har_saved_to": str(path)}
+            result = _write_outputs(result, save_to, sarif_to, baseline, bool(overwrite))
             failed = False
             return {"success": True, "session_id": sid if not opened or keep_open else None,
                     "fresh_isolated_load": opened, **result}
@@ -284,6 +283,130 @@ async def browser_api_report(
             if opened and (failed or not keep_open):  # при ошибке session_id не возвращается — сессия закрыта
                 browser_tools.close_session(sid)
     return await asyncio.to_thread(run)
+
+def _write_outputs(result: dict[str, Any], save_to: str | None, sarif_to: str | None,
+                   baseline: str | None, overwrite: bool) -> dict[str, Any]:
+    """Shared report outputs: JSON file, SARIF for CI, a regression against a saved baseline."""
+    if save_to:
+        text = json.dumps(result, ensure_ascii=False, indent=1, default=str)
+        path = write_download(save_to, text.encode("utf-8"), overwrite=overwrite)
+        result = {**result, "saved_to": str(path)}
+    if sarif_to:
+        path = write_download(sarif_to, sarif.dumps(result, version=__version__), overwrite=overwrite)
+        result = {**result, "sarif_saved_to": str(path)}
+    if baseline:
+        anchor = resolve_save_path(baseline)
+        if not anchor.is_file():
+            raise ValueError(f"baseline is not a file in the download folder: {baseline!r}")
+        try:
+            old = json.loads(anchor.read_text(encoding="utf-8"))
+        except ValueError as exc:
+            raise ValueError(f"baseline is not a JSON report: {baseline!r} ({exc})") from exc
+        result = {**result, "regression": diff.compare(old, result)}
+    return result
+
+
+async def browser_secret_scan(
+    url: str | None = None,
+    session_id: str | None = None,
+    hosts: list[str] | None = None,
+    keep_open: bool = False,
+    wait_seconds: float = 2.0,
+    timeout_seconds: float = 20.0,
+    save_to: str | None = None,
+    sarif_to: str | None = None,
+    baseline: str | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Секреты и эндпоинты в коде страницы: ключи, токены, openapi, формы входа.
+
+    Пассивно: страница (обычный GET), её скрипты из своей области (обычные
+    GET, все в requests_made) и описание API, на которое страница ссылается.
+    Чужие скрипты только называются. Своих запросов, кроме чтения, нет.
+    """
+    if url is None and not session_id:
+        raise ValueError("secret_scan needs url (a fresh isolated load) or the session_id of an open page")
+    if hosts:
+        scope.Scope.build(hosts)  # отказ до открытия браузера: wildcards/суффиксы/ >10 хостов
+    sid = session_id or f"secret-scan-{secrets.token_hex(3)}"
+
+    def run() -> dict[str, Any]:
+        opened = False
+        timeout = max(1.0, min(float(timeout_seconds), 120.0))
+        if url is not None:
+            with browser_tools._sessions_lock:
+                live = browser_tools._sessions.get(sid)
+            if live is not None:  # открытая сессия: тёплый переход её же браузером
+                browser_tools.open_page(url, session_id=sid, timeout_seconds=timeout,
+                                        profile_mode=live.profile_mode, profile_id=live.profile_id,
+                                        debugger_address=live.debugger_address)
+            else:
+                _open_isolated(url, sid, timeout)
+                opened = True
+        failed = True
+        try:
+            wait = max(0.0, min(float(wait_seconds), 30.0))
+            if wait:
+                time.sleep(wait)
+            try:
+                storage = _script_value(sid, api.STORAGE_SCRIPT, None, 15.0)
+                if not isinstance(storage, dict):
+                    storage = {"storage_error": "the storage script returned no object"}
+            except Exception as exc:
+                storage = {"storage_error": f"{type(exc).__name__}: {exc}"[:200]}
+            jar = browser_tools.cookies(op="get", session_id=sid, limit=1000).get("cookies") or []
+            session = browser_tools._get_session(sid)
+            with session.lock:
+                rows, dropped, pending = network_log.drain(session)
+                page_url = network_log.page_url(session)
+            scope_url = url or page_url
+            if not scope_url:
+                raise ValueError("secret_scan found no page URL: open a page in the session first")
+            own_scope = site._scope_for(scope_url, hosts, False, "page")
+            checker = report.Checker(own_scope, scope.Budget(), timeout)
+            page_view = checker.get(scope_url)
+            html = page_view.get("body") if isinstance(page_view.get("body"), str) else ""
+            journal_urls = [str(row.get("url") or "") for row in rows + pending]
+            own = api_parts.own_sites(page_url or scope_url, hosts)
+            snapshot = page_checks.snapshot_from_html(html, scope_url)
+            script_urls = secret_checks.script_urls(snapshot.get("scripts"), journal_urls,
+                                                    page_url or scope_url, own)
+            scripts: list[dict[str, Any]] = []
+            for script_url in script_urls:
+                view = checker.get(script_url)
+                text = view.get("body") if 200 <= int(view.get("status") or 0) < 300 \
+                    and isinstance(view.get("body"), str) else ""
+                if text:
+                    scripts.append({"url": script_url, "text": text, "bytes": len(text.encode("utf-8"))})
+                else:
+                    scripts.append({"url": script_url, "text": "",
+                                    "bytes": 0, "error": str(view.get("error") or view.get("status"))})
+            refs = secret_checks.openapi_refs(html, [item["text"] for item in scripts], journal_urls)
+            openapi_docs: list[dict[str, Any]] = []
+            for ref in refs[: secret_checks.MAX_OPENAPI * 3]:
+                if len(openapi_docs) >= secret_checks.MAX_OPENAPI:
+                    break
+                target = urljoin(scope_url, ref)
+                if not own_scope.allows(target):
+                    continue
+                view = checker.get(target)
+                if 200 <= int(view.get("status") or 0) < 300 and isinstance(view.get("body"), str):
+                    seen = secret_checks.openapi_view(target, view["body"])
+                    if seen:
+                        openapi_docs.append(seen)
+            result = secret_checks.build(page_url or scope_url, html, scripts, openapi_docs,
+                                         jar, storage, hosts, checker.budget.made)
+            result["third_party_scripts"] = secret_checks.third_party_scripts(
+                snapshot.get("scripts"), page_url or scope_url, hosts)
+            result = {**result, "session_id": sid if not opened or keep_open else None,
+                      "fresh_isolated_load": opened, "dropped": int(dropped)}
+            failed = False
+            return _write_outputs(result, save_to, sarif_to, baseline, bool(overwrite))
+        finally:
+            if opened and (failed or not keep_open):  # при ошибке session_id не возвращается — сессия закрыта
+                browser_tools.close_session(sid)
+    return await asyncio.to_thread(run)
+
 
 async def browser_har_export(
     session_id: str = "default",
@@ -472,10 +595,11 @@ async def _run_plan(plan: list[dict[str, Any]], session_id: str, url: str | None
 ACTION_SPECS = (
     ("security_report", browser_security_report, "audit", "Passive A-F security grade: page, site or hosts; fixes."),
     ("api_report", browser_api_report, "audit", "Map page-to-backend calls: CORS, cache, tokens, CSRF; fixes."),
+    ("secret_scan", browser_secret_scan, "audit", "Secrets, endpoints, openapi in page code."),
     ("perf_report", browser_perf_report, "audit", "Load metrics: TTFB, FCP, LCP, CLS, resources, blocking."),
     ("har_export", browser_har_export, "audit", "Save the session's network journal as a HAR file."),
     ("test_run", browser_test_run, "audit", "Run steps with expect checks; pass/fail per step."),
 )
 
 __all__ = ["ACTION_SPECS", "bind", "browser_api_report", "browser_har_export", "browser_perf_report",
-           "browser_security_report", "browser_test_run"]
+           "browser_secret_scan", "browser_security_report", "browser_test_run"]

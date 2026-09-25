@@ -2,9 +2,10 @@
 
 [← back to README](../README.md)
 
-Five actions help a developer look at a site the way a careful reviewer would before a
+Six actions help a developer look at a site the way a careful reviewer would before a
 release: `security_report` (what is configured unsafely and how to fix it), `api_report`
-(how the page talks to its own backend, and what each response says), `perf_report`
+(how the page talks to its own backend, and what each response says), `secret_scan`
+(what secrets and routes the page's own code carries), `perf_report`
 (how fast it loads), `har_export` (the network journal as a file) and `test_run` (a
 regression scenario with a pass/fail verdict per step). They are for sites, APIs and
 development servers you own or are allowed to test.
@@ -339,6 +340,49 @@ origins are classified, never contacted:
 `summary_line`, marks the answer `summary_mode: "min"` and names everything it left out in
 `summary_omitted` and `summary_clipped`.
 
+## `secret_scan`
+
+```json
+{"actions":[{"action":"secret_scan","url":"https://staging.example.com/"}]}
+```
+
+With `url` alone the page loads once in a fresh isolated browser that is closed afterwards
+(`keep_open` keeps it). With `session_id` alone the scripts of the page already open there
+are analysed. Either way the page itself is also read as served HTML, and its same-scope
+script files (at most 10) are read over ordinary GETs - every one listed in `requests_made`.
+Third-party scripts are named in `third_party_scripts`, never fetched. An API description
+the page references (`openapi.json`, `swagger.json`) is read the same way.
+
+| Parameter | Meaning |
+| --- | --- |
+| `url`, `session_id`, `keep_open` | The page to scan: a cold load in a fresh isolated session (closed unless `keep_open`), or the scripts of the session already open. |
+| `hosts` | Your other hosts, at most 10 (the same exact-host rules as `scope`): their scripts count as own too. |
+| `wait_seconds` | How long the page's scripts may take to land in the journal (default 2, at most 30). |
+| `timeout_seconds` | Per request, 1-120. |
+| `save_to`, `sarif_to`, `baseline`, `overwrite` | Also write the report as JSON (`save_to`), the findings as SARIF 2.1.0 (`sarif_to`), and compare with a saved report (`baseline`, below). |
+
+`code_endpoints[]` is what the code calls: method, path template (as in `api_report`),
+count and the files each route was seen in. `openapi` names the description found, its
+version and path count. `auth_forms[]` lists the sign-in forms (action, method, https,
+password field). `token_names` lists the session's token names without values.
+
+| Area | Checks |
+| --- | --- |
+| Secrets | Cloud keys (AWS, GitHub, Slack, Google, Stripe), private keys, secret-looking assignments, JWT values and high-entropy literals - every sample masked, with the file and line. |
+| Endpoints | Routes from `fetch`/`axios` calls and `/api/` literals, own scope only. |
+| API description | A referenced OpenAPI/Swagger document served without auth: version and path count. |
+| Sign-in forms | A form posting a password over http fails; password fields without a password `autocomplete` token warn. |
+
+`summary: "min"` keeps `counts`, `priority` and `summary_line` as usual.
+
+### SARIF and baselines
+
+`sarif_to` (on `security_report`, `api_report` and `secret_scan`) writes the findings as a
+SARIF 2.1.0 document: one rule per finding id, fail as error, warn as warning, the rest as
+note - ready for code-scanning CI. `baseline` (a report JSON saved earlier, in the download
+folder) adds `regression`: `fixed` (in the baseline, gone now) and `added` (new, or worse
+than before), matched by finding id, with a one-line `summary`.
+
 ## `perf_report`
 
 ```json
@@ -452,10 +496,11 @@ short result.
    pages: home, sign-in, checkout). Fix `priority` top-down; rerun until only accepted
    warnings remain.
 2. `api_report {url}` for the pages that call a backend; fix `priority` top-down.
-3. `perf_report {url}` for the same pages; compare with the previous release's numbers.
-4. `test_run` with the scenarios that must never break (sign-up, sign-in, the main form),
+3. `secret_scan {url}` for the pages that ship scripts; fix `priority` top-down.
+4. `perf_report {url}` for the same pages; compare with the previous release's numbers.
+5. `test_run` with the scenarios that must never break (sign-up, sign-in, the main form),
    `no_console_errors` and `no_failed_requests` on the steps that submit.
-5. For a failure, `open` the page in its own session and read `console`, `network
+6. For a failure, `open` the page in its own session and read `console`, `network
    {only_errors: true}` and `har_export` for the bug report.
 
 ## Recipe: check a dev server

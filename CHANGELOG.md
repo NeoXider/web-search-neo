@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### 1.22.0
+
+`secret_scan`: what secrets and routes the page's own code carries. The page is read as served HTML and its same-scope scripts (at most 10) over ordinary GETs - every one listed in `requests_made`; third-party scripts are named, never fetched. Findings with priority and fixes, like `security_report`: cloud keys (AWS, GitHub, Slack, Google, Stripe), private keys, secret-looking assignments, JWT values and high-entropy literals (every sample masked, with file and line), routes from `fetch`/`axios` calls and `/api/` literals, a referenced `openapi.json`/`swagger.json` (version and path count), and sign-in forms posting over http. `summary: "min"` keeps `counts`, `priority` and `summary_line`.
+
+Site checks (`web_search_neo/audit/secrets.py`, wrapper in `audit_actions.py`; `docs/site-checks.md`)
+- `secret_scan {url | session_id}` builds `code_endpoints[]` (method, path template, count, source files), `openapi[]`, `auth_forms[]` (action, method, https, password field) and `token_names` (names only) from the served page, the fetched scripts, the session journal, the cookie jar and page storage. `url` loads the page once in a fresh isolated session (closed unless `keep_open`, as `perf_report` does), `session_id` analyses an open page, `hosts` (at most 10, validated with `scope`'s rules) counts more hosts as own.
+- `sarif_to` (on `security_report`, `api_report`, `secret_scan`) writes the findings as SARIF 2.1.0 (`web_search_neo/audit/sarif.py`): one rule per finding id, fail as error, warn as warning, the rest as note.
+- `baseline` (on the same three) compares with a saved report JSON (`web_search_neo/audit/diff.py`, matched by finding id) and adds `regression`: `fixed`, `added` and a one-line `summary`.
+- The contract stays under 13 500 characters with the new action: the index summary is one line and the details live in `docs/site-checks.md`.
+
+Docs: README "Check your own site" lists six actions now, and `docs/site-checks.md` gained the `secret_scan` section (plus "SARIF and baselines").
+
 ### 1.21.0
 
 `api_report`: a passive review of how the page talks to its own backend - the map of the calls, and for every own-site API response the CORS, caching, Content-Type and error-body checks, plus transport, where tokens live, the CSRF surface and secrets in URLs. Every finding carries a priority and a fix, like `security_report`; `summary: "min"` keeps `counts`, `priority` and `summary_line`.
