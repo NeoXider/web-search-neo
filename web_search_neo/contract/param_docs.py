@@ -107,6 +107,12 @@ _BY_ACTION: dict[str, dict[str, str]] = {
         "url": "The page to scan: a cold load in a fresh isolated session (closed unless keep_open).",
         "hosts": "Your other hosts, <= 10 (same rules as scope): their scripts count as own too.",
     },
+    "active_probe": {
+        "url": "The page to probe: ordinary GETs plus OPTIONS/TRACE, all in scope and budget.",
+        "checks": "cors, methods, redirects, canary (default: all).",
+        "origin": "Origin header for the preflight (default https://probe.example).",
+        "paths": "Your own routes to probe too: /login, /api/health; <= 50.",
+    },
 }
 
 

@@ -355,13 +355,19 @@ def test_secret_scan_reads_a_cold_isolated_load(secret_site):
     assert found["secret-auth-http"]["severity"] == "high"
     assert found["secret-aws-key"]["status"] == "fail" and found["secret-github-token"]["status"] == "fail"
     assert found["secret-openapi-exposed"]["status"] == "warn"
+    assert data["sourcemaps"] == [{"url": secret_site.base_url + "/static/app.js.map",
+                                   "sources": 2, "names": ["src/app.ts", "src/secret.ts"],
+                                   "names_omitted": 0, "has_content": True}]
+    assert found["secret-sourcemap-sources"]["severity"] == "high"
     assert data["requests_made"] == [f"GET {secret_site.base_url}/",
                                      f"GET {secret_site.base_url}/static/app.js",
-                                     f"GET {secret_site.base_url}/openapi.json"]
+                                     f"GET {secret_site.base_url}/openapi.json",
+                                     f"GET {secret_site.base_url}/static/app.js.map"]
     assert data["fresh_isolated_load"] is True and data["session_id"] is None
     assert not browser_tools._sessions
     dump = json.dumps(data)
-    for secret in (FAKE_AWS, FAKE_GITHUB, FAKE_SESSION, "10.0.0.5"):
+    for secret in (FAKE_AWS, FAKE_GITHUB, FAKE_SESSION, "10.0.0.5",
+                   "console.log(1)", "const fixtureSource = 1"):
         assert secret not in dump
 
 

@@ -93,6 +93,28 @@ class Checker:
             answer["certificate_error"] = known
         return answer
 
+    def request(self, method: str, url: str, headers: dict[str, str] | None = None) -> dict[str, Any]:
+        """One non-GET request in scope and budget (an OPTIONS preflight, a TRACE probe).
+
+        ``method`` is "OPTIONS" or "TRACE" - the only two ``active_probe`` sends.
+        """
+        if method not in {"OPTIONS", "TRACE"}:
+            return {"url": url, "error": f"refused method {method}: only OPTIONS and TRACE are probed"}
+        if not self.scope.allows(url):
+            return {"url": url, "error": "outside the scope: not requested", "skipped": "scope"}
+        label = f"{method} {redacted(url)}"
+        if not self.budget.take(label):
+            return {"url": url, "error": "request budget exhausted: not requested", "skipped": "budget"}
+        answer = transport.options(url, self.timeout, method, headers,
+                                   allow_plain_http=True, plain_http_hosts=self.scope.allows)
+        error = answer.get("error")
+        if urlsplit(url).scheme == "https" and error and transport.is_certificate_error(error):
+            self.budget.take(f"{label} (certificate not verified)")
+            answer = transport.options(url, self.timeout, method, headers,
+                                       allow_plain_http=True, plain_http_hosts=self.scope.allows,
+                                       verify=False)
+        return answer
+
     def _send(self, url: str, small: bool, verify: bool) -> dict[str, Any]:
         if not self.budget.take(f"GET {redacted(url)}" + ("" if verify else " (certificate not verified)")):
             return {"url": url, "route": [url], "error": "request budget exhausted: not requested", "skipped": "budget"}

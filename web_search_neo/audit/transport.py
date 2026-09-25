@@ -280,4 +280,37 @@ def destination_error(url: str) -> str | None:
         classify_destination(url)
     except ValueError as exc:
         return str(exc)
+
+
+def options(url: str, timeout: float, method: str = "OPTIONS",
+            headers: dict[str, str] | None = None, *,
+            allow_plain_http: bool = False, plain_http_hosts: Any = frozenset(),
+            verify: bool = True, client: Fetcher = request) -> dict[str, Any]:
+    """One non-GET request (an OPTIONS preflight, a TRACE probe); errors come back as data.
+
+    ``method`` is "OPTIONS" or "TRACE" - the only two ``active_probe`` sends.
+    Only status, response headers and timing are kept: no cookies, no body.
+    """
+    started = time.monotonic()
+    extra: dict[str, Any] = {}
+    if plain_http_hosts:
+        extra["plain_http_hosts"] = plain_http_hosts
+    if not verify:
+        extra["verify"] = False
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # the unverified retry is deliberate and reported
+            response = client(url, method=method, timeout_seconds=timeout, max_response_bytes=0,
+                              allow_plain_http=allow_plain_http,
+                              headers=headers or {}, **extra)
+    except Exception as exc:
+        response = getattr(exc, "response", None)
+        if response is None or not isinstance(getattr(response, "status_code", None), int):
+            return {"url": url, "error": redact_text(f"{type(exc).__name__}: {exc}")[:400],
+                    "verified": verify, "ms": round((time.monotonic() - started) * 1000)}
+    return {
+        "url": url, "final_url": str(getattr(response, "url", "") or url),
+        "status": int(response.status_code), "headers": _lower_headers(response),
+        "verified": verify, "ms": round((time.monotonic() - started) * 1000),
+    }
     return None

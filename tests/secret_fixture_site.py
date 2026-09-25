@@ -18,9 +18,11 @@ const AWS_KEY = "AKIAIOSFODNN7EXAMPLE";
 const apiKey = "ghp_fixturetoken0123456789abcdef";
 const session = "Ab3dEf7hIj2kLm5nOp8Qr0sT3uV1wX4yZ6";
 const INTERNAL = "http://10.0.0.5/internal/status";
-fetch("/api/users/123").then(r => r.json());
+fetch("/api/users/123").then(r => r.json()).catch(() => {});
+const axios = {post: () => Promise.resolve({})};
 axios.post("/api/login", {u: 1});
-fetch("{third_party}/api/external");
+fetch("{third_party}/api/external").catch(() => {});
+//# sourceMappingURL=/static/app.js.map
 """
 
 VENDOR_JS = "// third-party bundle: named in reports, never fetched.\n"
@@ -28,13 +30,17 @@ VENDOR_JS = "// third-party bundle: named in reports, never fetched.\n"
 OPENAPI = {"openapi": "3.0.0", "info": {"title": "fixture", "version": "1"},
            "paths": {"/api/users": {}, "/api/login": {}}}
 
+APP_MAP = {"version": 3, "sources": ["src/app.ts", "src/secret.ts"],
+           "sourcesContent": ["console.log(1)", "const fixtureSource = 1"],
+           "mappings": ""}
+
 PAGE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>secret fixture</title>
 <script src="/static/app.js"></script>
 <script src="{third_party}/static/vendor.js"></script>
 <link rel="openapi" href="/openapi.json">
 </head><body><h1>secret fixture</h1>
-<form action="/login" method="post"><input type="password" name="pw"></form>
+<form action="/login" method="post"><input type="password" name="pw"><button type="submit" id="go">go</button></form>
 </body></html>
 """
 
@@ -86,11 +92,35 @@ def start() -> FixtureSite:
                 self._send(200, VENDOR_JS.encode("utf-8"), "text/javascript; charset=utf-8")
             elif path == "/openapi.json":
                 self._send(200, json.dumps(OPENAPI).encode("utf-8"), "application/json")
+            elif path == "/api/users/123":
+                self._send(200, b'{"id": 123}', "application/json")
+            elif path == "/favicon.ico":
+                self._send(200, b"", "image/x-icon")
+            elif path == "/static/app.js.map":
+                self._send(200, json.dumps(APP_MAP).encode("utf-8"), "application/json")
             else:
                 self._send(404, b"<html><body>not found</body></html>", "text/html; charset=utf-8")
 
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
             self._route()
+
+        def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length) if length else b""
+            path = self.path.split("?", 1)[0]
+            site.paths.append(f"POST {self.path}")
+            if path == "/login" and b"pw=" in body:
+                self.send_response(303)
+                self.send_header("Location", "/")
+                self.send_header("Set-Cookie", "fixture-session=logged-in; Path=/; SameSite=Lax")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            elif path == "/login":
+                self._send(200, b'{"ok": true}', "application/json")
+            elif path == "/api/login":
+                self._send(200, b'{"ok": true}', "application/json")
+            else:
+                self._send(404, b"<html><body>not found</body></html>", "text/html; charset=utf-8")
 
         def log_message(self, _format: str, *_args: object) -> None:
             return

@@ -2,10 +2,11 @@
 
 [← back to README](../README.md)
 
-Six actions help a developer look at a site the way a careful reviewer would before a
+Seven actions help a developer look at a site the way a careful reviewer would before a
 release: `security_report` (what is configured unsafely and how to fix it), `api_report`
 (how the page talks to its own backend, and what each response says), `secret_scan`
-(what secrets and routes the page's own code carries), `perf_report`
+(what secrets and routes the page's own code carries), `active_probe` (what the server
+answers when asked: CORS, methods, redirects, reflection), `perf_report`
 (how fast it loads), `har_export` (the network journal as a file) and `test_run` (a
 regression scenario with a pass/fail verdict per step). They are for sites, APIs and
 development servers you own or are allowed to test.
@@ -321,7 +322,7 @@ origins are classified, never contacted:
 | Content-Type | `Content-Type` plus `X-Content-Type-Options: nosniff` on JSON. |
 | Error bodies | 4xx/5xx bodies from Chrome's memory (at most 8, 4000 characters each): stack traces, server file paths, framework versions - snippets and URLs masked. Bodies Chrome did not keep are named, not silently skipped. |
 | Transport | `ws://` against `wss://` (fails on an https page, warns on http), `http://` calls from an https page, API calls to other sites' origins. |
-| Tokens | Cookies as name, domain and `Secure`/`HttpOnly`/`SameSite` flags with the value's format only; `localStorage`/`sessionStorage` by name and format only; JWT-like values as facts (`alg`, `exp`/`iat`, signature present - an `alg: none`/unsigned token fails high). Token and cookie values are never printed. |
+| Tokens | Cookies as name, domain and `Secure`/`HttpOnly`/`SameSite` flags with the value's format only; `localStorage`/`sessionStorage` by name and format only; JWT-like values as facts (`alg`, `exp`/`iat`, signature present - an `alg: none`/unsigned token fails high, a lifetime over a day warns). Token and cookie values are never printed. |
 | CSRF | `SameSite` on session cookies (`SameSite=None` without `Secure` fails), a visible token in state-changing requests, writes leaving your site without one. |
 | URLs | Secrets in query strings (tokens, e-mail addresses, session ids) - parameter names only, values masked. |
 
@@ -369,6 +370,7 @@ password field). `token_names` lists the session's token names without values.
 | Area | Checks |
 | --- | --- |
 | Secrets | Cloud keys (AWS, GitHub, Slack, Google, Stripe), private keys, secret-looking assignments, JWT values and high-entropy literals - every sample masked, with the file and line. |
+| Source maps | A referenced `sourceMappingURL` is opened the same way: shipped original sources fail high, names alone warn. |
 | Endpoints | Routes from `fetch`/`axios` calls and `/api/` literals, own scope only. |
 | API description | A referenced OpenAPI/Swagger document served without auth: version and path count. |
 | Sign-in forms | A form posting a password over http fails; password fields without a password `autocomplete` token warn. |
@@ -382,6 +384,39 @@ SARIF 2.1.0 document: one rule per finding id, fail as error, warn as warning, t
 note - ready for code-scanning CI. `baseline` (a report JSON saved earlier, in the download
 folder) adds `regression`: `fixed` (in the baseline, gone now) and `added` (new, or worse
 than before), matched by finding id, with a one-line `summary`.
+
+## `active_probe`
+
+```json
+{"actions":[{"action":"active_probe","url":"https://staging.example.com/"}]}
+```
+
+The call is the consent: this is the one action that sends requests beyond ordinary
+GETs, and every one stays inside the hosts you name, inside the shared request budget
+(200) and inside `requests_made`. It needs no browser. What it sends:
+
+| Check | Requests | Refused |
+| --- | --- | --- |
+| `cors` | One OPTIONS preflight with a foreign `Origin` on the page and your `paths` | Reflecting that origin (high with credentials), `null`, `*` with credentials, `Allow-Methods/Headers: *` |
+| `methods` | OPTIONS on the page and your `paths`, TRACE on the page | TRACE answering 2xx; the `Allow` list is reported for review |
+| `redirects` | Plain GETs of the page's own links (at most 20) | A chain leaving your site (open redirect), named with the hop that left |
+| `canary` | The page and its links with a query, plus one inert token (at most 8) | The token mirrored back - where to verify encoding by hand |
+
+What it never sends: POST/PUT/DELETE, payloads (the token is `[a-z0-9]+` and cannot
+execute anywhere), credentials, fuzzing, or anything outside the scope. Confirming XSS
+takes a payload, so reflection is a warning with the contexts, never a verdict.
+
+| Parameter | Meaning |
+| --- | --- |
+| `url` | The page to probe (required, `http://` or `https://`). |
+| `hosts` | More of your origins in scope, at most 10 (the same exact-host rules as `scope`). |
+| `paths` | Your own routes to probe too, at most 50 (same rules as `security_report`). |
+| `checks` | Any subset of `cors`, `methods`, `redirects`, `canary` (default: all). |
+| `origin` | The `Origin` header for the preflight: a bare `https://host` (default `https://probe.example`). |
+| `timeout_seconds` | Per request, 1-120. |
+| `save_to`, `sarif_to`, `baseline`, `overwrite` | As usual: JSON, SARIF 2.1.0, regression against a saved report. |
+
+`summary: "min"` keeps `counts`, `priority` and `summary_line` as usual.
 
 ## `perf_report`
 
@@ -497,10 +532,11 @@ short result.
    warnings remain.
 2. `api_report {url}` for the pages that call a backend; fix `priority` top-down.
 3. `secret_scan {url}` for the pages that ship scripts; fix `priority` top-down.
-4. `perf_report {url}` for the same pages; compare with the previous release's numbers.
-5. `test_run` with the scenarios that must never break (sign-up, sign-in, the main form),
+4. `active_probe {url}` for the CORS, methods and redirect surface; fix `priority` top-down.
+5. `perf_report {url}` for the same pages; compare with the previous release's numbers.
+6. `test_run` with the scenarios that must never break (sign-up, sign-in, the main form),
    `no_console_errors` and `no_failed_requests` on the steps that submit.
-6. For a failure, `open` the page in its own session and read `console`, `network
+7. For a failure, `open` the page in its own session and read `console`, `network
    {only_errors: true}` and `har_export` for the bug report.
 
 ## Recipe: check a dev server

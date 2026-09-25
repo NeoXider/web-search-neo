@@ -378,17 +378,18 @@ def auth_findings(cookies: list[dict[str, Any]], local: list[dict[str, Any]], se
             detail="Session/token cookies in the jar all carry HttpOnly; scripts cannot read them.",
             evidence=clip_list([entry["name"] for entry in token_cookies], EVIDENCE_LIMIT)))
     unsigned: list[dict[str, Any]] = []
-    for entry in cookies:
-        facts = entry.get("jwt")
-        if entry["format"] == "jwt" and isinstance(facts, dict) and (not facts.get("signed")
-                                                                     or facts.get("alg") == "none"):
-            unsigned.append({"where": f"cookie {entry['name']}", **facts})
-    for where, views in (("localStorage", local), ("sessionStorage", session)):
+    long_lived: list[dict[str, Any]] = []
+    for where, views in (("cookie", cookies), ("localStorage", local), ("sessionStorage", session)):
         for entry in views:
             facts = entry.get("jwt")
-            if entry["format"] == "jwt" and isinstance(facts, dict) and (not facts.get("signed")
-                                                                         or facts.get("alg") == "none"):
+            if entry["format"] != "jwt" or not isinstance(facts, dict):
+                continue
+            if not facts.get("signed") or facts.get("alg") == "none":
                 unsigned.append({"where": f"{where} {entry['name']}", **facts})
+            exp, iat = facts.get("exp"), facts.get("iat")
+            if isinstance(exp, int) and isinstance(iat, int) and exp - iat > 86_400:
+                long_lived.append({"where": f"{where} {entry['name']}",
+                                   "lifetime_hours": round((exp - iat) / 3600)})
     if unsigned:
         out.append(finding(
             "api-jwt-unsigned", "auth", "fail", "high",
@@ -398,6 +399,15 @@ def auth_findings(cookies: list[dict[str, Any]], local: list[dict[str, Any]], se
             fix="Verify the signature and the alg claim on every protected endpoint; reject unsigned "
                 "tokens.",
             evidence=clip_list(unsigned, EVIDENCE_LIMIT)))
+    if long_lived:
+        out.append(finding(
+            "api-jwt-long-lived", "auth", "warn", "medium",
+            "A JWT lives longer than a day",
+            detail="A stolen long-lived token stays usable for its whole lifetime: the theft "
+                   "window is the expiry window.",
+            fix="Keep access tokens short-lived (minutes to hours) with rotation, and long-lived "
+                "refresh in an HttpOnly Secure cookie.",
+            evidence=clip_list(long_lived, EVIDENCE_LIMIT)))
     if storage_error:
         out.append(info(
             "api-storage-unavailable", "auth", "The page's storage could not be read",

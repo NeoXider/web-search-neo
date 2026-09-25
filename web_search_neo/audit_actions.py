@@ -20,8 +20,9 @@ from typing import Any, Literal
 from urllib.parse import urljoin, urlsplit
 
 from web_search_neo import __version__, browser_tools, macros, network_log
-from web_search_neo.audit import api, api_parts, diff, har, page as page_checks, perf, report, sarif
-from web_search_neo.audit import scenario, scope, secrets as secret_checks, site
+from web_search_neo.audit import active, api, api_parts, diff, har, page as page_checks, perf, report
+from web_search_neo.audit import sarif, scenario, scope, secrets as secret_checks, site
+from web_search_neo.audit.findings import info as info_finding
 from web_search_neo.fetch.safety import resolve_save_path, write_download
 from web_search_neo.perception import min_summary
 
@@ -394,7 +395,24 @@ async def browser_secret_scan(
                     seen = secret_checks.openapi_view(target, view["body"])
                     if seen:
                         openapi_docs.append(seen)
-            result = secret_checks.build(page_url or scope_url, html, scripts, openapi_docs,
+            maps: list[dict[str, Any]] = []
+            done: set[str] = set()
+            for item in scripts:
+                for ref in secret_checks.sourcemap_refs(item["text"]):
+                    if len(maps) >= secret_checks.MAX_SOURCEMAPS:
+                        break
+                    target = urljoin(item["url"], ref)
+                    if target in done or not own_scope.allows(target):
+                        continue
+                    done.add(target)
+                    view = checker.get(target)
+                    if 200 <= int(view.get("status") or 0) < 300 and isinstance(view.get("body"), str):
+                        seen = secret_checks.sourcemap_view(target, view["body"])
+                        if seen:
+                            maps.append(seen)
+                if len(maps) >= secret_checks.MAX_SOURCEMAPS:
+                    break
+            result = secret_checks.build(page_url or scope_url, html, scripts, openapi_docs, maps,
                                          jar, storage, hosts, checker.budget.made)
             result["third_party_scripts"] = secret_checks.third_party_scripts(
                 snapshot.get("scripts"), page_url or scope_url, hosts, journal_urls)
@@ -405,6 +423,105 @@ async def browser_secret_scan(
         finally:
             if opened and (failed or not keep_open):  # при ошибке session_id не возвращается — сессия закрыта
                 browser_tools.close_session(sid)
+    return await asyncio.to_thread(run)
+
+
+async def browser_active_probe(
+    url: str | None = None,
+    hosts: list[str] | None = None,
+    paths: list[str] | None = None,
+    checks: list[str] | None = None,
+    origin: str | None = None,
+    timeout_seconds: float = 20.0,
+    save_to: str | None = None,
+    sarif_to: str | None = None,
+    baseline: str | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Активные проверки своей площадки: CORS-префлайт, методы, редиректы, отражение.
+
+    Вызов и есть согласие: только OPTIONS, TRACE и обычные GET своих страниц,
+    ссылок и одного инертного query-токена ([a-z0-9]+, исполниться нигде не
+    может). Всё в своей области (Scope), в общем бюджете и в requests_made.
+    Никаких POST/PUT/DELETE, пейлоадов, авторизации, фаззинга и чужих хостов.
+    """
+    if not url:
+        raise ValueError("active_probe needs url (http or https, in scope)")
+    known = ("cors", "methods", "redirects", "canary")
+    wanted = list(checks) if checks else list(known)
+    unknown = [name for name in wanted if name not in known]
+    if unknown:
+        raise ValueError(f"active_probe checks must be a subset of {list(known)}, not {unknown}")
+    wanted = list(dict.fromkeys(wanted))
+    probe_origin = origin or active.PROBE_ORIGIN
+    parts = urlsplit(probe_origin)
+    if parts.scheme not in {"http", "https"} or not parts.hostname or parts.username \
+            or parts.password or parts.query or parts.fragment or parts.path not in ("", "/"):
+        raise ValueError("origin must be a bare https://host origin, e.g. https://probe.example")
+    routes = site.validate_paths(paths) if paths else []
+
+    def run() -> dict[str, Any]:
+        timeout = max(1.0, min(float(timeout_seconds), 120.0))
+        own_scope = site._scope_for(url, hosts, False, "page")
+        checker = report.Checker(own_scope, scope.Budget(), timeout)
+        findings: list[dict[str, Any]] = []
+        page_view = checker.get(url)
+        if page_view.get("error"):
+            return {"success": False, "url": url,
+                    "error": f"active_probe could not read the page: {page_view.get('error')}",
+                    "requests_made": checker.budget.made}
+        html = page_view.get("body") if isinstance(page_view.get("body"), str) else ""
+        snapshot = page_checks.snapshot_from_html(html, url)
+        targets = [urljoin(report.origin_of(url), path) for path in routes]
+        if "cors" in wanted:
+            for target in [url, *targets]:
+                answer = checker.request("OPTIONS", target, {
+                    "Origin": probe_origin, "Access-Control-Request-Method": "GET"})
+                if answer.get("error"):
+                    findings.append(info_finding(
+                        "active-check-unreachable", "cors", "The preflight could not be sent",
+                        evidence={"url": api_parts.safe_url(target),
+                                  "error": str(answer.get("error"))[:200]}))
+                else:
+                    findings += active.preflight_findings(target, probe_origin, answer.get("headers"))
+        if "methods" in wanted:
+            for target in [url, *targets]:
+                answer = checker.request("OPTIONS", target)
+                if answer.get("error"):
+                    continue
+                headers = answer.get("headers") or {}
+                findings += active.methods_findings(
+                    target, answer.get("status"),
+                    str(headers.get("allow") or ""), None)
+            trace = checker.request("TRACE", url)
+            if not trace.get("error"):
+                findings += active.methods_findings(
+                    url, None, "", trace.get("status"))
+        if "redirects" in wanted:
+            links = [link for link in secret_checks.link_urls(snapshot)
+                     if own_scope.allows(link)][: active.MAX_LINKS]
+            for link in links:
+                view = checker.get(link)
+                if view.get("error"):
+                    continue
+                findings += active.redirect_findings(
+                    link, view.get("route") or [], view.get("final_url") or link, url,
+                    view.get("not_followed"))
+        if "canary" in wanted:
+            token = active.new_canary()
+            candidates = [url] + [link for link in secret_checks.link_urls(snapshot)
+                                  if "?" in link and own_scope.allows(link)][: active.MAX_CANARY - 1]
+            for candidate in candidates[: active.MAX_CANARY]:
+                base = candidate.split("#", 1)[0]
+                sep = "&" if "?" in base else "?"
+                probe_url = f"{base}{sep}{active.CANARY_PARAM}={token}"
+                view = checker.get(probe_url)
+                body = view.get("body")
+                if view.get("error") or not isinstance(body, str):
+                    continue
+                findings += active.reflection_findings(probe_url, token, body)
+        result = active.build(url, wanted, findings, checker.budget.made)
+        return _write_outputs(result, save_to, sarif_to, baseline, bool(overwrite))
     return await asyncio.to_thread(run)
 
 
@@ -596,10 +713,11 @@ ACTION_SPECS = (
     ("security_report", browser_security_report, "audit", "Passive A-F security grade: page, site or hosts; fixes."),
     ("api_report", browser_api_report, "audit", "Map page-to-backend calls: CORS, cache, tokens, CSRF; fixes."),
     ("secret_scan", browser_secret_scan, "audit", "Secrets, endpoints, openapi in page code."),
+    ("active_probe", browser_active_probe, "audit", "Active CORS/methods/redirect/canary probes."),
     ("perf_report", browser_perf_report, "audit", "Load metrics: TTFB, FCP, LCP, CLS, resources, blocking."),
     ("har_export", browser_har_export, "audit", "Save the session's network journal as a HAR file."),
     ("test_run", browser_test_run, "audit", "Run steps with expect checks; pass/fail per step."),
 )
 
-__all__ = ["ACTION_SPECS", "bind", "browser_api_report", "browser_har_export", "browser_perf_report",
-           "browser_secret_scan", "browser_security_report", "browser_test_run"]
+__all__ = ["ACTION_SPECS", "bind", "browser_active_probe", "browser_api_report", "browser_har_export",
+           "browser_perf_report", "browser_secret_scan", "browser_security_report", "browser_test_run"]

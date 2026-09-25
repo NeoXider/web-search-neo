@@ -22,9 +22,11 @@ from web_search_neo.audit import api_parts, grading, page as page_checks, sites
 from web_search_neo.audit.findings import clip_list, finding
 from web_search_neo.fetch.safety import REDACTED
 
-# How many script files one report fetches and how many API descriptions it opens.
+# How many script files one report fetches, and how many API descriptions and
+# source maps it opens. Maps are followed by reference only, never guessed.
 MAX_SCRIPTS = 10
 MAX_OPENAPI = 2
+MAX_SOURCEMAPS = 2
 # A string literal worth a second look: long, mixed-case alphanumerics.
 _ENTROPY_MIN_LEN = 24
 _ENTROPY_MIN_BITS = 4.0
@@ -87,6 +89,37 @@ _API_LITERAL = re.compile(r"['\"`]((?:/[^'\"`\n]*api[^'\"`\n]*|[^'\"`\n]*api[^'\
 _OPENAPI_REF = re.compile(r"(openapi\.json|swagger\.json|swagger/v\d+/swagger\.json|api-docs(?:\.json)?)"
                           r"|(['\"`])((?:https?://[^\s'\"`]+|/)[^\s'\"`]*?(?:openapi|swagger)[^\s'\"`]*\.json)\2")
 _LITERAL = re.compile(r"['\"`]([^'\"`\n]{1,400})['\"`]")
+_SOURCEMAP = re.compile(r"//# sourceMappingURL=(\S+)|/\*# sourceMappingURL=(\S+?)\s*\*/")
+
+
+def sourcemap_refs(text: str) -> list[str]:
+    """Source-map references a script carries: data: URLs are not fetchable files."""
+    refs: list[str] = []
+    for match in _SOURCEMAP.finditer(text or ""):
+        ref = match.group(1) or match.group(2)
+        if ref and not ref.lower().startswith("data:") and ref not in refs:
+            refs.append(ref)
+    return refs
+
+
+def sourcemap_view(url: str, text: str) -> dict[str, Any] | None:
+    """A fetched source map in one line: source names and whether it ships code.
+
+    ``sourcesContent`` never reaches the answer: names and counts travel, code
+    does not - the map itself is the leak being reported.
+    """
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(doc, dict) or not isinstance(doc.get("sources"), list):
+        return None
+    names = [str(name) for name in doc["sources"] if isinstance(name, str)]
+    content = doc.get("sourcesContent")
+    has_content = isinstance(content, list) and any(isinstance(item, str) and item for item in content)
+    return {"url": api_parts.safe_url(url), "sources": len(names),
+            "names": names[:8], "names_omitted": max(0, len(names) - 8),
+            "has_content": bool(has_content)}
 
 
 def _entropy(text: str) -> float:
@@ -242,6 +275,18 @@ def _entries(items: Any) -> list[dict[str, Any]]:
     return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
 
 
+def link_urls(snapshot: Any) -> list[str]:
+    """The snapshot's links: strings, not dicts, in arrival order, deduplicated."""
+    value = snapshot.get("links") if isinstance(snapshot, dict) else None
+    items = value.get("items") if isinstance(value, dict) else value
+    out: list[str] = []
+    for item in items if isinstance(items, list) else []:
+        text = str(item)
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
 def auth_facts(forms: Any, passwords: Any,
                page_https: bool) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Login forms as facts, plus the findings no other report owns for them."""
@@ -287,8 +332,9 @@ def script_urls(snapshot_scripts: Any, journal_urls: list[str],
 
 
 def build(page_url: str, html: str, scripts: list[dict[str, Any]],
-          openapi_docs: list[dict[str, Any]], jar: list[Any] | None,
-          storage: Any, hosts: list[str] | None, requests_made: list[str]) -> dict[str, Any]:
+          openapi_docs: list[dict[str, Any]], sourcemaps: list[dict[str, Any]],
+          jar: list[Any] | None, storage: Any, hosts: list[str] | None,
+          requests_made: list[str]) -> dict[str, Any]:
     """The assembled secret_scan report: findings with priority and fixes."""
     parts = api_parts
     own = parts.own_sites(str(page_url or ""), hosts)
@@ -316,6 +362,26 @@ def build(page_url: str, html: str, scripts: list[dict[str, Any]],
                    "endpoint, parameter and schema for an attacker.",
             fix="Gate the description behind auth on non-public APIs, or serve a redacted copy.",
             evidence=clip_list(openapi_docs, parts.EVIDENCE_LIMIT)))
+    for seen in sourcemaps or []:
+        if seen.get("has_content"):
+            findings.append(finding(
+                "secret-sourcemap-sources", "surface", "fail", "high",
+                "A source map ships original sources",
+                detail="The map carries sourcesContent: the bundle's original code - comments, "
+                       "internal paths and any secret baked into it - downloads with one GET.",
+                fix="Do not deploy source maps (or their sourcesContent) to production; keep "
+                    "them on the build host for debugging.",
+                evidence={"url": seen.get("url"), "sources": seen.get("sources"),
+                          "names": seen.get("names")}))
+        else:
+            findings.append(finding(
+                "secret-sourcemap-exposed", "surface", "warn", "medium",
+                "A source map exposes the file layout",
+                detail="The map names every original source file: an attacker learns the code "
+                       "structure and where to look next.",
+                fix="Do not deploy source maps to production unless the code is public anyway.",
+                evidence={"url": seen.get("url"), "sources": seen.get("sources"),
+                          "names": seen.get("names")}))
     cookies = parts.cookie_views(jar or [], own)
     local, session, storage_error = parts.storage_views(storage)
     token_names = sorted({entry["name"] for entry in cookies + local + session
@@ -329,6 +395,7 @@ def build(page_url: str, html: str, scripts: list[dict[str, Any]],
                      "bytes": int(item.get("bytes") or 0)} for item in scripts],
         "code_endpoints": sorted(endpoints.values(), key=lambda item: (-item["count"], item["path"])),
         "openapi": openapi_docs,
+        "sourcemaps": list(sourcemaps or []),
         "auth_forms": facts,
         "token_names": token_names,
         **({"storage_note": storage_error} if storage_error else {}),

@@ -370,6 +370,7 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
             "Fix priority[] top-down and rerun; localhost and private addresses are graded in local_development mode (https/HSTS/redirect/certificate not applicable) with a production_forecast.",
             "api_report {url}: the map of the page's backend calls (method, path template, frequency, origins, xhr/fetch/websocket/sse/beacon) plus CORS, caching, Content-Type, error bodies, transport, token storage, CSRF and sensitive URL params; priority[] with fixes, summary='min'.",
             "secret_scan {url}: secrets, endpoints and openapi in the page's own scripts; sign-in forms; values masked, third-party scripts named only.",
+            "active_probe {url}: opt-in active checks - CORS preflight with a foreign Origin, OPTIONS/TRACE methods, open redirects on own links, one inert reflected token; everything in scope, budget and requests_made.",
             "perf_report {url}: TTFB/FCP/LCP/CLS rated good|needs-improvement|poor, resources, render_blocking, recommendations.",
             "network {third_party_only: true} and har_export {session_id} for the requests of an open session (HAR 1.2 file).",
             "console {levels: ['error']} and network {only_errors: true} for runtime defects.",
@@ -378,6 +379,7 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
             "security_report sends only the GETs in requests_made (pages, http://host/, security.txt, robots.txt, sitemap.xml, one TLS handshake per https host), only to hosts in scope; browser_requests is the ordinary page load. No path guessing, port scanning, probing or fuzzing.",
             "api_report sends no requests of its own: it reads the session journal, the cookie jar and page storage; token and cookie values are never output - names, flags and formats only.",
             "sarif_to writes SARIF 2.1.0 for CI; baseline compares with a saved report (regression {fixed, added}).",
+            "active_probe is the consent boundary: never POST/PUT/DELETE, payloads, auth or fuzzing, and never outside the scope.",
             "It opens its own isolated session and closes it (keep_open=true to inspect further).",
             "Test only sites you own or may test; the server never bypasses a login or a CAPTCHA.",
         ],
@@ -402,6 +404,7 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
             "An expect-only step {expect: {...}} just checks; action_fails=true is a negative test (validation must refuse).",
             "The whole plan is validated first - every action's arguments and every expect key - before any step runs.",
             "Read failed_steps and summary_line; screenshot_on_failure=true saves a PNG per failed step.",
+            "An authenticated audit is a composition, not an action: test_run {url, session_id, steps} logs in with keep_open, then api_report {session_id} reads the jar, storage and CSRF of the logged-in session.",
         ],
         "rules": [
             "stop_on_failure (default true) skips the rest after a failure; each step reports its checks and duration_ms.",

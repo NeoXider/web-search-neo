@@ -3,15 +3,15 @@
 
 _INFO_TOPICS = {
     "capabilities": "This contract: topics, actions, recipes, and pitfalls.",
-    "skill": "Built-in automation playbook; params.section='<name>' returns one section in full.",
-    "actions": "Every action with its summary and required parameters; params.group narrows it.",
+    "skill": "Automation playbook; params.section='<name>' returns one section.",
+    "actions": "Every action: summary and required parameters; params.group narrows it.",
     "action_schema": "Full JSON Schema for one action or topic; pass params.action.",
     "page_outline": "Roles, names, states, refs, and boxes - start looking here.",
     "page_text": "Readable text of the rendered page; params.mode=main|full.",
-    "element_text": "One element's content: params.selector, params.mode=text|html|outer|both.",
-    "find": "Find an element by meaning: params.query='submit request'.",
-    "page_elements": "Links, forms, fields, buttons with selectors (CSS or '#host >>> #leaf'; '' when none is unique).",
-    "console": "console.log/warn/error and uncaught errors; params.levels, params.contains.",
+    "element_text": "One element's content (params.selector, params.mode).",
+    "find": "Find an element by meaning.",
+    "page_elements": "Links, forms, fields, buttons with selectors.",
+    "console": "Console output and uncaught errors; params.levels, params.contains.",
     "network": "HTTP requests with status, type, ms, size; params.only_errors, third_party_only.",
     "network_body": "One response body; params.request_id is the id from a network read with output='json'.",
     "execute_js": "Run page JavaScript (async body) and read its value.",
@@ -208,6 +208,11 @@ _ACTION_NOTES = {
     "secret_scan": {
         "scope": "Passive: the page, its same-scope scripts and a referenced API description over ordinary GETs (all in requests_made). Third-party scripts are named, never fetched.",
         "checks": "secrets in code (cloud keys, tokens, JWT, private keys, high-entropy literals - values masked), endpoints from fetch/axios literals, openapi/swagger when referenced, sign-in forms (http post, autocomplete).",
+        "modes": "summary='min' keeps counts, priority and summary_line. save_to writes JSON, sarif_to SARIF 2.1.0; baseline adds regression {fixed, added}.",
+    },
+    "active_probe": {
+        "scope": "The call is the consent: OPTIONS, TRACE and plain GETs of your pages, links and one inert query token - all in scope, budget and requests_made. No POST/PUT/DELETE, payloads, auth or fuzzing.",
+        "checks": "preflight reflection/credentials/open methods, TRACE, open redirects off-site, reflected inert input (confirming XSS takes a payload, never sent).",
         "modes": "summary='min' keeps counts, priority and summary_line. save_to writes JSON, sarif_to SARIF 2.1.0; baseline adds regression {fixed, added}.",
     },
     "perf_report": {

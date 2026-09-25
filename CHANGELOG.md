@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### 1.23.0
+
+`active_probe`: the opt-in active checks - the call itself is the consent. CORS preflight with a foreign `Origin` (reflection with credentials, `null`, `*` with credentials, open methods/headers), OPTIONS on the page and your `paths` plus a TRACE probe, plain GETs of the page's own links watching for chains that leave the site (open redirect), and one inert query token (`[a-z0-9]+`, can never execute) watching for reflection. Only own scope, shared budget, everything in `requests_made`; no POST/PUT/DELETE, payloads, auth or fuzzing; no browser needed. `summary: "min"` keeps `counts`, `priority` and `summary_line`.
+
+Site checks (`web_search_neo/audit/active.py`, `transport.options`, `report.Checker.request`; wrapper in `audit_actions.py`; `docs/site-checks.md`)
+- `active_probe {url, hosts?, paths?, checks?, origin?}` runs the `cors`, `methods`, `redirects` and `canary` families (default all, any subset). `paths` (at most 50, same rules as `security_report`) extends methods/preflight coverage; `origin` (default `https://probe.example`) is the preflight's Origin header. Findings carry priority and fixes, like the passive reports; `save_to`, `sarif_to` and `baseline` work as usual.
+- `secret_scan` follows `sourceMappingURL` references in its own scripts (at most 2, same scope): shipped `sourcesContent` fails high, names alone warn - code never reaches the answer.
+- `api_report` warns on JWTs living longer than a day (`api-jwt-long-lived`).
+- Authenticated audit is now a documented composition: `test_run` logs in with `keep_open`, then `api_report {session_id}` reads the jar, storage and CSRF of the logged-in session (playbook `testing` + release test).
+- The contract stays under 13 500 characters with the new action: info-topic prose was tightened; the details live in `docs/site-checks.md`.
+
+Docs: README "Check your own site" lists seven actions now, and `docs/site-checks.md` gained the `active_probe` section.
+
 ### 1.22.1
 
 Field fixes from the novita.ai verification pass (all pinned with regression tests):
