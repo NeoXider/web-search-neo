@@ -268,6 +268,65 @@ def test_a_tab_we_opened_is_claimed_too(monkeypatch, companion):
     assert companion.claimed == [7]
 
 
+def _scripted_tab_status(companion, initial):
+    """Give the fake bridge a request() that answers tabs.get / tabs.activate."""
+    state = {"activated": False}
+    activated: list[int] = []
+
+    def request(method, params=None, timeout=10.0):
+        if method == "tabs.get":
+            status = "complete" if state["activated"] else initial
+            return {"id": int(params["tabId"]), "status": status}
+        if method == "tabs.activate":
+            state["activated"] = True
+            activated.append(int(params["tabId"]))
+            return {}
+        raise AssertionError("unexpected bridge call " + str(method))
+
+    companion.request = request
+    return activated
+
+
+def test_attach_restores_a_discarded_tab_before_claiming(monkeypatch, companion):
+    """A discarded tab has no renderer; the attach used to hang ~25 s on it."""
+    _scripted_tab_status(companion, "unloaded")
+    monkeypatch.setattr(browser_tools, "create_driver", lambda *a, **k: _Tab(41))
+
+    result = browser_tools.attach_current_tab(41, session_id="restored")
+
+    assert result["success"] is True
+    assert result["restored_tab"] is True
+    assert result["tab_status_before"] == "unloaded"
+
+
+def test_attach_a_live_tab_is_not_touched_by_the_restore(monkeypatch, companion):
+    _scripted_tab_status(companion, "complete")
+    monkeypatch.setattr(browser_tools, "create_driver", lambda *a, **k: _Tab(41))
+
+    result = browser_tools.attach_current_tab(41, session_id="live")
+
+    assert result["success"] is True
+    assert "restored_tab" not in result
+
+
+def test_attach_a_gone_tab_fails_fast(monkeypatch, companion):
+    """No 25 s hang: a dead tab id is reported before Chrome is touched."""
+    from web_search_neo.chrome_bridge import ChromeBridgeError
+
+    def request(method, params=None, timeout=10.0):
+        raise ChromeBridgeError("No tab with given id 41")
+
+    companion.request = request
+    monkeypatch.setattr(
+        browser_tools, "create_driver", lambda *a, **k: pytest.fail("must not reach Chrome")
+    )
+
+    with pytest.raises(ValueError) as failure:
+        browser_tools.attach_current_tab(41, session_id="gone")
+
+    assert "no longer exists" in str(failure.value)
+
+
 def test_the_run_the_claim_was_granted_in_is_the_one_recorded(monkeypatch, companion):
     companion.browser_run = "run-from-the-daemon"
     monkeypatch.setattr(browser_tools, "create_driver", lambda *a, **k: _Tab(7))

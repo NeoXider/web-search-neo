@@ -2303,6 +2303,57 @@ def setup_current_chrome_companion(wait_seconds: float = 1.0) -> dict[str, Any]:
     return setup_current_chrome(wait_seconds)
 
 
+def _restore_unloaded_tab(tab_id: int) -> dict[str, Any]:
+    """Check a tab's live status via the companion and restore it if Chrome discarded it.
+
+    A discarded ("unloaded") tab has no renderer process: attaching a debugger to
+    it makes Chrome wait for a target that never comes on its own, so the claim
+    hangs ~25 s before failing. Activating the tab through the extension API is
+    what restores the renderer - after which the attach proceeds as usual. Returns
+    a note dict to merge into the answer; empty when there was nothing to do (no
+    companion connected, or the tab already reports live).
+    """
+    bridge = get_chrome_bridge()
+    if not getattr(bridge, "connected", False):
+        return {}  # no companion: fall back to the old behaviour and let attach surface it
+    try:
+        tab = bridge.request("tabs.get", {"tabId": int(tab_id)}, timeout=5.0) or {}
+    except Exception as exc:
+        if _is_stale_tab_error(exc):
+            raise ValueError(
+                f"Tab {tab_id} no longer exists in Chrome (closed, discarded and replaced,"
+                " or the browser restarted). List live tabs with web_info(topic='browser_tabs')"
+                f" and pick one of those. Original error: {type(exc).__name__}: {exc}"
+            ) from exc
+        return {}  # the companion cannot answer; fall back to the old behaviour
+    if not isinstance(tab, dict) or tab.get("status") != "unloaded":
+        return {}  # live (or unknown): attach as before
+    try:
+        bridge.request("tabs.activate", {"tabId": int(tab_id)}, timeout=10.0)
+    except Exception:
+        pass  # activation failed; proceed and let the attach surface the real error
+    deadline = time.monotonic() + 15.0
+    waited = 0.0
+    restored = False
+    while time.monotonic() < deadline:
+        time.sleep(0.5)
+        waited += 0.5
+        try:
+            tab = bridge.request("tabs.get", {"tabId": int(tab_id)}, timeout=5.0) or {}
+        except Exception:
+            break
+        if not isinstance(tab, dict):
+            break
+        if tab.get("status") == "complete":
+            restored = True
+            break
+    return {
+        "restored_tab": restored,
+        "tab_status_before": "unloaded",
+        "restore_wait_seconds": round(waited, 1),
+    }
+
+
 def attach_current_tab(
     tab_id: int,
     session_id: str = "default",
@@ -2329,9 +2380,12 @@ def attach_current_tab(
     with _sessions_lock:
         known = session_id in _sessions
     record = None if known else _parked_record(session_id)
+    # A tab Chrome has discarded hangs the attach for ~25 s; restore it first.
+    restore_note = _restore_unloaded_tab(tab_id)
     if record and record.get("tab_id") == int(tab_id):
         # This session's own parked tab: attaching it is continuing it.
-        return reattach_session(session_id)
+        answer = reattach_session(session_id)
+        return {**answer, **restore_note} if restore_note else answer
     # Otherwise an explicit attach supersedes a parked record under this name: its
     # tab is closed if it is provably the server's.
     retired = _retire_parked(session_id, record, explicit=True) if record else None
@@ -2360,6 +2414,7 @@ def attach_current_tab(
                 **summary,
                 "success": True,
                 **({"retired_parked": retired} if retired else {}),
+                **restore_note,
                 "headless": False,
                 "window_mode": "visible",
                 "profile_mode": "current",

@@ -249,6 +249,7 @@ _ACTION_NOTES = {
         "capture": "Console and network are recorded from the claim onwards; whatever the tab did before it was claimed is unrecoverable.",
         "badge": "The tab gets the agent-activity favicon dot while driven (gone after 5 quiet minutes); a dotted tab in the strip is agent-held - do not act on it from another session.",
         "alias": "action 'attach' is accepted as attach_tab. Attaching the tab a parked session of the same session_id holds continues it (like reattach); attaching another tab under a parked name retires that record first (retired_parked says what happened to its tab).",
+        "unloaded": "A tab Chrome has discarded (status 'unloaded' in browser_tabs) hangs the attach for ~25 s; it is activated through the companion first and reported as restored_tab=true with restore_wait_seconds. A tab that no longer exists fails fast instead of hanging: list live tabs with web_info(topic='browser_tabs') and pick one of those.",
         "parked": "A claimed tab is the user's and is never parked across MCP clients (persist exists only on open). Attaching the tab a parked session of the same session_id holds continues it, like reattach.",
     },
     "reattach": {
