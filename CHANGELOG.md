@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### 1.21.0
+
+`api_report`: a passive review of how the page talks to its own backend - the map of the calls, and for every own-site API response the CORS, caching, Content-Type and error-body checks, plus transport, where tokens live, the CSRF surface and secrets in URLs. Every finding carries a priority and a fix, like `security_report`; `summary: "min"` keeps `counts`, `priority` and `summary_line`.
+
+Site checks (`web_search_neo/audit/api.py`, `api_parts.py`, `api_checks.py`; wrapper in `audit_actions.py`; `docs/site-checks.md`)
+- `api_report {url | session_id}` builds `endpoints[]` in frequency order - method, path template (numeric, UUID and long-hex segments as `{id}`), count, origins and channel (`xhr`, `fetch`, `websocket`, `sse`, `beacon`) - from the session's network journal only. It sends no requests of its own: `requests_made` is always empty and repeating a call stays `replay_request`'s explicit job. `url` loads the page once in a fresh isolated session (closed unless `keep_open`, as `perf_report` does), `session_id` analyses an open page, `hosts` (at most 10, validated with `scope`'s rules) adds your API hosts to "own", `wait_seconds` (default 2) lets the page's calls land in the journal first.
+- Per own-site API response: CORS (`Access-Control-Allow-Origin` against credentials, `*` with credentials and `null` refused, specific origins listed, preflight methods/headers/max-age), caching (`Cache-Control`/`Pragma`: `public` on a JSON or cookie-setting response is a finding - it fails when the response also sets a cookie; `no-store`/`private` passes; a missing policy warns), `Content-Type` plus `X-Content-Type-Options: nosniff` on JSON, and error bodies (4xx/5xx read from Chrome's own buffer, never re-requested: stack traces, server file paths and framework versions, snippets and URLs masked; unread bodies are named, not silently skipped). Transport: `ws://` against `wss://` (fail on an https page, warn on http), `http://` from an https page, API calls to other sites' origins.
+- Client-side auth without ever printing a value: cookies as name, domain and `Secure`/`HttpOnly`/`SameSite` flags with the value's format; `localStorage`/`sessionStorage` by name and format only; JWT-like values as facts (`alg`, `exp`, `iat`, signature present - an `alg: none`/unsigned token fails high); tokens in JS-readable storage and non-`HttpOnly` token cookies warned. CSRF: `SameSite` on session cookies (`SameSite=None` without `Secure` fails), a visible token in state-changing requests, writes leaving your site without one. Secrets in query strings (tokens, e-mail addresses, session ids) with values masked - parameter names only.
+- `save_to` writes the report as JSON, `har_to` the same journal as HAR 1.2 (download folder, `overwrite` to replace). A companion session records no response headers, so the header checks say so (`api-headers-unavailable`) instead of quietly passing.
+- Response rows now carry `Cache-Control`, `Pragma`, `Content-Type` and the `Access-Control-Allow-*`/`Access-Control-Max-Age` headers (`diagnostics.SECURITY_HEADERS`).
+- The contract stays under 13 500 characters with the new action: the `how` and `discovery` prose was tightened; the details live in `docs/site-checks.md`.
+- Fixes found while pinning 1.21 with tests: the storage snapshot arrives as a function body (as written it was an uncalled `() => {...}`, so `api-storage-unavailable` always fired); a cookie with no `SameSite` no longer also fails as `SameSite=None`; values of sensitive-name query parameters (`sid`, `phpsessid`, ...) are masked in evidence URLs, not just detected; the header-less info path imports its constructor.
+
+Docs: README "Check your own site" lists five actions now, and `docs/site-checks.md` gained the `api_report` section.
+
+## 1.20.0
 ## 1.20.0
 
 Checking your own site: a passive security report graded with Mozilla HTTP Observatory's own tests and modifiers, load metrics, HAR export and regression test runs - plus a safer default for new sessions. The security report is a configuration review for sites the caller owns or may test: a page, a crawl of the site or a list of hosts - only the hosts the caller names, only what an ordinary visit or crawler reads, every request the report sends listed.

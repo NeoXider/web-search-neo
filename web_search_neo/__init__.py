@@ -1,3 +1,3 @@
 """Web Search Neo package."""
 
-__version__ = '1.20.0'
+__version__ = '1.21.0'

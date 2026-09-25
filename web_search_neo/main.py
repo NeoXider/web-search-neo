@@ -28,7 +28,7 @@ from web_search_neo.fetch import content as fetch_content
 from web_search_neo import dispatch
 
 
-__version__ = "1.20.0"
+__version__ = "1.21.0"
 
 log = configure_server_log()  # per-user state dir; see log_setup.py
 
@@ -2450,9 +2450,9 @@ def _capabilities(action_name: str | None = None, full_schemas: bool = False) ->
         "version": __version__,
         "public_tools": ["web_info", "web_action"],
         "how": (
-            "web_info(topic=...) reads state; web_action(actions=[...]) performs 1-32 "
-            "ordered actions. One session_id is one page - reuse it. This document "
-            "is the whole contract; no external skill is required."
+            "web_info(topic=...) reads state; web_action(actions=[...]) runs 1-32 "
+            "ordered actions. One session_id is one page. This contract is complete; "
+            "no external skill is needed."
         ),
         "info_topics": _INFO_TOPICS,
         "actions": _action_index(),
@@ -2476,14 +2476,13 @@ def _capabilities(action_name: str | None = None, full_schemas: bool = False) ->
             "next_call": "web_info",
             "topic": "action_schema",
             "params_example": {"action": "input"},
-            "list_actions": "web_info(topic='actions') is the action index alone; params.group narrows it.",
-            "playbook": "web_info(topic='skill') is the loop plus a section index; params.section='<name>' opens one in full (forms, games, audit, testing, ...); site checks: docs/site-checks.md.",
-            "note": "params.action names an action or an info topic; a topic's parameters are published nowhere else, and any key it does not list is refused.",
+            "list_actions": "web_info(topic='actions') is the action index; params.group narrows it.",
+            "playbook": "web_info(topic='skill'): the loop plus a section index; params.section='<name>' opens one (forms, games, audit, testing, ...); site checks: docs/site-checks.md.",
+            "note": "params.action names an action or topic; a topic's parameters are published nowhere else - unlisted keys are refused.",
             "parameters": (
-                "actions[name].required lists parameters you must always send; "
-                "also_required is a condition a list cannot express and is just as "
-                "mandatory. Optional names, types, and defaults exist only in "
-                "action_schema; capabilities full_schemas=true embeds them all at once."
+                "actions[name].required: always-send parameters; also_required: a "
+                "condition no list can express, just as mandatory. Names, types, "
+                "defaults: only action_schema (full_schemas=true embeds them all)."
             ),
         },
     }

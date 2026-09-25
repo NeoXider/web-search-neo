@@ -95,6 +95,12 @@ _BY_ACTION: dict[str, dict[str, str]] = {
         "paths": "Your own routes to check too: /login, /api/health; <= 50, GET only.",
         "browser": "false: read the served HTML instead of rendering (no Chrome needed).",
     },
+    "api_report": {
+        "url": "The page to analyse: a cold load in a fresh isolated session (closed unless keep_open).",
+        "hosts": "Your other API hosts, <= 10 (same rules as scope): their responses count as own too.",
+        "har_to": "File name for the session journal as HAR 1.2 beside the JSON report (download folder).",
+        "overwrite": "Replace an existing save_to/har_to file instead of refusing.",
+    },
 }
 
 

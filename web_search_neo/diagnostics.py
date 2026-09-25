@@ -204,8 +204,9 @@ def _evict_pending(pending: dict[str, dict[str, Any]]) -> None:
 
 # The response headers worth carrying on every row. Keeping all of them would
 # double the size of a network read for the sake of Date and Content-Length;
-# these are the ones that answer "why was that refused" and "how is this
-# session protected", which is what a defence audit is looking for.
+# these are the ones that answer "why was that refused", "how is this session
+# protected" and - for the api_report checks - "how does this API cache its
+# responses and answer cross-origin callers".
 SECURITY_HEADERS = (
     "content-security-policy",
     "content-security-policy-report-only",
@@ -221,6 +222,13 @@ SECURITY_HEADERS = (
     "www-authenticate",
     "retry-after",
     "location",
+    "cache-control",
+    "pragma",
+    "content-type",
+    "access-control-allow-methods",
+    "access-control-allow-headers",
+    "access-control-allow-credentials",
+    "access-control-max-age",
 )
 
 POST_DATA_LIMIT = 4_000

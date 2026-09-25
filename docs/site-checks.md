@@ -2,8 +2,9 @@
 
 [← back to README](../README.md)
 
-Four actions help a developer look at a site the way a careful reviewer would before a
-release: `security_report` (what is configured unsafely and how to fix it), `perf_report`
+Five actions help a developer look at a site the way a careful reviewer would before a
+release: `security_report` (what is configured unsafely and how to fix it), `api_report`
+(how the page talks to its own backend, and what each response says), `perf_report`
 (how fast it loads), `har_export` (the network journal as a file) and `test_run` (a
 regression scenario with a pass/fail verdict per step). They are for sites, APIs and
 development servers you own or are allowed to test.
@@ -284,6 +285,60 @@ the application decodes itself (`X-User-Name: %D0%90%D0%BD%D0%BD%D0%B0`), or the
 extended notation for a header parameter that supports it
 (`Content-Disposition: attachment; filename*=UTF-8''%E2%82%AC%20rates.pdf`).
 
+## `api_report`
+
+```json
+{"actions":[{"action":"api_report","url":"https://staging.example.com/"}]}
+```
+
+With `url` alone the page loads once in a fresh isolated browser that is closed afterwards
+(`keep_open` keeps it). With `session_id` alone the calls of the page already open there are
+analysed - open it first and work with it (or run a `test_run` scenario against it) so the
+calls land in the session's network journal; with both, that session navigates to `url`
+first. `wait_seconds` (default 2) is the pause after the load before the journal is read.
+The report sends no requests of its own: `requests_made` is always empty, an error
+response's body is read from Chrome's own memory (never a second request), and repeating a
+call on purpose stays `replay_request`'s explicit job.
+
+| Parameter | Meaning |
+| --- | --- |
+| `url`, `session_id`, `keep_open` | The page to analyse: a cold load in a fresh isolated session (closed unless `keep_open`), or the calls of the session already open. |
+| `hosts` | Your other API hosts, at most 10 (the same exact-host rules as `scope`): their responses count as own too. |
+| `wait_seconds` | How long the page's calls may take to land in the journal (default 2, at most 30). |
+| `timeout_seconds` | Per request, 1-120. |
+| `save_to`, `har_to`, `overwrite` | Also write the report as JSON (`save_to`) and the same journal as HAR 1.2 (`har_to`) into the download folder. A HAR can carry what its URLs carried: treat it like a secret. |
+
+`endpoints[]` is the map of the page's backend calls in frequency order: method, path template
+(numeric, UUID and long-hex segments as `{id}`), count, origins and channel (`xhr`, `fetch`,
+`websocket`, `sse`, `beacon`). Own-site API responses get the full checks; other sites'
+origins are classified, never contacted:
+
+| Area | Checks |
+| --- | --- |
+| CORS | `Access-Control-Allow-Origin` against credentials (`*` with credentials and `null` refused, specific origins listed), preflight methods, headers and `max-age`. |
+| Caching | `Cache-Control`/`Pragma`: `public` on a JSON or cookie-setting response is a finding (it fails when the response also sets a cookie); `no-store`/`private` passes; a missing policy warns. |
+| Content-Type | `Content-Type` plus `X-Content-Type-Options: nosniff` on JSON. |
+| Error bodies | 4xx/5xx bodies from Chrome's memory (at most 8, 4000 characters each): stack traces, server file paths, framework versions - snippets and URLs masked. Bodies Chrome did not keep are named, not silently skipped. |
+| Transport | `ws://` against `wss://` (fails on an https page, warns on http), `http://` calls from an https page, API calls to other sites' origins. |
+| Tokens | Cookies as name, domain and `Secure`/`HttpOnly`/`SameSite` flags with the value's format only; `localStorage`/`sessionStorage` by name and format only; JWT-like values as facts (`alg`, `exp`/`iat`, signature present - an `alg: none`/unsigned token fails high). Token and cookie values are never printed. |
+| CSRF | `SameSite` on session cookies (`SameSite=None` without `Secure` fails), a visible token in state-changing requests, writes leaving your site without one. |
+| URLs | Secrets in query strings (tokens, e-mail addresses, session ids) - parameter names only, values masked. |
+
+### Reading the answer
+
+| Field | Meaning |
+| --- | --- |
+| `requests_observed`, `api_calls`, `dropped` | Journal rows read, calls they hold, rows that fell out of the history. |
+| `endpoints`, `endpoints_omitted` | The call map (the first 60) and how many further endpoints were left out. |
+| `auth` | Cookies, `local_storage`, `session_storage` - names, flags and formats, never values (`storage_note` when the storage script failed). |
+| `counts`, `summary_line`, `priority`, `findings` | The verdict: counts by severity, the one-line summary, the fixes in order (each with `fix`), every check. |
+| `scope`, `requests_made` | What counts as own, and the empty list proving nothing was sent. |
+| `api-headers-unavailable` | A companion session records no response headers, so the finding says the CORS, caching and Content-Type checks could not run for those responses instead of quietly passing. |
+
+`summary: "min"` (on `web_action` or inside the action) keeps `counts`, `priority` and
+`summary_line`, marks the answer `summary_mode: "min"` and names everything it left out in
+`summary_omitted` and `summary_clipped`.
+
 ## `perf_report`
 
 ```json
@@ -396,10 +451,11 @@ short result.
 1. `security_report {url, scope: "site"}` on the staging host (or `paths` with the entry
    pages: home, sign-in, checkout). Fix `priority` top-down; rerun until only accepted
    warnings remain.
-2. `perf_report {url}` for the same pages; compare with the previous release's numbers.
-3. `test_run` with the scenarios that must never break (sign-up, sign-in, the main form),
+2. `api_report {url}` for the pages that call a backend; fix `priority` top-down.
+3. `perf_report {url}` for the same pages; compare with the previous release's numbers.
+4. `test_run` with the scenarios that must never break (sign-up, sign-in, the main form),
    `no_console_errors` and `no_failed_requests` on the steps that submit.
-4. For a failure, `open` the page in its own session and read `console`, `network
+5. For a failure, `open` the page in its own session and read `console`, `network
    {only_errors: true}` and `har_export` for the bug report.
 
 ## Recipe: check a dev server

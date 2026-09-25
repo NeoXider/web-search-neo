@@ -362,18 +362,20 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
         },
     },
     "audit": {
-        "summary": "Check your own site before a release: security grade, performance, third parties.",
+        "summary": "Check your own site before a release: security grade, API traffic, performance, third parties.",
         "when": "A site, API or dev server you own or may test; passive reads only, within the hosts you name.",
         "steps": [
             "security_report {url}: grade A+..F with Mozilla Observatory's tests and modifiers, score_explanation, extended (plus this report's own checks), priority[] (fix first), findings[] each with fix; summary='min' for the verdict alone.",
             "scope='site' crawls your site (links + sitemap, max_pages <= 50, robots.txt), scope='hosts' checks several origins (<= 10, e.g. localhost:3000 and localhost:8000), paths lists your own routes; the weakest page decides the grade.",
             "Fix priority[] top-down and rerun; localhost and private addresses are graded in local_development mode (https/HSTS/redirect/certificate not applicable) with a production_forecast.",
+            "api_report {url}: the map of the page's backend calls (method, path template, frequency, origins, xhr/fetch/websocket/sse/beacon) plus CORS, caching, Content-Type, error bodies, transport, token storage, CSRF and sensitive URL params; priority[] with fixes, summary='min'.",
             "perf_report {url}: TTFB/FCP/LCP/CLS rated good|needs-improvement|poor, resources, render_blocking, recommendations.",
             "network {third_party_only: true} and har_export {session_id} for the requests of an open session (HAR 1.2 file).",
             "console {levels: ['error']} and network {only_errors: true} for runtime defects.",
         ],
         "rules": [
             "security_report sends only the GETs in requests_made (pages, http://host/, security.txt, robots.txt, sitemap.xml, one TLS handshake per https host), only to hosts in scope; browser_requests is the ordinary page load. No path guessing, port scanning, probing or fuzzing.",
+            "api_report sends no requests of its own: it reads the session journal, the cookie jar and page storage; token and cookie values are never output - names, flags and formats only.",
             "It opens its own isolated session and closes it (keep_open=true to inspect further).",
             "Test only sites you own or may test; the server never bypasses a login or a CAPTCHA.",
         ],
@@ -383,6 +385,7 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
         "example": {
             "actions": [
                 {"action": "security_report", "url": "https://example.com", "summary": "min"},
+                {"action": "api_report", "url": "https://example.com", "summary": "min"},
                 {"action": "perf_report", "url": "https://example.com"},
             ]
         },

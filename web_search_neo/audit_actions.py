@@ -1,4 +1,4 @@
-"""MCP wrappers for the 1.20 site checks: security_report, perf_report, har_export, test_run.
+"""MCP wrappers for the site checks: security_report, api_report, perf_report, har_export, test_run.
 
 Like ``extra_actions``, these live outside the size-ratcheted facade and are
 registered on the same legacy FastMCP instance main's action table resolves
@@ -19,7 +19,7 @@ import time
 from typing import Any, Literal
 
 from web_search_neo import __version__, browser_tools, macros, network_log
-from web_search_neo.audit import har, page as page_checks, perf, report, scenario, site
+from web_search_neo.audit import api, har, page as page_checks, perf, report, scenario, site, scope
 from web_search_neo.fetch.safety import write_download
 from web_search_neo.perception import min_summary
 
@@ -178,6 +178,112 @@ async def browser_perf_report(
                 browser_tools.close_session(sid)
     return await asyncio.to_thread(run)
 
+
+# api_report: сколько тел ответов с ошибками читаем и на сколько символов.
+# Chrome держит их в памяти — чтение не является новым запросом.
+API_ERROR_BODIES = 8
+API_ERROR_BODY_CHARS = 4_000
+
+
+def _api_error_bodies(session: Any, session_id: str, rows: list[dict[str, Any]], page_url: str,
+                      hosts: list[str] | None) -> tuple[dict[str, str], int]:
+    """Тела ответов 4xx/5xx своих API-вызовов из памяти Chrome (замок под session.lock)."""
+    own = api.own_sites(page_url, hosts)
+    bodies: dict[str, str] = {}
+    unread = 0
+    wanted = [row for row in rows
+              if api._status(row) >= 400 and api.channel(row) and row.get("id")
+              and api.is_own(str(row.get("url") or ""), own)]
+    for row in wanted[:API_ERROR_BODIES]:
+        answer = network_log.read_body(session.driver, str(row["id"]), session_id, API_ERROR_BODY_CHARS,
+                                       lambda exc: f"{type(exc).__name__}: {exc}")
+        if answer.get("success"):
+            bodies[str(row["id"])] = str(answer.get("body") or "")
+        else:
+            unread += 1
+    return bodies, unread
+
+
+async def browser_api_report(
+    url: str | None = None,
+    session_id: str | None = None,
+    hosts: list[str] | None = None,
+    keep_open: bool = False,
+    wait_seconds: float = 2.0,
+    timeout_seconds: float = 20.0,
+    save_to: str | None = None,
+    har_to: str | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Карта вызовов страницы к бэкенду: CORS, кэш, Content-Type, ошибки, транспорт, токены, CSRF.
+
+    Пассивно: читается только журнал сети страницы (трафик, который страница
+    сама сделала, пока пользователь или сценарий test_run работали с ней),
+    cookie-джар, localStorage/sessionStorage (имена и формат; значения токенов
+    и cookie никогда не выводятся) и тела ответов с ошибками, которые Chrome
+    уже держит. Своих запросов api_report не шлёт: url грузит страницу в свежей
+    изолированной сессии (закрывается, если не keep_open), session_id работает с
+    уже открытой страницей, hosts (≤10, те же правила, что у scope) добавляет
+    твои хосты в «свои». wait_seconds — пауза после загрузки, чтобы вызовы успели
+    долететь в журнал. save_to пишет отчёт JSON, har_to — HAR того же журнала
+    (папка загрузок). summary='min' оставляет counts, priority и summary_line.
+    """
+    if url is None and not session_id:
+        raise ValueError("api_report needs url (a fresh isolated load) or the session_id of an open page")
+    if hosts:
+        scope.Scope.build(hosts)  # отказ до открытия браузера: wildcards/суффиксы/ >10 хостов
+    sid = session_id or f"api-report-{secrets.token_hex(3)}"
+
+    def run() -> dict[str, Any]:
+        opened = False
+        timeout = max(1.0, min(float(timeout_seconds), 120.0))
+        if url is not None:
+            with browser_tools._sessions_lock:
+                live = browser_tools._sessions.get(sid)
+            if live is not None:  # открытая сессия: тёплый переход её же браузером
+                browser_tools.open_page(url, session_id=sid, timeout_seconds=timeout,
+                                        profile_mode=live.profile_mode, profile_id=live.profile_id,
+                                        debugger_address=live.debugger_address)
+            else:
+                _open_isolated(url, sid, timeout)
+                opened = True
+        failed = True
+        try:
+            wait = max(0.0, min(float(wait_seconds), 30.0))
+            if wait:
+                time.sleep(wait)
+            try:
+                storage = _script_value(sid, api.STORAGE_SCRIPT, None, 15.0)
+                if not isinstance(storage, dict):
+                    storage = {"storage_error": "the storage script returned no object"}
+            except Exception as exc:
+                storage = {"storage_error": f"{type(exc).__name__}: {exc}"[:200]}
+            jar = browser_tools.cookies(op="get", session_id=sid, limit=1000).get("cookies") or []
+            session = browser_tools._get_session(sid)
+            with session.lock:
+                rows, dropped, pending = network_log.drain(session)
+                page_url = network_log.page_url(session)
+                bodies, unread = _api_error_bodies(session, sid, rows + pending, page_url, hosts)
+            result = api.build(rows + pending, page_url=page_url, jar=jar, storage=storage,
+                               bodies=bodies, unread=unread, hosts=hosts, dropped=dropped)
+            if save_to:
+                text = json.dumps(result, ensure_ascii=False, indent=1, default=str)
+                path = write_download(save_to, text.encode("utf-8"), overwrite=bool(overwrite))
+                result = {**result, "saved_to": str(path)}
+            if har_to:
+                document = har.build(rows + pending, page_url=page_url,
+                                     title=str(getattr(session, "last_title", "") or ""),
+                                     version=__version__, dropped=dropped)
+                path = write_download(har_to, json.dumps(document, ensure_ascii=False, indent=1).encode("utf-8"),
+                                      overwrite=bool(overwrite))
+                result = {**result, "har_saved_to": str(path)}
+            failed = False
+            return {"success": True, "session_id": sid if not opened or keep_open else None,
+                    "fresh_isolated_load": opened, **result}
+        finally:
+            if opened and (failed or not keep_open):  # при ошибке session_id не возвращается — сессия закрыта
+                browser_tools.close_session(sid)
+    return await asyncio.to_thread(run)
 
 async def browser_har_export(
     session_id: str = "default",
@@ -365,10 +471,11 @@ async def _run_plan(plan: list[dict[str, Any]], session_id: str, url: str | None
 
 ACTION_SPECS = (
     ("security_report", browser_security_report, "audit", "Passive A-F security grade: page, site or hosts; fixes."),
+    ("api_report", browser_api_report, "audit", "Map page-to-backend calls: CORS, cache, tokens, CSRF; fixes."),
     ("perf_report", browser_perf_report, "audit", "Load metrics: TTFB, FCP, LCP, CLS, resources, blocking."),
     ("har_export", browser_har_export, "audit", "Save the session's network journal as a HAR file."),
     ("test_run", browser_test_run, "audit", "Run steps with expect checks; pass/fail per step."),
 )
 
-__all__ = ["ACTION_SPECS", "bind", "browser_har_export", "browser_perf_report", "browser_security_report",
-           "browser_test_run"]
+__all__ = ["ACTION_SPECS", "bind", "browser_api_report", "browser_har_export", "browser_perf_report",
+           "browser_security_report", "browser_test_run"]
