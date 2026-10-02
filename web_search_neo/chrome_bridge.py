@@ -1493,10 +1493,15 @@ class ChromeBridgeDriver:
         # whether an empty result means "quiet page" or "nothing was recorded".
         self.events_subscribed = False
         if tab_id is None:
+            # 10 s was enough on an idle machine; with the CPU pegged by other work
+            # (Unity/CUDA builds, 30.09.2026) the extension answers late, the
+            # request times out, and the tab it already made is left behind as an
+            # orphan about:blank - which slows the next attempt even more. A longer
+            # wait costs nothing when the answer is fast.
             tab = self.bridge.request(
                 "tabs.create",
                 {"url": "about:blank", "group": self.tab_group, "active": self.foreground},
-                timeout=10.0,
+                timeout=float(os.environ.get("WSN_TAB_CREATE_TIMEOUT", "60")),
             )
         else:
             # Claiming a tab the user pointed at can be a "show me" moment, but
