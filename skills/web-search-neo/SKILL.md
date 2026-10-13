@@ -444,6 +444,18 @@ and writes the returned token into the page; it needs `WEB_SEARCH_NEO_CAPTCHA_KE
 solve. `mode=auto` waits for the user; it solves only if the operator also set
 `WEB_SEARCH_NEO_CAPTCHA_AUTO_SOLVE=1`. A token is applied only if the page URL is unchanged.
 
+A slider captcha — Tencent TCaptcha (`#tcaptcha_transform_dy`, `tencent-captcha-dy__*`),
+Geetest — has no sitekey, so there is nothing to buy: `mode=solve` and `mode=auto` capture
+its picture, find the hole in it and drag the handle along a human-shaped path, free and
+locally (`WEB_SEARCH_NEO_CAPTCHA_LOCAL_SOLVE=0` turns that off). If the measurement is not
+confident nothing is dragged and `slider_solve` says why; then it waits for a person.
+
+The same drag happens unasked where a captcha blocks the agent's own work: a click that sent
+nothing while an unsolved widget sat on the page tries it before reporting
+`submit_blocked_by_challenge` (a cleared one comes back as `challenge_cleared_by` - nothing was
+sent, so click once more), and `wait_for_challenge_resolution` solves before it waits for a
+human. Plain reads never drag anything; `WEB_SEARCH_NEO_CAPTCHA_AUTO_ON_TAB=0` stops this too.
+
 A solved token is not a submitted form: some sites submit from the widget's own callback and
 some wait for the button, so re-read the page and submit if it did not. A captcha with no
 sitekey — an image or a behavioural check — cannot be sent to a service at all and has to be
@@ -463,6 +475,14 @@ a captured request, or spell out `url`/`method`/`headers`/`body`. The response c
 status, headers and a clipped body — enough to check whether a session token still works, an
 endpoint is rate-limited, or what a form's POST returns, without driving the form again.
 Captured POST bodies are not retained, so pass `body` explicitly to resend one.
+
+`vary` turns one replay into a bounded A/B sweep: `{"headers": [{"x-role": "admin"}], "query":
+[{"uid": "61808"}], "body": ["{\"role\": \"admin\"}"]}` sends the baseline once plus one request
+per single change - twelve at most, `variants_dropped` names what did not fit - and answers with
+each delta: status change, size change, JSON paths added, removed or changed, response header
+names. Values are shapes (`string(24)`, `list(3)`), never the values themselves, so a diff cannot
+carry a token out of the answer; a body mutation is asked as a POST, because a GET with a body is
+a body most servers ignore. It is a question about one endpoint, not a fuzzer.
 
 `stealth op=on` hides the usual automation tells (`navigator.webdriver`, plugin/language
 shape) before the page's own scripts read them, which lowers how often a site *shows* a

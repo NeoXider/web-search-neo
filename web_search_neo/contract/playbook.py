@@ -172,7 +172,7 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
             "Only a <select multiple> takes a list. Checkboxes take 1/yes/on/check or 0/no/off/uncheck. Date, time, range, and colour are set rather than typed, so a bad format is refused untouched.",
             "fill blurs each control it writes, so focus ends on the body: a following press_keys needs target_selector; submit needs no focus.",
             "challenge_detected means a challenge is blocking the page. Use the captcha action; never hammer clicks. captcha_widgets lists ones merely present and can be ignored.",
-            "invisible_challenge_pending=true, or submit_blocked_by_challenge on a click, means a captcha with no box holds the form: the button sticks on 'Submitting…', nothing is sent and nothing is logged. Clear it with the captcha action; retrying or a new session changes nothing.",
+            "invisible_challenge_pending=true, or submit_blocked_by_challenge on a click, means a captcha with no box holds the form: the button sticks on 'Submitting…', nothing is sent and nothing is logged. A stalled submit already tried a local slider drag; anything else needs the captcha action - retrying or a new session changes nothing.",
             "upload_state=unconfirmed is not a failed upload: check the page for the file name and network for the request before attaching again. taken_by_widget means it worked and the widget emptied the input.",
             "A heading like 'answer questions' is boilerplate. Only live enabled controls are questions.",
         ],
@@ -475,7 +475,7 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
             {
                 "symptom": "The submit button says 'Submitting…' forever and no request is ever made.",
                 "cause": "An invisible captcha is waiting for a token; the page's own handler waits with it, silently.",
-                "fix": "Look for invisible_challenge_pending or submit_blocked_by_challenge in the answer, clear it with the captcha action, then click once more.",
+                "fix": "Look for invisible_challenge_pending or submit_blocked_by_challenge in the answer - a stalled submit already tried the free slider drag (challenge_cleared_by says when it worked), otherwise clear it with the captcha action and click once more.",
             },
             {
                 "symptom": "A screenshot times out in current Chrome.",

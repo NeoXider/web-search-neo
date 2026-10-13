@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "web-search-neo"
-version = "1.24.0"
+version = "1.25.0"
 description = "Free API-keyless web search and visible Chrome automation for AI agents over MCP."
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
@@ -17,6 +17,17 @@ dependencies = [
     "beautifulsoup4>=4.13,<5",
     "selenium>=4.34,<5",
     "websockets>=15,<18",
+]
+
+[project.optional-dependencies]
+# Slider captchas (TCaptcha, Geetest) are measured locally: numpy is what measures,
+# Pillow decodes the capture, and OpenCV is only used by the two-image template
+# match. Without them the solve reports that it cannot measure rather than failing,
+# so nothing here is required to run the server.
+slider = [
+    "numpy>=1.26",
+    "Pillow>=10.4",
+    "opencv-python-headless>=4.10",
 ]
 
 [project.scripts]
@@ -35,6 +46,7 @@ packages = [
     "web_search_neo.actions",
     "web_search_neo.audit",
     "web_search_neo.cdp",
+    "web_search_neo.captcha_solvers",
     "web_search_neo.contract",
     "web_search_neo.fetch",
     "web_search_neo.perception",

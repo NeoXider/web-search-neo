@@ -286,7 +286,7 @@ DevTools port cannot be given one later. So three steps stay with the user:
 
 Keep **Web Search Neo Companion** enabled. Click its toolbar icon to open the
 companion panel: it shows the bridge state and controlled-tab count, and offers
-**Reconnect**, **Release tabs**, a GitHub release/version check, a repository link,
+**Reconnect**, **Update**, **Release tabs**, a GitHub release/version check, a repository link,
 and a persistent on/off switch. Turning the switch
 off closes the bridge and detaches every controlled tab. Its toolbar badge reads
 `ON` while the companion is connected and authenticated to the [bridge daemon](#the-bridge-daemon),
@@ -316,7 +316,7 @@ companion popup's Reconnect (Restart companion when its service worker has
 stopped) is the one action; Reload on its card at chrome://extensions is the
 fallback.
 
-The bundled companion is version 1.24.0. Chrome does not refresh an unpacked
+The bundled companion is version 1.25.0. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. That only works for
@@ -641,6 +641,10 @@ Detection answers "is a challenge in the way", not "does this page contain a cap
 A challenge with no box is the other half of this. An invisible Turnstile renders no picture and no checkbox — the whole widget is a container in the DOM and a hidden field its token would go into — so a visibility test walked straight past it while the site's own submit handler waited for a token that was never coming: the button sits on "Submitting…", no request leaves the page, and the console stays empty. Every page summary therefore also carries `invisible_challenge_pending`, and with it `invisible_challenge` naming the vendor, the state (`token_empty` when the hidden `cf-turnstile-response`, `g-recaptcha-response`, `h-captcha-response` or `smart-token` field is empty; `widget_hidden` when the widget rendered before its field existed), the evidence and what to do about it. It gates the form rather than the page, so `challenge_detected` stays false — but `captcha` with `op=detect` reports it, `mode='wait'` no longer calls it resolved, and a `click` that made no network request at all while it is pending comes back with `submit_blocked_by_challenge` and a reason.
 
 The `captcha` web action can also hand a widget's sitekey to a third-party solving service (2captcha-compatible, `WEB_SEARCH_NEO_CAPTCHA_HOST`), but only on request: `mode='solve'`, or `mode='auto'` with `WEB_SEARCH_NEO_CAPTCHA_AUTO_SOLVE=1`, and always with `WEB_SEARCH_NEO_CAPTCHA_KEY` set, because every solve costs money. By default `auto` waits for a human. The returned token is applied only if the page URL has not changed, and the result reports success only when it was. Search `challenge_mode` never calls a service.
+
+Slider captchas are solved on this machine instead of bought. Tencent TCaptcha (`#tcaptcha_transform_dy` and its `tencent-captcha-dy__*` parts, or the older `turing.captcha.qcloud.com` frame) and Geetest publish no sitekey, so there is nothing to send a service and no hidden field for a token to be written into: the answer is a drag, and the vendor grades the movement. `mode='solve'` and `mode='auto'` capture the widget's own picture, find the hole in it — the pair of vertical edges one piece-width apart, which is what the open-source slider solvers read — and move the handle along an accelerating path that overshoots slightly and eases back onto the target, because a linear 300 px move in six identical steps is exactly the signature these vendors score as a bot. Nothing leaves the machine and nothing is charged; `WEB_SEARCH_NEO_CAPTCHA_LOCAL_SOLVE=0` leaves every slider to a person. When the measurement is not sure of itself the drag is refused and the reason comes back in `slider_solve`, because an unsure guess spends the attempt and hands back a refreshed puzzle. The measuring code lives in `web_search_neo/captcha_solvers/` and needs numpy (Pillow decodes the capture, OpenCV is used only when the page really does serve the cut-out piece as its own image); `pip install "web-search-neo[slider]"` installs all three. Without them the solve reports that it cannot measure rather than guessing.
+
+The same drag is used without being asked, where a captcha is what stands between the agent and its own work. A submit that produced no request at all while an unsolved widget sat on the page used to come back as `submit_blocked_by_challenge` and wait for the caller to run the captcha action; now the slider is measured and dragged first — nothing was sent, so a cleared widget means clicking once more submits once — and only a captcha that cannot be dragged here reports the block, with `captcha_auto_solve` naming the measurement that was unsure. `wait_for_challenge_resolution` solves before it waits for a person. A page with no challenge on it is not probed, plain reads never drag anything, and `WEB_SEARCH_NEO_CAPTCHA_AUTO_ON_TAB=0` puts every such captcha back on a human.
 
 ## Current Chrome automation
 
@@ -1814,7 +1818,7 @@ It reports the eager tool-schema size and the median and p95 latency of both MCP
 - Plain `http://` to public hosts is refused unless `WEB_SEARCH_NEO_ALLOW_PLAIN_HTTP=1` is set; loopback and private-network addresses are reachable when addressed directly, but a public host redirecting to one is refused, and link-local/cloud-metadata addresses are always blocked. Cross-origin redirects drop credential headers, and `save_to` writes only under `WEB_SEARCH_NEO_DOWNLOAD_DIR` (default `./downloads`), never over an existing file without `overwrite=true`.
 - File upload tools can upload local paths supplied to the tool. Review agent actions and scope filesystem access appropriately.
 - Browser automation may be restricted by a site's terms of service. Use it only where you are authorized.
-- Manual challenge mode hands control to you. A paid CAPTCHA solving service is contacted only on `captcha` `mode='solve'` (or `mode='auto'` with `WEB_SEARCH_NEO_CAPTCHA_AUTO_SOLVE=1`) and only when `WEB_SEARCH_NEO_CAPTCHA_KEY` is set.
+- Manual challenge mode hands control to you. A paid CAPTCHA solving service is contacted only on `captcha` `mode='solve'` (or `mode='auto'` with `WEB_SEARCH_NEO_CAPTCHA_AUTO_SOLVE=1`) and only when `WEB_SEARCH_NEO_CAPTCHA_KEY` is set. A slider captcha (TCaptcha, Geetest) is measured and dragged locally instead: no key, no request leaves the machine, and its picture is never sent anywhere. Where that drag happens unasked - a submit that sent nothing, a wait for a human - it is still only a pointer moving in a tab you already opened, on a page that was already waiting for one; `WEB_SEARCH_NEO_CAPTCHA_AUTO_ON_TAB=0` asks every such captcha of you instead.
 
 ## Contributing
 

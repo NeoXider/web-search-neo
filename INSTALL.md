@@ -2,7 +2,7 @@
 
 This guide installs the MCP server from source and connects it to LM Studio or another stdio-compatible MCP client.
 
-It describes version 1.24.0. The Python package, the server, and the bundled Chrome
+It describes version 1.25.0. The Python package, the server, and the bundled Chrome
 companion carry that same version, and the bridge only accepts a companion that speaks the
 current handshake (bridge protocol 2, since 1.15.0) — see [Updating](#updating) if an older one is already
 installed.
@@ -222,7 +222,9 @@ Leave **Web Search Neo Companion** enabled. Its toolbar popup (also on
 connecting, waiting with the retry countdown, disabled, or error — the
 controlled-tab count against the parallel-session limit, the bridge endpoint,
 a GitHub release/version check and repository link, a persistent on/off switch,
-**Reconnect**, and **Release tabs**.
+**Reconnect**, **Update**, and **Release tabs**. **Update** re-checks GitHub, opens the newer
+release, prints the pull-and-reinstall step, and reloads the companion onto the files on disk —
+the Reload nobody can press from outside Chrome after a `git pull` of an unpacked extension.
 Switching it off also detaches every controlled tab. Its toolbar badge reads `ON` once it has
 connected and authenticated to the [bridge daemon](#the-bridge-daemon). The daemon, not the
 MCP server — it outlives every server process, so the badge says nothing about whether an
@@ -233,7 +235,7 @@ Earlier revisions tried to perform those clicks for you through Windows UI Autom
 code is gone. It depended on the interface language, on which window happened to have focus,
 and on a folder picker that the automation backend does not even enumerate.
 
-The bundled companion is version 1.24.0 and declares five permissions: `alarms`, `debugger`,
+The bundled companion is version 1.25.0 and declares five permissions: `alarms`, `debugger`,
 `storage`, `tabs`, and `tabGroups`. There are no content scripts and no `host_permissions`;
 page access comes from `debugger`, which attaches the Chrome DevTools Protocol to the tabs
 the agent drives. `alarms` exists because Chrome suspends an idle MV3 service worker after
@@ -581,6 +583,8 @@ Set these for the MCP server process before it starts.
 | `WEB_SEARCH_NEO_LOG_FILE` | Path of the server's `msp_server.log`, instead of the per-user state directory. |
 | `WEB_SEARCH_NEO_AGENT_NAME` | Friendly agent name the companion shows on its toolbar badge and in the popup's **Agent tabs** card. |
 | `WEB_SEARCH_NEO_CAPTCHA_KEY` | Key for a paid CAPTCHA solving service (`WEB_SEARCH_NEO_CAPTCHA_HOST`, 2captcha by default). Used only by `captcha` `mode='solve'`, or `mode='auto'` with `WEB_SEARCH_NEO_CAPTCHA_AUTO_SOLVE=1`. |
+| `WEB_SEARCH_NEO_CAPTCHA_LOCAL_SOLVE` | Set to `0` to stop the free local solving of slider captchas (TCaptcha, Geetest). On by default: it spends no money and sends nothing off the machine. Their measurement needs numpy (`pip install "web-search-neo[slider]"`); without it the solve reports that it cannot measure. |
+| `WEB_SEARCH_NEO_CAPTCHA_AUTO_ON_TAB` | Set to `0` to stop the slider drag that a stalled submit or a challenge wait tries by itself on the tab the agent is driving. On by default; `WEB_SEARCH_NEO_CAPTCHA_LOCAL_SOLVE=0` covers it too. |
 | `WEB_SEARCH_NEO_LEGACY_TOOLS` | Advertise the former wide tool list instead of the two compact tools. |
 | `WEB_SEARCH_NEO_PLUGINS` | `os.pathsep`-separated plugin `.py` files or directories; plugins may add actions, observation topics, and search providers. |
 
@@ -684,7 +688,7 @@ or when `setup_current_chrome` answered `self_update: "unsupported"` or `"timeou
    very directory **Load unpacked** points at, then reload the extension. Restarting the
    daemon does not help and never did after the daemon learned to re-read the token file:
    it already fetches the current secret from disk before calling anything a mismatch.
-3. Check the card's version. It must read 1.24.0; anything older speaks bridge protocol 1
+3. Check the card's version. It must read 1.25.0; anything older speaks bridge protocol 1
    and is refused with `Expected Web Search Neo bridge protocol 2; update and reload the
    companion`, and Chrome only picks up the new manifest on reload.
 4. `%LOCALAPPDATA%\WebSearchNeo\bridge-daemon.log` records the bridge's side: `Rejected a

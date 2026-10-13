@@ -1,8 +1,37 @@
 # Changelog
 
-## Unreleased
+## 1.25.0
 
-### 1.24.0
+Slider captchas get solved on this machine: no key, no money, nothing sent off it. No new actions or params, so the capabilities budget is untouched.
+- New leaf package `web_search_neo/captcha_solvers/`: `images.py` finds the hole in a slider picture (column edge-pair search on the rendered widget - what a browser session can honestly provide - and Canny/template matching when the page really does serve the cut-out piece as its own image); `trajectory.py` produces the drag path these vendors score (accelerate, overshoot, ease back onto the exact target, wobble in y, never two identical steps); `slider.py` holds the TCaptcha and Geetest v4 widget specs plus the locate/cleared scripts and the measure-drag-verify loop, which takes its browser primitives as callables and so stays testable without a browser.
+- `captcha` `mode='solve'` and `mode='auto'` now drag a slider captcha locally when no sitekey vendor was found; `mode='wait'` and `mode='detect'` are unchanged. An unsure measurement is refused, reported in `slider_solve`, and falls back to waiting instead of spending the attempt. `WEB_SEARCH_NEO_CAPTCHA_LOCAL_SOLVE=0` opts out.
+- The page probe knows Tencent TCaptcha: `#tcaptcha_transform_dy`/`tencent-captcha-dy__*`, the older `turing.captcha.qcloud.com` frame, and Geetest v4 - all by class-family substring because both vendors rename their parts between releases. `isVisible` now walks ancestors for opacity: a widget inside a layer faded to 0 reports opacity 1, which made an auto-passed TCaptcha look unsolved.
+- Optional extras `[project.optional-dependencies] slider` (numpy, Pillow, opencv-python-headless). Without them the solve says it cannot measure instead of guessing.
+
+The same captcha is now solved without being asked about, on the tab the agent is already driving:
+- A submit that sent nothing but has an unsolved widget on the page used to be reported as `submit_blocked_by_challenge` and left for the caller to clear. Now the free slider drag is tried first: if it clears, the answer says `challenge_cleared_by: "local_slider"` and that clicking once more submits once (nothing was sent, so nothing can double-submit); if the measurement was unsure, `captcha_auto_solve` names why and the old verdict stays.
+- `wait_for_challenge_resolution` solves before it waits: a slider is measured and dragged, and only a captcha that cannot be dragged here starts the wait for a person. A page with no challenge on it is not probed at all.
+- `WEB_SEARCH_NEO_CAPTCHA_AUTO_ON_TAB=0` puts every such captcha back on a human; `WEB_SEARCH_NEO_CAPTCHA_LOCAL_SOLVE=0` covers both paths.
+- The duplicated slider attempt inside `captcha` was removed: an unsure measurement had been dragged twice before the wait began.
+
+`replay_request` gained `vary`, which turns one replay into a bounded A/B sweep (no new action, one new param):
+- `{"headers": [{"x-role": "admin"}], "query": [{"uid": "61808"}], "body": ["{\\"role\\": \\"admin\\"}"]}` sends the baseline once plus one request per single change, at most twelve, and answers with each delta: status change, size change, JSON paths added, removed or changed, response header names added or removed. A body mutation is asked as a POST, because a GET with a body is a body most servers ignore.
+- Values are never quoted: `string(24)`, `null`, `list(1)`. A diff that could carry a token would break the same rule every report here keeps.
+- New paths are named at the branch that appeared (`scope`, not `scope[0]`), unless the object already existed, in which case the full path is kept (`profile.email`).
+- New leaf module `web_search_neo/fetch/variants.py` holds the sweep and the diff; it takes its send function as a callable, so it is testable without a browser.
+
+Tab presence reads at strip size now, on all three surfaces:
+- The corner slime is drawn at full size and fully opaque instead of 75 % and partly see-through, and its geometry is a documented constant (`SLIME_ORIGIN`, `SLIME_SCALE`, `SLIME_ALPHA`) carried in the installer's CONFIG. Presence script version 8.
+- Green means "an action was under a minute ago" - thirty seconds was gone before a person watching the tab strip looked at it. Amber carries it to five minutes, then the favicon is handed back. Same windows in the server-side fallback dot (which now repaints green to amber on its own schedule instead of staying bright until the restore) and in the extension's per-tab badge (`ACTIVE_MS = 60_000`).
+
+The popup has an **Update** button:
+- It re-checks GitHub, and when a newer release exists it opens that release page, prints the pull-and-reinstall step the page has no shell to run, and asks the worker to reload the companion onto the files on disk - the Reload nobody can press from outside Chrome, which is the half people forget after a `git pull` of an unpacked extension. New message `companion.reloadExtension`.
+
+Tests: `tests/test_captcha_slider.py` - synthetic notch measured to the pixel, device-pixel crop scaled back to CSS, template match on a hole-only background, trajectory overshoot and exact landing, an unsure picture that is never dragged, and an end-to-end run (`/slider-captcha` fixture) where the page only removes its widget when the drag lands within 8 px of the distance it was built around. `tests/test_captcha_auto_solve.py` - both kill switches, a stalled submit unblocked by the drag, one that says why it failed, a submit that reached the server left alone, a wait that solves before it waits and one that does not probe a clean page. `tests/test_replay_variants.py` - the sweep's labels, its POST rule, its bound and what it reports as dropped, values kept as shapes with a planted secret never quoted, branch naming, and three runs through `replay_request` itself. `tests/test_agent_presence.py`, `tests/test_agent_activity.py` (59 s still active, 61 s amber, next change 50 s out), `tests/test_tab_activity.py` pin the colours and windows; `tests/test_chrome_bridge.py` drives the Update button under Node against a release that is newer than the build.
+
+Docs: README (slider solving, privacy note, `replay_request vary`, Update button), `docs/complex-forms.md`, `INSTALL.md` (env vars + extras), `skills/web-search-neo/SKILL.md`, contract notes for `captcha` and the stalled-submit rule, TODO roadmap.
+
+## 1.24.0
 
 Fuller pentest coverage with the same safety contract: no new actions, so the capabilities budget is untouched.
 - `secret_scan` learned `scope`: `page` (as before, browser optional) plus `site` (a bounded crawl of links and sitemap from `url`, served HTML only, `robots.txt` honoured) and `hosts` (each named origin's front page); `paths` scans your own routes too. Sections merge into one `priority[]`.
@@ -13,7 +42,7 @@ Fuller pentest coverage with the same safety contract: no new actions, so the ca
 
 Docs: `docs/site-checks.md` (secret_scan scope, agent files, active_probe hosts), README, TODO roadmap 1.24/1.25.
 
-### 1.23.0
+## 1.23.0
 
 `active_probe`: the opt-in active checks - the call itself is the consent. CORS preflight with a foreign `Origin` (reflection with credentials, `null`, `*` with credentials, open methods/headers), OPTIONS on the page and your `paths` plus a TRACE probe, plain GETs of the page's own links watching for chains that leave the site (open redirect), and one inert query token (`[a-z0-9]+`, can never execute) watching for reflection. Only own scope, shared budget, everything in `requests_made`; no POST/PUT/DELETE, payloads, auth or fuzzing; no browser needed. `summary: "min"` keeps `counts`, `priority` and `summary_line`.
 
@@ -26,7 +55,7 @@ Site checks (`web_search_neo/audit/active.py`, `transport.options`, `report.Chec
 
 Docs: README "Check your own site" lists seven actions now, and `docs/site-checks.md` gained the `active_probe` section.
 
-### 1.22.1
+## 1.22.1
 
 Field fixes from the novita.ai verification pass (all pinned with regression tests):
 - `secret_scan` evidence samples center on the redacted match with its line number, instead of the bundle head.
@@ -38,7 +67,7 @@ Field fixes from the novita.ai verification pass (all pinned with regression tes
 - `network {only_errors: true}` skips aborted prefetches (2xx/3xx + abort); `page_text` names a hidden majority (cookie banner over `aria-hidden`).
 - `perf_report` resource `type` was the initiator type: renamed to `initiator` under `resources.by_initiator` and in `largest[]`.
 
-### 1.22.0
+## 1.22.0
 
 `secret_scan`: what secrets and routes the page's own code carries. The page is read as served HTML and its same-scope scripts (at most 10) over ordinary GETs - every one listed in `requests_made`; third-party scripts are named, never fetched. Findings with priority and fixes, like `security_report`: cloud keys (AWS, GitHub, Slack, Google, Stripe), private keys, secret-looking assignments, JWT values and high-entropy literals (every sample masked, with file and line), routes from `fetch`/`axios` calls and `/api/` literals, a referenced `openapi.json`/`swagger.json` (version and path count), and sign-in forms posting over http. `summary: "min"` keeps `counts`, `priority` and `summary_line`.
 
@@ -50,7 +79,7 @@ Site checks (`web_search_neo/audit/secrets.py`, wrapper in `audit_actions.py`; `
 
 Docs: README "Check your own site" lists six actions now, and `docs/site-checks.md` gained the `secret_scan` section (plus "SARIF and baselines").
 
-### 1.21.0
+## 1.21.0
 
 `api_report`: a passive review of how the page talks to its own backend - the map of the calls, and for every own-site API response the CORS, caching, Content-Type and error-body checks, plus transport, where tokens live, the CSRF surface and secrets in URLs. Every finding carries a priority and a fix, like `security_report`; `summary: "min"` keeps `counts`, `priority` and `summary_line`.
 

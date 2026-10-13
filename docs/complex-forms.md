@@ -623,6 +623,22 @@ or `mode='auto'` with `WEB_SEARCH_NEO_CAPTCHA_AUTO_SOLVE=1`, and always with
 result reports success only when it was applied. `wait_challenge` never calls a
 service.
 
+A slider captcha has no sitekey to send anywhere, so it is handled without a service:
+`mode='solve'` and `mode='auto'` capture the widget's own picture, find the hole in it,
+and drag its handle along an accelerating path that overshoots slightly and settles on
+the target — TCaptcha and Geetest score the movement, not just where the piece lands.
+It needs no key and sends nothing off the machine; `WEB_SEARCH_NEO_CAPTCHA_LOCAL_SOLVE=0`
+leaves every slider to a person. When the measurement is not confident the drag is
+refused and `slider_solve` says why, then the action waits for a human as it would have
+anyway.
+
+The same drag is used where a captcha blocks work already underway: a click that produced no
+request at all while an unsolved widget sat on the page tries it before reporting
+`submit_blocked_by_challenge` (a cleared one comes back as `challenge_cleared_by`, and since
+nothing was sent, clicking once more submits once), and `wait_challenge` solves before it waits
+for a person. Plain reads never drag anything; `WEB_SEARCH_NEO_CAPTCHA_AUTO_ON_TAB=0` asks every
+such captcha of you instead.
+
 ## When the submit fails
 
 A form that "did nothing" almost always said why, in the console or on the wire.

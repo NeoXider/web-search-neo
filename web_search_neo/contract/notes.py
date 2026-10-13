@@ -135,7 +135,7 @@ _ACTION_NOTES = {
         "choice": "Provide exactly one target: selector (CSS, ref handle, or 'a >>> b' piercing path) for the element, text with role for a strict rendered-text match that refuses ambiguity, or x+y for a viewport CSS-pixel point. In current Chrome a CSS selector must be plain CSS, never ref: or >>>.",
         "text": "text clicks the one visible interactive element whose rendered text matches; role narrows by ARIA role and exact=false switches to substring matching. Zero or several matches are refused with samples, so narrow with role or selector rather than retrying.",
         "coords": "x/y click the viewport point in CSS pixels, useful for image-guided clicks from a fresh screenshot. Scale image pixels to reported viewport width/height and recapture after any layout change.",
-        "stalled_submit": "submit_blocked_by_challenge=true means the click produced no network request at all while an unsolved invisible captcha sits on the page: clicking again cannot help, clear it with the captcha action first.",
+        "stalled_submit": "submit_blocked_by_challenge=true means the click produced no network request at all while an unsolved invisible captcha sits on the page: clicking again cannot help. A slider captcha is measured and dragged before this verdict - when that clears it, the answer says challenge_cleared_by instead of blocking; anything else needs the captcha action first.",
         "trusted": "trusted=true sends a real trusted mouse sequence at the element's centre (scrolled into view first), so pages that require isTrusted events or read pointer position behave as if a user clicked. Use it when a synthetic click is ignored. It lands on whatever is at that point, like a human pointer.",
         "no_box": "trusted=true needs a visible box; an element with zero size refuses with a clear error instead of falling back silently.",
         "frame_selector": _FRAME_ANY,
@@ -159,6 +159,7 @@ _ACTION_NOTES = {
     },
     "captcha": {
         "paid": "mode='auto' waits for a human. A paid solving service is used only with mode='solve' (or auto with WEB_SEARCH_NEO_CAPTCHA_AUTO_SOLVE=1) and always needs WEB_SEARCH_NEO_CAPTCHA_KEY.",
+        "slider": "A slider captcha (TCaptcha, Geetest) has no sitekey to buy: mode='solve' and 'auto' measure its picture and drag the handle on this machine, free. An unsure measurement says so in slider_solve and waits instead.",
         "timeout": "timeout_seconds is capped at 300; timeout_note says when the cap applied.",
     },
     "wait": {
@@ -179,7 +180,7 @@ _ACTION_NOTES = {
         "scope": "Always the whole page: this topic takes no frame_selector, and it is the only read topic reporting challenge_detected/captcha_widgets.",
         "duplicates": "For repeated labels, compare each returned link href or stable value/attribute. Never choose by array index or nth-child alone.",
         "captcha_scan_incomplete": "true means the captcha walk stopped early, so an empty captcha_widgets is not proof there is none. Every page summary carries this key.",
-        "invisible_challenge_pending": "true means a captcha with no box - an invisible Turnstile and the like - is on the page with an empty token field. It blocks the form, not the page, so challenge_detected stays false; invisible_challenge names the vendor and the evidence. Clear it with the captcha action before submitting. Every page summary carries this key too.",
+        "invisible_challenge_pending": "true means a captcha with no box - an invisible Turnstile and the like - is on the page with an empty token field. It blocks the form, not the page, so challenge_detected stays false; invisible_challenge names the vendor and the evidence. A stalled submit tries to clear a slider here by itself; anything else needs the captcha action before submitting. Every page summary carries this key too.",
         "contenteditable": "The legacy fields list includes [contenteditable=\"true\"]; category='interactive' also includes bare contenteditable and plaintext-only editors.",
         "stable_locators": "A row whose selector is fragile (an nth-of-type chain or a generated React id) carries stable_selector=false and suggested_locator={text, role} - pass those to click instead. A testing hook is reported as testid with suggested_locator={selector}. Rows with a plain stable selector carry neither.",
         "pagination": "The whole existing DOM is counted before each category is sliced. Use offset plus limit, then follow range.<category>.next_offset until null; reread after scrolling a lazy/infinite page.",
@@ -262,7 +263,7 @@ _ACTION_NOTES = {
     "attach_tab": {
         "ownership": "Refused, naming the holder, when another agent is already driving that tab. Pick another tab or open your own; do not retry. A tab claimed by another session in this server is refused the same way: it is busy, so observe it read-only through its own session or open your own tab.",
         "capture": "Console and network are recorded from the claim onwards; whatever the tab did before it was claimed is unrecoverable.",
-        "badge": "The tab gets the agent-activity favicon dot while driven (gone after 5 quiet minutes); a dotted tab in the strip is agent-held - do not act on it from another session.",
+        "badge": "The tab gets the agent-activity favicon dot while driven: green for a minute after the last action, amber until five quiet minutes are up, then the page's own icon returns. A dotted tab in the strip is agent-held - do not act on it from another session.",
         "alias": "action 'attach' is accepted as attach_tab. Attaching the tab a parked session of the same session_id holds continues it (like reattach); attaching another tab under a parked name retires that record first (retired_parked says what happened to its tab).",
         "unloaded": "A tab Chrome has discarded (status 'unloaded' in browser_tabs) hangs the attach for ~25 s; it is activated through the companion first and reported as restored_tab=true with restore_wait_seconds. A tab that no longer exists fails fast instead of hanging: list live tabs with web_info(topic='browser_tabs') and pick one of those.",
         "parked": "A claimed tab is the user's and is never parked across MCP clients (persist exists only on open). Attaching the tab a parked session of the same session_id holds continues it, like reattach.",
