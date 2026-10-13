@@ -177,6 +177,52 @@ def local_site() -> LocalSite:
                     <noscript>hidden noscript</noscript></body></html>"""
                 )
                 return
+            if parsed.path == "/slider-captcha":
+                # A slider captcha the test can actually solve: a flat field with one
+                # dark hole and the piece at the start of the track, drawn by the page
+                # so the geometry is known exactly. It removes its own widget when a
+                # mouseup lands about 174 px from its mousedown, which is the distance
+                # a correct measurement has to produce.
+                self._send_html(
+                    """<!doctype html>
+                    <html><head><title>Slider captcha fixture</title>
+                    <style>
+                      #tcaptcha_transform_dy { position: fixed; left: 20px; top: 20px;
+                        width: 340px; height: 260px; background: #f4f4f4; }
+                      .tencent-captcha-dy__slider-block { width: 300px; height: 40px;
+                        background: #dddddd; }
+                    </style></head>
+                    <body><h1>Sign in</h1>
+                    <div id="tcaptcha_transform_dy">
+                      <canvas class="tencent-captcha-dy__bg-placeholder
+                               tencent-captcha-dy__bg-placeholder--slider"
+                              width="300" height="180"></canvas>
+                      <div class="tencent-captcha-dy__slider-block"></div>
+                    </div>
+                    <p id="slider-state">waiting</p>
+                    <script>
+                    const canvas = document.querySelector('canvas');
+                    const ctx = canvas.getContext('2d');
+                    ctx.fillStyle = '#808080'; ctx.fillRect(0, 0, 300, 180);
+                    ctx.fillStyle = '#080808'; ctx.fillRect(178, 30, 52, 56);
+                    ctx.fillStyle = '#f6f6f6'; ctx.fillRect(4, 30, 52, 56);
+                    let startX = null;
+                    document.addEventListener('mousedown', (event) => { startX = event.clientX; });
+                    document.addEventListener('mouseup', (event) => {
+                      if (startX === null) return;
+                      const distance = event.clientX - startX;
+                      window.__drag = {startX: startX, endX: event.clientX, distance: distance};
+                      if (Math.abs(distance - 174) <= 8) {
+                        document.getElementById('tcaptcha_transform_dy').remove();
+                        document.getElementById('slider-state').textContent = 'solved';
+                      } else {
+                        document.getElementById('slider-state').textContent = 'dragged ' + distance;
+                      }
+                      startX = null;
+                    });
+                    </script></body></html>"""
+                )
+                return
             if parsed.path == "/relative":
                 self._send_html("<html><title>Relative</title><body>relative target</body></html>")
                 return

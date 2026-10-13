@@ -17,13 +17,25 @@ const WIDGETS = [
   'iframe[src*="captcha.awswaf.com"]', 'iframe[title*="captcha" i]',
   'div.g-recaptcha', 'div.h-captcha', 'div.cf-turnstile', 'div#cf-challenge-running',
   'form#challenge-form', '#px-captcha', '.smart-captcha', '.datadome-captcha',
-  'awswaf-captcha', '[data-sitekey]'
+  'awswaf-captcha', '[data-sitekey]',
+  // Tencent TCaptcha has no sitekey and no iframe of its own in the current SDK:
+  // TJCaptcha.js builds the widget into the page as #tcaptcha_transform_dy with
+  // tencent-captcha-dy__* parts around it, and the older one is a frame from
+  // turing.captcha.qcloud.com. The class family is matched by substring because
+  // Tencent renames these pieces between releases.
+  '#tcaptcha_transform_dy', '#TCaptcha', '#captcha_popup', '[id^="tCaptcha"]',
+  'iframe[src*="turing.captcha.qcloud.com"]', 'iframe[src*="captcha.gtimg.cn"]',
+  '[class*="tencent-captcha-dy__"]',
+  // Geetest v4 slider: same family of substring selectors for the same reason.
+  '.geetest_widget', '[class*="geetest_widget"]', 'iframe[src*="geetest.com"]'
 ];
 // A script tag has no box of its own, so these are counted by presence. Both
 // hosts only serve the SDK that asks a human to solve something; the tags that
 // merely score a request quietly are deliberately not here.
 const MARKERS = [
-  'script[src*="captcha-sdk.awswaf.com"]', 'script[src*="captcha.awswaf.com"]'
+  'script[src*="captcha-sdk.awswaf.com"]', 'script[src*="captcha.awswaf.com"]',
+  'script[src*="turing.captcha.qcloud.com"]', 'script[src*="captcha.gtimg.cn"]',
+  'script[src*="static.geetest.com"]'
 ];
 // A widget of one of these kinds is a real gate even with no box on the screen:
 // the invisible modes of Turnstile, reCAPTCHA and Smart CAPTCHA render exactly
@@ -65,9 +77,23 @@ let blocking = false;
 function isVisible(element) {
   const rect = element.getBoundingClientRect();
   if (rect.width < 20 || rect.height < 20) return false;
-  const view = (element.ownerDocument && element.ownerDocument.defaultView) || window;
-  const style = view.getComputedStyle(element);
-  return style.visibility !== 'hidden' && style.opacity !== '0';
+  // Computed opacity is not inherited: a widget inside a layer the provider faded
+  // out reports opacity 1 while being as invisible as its parent. TCaptcha does
+  // exactly this when it auto-passes - the whole #tcaptcha_transform_dy subtree
+  // stays in the document at opacity 0, and reading only its own style made a
+  // solved challenge look like an unsolved one. visibility and display do inherit
+  // their effect, so checking each layer is what makes this say "not on screen".
+  let node = element;
+  for (let step = 0; step < 8 && node; step += 1) {
+    const view = (node.ownerDocument && node.ownerDocument.defaultView) || window;
+    if (!view) break;
+    const style = view.getComputedStyle(node);
+    if (style.visibility === 'hidden' || style.display === 'none') return false;
+    const opacity = parseFloat(style.opacity);
+    if (!isNaN(opacity) && opacity <= 0.05) return false;
+    node = node.parentElement || (node.parentNode && node.parentNode.host) || null;
+  }
+  return true;
 }
 
 // data-sitekey alone says nothing: chat, payment and analytics widgets mint one

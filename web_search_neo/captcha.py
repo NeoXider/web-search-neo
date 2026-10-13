@@ -13,6 +13,14 @@ The token a service returns is not a click. It is a string the page's own script
 was going to receive, and it only takes effect once the page is told - hence
 ``apply_token``, which fills the field every vendor hides for exactly this and
 then calls the callback the widget registered.
+
+There is a third answer, and it belongs to neither of those two. Slider captchas -
+Tencent TCaptcha, Geetest - publish no sitekey, so there is nothing to send to a
+service and nothing for ``apply_token`` to fill: the answer is a *drag*, and the
+vendor grades the movement itself. That is ``web_search_neo.captcha_solvers``,
+which measures the hole in the picture and drags the handle into it for free, on
+the machine's own CPU. This module keeps the policy of when any solving happens;
+the slider package keeps the mechanics.
 """
 
 from __future__ import annotations
