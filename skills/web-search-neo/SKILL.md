@@ -272,6 +272,25 @@ Inspect every batch result: `success=false`, validation error, or `challenge_det
 the step is not complete. Use DOM/text to prove labels and selected values. If submission
 silently fails, check `console` and `network`.
 
+## When the page tells you what it wants
+
+`auto_fix {session_id}` applies what the page already asked for, in the open session, and
+names every thing it touched: a consent checkbox by its own label, a field format taken from
+the hint beside that field (`Expected format: DD.MM.YYYY`), and a wait when a live region says
+"please wait"/"processing". It reads only what the DOM named itself - no guessed selectors - so
+it refuses rather than pick: `several_consent_labels` when the page offers two things to agree
+to, `several_formats_named` when a field has two candidate formats, `no_field_named` when a hint
+exists but its control does not. Those refusals are your decision, not its guess, and each one is
+reported with the candidates it saw. It never submits, clicks a button, or solves a captcha - that
+stays yours. `consent=false`, `format_hint=false`, `wait=false` turn a family of fixes off;
+`selector` limits it to one control.
+
+An observing step (`wait`, `screenshot`, the `fetch_*` and observation topics) that fails while the
+page itself asked to wait is retried once by the harness, with the pause the page implied; a step
+that changes the page (`submit`, `click`, `fill`) is never repeated, because its first attempt may
+already have gone through. When repeats stop, the answer says why in `retry_stopped`. Set
+`WEB_SEARCH_NEO_RETRY=0` to switch the repeat off, or a number 1-5 to allow that many repeats.
+
 ## Page scripts and trusted clicks
 
 When a page ignores a synthetic `click` (its handler checks `event.isTrusted`, or it reads

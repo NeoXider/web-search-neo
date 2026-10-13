@@ -19,11 +19,12 @@ import time
 from typing import Any, Literal
 from urllib.parse import urljoin, urlsplit
 
-from web_search_neo import __version__, browser_tools, macros, network_log
+from web_search_neo import __version__, browser_tools, macros, network_log, obstacle_recovery, obstacle_scripts
 from web_search_neo.audit import active, api, api_contract, api_parts, diff, har, multipage, page as page_checks
 from web_search_neo.audit import perf, report, sarif, scenario, secrets as secret_checks, site
 from web_search_neo.audit import scope as scope_mod
 from web_search_neo.audit import transport as transport_mod
+from web_search_neo.audit import api_reads
 from web_search_neo.fetch.safety import resolve_save_path, write_download
 from web_search_neo.perception import min_summary
 
@@ -181,62 +182,8 @@ async def browser_perf_report(
     return await asyncio.to_thread(run)
 
 
-# api_report: сколько тел ответов с ошибками читаем и на сколько символов.
-# Chrome держит их в памяти — чтение не является новым запросом.
-API_ERROR_BODIES = 8
-API_ERROR_BODY_CHARS = 4_000
-
-
-def _api_error_bodies(session: Any, session_id: str, rows: list[dict[str, Any]], page_url: str,
-                      hosts: list[str] | None) -> tuple[dict[str, str], int]:
-    """Тела ответов 4xx/5xx своих API-вызовов из памяти Chrome (замок под session.lock)."""
-    own = api.own_sites(page_url, hosts)
-    bodies: dict[str, str] = {}
-    unread = 0
-    wanted = [row for row in rows
-              if api._status(row) >= 400 and api.channel(row) and row.get("id")
-              and api.is_own(str(row.get("url") or ""), own)]
-    for row in wanted[:API_ERROR_BODIES]:
-        answer = network_log.read_body(session.driver, str(row["id"]), session_id, API_ERROR_BODY_CHARS,
-                                       lambda exc: f"{type(exc).__name__}: {exc}")
-        if answer.get("success"):
-            bodies[str(row["id"])] = str(answer.get("body") or "")
-        else:
-            unread += 1
-    return bodies, unread
-
-
-def _spec_fetcher() -> Any:
-    """GET опубликованного контракта API: один верифицированный запрос на заявку.
-
-    Только GET, только верифицированная выдача web_client (TLS проверяется, public→private
-    redirect отвергается), тело не больше бюджета спецификации. Ответ отдаётся как
-    {ok, status, content_type, text}; ошибка — как {ok: False, why}.
-    """
-    from web_search_neo import web_client
-
-    def fetch(url: str) -> dict[str, Any]:
-        try:
-            response = web_client.request(url, method="GET", timeout_seconds=10.0,
-                                          max_response_bytes=api_contract.BODY_LIMIT)
-        except Exception as exc:  # unreachable/TLS/refused redirect: контракт не найден
-            return {"ok": False, "status": 0, "why": f"{type(exc).__name__}", "text": ""}
-        body = getattr(response, "content", b"") or b""
-        return {"ok": 200 <= int(getattr(response, "status_code", 0) or 0) < 400,
-                "status": int(getattr(response, "status_code", 0) or 0),
-                "content_type": str(getattr(response, "headers", {}).get("content-type") or ""),
-                "text": body.decode("utf-8", "replace")}
-    return fetch
-
-
-_LINK_SCRIPT = r"""
-  const out = [];
-  for (const node of document.querySelectorAll('link[href]')) {
-    out.push({href: node.getAttribute('href'), rel: node.getAttribute('rel')});
-    if (out.length >= 200) break;
-  }
-  return out;
-"""
+# api_report читает тела ошибок и опубликованный контракт origin'а в
+# audit/api_reads.py: там же, где его единственные GET'ы и их бюджет.
 
 
 async def browser_api_report(
@@ -303,19 +250,23 @@ async def browser_api_report(
                 storage = {"storage_error": f"{type(exc).__name__}: {exc}"[:200]}
             jar = browser_tools.cookies(op="get", session_id=sid, limit=1000).get("cookies") or []
             try:
-                declared = _script_value(sid, _LINK_SCRIPT, None, 10.0)
-                links = declared if isinstance(declared, list) else []
+                declared = _script_value(sid, api_reads.LINK_SCRIPT, None, 10.0)
             except Exception:
-                links = []
-            budget = scope_mod.Budget(limit=api_contract.SPEC_REQUEST_LIMIT)
+                declared = None
+            links = api_reads.read_links(lambda: declared)
+            budget = api_reads.spec_budget()
             session = browser_tools._get_session(sid)
             with session.lock:
                 rows, dropped, pending = network_log.drain(session)
                 page_url = network_log.page_url(session)
-                bodies, unread = _api_error_bodies(session, sid, rows + pending, page_url, hosts)
+                bodies, unread = api_reads.error_bodies(
+                    lambda request_id: network_log.read_body(session.driver, request_id, sid,
+                                                              api_reads.API_ERROR_BODY_CHARS,
+                                                              lambda exc: f"{type(exc).__name__}: {exc}"),
+                    rows + pending, page_url, hosts)
             result = api.build(rows + pending, page_url=page_url, jar=jar, storage=storage,
                                bodies=bodies, unread=unread, hosts=hosts, dropped=dropped,
-                               links=links, fetch_spec=_spec_fetcher(), budget=budget)
+                               links=links, fetch_spec=api_reads.spec_fetcher(), budget=budget)
             if har_to:
                 document = har.build(rows + pending, page_url=page_url,
                                      title=str(getattr(session, "last_title", "") or ""),
@@ -733,16 +684,77 @@ async def _run_plan(plan: list[dict[str, Any]], session_id: str, url: str | None
                               kept_open=bool(opened_here and keep_open) or not opened_here)
 
 
+# auto_fix: что страница сама назвала как препятствие — её тексты ожидания,
+# подписи чекбоксов согласия и подсказки формата рядом с полями.
+_OBSTACLE_TIMEOUT = 10.0
+
+
+def _obstacle_state(session_id: str, timeout: float) -> dict[str, Any]:
+    value = _script_value(session_id, obstacle_scripts.read_script(), None, timeout)
+    return obstacle_scripts.state_of(value)
+
+
+def _apply_fix(session_id: str, selector: str, value: Any, timeout: float) -> dict[str, Any]:
+    """Одно исправление одной страницы: чекбокс отмечается, формату поле верят."""
+    if isinstance(value, bool):
+        script = obstacle_scripts.tick_script(selector)
+        return dict(_script_value(session_id, script, None, timeout) or {})
+    filled = browser_tools.fill_fields({selector: value}, session_id=session_id)
+    return {"success": bool(filled.get("success")), **({"error": filled.get("errors")}
+                                                        if filled.get("errors") else {})}
+
+
+async def browser_auto_fix(
+    session_id: str = "default",
+    selector: str | None = None,
+    consent: bool = True,
+    format_hint: bool = True,
+    wait: bool = True,
+    timeout_seconds: float = 10.0,
+) -> dict[str, Any]:
+    """Fix what the page itself asked for: a checkbox to agree with, a field format, a wait.
+
+    Only what the page named is touched. A consent control is ticked when exactly
+    one thing on the page asks to be agreed to; a format is written into a field
+    only when the page wrote that format next to it. Two candidate consents or two
+    formats are left for you and the answer says why. `selector` limits the fix to
+    the control you mean. It never clicks a button and never submits anything.
+    """
+    if not _session_exists(session_id):
+        raise ValueError(f"auto_fix needs an open session; '{session_id}' has none")
+
+    def read() -> dict[str, Any]:
+        state = _obstacle_state(session_id, timeout_seconds)
+        if selector:
+            state["consents"] = [item for item in state.get("consents", []) if item.get("selector") == selector]
+            state["format_hints"] = [item for item in state.get("format_hints", [])
+                                     if item.get("selector") == selector]
+        return state
+
+    def apply(fix_selector: str, value: Any) -> dict[str, Any]:
+        return _apply_fix(session_id, fix_selector, value, timeout_seconds)
+
+    def locate(needle: str) -> dict[str, Any]:
+        found = browser_tools.find_elements(needle, session_id=session_id, limit=1)
+        return {"found": bool(found.get("success")) and bool(found.get("matches") or found.get("elements"))}
+
+    answer = await asyncio.to_thread(
+        obstacle_recovery.auto_fix, locate, read, apply, time.sleep,
+        consent=consent, format_hint=format_hint, wait=wait)
+    return {"success": True, "session_id": session_id, "selector_filter": selector or None, **answer}
+
+
 ACTION_SPECS = (
     ("security_report", browser_security_report, "audit", "Passive A-F security grade: page, site or hosts; fixes."),
-    ("api_report", browser_api_report, "audit",
-     "Map backend calls and API errors; drift from the published contract."),
+    ("api_report", browser_api_report, "audit", "Map backend calls and API errors; drift from the contract."),
     ("secret_scan", browser_secret_scan, "audit", "Secrets, endpoints, openapi in page code."),
     ("active_probe", browser_active_probe, "audit", "Active CORS/methods/redirect/canary probes."),
     ("perf_report", browser_perf_report, "audit", "Load metrics: TTFB, FCP, LCP, CLS, resources, blocking."),
     ("har_export", browser_har_export, "audit", "Save the session's network journal as a HAR file."),
     ("test_run", browser_test_run, "audit", "Run steps with expect checks; pass/fail per step."),
+    ("auto_fix", browser_auto_fix, "page", "Apply what the page asked: consent, its field format, a wait."),
 )
 
-__all__ = ["ACTION_SPECS", "bind", "browser_active_probe", "browser_api_report", "browser_har_export",
-           "browser_perf_report", "browser_secret_scan", "browser_security_report", "browser_test_run"]
+__all__ = ["ACTION_SPECS", "bind", "browser_active_probe", "browser_api_report", "browser_auto_fix",
+           "browser_har_export", "browser_perf_report", "browser_secret_scan", "browser_security_report",
+           "browser_test_run"]

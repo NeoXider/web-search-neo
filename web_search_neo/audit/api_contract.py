@@ -77,17 +77,18 @@ def spec_urls(page_url: str) -> list[str]:
 
 
 def declared_parameters(operations: Any) -> list[str]:
-    """Имена параметров операции: и её собственные `parameters`, и те, что объявлены на пути."""
+    """Имена параметров операции: её собственные `parameters` и объявленные на пути."""
     names: list[str] = []
-    if isinstance(operations, dict):
-        shared = operations.get("parameters")
-        if isinstance(shared, list):
-            names += [str(item.get("name")) for item in shared
+    if not isinstance(operations, dict):
+        return names
+    shared = operations.get("parameters")
+    if isinstance(shared, list):
+        names += [str(item.get("name")) for item in shared
+                  if isinstance(item, dict) and item.get("name")]
+    for entry in operations.values():
+        if isinstance(entry, dict) and isinstance(entry.get("parameters"), list):
+            names += [str(item.get("name")) for item in entry["parameters"]
                       if isinstance(item, dict) and item.get("name")]
-        for entry in operations.values():
-            if isinstance(entry, dict) and isinstance(entry.get("parameters"), list):
-                names += [str(item.get("name")) for item in entry["parameters"]
-                          if isinstance(item, dict) and item.get("name")]
     return names
 
 

@@ -554,6 +554,40 @@ short result.
    `no_console_errors` and `no_failed_requests` on the steps that submit.
 7. For a failure, `open` the page in its own session and read `console`, `network
    {only_errors: true}` and `har_export` for the bug report.
+8. When a scenario step fails because the page asked for something it named itself - a
+   checkbox, a date format, a moment to finish - `auto_fix {session_id}` applies exactly that
+   and reports what it touched; re-run the step. What it refuses (`several_consent_labels`,
+   `several_formats_named`, `no_field_named`) is a decision for you, not for a guess.
+
+## `auto_fix`: when the page says what it wants
+
+```json
+{"actions":[{"action":"open","url":"https://staging.example.com/checkout"},
+            {"action":"auto_fix","selector":"input[name=due_date]"}]}
+```
+
+It reads one snapshot of the page and acts only on what the DOM named itself: a live region
+(`[aria-live]`, `[role=status]`, `[role=alert]`) that says "please wait"/"processing", an
+unchecked checkbox with its own label, and a format hint attached to a field
+(`aria-describedby`, `data-format`, `.field-error`). The control's address comes from the DOM
+(`#id`, `input[name=…]`, else a short path), never from a guessed selector.
+
+| Applied | What the answer says |
+| --- | --- |
+| `wait_when_asked` | `waited_seconds`, and `still_waiting: true` if the page is still waiting |
+| `field_format` | the selector and the format string the page itself printed |
+| `consent_checkbox` | the selector and the label it agreed to, by clicking that label |
+
+Refusals are named and carry the candidates the page offered: `no_consent_word_named`,
+`several_consent_labels`, `no_format_named`, `several_formats_named`, `no_field_named`. A fix
+that the page rejected (its control was gone) is listed in `skipped` with its reason, never
+hidden. `consent=false`, `format_hint=false`, `wait=false` switch a family of fixes off;
+`selector` narrows it to one control. It does not submit, click a button or solve a captcha.
+
+The same rule covers a repeated step: an observing action that failed while the page asked to
+wait is tried once more after the pause the page implied; a step that changes the page
+(`submit`, `click`, `fill`) is never repeated. `WEB_SEARCH_NEO_RETRY=0` switches the repeat off,
+1-5 allow that many repeats, and every stop is reported in `retry_stopped`.
 
 ## Recipe: check a dev server
 

@@ -9,16 +9,39 @@ this loop.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from typing import Any
 
-from web_search_neo import browser_tools, tab_actions
+from web_search_neo import browser_tools, obstacle_recovery, tab_actions
 from web_search_neo.perception import min_summary
 
 # Repeated once after the session followed a tab Chrome replaced, because they
 # only observe: a wait and a screenshot change nothing. Nothing that writes -
 # reload, cookies (set/clear), scripts, input - is ever repeated on its own.
 RETRY_AFTER_TAB_FOLLOW = frozenset({"wait", "screenshot"})
+
+# Off with WEB_SEARCH_NEO_RETRY=0 (no repeats at all). A blocked observation gets
+# at most this many repeats, and only while the page itself asked to wait (see
+# obstacle_recovery.retry_plan for what refuses to repeat).
+RETRY_LIMIT_ENV = "WEB_SEARCH_NEO_RETRY"
+
+
+def retry_limit() -> int:
+    """Сколько всего попыток делает один шаг: первая плюс разрешённые повторы.
+
+    ``WEB_SEARCH_NEO_RETRY=0`` оставляет только первую попытку (0 повторов);
+    ``WEB_SEARCH_NEO_RETRY=N`` даёт N повторных попыток, не больше потолка.
+    Само число — это obstacle_recovery.RETRY_LIMIT_MAX повторов.
+    """
+    raw = os.environ.get(RETRY_LIMIT_ENV, "").strip()
+    if raw in {"0", "off", "no"}:
+        return 1
+    try:
+        repeats = max(0, min(int(raw), obstacle_recovery.RETRY_LIMIT_MAX))
+    except ValueError:
+        repeats = obstacle_recovery.RETRY_LIMIT_DEFAULT
+    return repeats + 1
 
 
 def step_session(facade: Any, tool_name: str, arguments: dict[str, Any]) -> str | None:
@@ -84,7 +107,26 @@ def _unknown_action(facade: Any, index: int, action_name: str, arguments: dict[s
 
 async def _run_one(facade: Any, index: int, spec: Any, action_name: str, arguments: dict[str, Any],
                    summary: str) -> dict[str, Any]:
-    started = time.monotonic()  # duration_ms: every step says what it cost
+    attempts = 0
+    while True:
+        attempts += 1
+        started = time.monotonic()  # duration_ms: every step says what it cost
+        result = await _attempt(facade, index, spec, action_name, arguments, summary)
+        result["duration_ms"] = round((time.monotonic() - started) * 1000)
+        if result["success"]:
+            if attempts > 1:
+                result["attempts"] = attempts
+            return result
+        plan = obstacle_recovery.retry_plan(action_name, str(result.get("error") or ""),
+                                            attempts, retry_limit())
+        if not plan.get("retry"):
+            result["retry_stopped"] = plan
+            return result
+        await asyncio.sleep(plan["wait_seconds"])
+
+
+async def _attempt(facade: Any, index: int, spec: Any, action_name: str, arguments: dict[str, Any],
+                   summary: str) -> dict[str, Any]:
     try:
         step_summary = min_summary.step_mode(arguments, facade._argument_model(spec.tool_name).model_fields, summary)
         validated = facade._validate_arguments(spec.tool_name, f"action '{action_name}'", arguments)
@@ -97,7 +139,6 @@ async def _run_one(facade: Any, index: int, spec: Any, action_name: str, argumen
             "index": index,
             "action": action_name,
             "success": not reported_failure,
-            "duration_ms": round((time.monotonic() - started) * 1000),
             "data": min_summary.minimize(data) if step_summary == "min" else data,
         }
         if reported_failure:
@@ -110,7 +151,6 @@ async def _run_one(facade: Any, index: int, spec: Any, action_name: str, argumen
             "index": index,
             "action": action_name,
             "success": False,
-            "duration_ms": round((time.monotonic() - started) * 1000),
             "error": f"{type(exc).__name__}: {exc}",
         }
 

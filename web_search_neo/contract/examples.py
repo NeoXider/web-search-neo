@@ -3,13 +3,6 @@
 
 _RECIPES = {
     "lookup": ["search {query}", "open {url}", "page_elements", "read the answer"],
-    "form": [
-        "open {url}",
-        "fresh page_elements",
-        "fill (custom option: click_text exact text + role); reread key values",
-        "submit exactly once with submit_attempted=true",
-        "verify URL/text/elements; after a timeout never submit again",
-    ],
     "visual_click": [
         "screenshot; note viewport_width/height",
         "scale the image point to viewport CSS x/y",
@@ -33,15 +26,15 @@ _RECIPES = {
     ],
     "fps_game": ["pointer_lock acquire", "look {dx, dy}", "wait_frames {frames: 2}",
                  "screenshot {wait_frames: 1}; frame_health if slow"],
-    "release_check": ["security_report {url}", "secret_scan {url}", "fix priority[] top-down, rerun",
-                       "perf_report {url}", "skill section=audit"],
+    "release_check": ["security_report {url}", "secret_scan {url}", "api_report {session_id}",
+                      "fix priority[] top-down, rerun", "perf_report {url}"],
     "form_regression": ["test_run {url, steps: [{fill}, {click, expect: {text}}]}", "skill section=testing"],
 }
 
 _PITFALLS = [
     "Noisy page: page_elements category='interactive', visible_only, role/text_pattern (filter before paging).",
     "web_action success=true is not task success: check every results[i].success.",
-    "Never repeat a click or submit on verified=false/null or after a timeout: read the page first - it may have gone through.",
+    "Never repeat a click or submit on verified=false/null or after a timeout: read the page first - it may have gone through. Only an observation repeats on its own, while the page asks to wait.",
     "Never guess optional names: call action_schema (timeout_ms does not exist).",
     "Selectors and screenshots go stale when the page changes: reread after it.",
     "Locators are plain CSS: never send ref: from page_outline or >>> to actions.",
