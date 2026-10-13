@@ -72,14 +72,25 @@ def test_allowed_dependencies_and_own_modules(source):
 # moved to perception/challenge.py, perception/action_scripts.py and
 # sessions/tab_label_source.py unchanged; service-worker.js went down after its
 # code hash moved to code-hash.js.
+# 1.25.0 (local slider captchas): browser_tools.py and service-worker.js raised,
+# agent_presence.py added to the table. Reviewed line by line: what grew in
+# browser_tools.py is the adapter over its own primitives - the injected callables
+# captcha_solvers needs, the replay `vary` plumbing, and the two places where a
+# stalled submit or a challenge wait now try the free drag - while the measuring,
+# the vendor specs and the drag path left for web_search_neo/captcha_solvers/, and a
+# duplicated slider attempt inside `captcha` was deleted. service-worker.js gained
+# one message branch for the popup's Update button, reusing its own reload command.
+# agent_presence.py is new to this table: the corner-mark geometry became documented
+# constants carried in the installer's CONFIG instead of literals inside the script.
 _RATCHET_CEILINGS = {
-    "web_search_neo/browser_tools.py": 8446,
+    "web_search_neo/browser_tools.py": 8605,
     "web_search_neo/main.py": 2822,
     "web_search_neo/page_perception.py": 2720,
     "web_search_neo/chrome_bridge.py": 2090,
-    "chrome-extension/service-worker.js": 1734,
+    "chrome-extension/service-worker.js": 1738,
     "web_search_neo/bridge_daemon.py": 1166,
     "web_search_neo/macros.py": 849,
+    "web_search_neo/agent_presence.py": 817,
 }
 
 
