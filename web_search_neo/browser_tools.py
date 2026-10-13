@@ -54,6 +54,7 @@ from web_search_neo.chrome_bootstrap import (
     setup_current_chrome,
 )
 from web_search_neo import captcha
+from web_search_neo import captcha_solvers as _captcha_solvers
 from web_search_neo import process_probe as _process_probe
 from web_search_neo import diagnostics
 from web_search_neo import network_log as _network_log
@@ -66,6 +67,7 @@ from web_search_neo import script_results as _script_results
 from web_search_neo import key_table
 from web_search_neo import page_perception
 from web_search_neo.web_client import validate_http_url
+from web_search_neo.fetch import variants as fetch_variants
 from web_search_neo.fetch.safety import redact_url, resolve_save_path, write_download
 from web_search_neo.actions.render_source import _RENDER_BOOTSTRAP_SCRIPT, _RENDER_CONTROL_SCRIPT
 from web_search_neo.actions.scripts import execute as _execute_script
@@ -2977,8 +2979,39 @@ def wait_for_challenge_resolution(
     empty is the same wait, and returning "resolved" over it told the caller the
     form was free to submit when it was not. The session lock is taken per poll
     only, and ``timeout_seconds`` is capped (``timeout_note`` says when).
+
+    A challenge that is a slider gets solved before this waits at all - there is no
+    sitekey to buy and the tab is already here - and comes back ``resolved`` with
+    ``solved_by: "local_slider"`` and ``waited_seconds: 0.0``. Only what cannot be
+    dragged here reaches the wait for a person, and a page with nothing on it is not
+    probed for one.
     """
     session = _get_session(session_id)
+    with session.lock:
+        status = _challenge_status(session.driver)
+    if status.get("challenge_detected") or status.get("invisible_challenge_pending"):
+        # A person is the last resort here, not the first: a slider captcha has
+        # nothing to buy and this tab is already open, so try the free drag before
+        # promising a wait the caller would have had to sit through.
+        attempt = _auto_solve_challenge(session_id)
+        if attempt.get("solved"):
+            with session.lock:
+                summary = _page_summary(session.driver, session_id)
+            return {
+                **summary,
+                "success": True,
+                "resolved": True,
+                "timed_out": False,
+                "challenge_seen": True,
+                "waited_seconds": 0.0,
+                "session_open": True,
+                "solved_by": "local_slider",
+                "slider": {
+                    key: value
+                    for key, value in attempt.items()
+                    if key not in {"solved", "locate", "challenge_after_solve"}
+                },
+            }
     return _wait_out_challenge(
         session.lock, timeout_seconds=timeout_seconds,
         poll_interval_seconds=poll_interval_seconds,
@@ -5256,6 +5289,11 @@ def _note_stalled_submit(
     same. The two facts that explain it - an unsolved widget in the DOM and a
     network log with nothing new in it - are both already here, so the answer
     says so instead of leaving the caller to wait it out twelve times.
+
+    It is also the one place where clearing the widget unasked cannot do damage:
+    nothing was sent, so dragging a slider here cannot repeat an action. A solved
+    widget comes back as ``challenge_cleared_by``; only what could not be dragged
+    is reported as blocked, with the reason the measurement gave.
     """
     if not result.get("invisible_challenge_pending"):
         return result
@@ -5265,6 +5303,25 @@ def _note_stalled_submit(
         return result
     invisible = result.get("invisible_challenge") or {}
     vendor = _VENDOR_NAMES.get(str(invisible.get("vendor")), "A captcha")
+    session_id = str(result.get("session_id") or "")
+    if session_id:
+        # The stall is exactly where a free drag earns its keep: nothing was sent,
+        # the tab is open, and the widget is on the page. Try it before declaring
+        # the submit blocked, because a solved slider is not a blocked submit.
+        attempt = _auto_solve_challenge(session_id)
+        if attempt.get("solved"):
+            result["challenge_cleared_by"] = "local_slider"
+            result["challenge_cleared_note"] = (
+                f"{vendor} was measured and dragged on this tab, and the widget is "
+                "gone. Nothing was sent by the stalled click, so clicking once more "
+                "submits once rather than twice."
+            )
+            return result
+        if attempt.get("attempted"):
+            result["captcha_auto_solve"] = {
+                "solved": False,
+                "reason": attempt.get("reason") or "the slider measurement was unsure",
+            }
     result["submit_blocked_by_challenge"] = True
     result["submit_block_reason"] = (
         f"The click sent no network request at all, and {vendor} is on the page "
@@ -5451,6 +5508,112 @@ def local_storage(
     return payload
 
 
+def _slider_solve(session_id: str, budget_seconds: float) -> dict[str, Any]:
+    """Measure a slider captcha's hole and drag its handle into it, for free.
+
+    TCaptcha and Geetest mint no sitekey, so there is nothing to hand a solving
+    service and nothing for a token to be written into: the answer is a drag, and
+    the vendor grades the movement itself. ``captcha_solvers`` owns that maths and
+    stays browser-blind; this is the half that hands it the four primitives it needs -
+    a script to see the widget, one viewport capture to measure the picture from,
+    the pointer dispatch that presses and follows the path, and a script that asks
+    the page whether the widget went away.
+    """
+    session = _get_session(session_id)
+    seen = {"vendor": None}
+
+    def locate() -> dict[str, Any]:
+        answer = execute_js(_captcha_solvers.SLIDER_LOCATE_SCRIPT, session_id=session_id)
+        value = answer.get("value") or {}
+        if isinstance(value, dict) and value.get("vendor"):
+            seen["vendor"] = str(value["vendor"])
+            return value
+        return {}
+
+    def capture() -> bytes:
+        return screenshot(session_id=session_id)
+
+    def drag(start: tuple[float, float], path: list[tuple[float, float, float]]) -> None:
+        with session.lock:
+            frame_map, viewport = _pointer_context(session.driver, None)
+            _pointer_dispatch(
+                session, "press", start[0], start[1], viewport, frame_map=frame_map
+            )
+            for dx, dy, pause in path:
+                # Clamped rather than refused: a handle near the right edge of a
+                # narrow window has nowhere to go, and a move outside the viewport
+                # is a pointer event into nothing.
+                move_x = max(0.0, min(start[0] + dx, float(viewport["width"]) - 1.0))
+                move_y = max(0.0, min(start[1] + dy, float(viewport["height"]) - 1.0))
+                _pointer_dispatch(
+                    session, "move", move_x, move_y, viewport, frame_map=frame_map
+                )
+                time.sleep(pause)
+            last_x, last_y, _ = path[-1]
+            _pointer_dispatch(
+                session,
+                "release",
+                max(0.0, min(start[0] + last_x, float(viewport["width"]) - 1.0)),
+                max(0.0, min(start[1] + last_y, float(viewport["height"]) - 1.0)),
+                viewport,
+                frame_map=frame_map,
+            )
+
+    def cleared() -> dict[str, Any]:
+        answer = execute_js(
+            _captcha_solvers.SLIDER_CLEARED_SCRIPT, args=[seen["vendor"]], session_id=session_id
+        )
+        value = answer.get("value") or {}
+        return value if isinstance(value, dict) else {}
+
+    outcome = _captcha_solvers.solve_slider(
+        locate, capture, drag, cleared, time.sleep, budget_seconds=budget_seconds
+    )
+    outcome["attempted"] = True
+    return outcome
+
+
+# Solving a slider is free, and the agent is already sitting on the tab that has
+# one. Making the solve wait for an explicit `captcha` call means the caller pays
+# for a round trip to be told what one drag here would have fixed, so the blocking
+# paths - a submit that sent nothing, a wait for a human - try it themselves.
+# WEB_SEARCH_NEO_CAPTCHA_AUTO_ON_TAB=0 puts every such captcha back on a person.
+_AUTO_ON_TAB_ENV = "WEB_SEARCH_NEO_CAPTCHA_AUTO_ON_TAB"
+_AUTO_SOLVE_BUDGET_SECONDS = 12.0
+
+
+def _auto_solve_enabled() -> bool:
+    return str(os.environ.get(_AUTO_ON_TAB_ENV, "")).strip().lower() not in {
+        "0", "false", "off", "no",
+    }
+
+
+def _auto_solve_challenge(session_id: str) -> dict[str, Any]:
+    """Try the free slider solve on a captcha that is holding up work on this tab.
+
+    Only a widget with no sitekey to buy is touched: the locate script names the
+    slider vendors it knows and reports nothing for a box that needs a person or a
+    paid service, so this never drags something it cannot finish.
+    """
+    if not _auto_solve_enabled() or not _captcha_solvers.local_solve_enabled():
+        return {"attempted": False}
+    try:
+        outcome = _slider_solve(session_id, _AUTO_SOLVE_BUDGET_SECONDS)
+    except (ChromeBridgeError, WebDriverException, ValueError) as exc:
+        return {
+            "attempted": True,
+            "solved": False,
+            "reason": f"the slider solve stopped: {_brief_error(exc)}",
+        }
+    if outcome.get("solved"):
+        session = _get_session(session_id)
+        with session.lock:
+            status = _challenge_status(session.driver)
+        outcome["challenge_after_solve"] = status
+        return outcome
+    return outcome
+
+
 def solve_captcha(
     mode: str = "auto",
     session_id: str = "default",
@@ -5468,6 +5631,14 @@ def solve_captcha(
 
     Waiting returns as soon as the page stops showing the challenge, so a captcha
     the user clears in four seconds costs four seconds, not the whole timeout.
+
+    A slider captcha - TCaptcha, Geetest - is handled here rather than bought: it
+    has no sitekey to send anywhere, so ``mode='solve'`` and ``mode='auto'`` measure
+    the hole in its picture and drag the handle into it with a human-shaped path.
+    That costs nothing and needs no key. When the measurement is too unsure to drag
+    on, it says so in ``slider_solve`` and falls back to waiting for a person
+    instead of spending the attempt on a guess. Set
+    WEB_SEARCH_NEO_CAPTCHA_LOCAL_SOLVE=0 to leave every slider to a human.
     """
     captcha.validate_mode(mode)
     session = _get_session(session_id)
@@ -5484,6 +5655,33 @@ def solve_captcha(
 
     identity = execute_js(captcha.IDENTIFY_SCRIPT, session_id=session_id)
     found = identity.get("value") or {}
+
+    # No sitekey means nothing to buy. A slider captcha is still solvable here:
+    # measure the hole, drag the handle into it, ask the page whether it left. It
+    # costs CPU and a third party nothing, so mode='auto' may do it unasked - and
+    # it is worth knowing when it tried and failed, because the failure names the
+    # measurement that was unsure rather than hiding behind a timeout.
+    slider: dict[str, Any] = {}
+    if not found.get("vendor") and mode in {"solve", "auto"} and _captcha_solvers.local_solve_enabled():
+        try:
+            slider = _slider_solve(session_id, min(30.0, max(8.0, float(timeout_seconds))))
+        except (ChromeBridgeError, WebDriverException, ValueError) as exc:
+            slider = {
+                "attempted": True,
+                "solved": False,
+                "reason": f"the slider solve stopped: {_brief_error(exc)}",
+            }
+        if slider.get("solved"):
+            return {
+                "success": True,
+                "session_id": session_id,
+                "captcha_present": False,
+                "mode": "solve",
+                "solved_by": "local_slider",
+                "slider": slider,
+                **_challenge_status(session.driver),
+            }
+
     if captcha.wants_paid_solve(mode, found):
         solved = captcha.solve_and_apply(
             found,
@@ -5503,6 +5701,10 @@ def solve_captcha(
         "mode": "wait",
         "vendor": found.get("vendor"),
     }
+    if slider.get("attempted"):
+        outcome["slider_solve"] = {
+            key: value for key, value in slider.items() if key != "locate"
+        }
     if not waited["resolved"]:
         outcome["error"] = (
             f"The captcha was still on the page after {waited['waited_seconds']:.0f}s. "
@@ -5603,6 +5805,7 @@ def replay_request(
     headers: dict[str, str] | None = None,
     body: str | None = None,
     credentials: str = "include",
+    vary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Re-send a request from the page's own context and return status, headers and body.
 
@@ -5619,6 +5822,15 @@ def replay_request(
     ``REPLAY_BODY_CHARS`` (``response.truncated``) and the answer may be windowed;
     either way ``window_note`` names the same fetch as a ``run_script`` with
     ``save_to``, which brings the whole body back as a file.
+
+    Pass ``vary`` to turn one replay into a bounded A/B sweep: ``{"headers":
+    [{"x-role": "admin"}], "query": [{"uid": "61808"}], "body": ["{\\"role\\": \\"admin\\"}"]}``
+    sends the baseline plus one request per single change (at most twelve) and
+    answers with each delta - status, size, JSON paths added, removed or changed,
+    response header names - rather than a second body to compare by eye. Values
+    are reported as shapes (``string(24)``, ``null``), never quoted. This is how an
+    access-control, client-routing or mass-assignment question gets settled in one
+    call instead of a loop you write yourself.
     """
     session = _get_session(session_id)
     target_url, target_method = url, method
@@ -5650,7 +5862,28 @@ def replay_request(
     if not result.get("success"):
         return {"success": False, "session_id": session_id, "error": result.get("error")}
     carried = _script_results.carry(result, "response")
-    return {"success": True, "session_id": session_id, "request": spec, **carried, **_replay_window_note(spec, carried)}
+
+    def _send(variant_spec: dict[str, Any]) -> dict[str, Any]:
+        """Send one variant through the same page-side fetch."""
+        variant_result = execute_js(
+            _REPLAY_SCRIPT, args=[variant_spec], session_id=session_id, await_promise=True
+        )
+        if not variant_result.get("success"):
+            return {"ok": False, "error": variant_result.get("error")}
+        return dict((_script_results.carry(variant_result, "response") or {}).get("response") or {})
+
+    answer = {
+        "success": True,
+        "session_id": session_id,
+        "request": spec,
+        **carried,
+        **_replay_window_note(spec, carried),
+    }
+    if vary:
+        answer["variants"] = fetch_variants.run_variants(
+            _send, spec, vary, baseline=dict((carried or {}).get("response") or {})
+        )
+    return answer
 
 
 # Third-party response stubs: answering the page with a canned response instead

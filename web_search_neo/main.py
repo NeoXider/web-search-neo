@@ -28,7 +28,7 @@ from web_search_neo.fetch import content as fetch_content
 from web_search_neo import dispatch
 
 
-__version__ = "1.24.0"
+__version__ = "1.25.0"
 
 log = configure_server_log()  # per-user state dir; see log_setup.py
 
@@ -1932,6 +1932,7 @@ async def browser_replay_request(
     headers: dict[str, str] | None = None,
     body: str | None = None,
     credentials: str = "include",
+    vary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Re-send a captured or explicit request from the page's context; return the full response."""
     return await asyncio.to_thread(
@@ -1943,6 +1944,7 @@ async def browser_replay_request(
         headers,
         body,
         credentials,
+        vary,
     )
 
 
@@ -2214,7 +2216,7 @@ _ACTIONS: dict[str, ActionSpec] = {
             "replay_request",
             browser_replay_request,
             "page",
-            "Re-send a captured or explicit request from the page context.",
+            "Re-send a captured or explicit request from the page context; vary sweeps single changes and reports each response's delta.",
         ),
         _action(
             "mock",
