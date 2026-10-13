@@ -131,6 +131,16 @@ def test_badge_source_is_self_contained_and_defensive():
     assert "delete window[KEY]" in source or "delete window" in source
 
 
+def test_badge_is_green_for_a_minute_then_amber_until_the_restore():
+    source = browser_tools._TAB_ACTIVITY_SOURCE
+    assert "const ACTIVE_MS = 60 * 1000;" in source
+    assert 'GREEN = "#22c55e"' in source and 'AMBER = "#d97706"' in source
+    # The colour is chosen per paint and the green -> amber edge re-paints itself,
+    # so a session that went quiet does not stay bright until the five-minute restore.
+    assert "phaseColor()" in source
+    assert "setTimeout(() => setBadge(generation), ACTIVE_MS)" in source
+
+
 # --- roster activity + busy warnings ------------------------------------------
 
 

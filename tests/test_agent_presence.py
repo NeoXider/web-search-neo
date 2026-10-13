@@ -147,6 +147,18 @@ def test_the_installer_carries_this_build_s_timings():
     assert f'"recentMs": {5 * 60 * 1000}' in source
     assert f'"flashMs": {agent_presence.FLASH_MS}' in source
     assert agent_presence.FLASH_MS <= 300
+    # The badge the person in the tab strip reads: green for a minute after the
+    # last action, amber until five minutes, then the favicon is handed back.
+    assert agent_presence.ACTIVE_MS == 60_000
+    assert f'"activeMs": {agent_presence.ACTIVE_MS}' in source
+    assert agent_presence.RECENT_MS == 5 * 60 * 1000
+
+
+def test_the_corner_mark_geometry_reaches_the_page_script():
+    source = agent_presence.install_source()
+    assert f'"slimeAlpha": {agent_presence.SLIME_ALPHA}' in source
+    assert f'"slimeScale": {agent_presence.SLIME_SCALE}' in source
+    assert '"slimeOrigin": [' in source
 
 
 def test_the_ping_refuses_a_stale_installation():
@@ -415,15 +427,21 @@ def test_a_broken_signal_never_fails_the_action(monkeypatch):
     assert result["success"] is True
 
 
-def test_favicon_mark_is_a_translucent_slime_over_the_page_icon():
+def test_favicon_mark_is_an_opaque_full_size_slime_over_the_page_icon():
     source = agent_presence.install_source()
     # The page's own icon is drawn first and the slime goes on top of it in the
-    # bottom-right corner, partly see-through: the tab keeps its identity.
+    # bottom-right corner, at full size and fully opaque: the tab keeps its
+    # identity, and the mark survives being looked at in a crowded tab strip.
     assert "context.drawImage(baseImage, 0, 0, 32, 32)" in source
-    assert "context.translate(20, 20)" in source
-    assert "context.scale(0.75, 0.75)" in source
-    alphas = [float(value) for value in re.findall(r"globalAlpha = active \? ([\d.]+) : ([\d.]+)", source)[0]]
-    assert all(0 < alpha < 1 for alpha in alphas)
+    assert "CONFIG.slimeOrigin[0], CONFIG.slimeOrigin[1]" in source
+    assert "context.scale(CONFIG.slimeScale, CONFIG.slimeScale)" in source
+    assert "context.globalAlpha = CONFIG.slimeAlpha;" in source
+    assert agent_presence.SLIME_ALPHA == 1.0 and agent_presence.SLIME_SCALE >= 1.0
+    # The geometry has to stay inside the canvas, halo stroke included: a mark
+    # clipped at the tab edge reads as a chip of the site's own icon.
+    origin_x, origin_y = agent_presence.SLIME_ORIGIN
+    assert origin_x + 16 * agent_presence.SLIME_SCALE <= 31
+    assert origin_y + 15 * agent_presence.SLIME_SCALE <= 31
     # An unreadable (tainted) favicon is left alone instead of being replaced by
     # an opaque tile, and the older activity dot defers to this script.
     assert "#20272e" not in source

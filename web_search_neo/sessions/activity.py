@@ -14,15 +14,22 @@ _TAB_ACTIVITY_SOURCE = r"""
 (() => {
   const KEY = "__wsnActivity";
   const IDLE_MS = 5 * 60 * 1000;
+  // Green while an action is under a minute old, amber for the rest of the five
+  // minutes: "just drove this tab" and "drove it a while ago" are different
+  // facts, and a person deciding whether to touch the tab needs both.
+  const ACTIVE_MS = 60 * 1000;
+  const GREEN = "#22c55e";
+  const AMBER = "#d97706";
   if (window[KEY] && window[KEY].ping) {
     try { window[KEY].ping(); } catch (error) {}
     return;
   }
-  const state = {links: [], timer: 0, generation: 0, stopped: false};
+  const state = {links: [], timer: 0, phaseTimer: 0, generation: 0, stopped: false, pingedAt: 0};
   window[KEY] = state;
-  const robotIcon = () => "data:image/svg+xml," + encodeURIComponent(
+  const phaseColor = () => (Date.now() - state.pingedAt <= ACTIVE_MS ? GREEN : AMBER);
+  const robotIcon = (color) => "data:image/svg+xml," + encodeURIComponent(
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
-    + '<circle cx="32" cy="32" r="30" fill="#22c55e"/>'
+    + `<circle cx="32" cy="32" r="30" fill="${color}"/>`
     + '<circle cx="22" cy="26" r="5" fill="#fff"/><circle cx="42" cy="26" r="5" fill="#fff"/>'
     + '<rect x="20" y="40" width="24" height="5" rx="2.5" fill="#fff"/></svg>');
   const snapshot = () => {
@@ -59,10 +66,11 @@ _TAB_ACTIVITY_SOURCE = r"""
     // The presence script owns the favicon when it is installed; painting a
     // second badge over its icon made the tab flicker between the two.
     if (window.__wsnPresence) { restore(); return; }
+    const color = phaseColor();
     try {
       snapshot();
       const first = state.links.length ? state.links[0] : "";
-      if (!first) { applyIcon(robotIcon(), generation); return; }
+      if (!first) { applyIcon(robotIcon(color), generation); return; }
       const img = new Image();
       img.onload = () => {
         try {
@@ -71,7 +79,7 @@ _TAB_ACTIVITY_SOURCE = r"""
           const ctx = canvas.getContext("2d");
           if (!ctx) return;
           ctx.drawImage(img, 0, 0, 64, 64);
-          ctx.fillStyle = "#22c55e";
+          ctx.fillStyle = color;
           ctx.beginPath(); ctx.arc(50, 50, 15, 0, 7); ctx.fill();
           ctx.fillStyle = "#ffffff";
           ctx.font = "bold 22px sans-serif";
@@ -88,6 +96,8 @@ _TAB_ACTIVITY_SOURCE = r"""
     try {
       if (state.stopped) return;
       if (state.timer) clearTimeout(state.timer);
+      if (state.phaseTimer) clearTimeout(state.phaseTimer);
+      state.pingedAt = Date.now();
       const generation = ++state.generation;
       const run = () => { setBadge(generation); };
       if (document.readyState === "loading" && !document.head) {
@@ -95,13 +105,18 @@ _TAB_ACTIVITY_SOURCE = r"""
       } else {
         run();
       }
+      // The green -> amber edge is repainted on its own schedule: a session
+      // that went quiet must not stay bright until the five-minute restore.
+      state.phaseTimer = setTimeout(() => setBadge(generation), ACTIVE_MS);
       state.timer = setTimeout(restore, IDLE_MS);
     } catch (error) {}
   };
   state.stop = () => {
     state.stopped = true;
     try { if (state.timer) clearTimeout(state.timer); } catch (error) {}
+    try { if (state.phaseTimer) clearTimeout(state.phaseTimer); } catch (error) {}
     state.timer = 0;
+    state.phaseTimer = 0;
     restore();
     try { delete window[KEY]; } catch (error) {}
   };

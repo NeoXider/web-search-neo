@@ -4,7 +4,7 @@
 // refuse ours - which the in-page favicon badge cannot.
 //
 // The toolbar badge is per tab: green "AI" while an agent acted on the tab in
-// the last ~30 s, amber until five minutes have passed, then the tab goes back
+// the last minute, amber until five minutes have passed, then the tab goes back
 // to the global ON/OFF badge. The map is mirrored into chrome.storage.session
 // and a one-minute alarm sweeps it, so expiry survives MV3 worker eviction.
 import {

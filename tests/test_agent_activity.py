@@ -56,6 +56,7 @@ def test_activity_phases_badges_and_expiry() -> None:
           entry: map["42"],
           ignoredSame: Object.keys(ignored).length,
           fresh: at(1_000), recent: at(150_000), gone: at(300_000), young: at(35_000),
+          green_edge: at(59_000)["phase"], amber_edge: at(61_000)["phase"],
           expiredIds: expired.expired, kept: Object.keys(expired.map),
           next: m.nextChangeIn(map, t0 + 10_000),
           nextEmpty: m.nextChangeIn({}, t0),
@@ -80,11 +81,17 @@ def test_activity_phases_badges_and_expiry() -> None:
     assert out["recent"]["phase"] == "recent"
     assert out["recent"]["badge"]["color"] == "#d97706"
     assert out["recent"]["badge"]["title"].endswith("Agent claude — last action 2 min ago")
-    # Under a minute is counted in seconds: "1 min ago" for a 35 s gap misleads.
-    assert out["young"]["age"] == "last action 35 s ago"
+    # Inside the green window the badge says "active now" outright; the seconds
+    # wording is what a gap just past it gets, and never a rounded "1 min ago".
+    assert out["young"]["age"] == "active now" and out["young"]["phase"] == "active"
+    # The green window is the minute the user asked for: still "active now" at
+    # 59 s, amber from 61 s on, and gone when five quiet minutes are up.
+    assert out["green_edge"] == "active"
+    assert out["amber_edge"] == "recent"
     assert out["gone"] == {"phase": "expired", "badge": None, "age": "last action 5 min ago"}
     assert out["expiredIds"] == [43] and out["kept"] == ["42"]
-    assert out["next"] == 20_000
+    # The next scheduled change is the green -> amber edge, not a 30 s flicker.
+    assert out["next"] == 50_000
     assert out["nextEmpty"] is None
     assert out["forgotten"] == ["43"]
     assert out["labels"] == ["agent", "a.py#3", "badlabel"]

@@ -26,14 +26,16 @@ from typing import Any
 # reinstall itself. Without it a long-lived tab would keep running whatever
 # version was current when it first loaded, and a fix here would only reach
 # pages opened afterwards.
-PRESENCE_VERSION = 7
+PRESENCE_VERSION = 8
 
 PRESENCE_ENV = "WEB_SEARCH_NEO_AGENT_PRESENCE"
 
 # How long a single action keeps the badge in its bright "working now" state.
-# Agents pause between steps to think, so a few seconds made a busy tab flicker
-# to "recent"; this matches the companion's toolbar badge.
-ACTIVE_MS = 30_000
+# A minute, because that is how long a person watching the tab strip needs to
+# still see "the model was here" after the agent paused to think: a few seconds
+# made a busy tab flip to amber between two actions, which read as "nobody is
+# driving this". Matches the companion's toolbar badge (agent-activity.js).
+ACTIVE_MS = 60_000
 # The afterglow the user asked for: the tab stays marked for five minutes after
 # the agent's last action, then gives the favicon back.
 RECENT_MS = 5 * 60 * 1000
@@ -55,6 +57,16 @@ CURSOR_CHIP_MS = 1500
 
 _ACTIVE_COLOR = "#2fbf5c"
 _RECENT_COLOR = "#e2a03f"
+
+# The corner mark's geometry on the 32x32 canvas: 16-unit slime drawn at full
+# size (half the tab icon) in the bottom-right corner, with no transparency.
+# A see-through 12 px mark was invisible at tab-strip size - which defeats the
+# whole point of painting it there - and "the agent is on this tab" is not a
+# claim you should have to squint for. The offset keeps the 2 px halo stroke
+# inside the canvas instead of clipped at the edge.
+SLIME_ORIGIN = (14, 15)
+SLIME_SCALE = 1.0
+SLIME_ALPHA = 1.0
 
 # Coordinate presses and selector clicks both have a human-visible indicator.
 _TAP_POINTER_ACTIONS = frozenset({"click", "double_click", "press"})
@@ -111,6 +123,9 @@ def _config() -> dict[str, Any]:
         "maxFlashes": MAX_FLASHES,
         "activeColor": _ACTIVE_COLOR,
         "recentColor": _RECENT_COLOR,
+        "slimeOrigin": list(SLIME_ORIGIN),
+        "slimeScale": SLIME_SCALE,
+        "slimeAlpha": SLIME_ALPHA,
         "glideMs": CURSOR_GLIDE_MS,
         "rippleMs": RIPPLE_MS,
         "maxRipples": MAX_RIPPLES,
@@ -293,10 +308,10 @@ _INSTALL_TEMPLATE = r"""
     }
   }
 
-  // The mark is the project's slime, drawn into the bottom-right corner over
-  // the page's own favicon and slightly see-through, so the tab keeps its
-  // identity and only gains a small companion. Active: awake and bright;
-  // recent: dimmer and asleep.
+  // The mark is the project's slime, drawn opaque into the bottom-right corner
+  // over the page's own favicon, so the tab keeps its identity and gains a
+  // companion that is actually visible. Active: awake, green, for a minute
+  // after the last action; recent: amber and asleep until five minutes are up.
   function slimeBody(context) {
     context.beginPath();
     context.moveTo(1.5, 15);
@@ -308,11 +323,13 @@ _INSTALL_TEMPLATE = r"""
   function drawSlime(context, phase) {
     const active = phase === "active";
     context.save();
-    // 16 units scaled to 12 px in the corner: the site's own icon keeps its
-    // identity and only gains a small mark; at strip size it reads as a dot.
-    context.translate(20, 20);
-    context.scale(0.75, 0.75);
-    context.globalAlpha = active ? 0.88 : 0.78;
+    // 16 units drawn at full size in the bottom-right corner: half the tab
+    // icon, fully opaque. The site keeps its own identity, and the mark is
+    // readable at strip size instead of reading as a faint dot. Green while an
+    // action is recent (a minute), amber for the rest of the five minutes.
+    context.translate(CONFIG.slimeOrigin[0], CONFIG.slimeOrigin[1]);
+    context.scale(CONFIG.slimeScale, CONFIG.slimeScale);
+    context.globalAlpha = CONFIG.slimeAlpha;
     // A light halo keeps the slime readable on dark favicons, the dark edge on
     // light ones; which one the page has is unknowable here.
     slimeBody(context);
