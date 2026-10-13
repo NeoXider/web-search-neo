@@ -13,27 +13,37 @@ api_report не шлёт ни одного запроса. На вход — с�
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from web_search_neo.audit import grading
+from web_search_neo.audit.api_contract import collect as collect_contract
+from web_search_neo.audit.api_errors import error_shapes
+from web_search_neo.audit.api_parts import EVIDENCE_LIMIT
 from web_search_neo.audit.findings import info
 from web_search_neo.audit.api_checks import (auth_findings, cache_findings, content_findings, cors_findings,
                                              csrf_findings, error_findings, transport_findings, url_findings)
-from web_search_neo.audit.api_parts import (ENDPOINT_LIMIT, channel, cookie_views, endpoint_map, is_own,
+from web_search_neo.audit.api_parts import (ENDPOINT_LIMIT, EVIDENCE_LIMIT, channel, cookie_views, endpoint_map, is_own,
                                             jwt_facts, own_sites, path_template, safe_url, storage_views,
                                             _is_api_response, _status)
 from web_search_neo.fetch.safety import redact_url
 
 SCOPE_TEXT = (
-    "api_report is passive and sends no requests of its own: it reads the session's network journal "
-    "(the traffic the page itself made while the user or a test_run scenario worked with it), the browser "
-    "cookie jar, the page's own localStorage/sessionStorage, and response bodies Chrome already holds for "
-    "error responses - never re-requested. url loads the page once in a fresh isolated browser (as "
-    "perf_report does), closed unless keep_open, so requests_made is always empty; repeating a request "
-    "stays replay_request's explicit job. The analysis covers your own site (the page's registrable "
-    "domain plus any hosts you name); third-party origins are classified, never requested. Cookie, "
-    "storage and token values are never output - names, flags and formats only - and query values are "
-    "masked."
+    "api_report is passive: it reads the session's network journal (the traffic the page itself made while "
+    "the user or a test_run scenario worked with it), the browser cookie jar, the page's own "
+    "localStorage/sessionStorage, and response bodies Chrome already holds for error responses - never "
+    "re-requested. url loads the page once in a fresh isolated browser (as perf_report does), closed unless "
+    "keep_open. It sends no request to an API route of its own; repeating one stays replay_request's job. "
+    "Its only plain GETs are the documents the site itself publishes as its contract (an openapi/swagger/mcp "
+    "link it announces or that origin's standard document addresses); those are listed in requests_made and "
+    "counted against the shared audit request budget. The analysis covers your own site (the page's "
+    "registrable domain plus any hosts you name); third-party origins are rejected as targets, classified as "
+    "traffic, and never requested. Cookie, storage and token values are never output - names, flags and "
+    "formats only - and query values are masked. What each error says about the API itself is reported too: "
+    "`errors` groups 4xx/5xx by method, path template and status with the body's shape and its error "
+    "code, and `error_meanings` names what those responses publish - a role or scope that guards routes, "
+    "a balance or plan wall, a rate limit and the headers that carry it, a validation rejection and the "
+    "parameter it named. Error codes and messages are quoted because they are the API's own published "
+    "vocabulary; user data in them is masked."
 )
 
 
@@ -83,12 +93,16 @@ STORAGE_SCRIPT = r"""
 
 def build(rows: list[dict[str, Any]], *, page_url: str, jar: list[Any] | None = None,
           storage: Any = None, bodies: dict[str, str] | None = None, unread: int = 0,
-          hosts: list[str] | None = None, dropped: int = 0) -> dict[str, Any]:
-    """Итоговый отчёт api_report: карта вызовов, находки с приоритетом и рекомендациями.
+          hosts: list[str] | None = None, dropped: int = 0, links: Any = None,
+          fetch_spec: Callable[[str], dict[str, Any]] | None = None,
+          budget: Any = None) -> dict[str, Any]:
+    """Итоговый отчёт api_report: карта вызовов, смысл ошибок, находки и рекомендации.
 
     rows — законченные и ещё идущие строки журнала; bodies — тексты тел ответов
     с ошибками, прочитанные из памяти Chrome; значения cookie и хранилища
     сюда попадают только чтобы определить формат, в ответ они не копируются.
+    links — объявленные страницей ссылки (для поиска опубликованного контракта);
+    fetch_spec — GET одной верифицированной выдачей, если оболочка умеет его сделать.
     """
     rows = [row for row in rows if isinstance(row, dict)]
     own = own_sites(str(page_url or ""), hosts)
@@ -120,17 +134,41 @@ def build(rows: list[dict[str, Any]], *, page_url: str, jar: list[Any] | None = 
     order = grading.priority(findings)
     first = "; ".join(item["title"] for item in order[:3]) or "nothing to fix"
     endpoints = endpoint_map(rows)
+    errors = error_shapes(own_rows, bodies or {})
+    contract: dict[str, Any] | None = None
+    if fetch_spec is not None:
+        try:
+            contract = collect_contract(str(page_url or ""), own_rows, own, links or [], fetch_spec, budget)
+        except Exception as exc:  # контракт — добавка к отчёту, не его условие
+            contract = {"found": False, "note": f"the contract check did not finish: {type(exc).__name__}"}
+    if contract and contract.get("found"):
+        findings.append(info(
+            "api-contract-drift", "api",
+            f"{len(contract.get('unpublished_in_use', []))} path(s) in use are not in the published "
+            f"contract; {len(contract.get('published_never_called', []))} published path(s) were never called",
+            detail=("The site publishes its own API contract. Paths the interface calls without publishing them "
+                    "are undocumented surface; paths the contract publishes that nothing calls are doors nobody "
+                    "walks through. Both are named from the site's own documents and its own traffic - no path "
+                    "was guessed or probed here."),
+            evidence={"spec_formats": contract.get("spec_formats", []),
+                      "declared_endpoints": contract.get("declared_endpoints", 0),
+                      "observed_endpoints": contract.get("observed_endpoints", 0),
+                      "matched": contract.get("matched", 0)}))
     report: dict[str, Any] = {
         "success": True, "url": redact_url(str(page_url or "")),
         "requests_observed": len(rows), "api_calls": sum(item["count"] for item in endpoints),
         "dropped": int(dropped),
         "endpoints": endpoints[:ENDPOINT_LIMIT],
+        "errors": errors[:ENDPOINT_LIMIT],
+        "error_meanings": [item["meaning"] for item in errors if item.get("meaning")][:EVIDENCE_LIMIT],
+        **({"contract_drift": contract} if contract else {}),
         "auth": {"cookies": cookies, "local_storage": local, "session_storage": session,
                  **({"storage_note": storage_error} if storage_error else {})},
         "counts": counts,
         "summary_line": f"{counts['high']} high, {counts['medium']} medium, {counts['low']} low. "
                         f"Fix first: {first}.",
-        "priority": order, "findings": findings, "scope": SCOPE_TEXT, "requests_made": [],
+        "priority": order, "findings": findings, "scope": SCOPE_TEXT,
+        "requests_made": [str(label) for label in (getattr(budget, "made", []) or [])],
     }
     if len(endpoints) > ENDPOINT_LIMIT:
         report["endpoints_omitted"] = len(endpoints) - ENDPOINT_LIMIT

@@ -298,9 +298,11 @@ With `url` alone the page loads once in a fresh isolated browser that is closed 
 analysed - open it first and work with it (or run a `test_run` scenario against it) so the
 calls land in the session's network journal; with both, that session navigates to `url`
 first. `wait_seconds` (default 2) is the pause after the load before the journal is read.
-The report sends no requests of its own: `requests_made` is always empty, an error
-response's body is read from Chrome's own memory (never a second request), and repeating a
-call on purpose stays `replay_request`'s explicit job.
+The report sends no request to an API route of its own: an error response's body is read from
+Chrome's own memory (never a second request), and repeating a call on purpose stays
+`replay_request`'s explicit job. Its only plain GETs read the contract documents this origin
+publishes - an announced `openapi`/`swagger`/`mcp` link or that origin's standard document
+addresses, at most 6 - and every one of them appears in `requests_made`.
 
 | Parameter | Meaning |
 | --- | --- |
@@ -321,6 +323,8 @@ origins are classified, never contacted:
 | Caching | `Cache-Control`/`Pragma`: `public` on a JSON or cookie-setting response is a finding (it fails when the response also sets a cookie); `no-store`/`private` passes; a missing policy warns. |
 | Content-Type | `Content-Type` plus `X-Content-Type-Options: nosniff` on JSON. |
 | Error bodies | 4xx/5xx bodies from Chrome's memory (at most 8, 4000 characters each): stack traces, server file paths, framework versions - snippets and URLs masked. Bodies Chrome did not keep are named, not silently skipped. |
+| What the API says about itself | `errors[]` groups your own 4xx/5xx by method, path template and status: how often, the body's shape (`object(2)`, `string(18)` - never its values; a text error is measured by length), the response header names it carried, its error code and message. `error_meanings[]` names what those responses publish: `access_scope` with the role words used, `balance_or_plan`, `rate_limited` with the limit headers, `validation` with the parameter the rejection named. An error that says nothing about the API gets no invented hint. |
+| Contract drift | `contract_drift` compares the traffic with the specification the site publishes itself (OpenAPI JSON or YAML read as text, an announced `<link>`, the origin's standard addresses, MCP/`llms.txt`): `unpublished_in_use`, `published_never_called`, `parameter_drift`. `{uid}` in a document and `/61807` in traffic count as one route. No path is guessed or probed; with no published document the answer says so instead of comparing against nothing. |
 | Transport | `ws://` against `wss://` (fails on an https page, warns on http), `http://` calls from an https page, API calls to other sites' origins. |
 | Tokens | Cookies as name, domain and `Secure`/`HttpOnly`/`SameSite` flags with the value's format only; `localStorage`/`sessionStorage` by name and format only; JWT-like values as facts (`alg`, `exp`/`iat`, signature present - an `alg: none`/unsigned token fails high, a lifetime over a day warns). Token and cookie values are never printed. |
 | CSRF | `SameSite` on session cookies (`SameSite=None` without `Secure` fails), a visible token in state-changing requests, writes leaving your site without one. |
@@ -332,9 +336,11 @@ origins are classified, never contacted:
 | --- | --- |
 | `requests_observed`, `api_calls`, `dropped` | Journal rows read, calls they hold, rows that fell out of the history. |
 | `endpoints`, `endpoints_omitted` | The call map (the first 60) and how many further endpoints were left out. |
+| `errors`, `error_meanings` | The grouped 4xx/5xx of your own site (shapes, header names, codes - never values) and what those responses publish about the API. |
+| `contract_drift` | Published specification vs. traffic actually used: undocumented paths in use, documented paths never called, and query names accepted but not published (or published and unused). `found: false` with a `note` when the site publishes no contract. |
 | `auth` | Cookies, `local_storage`, `session_storage` - names, flags and formats, never values (`storage_note` when the storage script failed). |
 | `counts`, `summary_line`, `priority`, `findings` | The verdict: counts by severity, the one-line summary, the fixes in order (each with `fix`), every check. |
-| `scope`, `requests_made` | What counts as own, and the empty list proving nothing was sent. |
+| `scope`, `requests_made` | What counts as own, and the GETs of published contract documents the report sent (nothing else; an API request is never re-sent here). |
 | `api-headers-unavailable` | A companion session records no response headers, so the finding says the CORS, caching and Content-Type checks could not run for those responses instead of quietly passing. |
 
 `summary: "min"` (on `web_action` or inside the action) keeps `counts`, `priority` and

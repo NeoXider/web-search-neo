@@ -20,7 +20,7 @@ from typing import Any, Literal
 from urllib.parse import urljoin, urlsplit
 
 from web_search_neo import __version__, browser_tools, macros, network_log
-from web_search_neo.audit import active, api, api_parts, diff, har, multipage, page as page_checks
+from web_search_neo.audit import active, api, api_contract, api_parts, diff, har, multipage, page as page_checks
 from web_search_neo.audit import perf, report, sarif, scenario, secrets as secret_checks, site
 from web_search_neo.audit import scope as scope_mod
 from web_search_neo.audit import transport as transport_mod
@@ -206,6 +206,39 @@ def _api_error_bodies(session: Any, session_id: str, rows: list[dict[str, Any]],
     return bodies, unread
 
 
+def _spec_fetcher() -> Any:
+    """GET опубликованного контракта API: один верифицированный запрос на заявку.
+
+    Только GET, только верифицированная выдача web_client (TLS проверяется, public→private
+    redirect отвергается), тело не больше бюджета спецификации. Ответ отдаётся как
+    {ok, status, content_type, text}; ошибка — как {ok: False, why}.
+    """
+    from web_search_neo import web_client
+
+    def fetch(url: str) -> dict[str, Any]:
+        try:
+            response = web_client.request(url, method="GET", timeout_seconds=10.0,
+                                          max_response_bytes=api_contract.BODY_LIMIT)
+        except Exception as exc:  # unreachable/TLS/refused redirect: контракт не найден
+            return {"ok": False, "status": 0, "why": f"{type(exc).__name__}", "text": ""}
+        body = getattr(response, "content", b"") or b""
+        return {"ok": 200 <= int(getattr(response, "status_code", 0) or 0) < 400,
+                "status": int(getattr(response, "status_code", 0) or 0),
+                "content_type": str(getattr(response, "headers", {}).get("content-type") or ""),
+                "text": body.decode("utf-8", "replace")}
+    return fetch
+
+
+_LINK_SCRIPT = r"""
+  const out = [];
+  for (const node of document.querySelectorAll('link[href]')) {
+    out.push({href: node.getAttribute('href'), rel: node.getAttribute('rel')});
+    if (out.length >= 200) break;
+  }
+  return out;
+"""
+
+
 async def browser_api_report(
     url: str | None = None,
     session_id: str | None = None,
@@ -225,10 +258,16 @@ async def browser_api_report(
     сама сделала, пока пользователь или сценарий test_run работали с ней),
     cookie-джар, localStorage/sessionStorage (имена и формат; значения токенов
     и cookie никогда не выводятся) и тела ответов с ошибками, которые Chrome
-    уже держит. Своих запросов api_report не шлёт: url грузит страницу в свежей
-    изолированной сессии (закрывается, если не keep_open), session_id работает с
-    уже открытой страницей, hosts (≤10, те же правила, что у scope) добавляет
-    твои хосты в «свои». wait_seconds — пауза после загрузки, чтобы вызовы успели
+    уже держит. Своих запросов к маршрутам API api_report не шлёт: url грузит
+    страницу в свежей изолированной сессии (закрывается, если не keep_open),
+    session_id работает с уже открытой страницей, hosts (≤10, те же правила,
+    что у scope) добавляет твои хосты в «свои». Единственные его GET'ы — чтение
+    опубликованного контракта этого origin (объявленная ссылка openapi/swagger/mcp
+    или стандартные адреса документа): они в requests_made и в общем бюджете.
+    Ошибки 4xx/5xx сводятся по (метод, путь, статус) с формой тела и смыслом,
+    который они сообщают про API (роль, платёжная стена, лимит, отвергнутый
+    параметр); трафик сравнивается с опубликованной спецификацией. Ни один путь
+    не угадывается. wait_seconds — пауза после загрузки, чтобы вызовы успели
     долететь в журнал. save_to пишет отчёт JSON, har_to — HAR того же журнала
     (папка загрузок). summary='min' оставляет counts, priority и summary_line.
     """
@@ -263,13 +302,20 @@ async def browser_api_report(
             except Exception as exc:
                 storage = {"storage_error": f"{type(exc).__name__}: {exc}"[:200]}
             jar = browser_tools.cookies(op="get", session_id=sid, limit=1000).get("cookies") or []
+            try:
+                declared = _script_value(sid, _LINK_SCRIPT, None, 10.0)
+                links = declared if isinstance(declared, list) else []
+            except Exception:
+                links = []
+            budget = scope_mod.Budget(limit=api_contract.SPEC_REQUEST_LIMIT)
             session = browser_tools._get_session(sid)
             with session.lock:
                 rows, dropped, pending = network_log.drain(session)
                 page_url = network_log.page_url(session)
                 bodies, unread = _api_error_bodies(session, sid, rows + pending, page_url, hosts)
             result = api.build(rows + pending, page_url=page_url, jar=jar, storage=storage,
-                               bodies=bodies, unread=unread, hosts=hosts, dropped=dropped)
+                               bodies=bodies, unread=unread, hosts=hosts, dropped=dropped,
+                               links=links, fetch_spec=_spec_fetcher(), budget=budget)
             if har_to:
                 document = har.build(rows + pending, page_url=page_url,
                                      title=str(getattr(session, "last_title", "") or ""),
@@ -689,7 +735,8 @@ async def _run_plan(plan: list[dict[str, Any]], session_id: str, url: str | None
 
 ACTION_SPECS = (
     ("security_report", browser_security_report, "audit", "Passive A-F security grade: page, site or hosts; fixes."),
-    ("api_report", browser_api_report, "audit", "Map page-to-backend calls: CORS, cache, tokens, CSRF; fixes."),
+    ("api_report", browser_api_report, "audit",
+     "Map backend calls and API errors; drift from the published contract."),
     ("secret_scan", browser_secret_scan, "audit", "Secrets, endpoints, openapi in page code."),
     ("active_probe", browser_active_probe, "audit", "Active CORS/methods/redirect/canary probes."),
     ("perf_report", browser_perf_report, "audit", "Load metrics: TTFB, FCP, LCP, CLS, resources, blocking."),

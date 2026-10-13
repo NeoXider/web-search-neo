@@ -625,6 +625,17 @@ Use the `console` topic when you need history, `log`/`info` levels, or stack fra
   It is passive - `requests_made` lists what the report sends (only to hosts in scope; no path
   guessing, port scanning or fuzzing), `browser_requests` the ordinary page load - and only
   for sites the user owns or may test.
+- `api_report {session_id}` reads what the backend already answered to the page and what that
+  says about the API itself. `errors[]` groups 4xx/5xx by method, path template and status with
+  the body's *shape* (`object(2)`), its header names and the error code/message; `error_meanings[]`
+  names what the response publishes: `access_scope` (a role guarding a group of routes - the API
+  admitted it exists), `balance_or_plan` (a billing wall, not a credential problem), `rate_limited`
+  with the headers carrying the window, `validation` with the parameter it named. `contract_drift`
+  compares the traffic with the specification the site publishes itself: paths in use that are not
+  published, published paths nothing calls, query names accepted but undocumented. Start an audit
+  of an API here - it costs no new requests to routes and guesses no paths (its only GETs read
+  documents the site publishes, listed in `requests_made`). Then aim `replay_request` with `vary`
+  at whatever it named.
 - `perf_report {url}` reads the Performance API after a cold isolated load: TTFB, FCP, LCP,
   CLS with Web Vitals ratings, resources, render-blocking files, recommendations.
 - `har_export {session_id}` saves the network journal as a HAR file; `network

@@ -410,7 +410,11 @@ def test_api_report_maps_a_cold_isolated_load(api_site):
     data = result["results"][0]["data"]
     paths = {(entry["method"], entry["path"]) for entry in data["endpoints"]}
     assert ("GET", "/api/users/{id}") in paths and ("POST", "/api/login") in paths
-    assert data["requests_made"] == [] and data["fresh_isolated_load"] is True
+    assert data["fresh_isolated_load"] is True
+    # api_report sends no request to an API route of its own; its only GETs are the
+    # contract documents this origin publishes, and each one is listed.
+    assert all(label.startswith("GET ") for label in data["requests_made"])
+    assert not any("/api/users" in label or "/api/login" in label for label in data["requests_made"])
     assert data["session_id"] is None and not browser_tools._sessions
     found = ids(data["findings"])
     assert {"api-cors-wildcard-credentials", "api-error-stack-trace",
