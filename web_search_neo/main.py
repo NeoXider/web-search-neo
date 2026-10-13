@@ -14,7 +14,7 @@ from web_search_neo.contract.notes import _SERVER_INSTRUCTIONS, _ARGUMENT_RECOVE
 from web_search_neo.contract.param_docs import annotate as annotate_params
 from web_search_neo import bridge_daemon
 from web_search_neo import browser_tools
-from web_search_neo import chrome_bridge, extra_actions, persist_actions, tab_actions
+from web_search_neo import chrome_bridge, companion_update, extra_actions, persist_actions, tab_actions
 from web_search_neo import macros
 from web_search_neo import msp_date_time
 from web_search_neo import msp_search
@@ -543,6 +543,26 @@ async def browser_setup_current_chrome(wait_seconds: float = 1.0) -> dict[str, A
     """Publish the bridge secret, update a stale companion, and return what is left."""
     return await asyncio.to_thread(
         browser_tools.setup_current_chrome_companion, wait_seconds
+    )
+
+
+@mcp.tool()
+async def browser_update_companion() -> dict[str, Any]:
+    """Pull this checkout, reinstall when that is what changed, reload the companion.
+
+    An unpacked Chrome extension cannot update itself - a service worker has no git and
+    no filesystem, and its own reload only re-reads the folder it was loaded from. This
+    server can run git, so it does the pull and the companion then reloads onto those
+    files. It refuses instead of forcing: a checkout with uncommitted tracked changes is
+    not pulled, a branch that diverged from its upstream is not merged or rebased, nothing
+    runs while an agent is driving a tab (a reload detaches those sessions), and a server
+    installed from a wheel says so rather than pretending. After a pull that changed
+    Python code this process still runs the code it started with - ``server_restart_note``
+    says which parts are current and which are not.
+    """
+    return await asyncio.to_thread(
+        companion_update.update_companion,
+        local_sessions=browser_tools._local_current_sessions(),
     )
 
 
@@ -2102,6 +2122,12 @@ _ACTIONS: dict[str, ActionSpec] = {
             "Publish the bridge secret; return the manual steps Chrome needs.",
         ),
         _action(
+            "update_companion",
+            browser_update_companion,
+            "session",
+            "Pull this checkout, reload the companion onto it; a dirty tree is refused.",
+        ),
+        _action(
             "show",
             browser_show,
             "session",
@@ -2216,7 +2242,7 @@ _ACTIONS: dict[str, ActionSpec] = {
             "replay_request",
             browser_replay_request,
             "page",
-            "Re-send a captured or explicit request from the page context; vary sweeps single changes and reports each response's delta.",
+            "Re-send a captured or explicit request; vary sweeps single changes as deltas.",
         ),
         _action(
             "mock",
@@ -2480,11 +2506,11 @@ def _capabilities(action_name: str | None = None, full_schemas: bool = False) ->
             "params_example": {"action": "input"},
             "list_actions": "web_info(topic='actions') is the action index; params.group narrows it.",
             "playbook": "web_info(topic='skill'): the loop plus a section index; params.section='<name>' opens one (forms, games, audit, testing, ...); site checks: docs/site-checks.md.",
-            "note": "params.action names an action or topic; a topic's parameters are published nowhere else - unlisted keys are refused.",
+            "note": "params.action names an action or topic; a topic's parameters are published nowhere else.",
             "parameters": (
                 "actions[name].required: always-send parameters; also_required: a "
-                "condition no list can express, just as mandatory. Names, types, "
-                "defaults: only action_schema (full_schemas=true embeds them all)."
+                "condition no list can express, just as mandatory. Types and defaults: "
+                "only action_schema."
             ),
         },
     }

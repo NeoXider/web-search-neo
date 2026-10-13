@@ -22,12 +22,16 @@ LEGACY_MAX_LINES = {
     # left is the behaviour each path now has to state. The pointer and captcha
     # adapter clusters are still worth extracting.
     "web_search_neo/browser_tools.py": 8605,
-    # Raised 2678 -> 2680 (2026-10-13) for the `vary` parameter of replay_request
-    # and its action summary; the sweep itself lives in fetch/variants.py.
-    "web_search_neo/main.py": 2680,
+    # Raised 2680 -> 2706 (2026-10-13) for the update_companion action and its tool:
+    # the pull, the refusal rules and the reload all live in companion_update.py, so
+    # this file only carries the call and what it says it refuses.
+    "web_search_neo/main.py": 2706,
     # Raised 2681 -> 2686 for the aria-hidden majority hint in page_text exclusions.
     "web_search_neo/page_perception.py": 2686,
-    "web_search_neo/chrome_bridge.py": 2070,
+    # Raised 2070 -> 2075 (2026-10-13, from upstream 96427c0): a tab create on a busy
+    # machine answered late and left an orphan about:blank behind, so the wait is now
+    # configurable. Came in with the rebase; the ratchet follows the file.
+    "web_search_neo/chrome_bridge.py": 2075,
     # Raised 1734 -> 1738 (2026-10-13) for the popup Update button's message: it
     # reuses the reload command the daemon already had, so this is one branch.
     "chrome-extension/service-worker.js": 1738,

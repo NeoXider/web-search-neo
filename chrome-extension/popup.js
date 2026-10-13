@@ -448,7 +448,8 @@ updateButton.addEventListener("click", async () => {
       updateHintNode.textContent =
         `v${remote} is published. In the folder this extension was loaded from, run ` +
         `"git pull --ff-only" and reinstall the package; this button then reloads the ` +
-        `companion onto those files.`;
+        `companion onto those files. An agent on this machine can do that pull itself: ` +
+        `the update_companion action.`;
       if (!PREVIEW) chrome.tabs.create({url: latestReleaseUrl});
     }
     await send("companion.reloadExtension");
