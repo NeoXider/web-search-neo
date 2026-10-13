@@ -20,8 +20,17 @@ steps is the signature of a bot.
 loop - find, measure, drag, check - against callables the caller injects, so the
 whole thing is testable without a browser and depends on neither Selenium nor
 the orchestrators.
+
+``classify.py`` names what the slider loop cannot clear: the vendor family and
+the challenge type, from text labels, class names, SDK URLs and Tencent's
+``aid``. Pure strings in, a small dict out - no browser, no network.
 """
 
+from web_search_neo.captcha_solvers.classify import (
+    CLASSIFY_FACTS_SCRIPT,
+    classify_captcha,
+    classify_from_harness,
+)
 from web_search_neo.captcha_solvers.images import crop_png, detect_gap
 from web_search_neo.captcha_solvers.slider import (
     SLIDER_CLEARED_SCRIPT,
@@ -33,9 +42,12 @@ from web_search_neo.captcha_solvers.slider import (
 from web_search_neo.captcha_solvers.trajectory import human_trajectory
 
 __all__ = [
+    "CLASSIFY_FACTS_SCRIPT",
     "SLIDER_CLEARED_SCRIPT",
     "SLIDER_LOCATE_SCRIPT",
     "SLIDER_VENDORS",
+    "classify_captcha",
+    "classify_from_harness",
     "crop_png",
     "detect_gap",
     "human_trajectory",

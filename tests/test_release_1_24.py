@@ -1,4 +1,4 @@
-"""1.24: scope site/hosts for secret_scan and active_probe, agent docs, AI crawlers.
+﻿"""1.24: scope site/hosts for secret_scan and active_probe, agent docs, AI crawlers.
 
 Pure unit tests pin the multipage merge, the agent-surface discovery and the
 robots AI policy; the fixture servers prove the modes end to end. secret_scan
@@ -16,6 +16,7 @@ import pytest
 import active_fixture_site
 import secret_fixture_site
 from web_search_neo import audit_actions, browser_tools, main
+from web_search_neo.contract import budget
 from web_search_neo.audit import multipage, wellknown
 from web_search_neo.audit import secrets as secret_checks
 from web_search_neo.contract import notes, param_docs
@@ -196,7 +197,7 @@ def test_scope_params_in_action_schema():
     schema = asyncio.run(main.web_info("action_schema", {"action": "active_probe"}))
     assert {"scope", "include_subdomains"} <= set(schema["input_schema"]["properties"])
     assert "secret_scan" in param_docs._BY_ACTION and "active_probe" in param_docs._BY_ACTION
-    assert len(json.dumps(main._capabilities())) <= 13_500
+    assert len(json.dumps(main._capabilities())) <= budget.CONTRACT_BUDGET
 
 
 # --- against the local fixture servers ---------------------------------------------------------------------

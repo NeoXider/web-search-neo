@@ -32,6 +32,10 @@ from typing import Any, Callable
 from urllib import error, request
 
 from web_search_neo.actions.waits import clamp_wait
+from web_search_neo.captcha_solvers.classify import (
+    CLASSIFY_FACTS_SCRIPT,
+    classify_from_harness,
+)
 
 # A human solver needs tens of seconds; the ceiling is the shared wait cap.
 MIN_SOLVE_SECONDS = 30.0
@@ -240,6 +244,42 @@ def solve_and_apply(
             "The solve was paid for; run detect again before retrying."
         )
     return result
+
+
+def unsolved_report(
+    run_script: Callable[[str], dict[str, Any]],
+    found: Any,
+    slider: Any,
+    status: Any,
+    waited_seconds: float,
+) -> dict[str, Any]:
+    """Name the challenge still on the page and say what would clear it.
+
+    Runs after the local slider attempt and the wait for a person both failed:
+    one fact probe, classified from strings alone, and the error keeps its
+    actionable shape with the type appended. A probe that answers junk
+    degrades to ``unknown``, never to an exception, because this is the
+    reporting path, not the solving one.
+    """
+    facts: dict[str, Any] = {}
+    try:
+        answer = run_script(CLASSIFY_FACTS_SCRIPT) or {}
+        value = answer.get("value")
+        if isinstance(value, dict):
+            facts = value
+    except Exception:
+        facts = {}
+    named = classify_from_harness(found=found, slider=slider, status=status, facts=facts)
+    return {
+        "challenge_classification": named,
+        "error": (
+            f"The captcha was still on the page after {waited_seconds:.0f}s. "
+            "It needs a person to click it in the browser window, or an explicit "
+            "mode='solve' with a solving service configured through "
+            "WEB_SEARCH_NEO_CAPTCHA_KEY. "
+            f"It looks like {named['vendor_label']} ({named['challenge']}): {named['needs']}."
+        ),
+    }
 
 
 def solver_config() -> dict[str, Any]:

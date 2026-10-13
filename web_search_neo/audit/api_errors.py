@@ -43,7 +43,27 @@ RATE_HINT = re.compile(r"rate limit|too many requests|throttl|retry after", re.I
 VALIDATION_HINT = re.compile(
     r"\b(required|must be|invalid|at least|at most|maximum|minimum|too long|too short|"
     r"unsupported|allowed values|expected)\b", re.I)
-# Имена параметров из сообщения валидации: либо слово перед тем, о чём сообщение
+# Что отличает отказ ребра/WAF от отказа самого приложения: только наблюдаемое.
+# Ребро (Cloudflare, CloudFront, Akamai, Fastly, Sucuri, Varnish, Incapsula)
+# отвечает пустым или текстовым телом и подписывается своими заголовками;
+# приложение отвечает JSON-конвертом ошибки с полем кода. Тело решает первым:
+# JSON-конверт с кодом — это приложение заговорило, даже если поверх стоят
+# заголовки CDN. Пустое/текстовое тело с краевыми заголовками — это ребро.
+# Без того и другого — unknown: отсутствие доказательств не доказательство.
+EDGE_HEADER_NAMES = frozenset({
+    "cf-ray", "cf-mitigated", "cf-cache-status", "cf-chl-bypass", "cf-apo-via",
+    "cf-chl-outcome", "x-amz-cf-id", "x-amz-cf-pop", "x-cache", "x-varnish",
+    "x-fastly-request-id", "x-served-by", "x-akamai-request-id", "akamai-origin-hop",
+    "x-sucuri-id", "x-sucuri-cache", "x-firewall", "x-waf", "x-waf-event",
+    "x-protected-by", "x-cdn", "x-edge-location", "x-arvan-id", "x-incapsula-id",
+    "x-iinfo", "x-cdn-cache-status",
+})
+EDGE_SERVER_HINT = re.compile(
+    r"cloudflare|cloudfront|akamai|fastly|varnish|sucuri|incapsula|imperva|"
+    r"edgecast|cachefly|arvan|ddos-guard|stormwall", re.I)
+CHALLENGE_HINT = re.compile(
+    r"just a moment|attention required|checking your browser|ddos protection|"
+    r"cf-challenge|captcha-delivery|incapsula incident", re.I)
 # говорит про него (must/is required/was...), либо нижний идентификатор перед
 # `=` или `:`. Стоп-слова отсекают прозу сообщения: имена API, а не его текст.
 _FIELD_BEFORE_VERB = re.compile(r"\b([A-Za-z][A-Za-z0-9_.\-]{2,40})\s+"
@@ -118,6 +138,38 @@ def parse_body(text: Any) -> dict[str, Any]:
     return out
 
 
+def classify_rejected_by(status: int, body: dict[str, Any], headers: dict[str, Any]) -> str:
+    """Кто отказал: ребро/WAF, приложение — или неизвестно.
+
+    Только наблюдаемые факты, без догадок по статусу: JSON-конверт ошибки
+    (dict с кодом/сообщением или просто dict — приложение говорит своим
+    словарём) — всегда application; пустое/текстовое тело при краевых
+    заголовках (cf-ray, сервер cloudflare/cloudfront/...) — edge; всё
+    остальное, включая не-ошибки (status < 400 — отказывать было некому), —
+    unknown.
+    """
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        return "unknown"
+    if status < 400 or not isinstance(body, dict):
+        return "unknown"
+    if body.get("kind") == "json":
+        return "application"
+    # A parsed error object is the service speaking its own dictionary; `parse_body` hands
+    # back a shape record for a raw string, so a body that carries a code or a message is
+    # JSON by content whatever envelope it arrived in.
+    if any(isinstance(body.get(key), str) and body.get(key) for key in ("code", "message", "msg")):
+        return "application"
+    names = {str(name).lower() for name in headers}
+    if names & EDGE_HEADER_NAMES:
+        return "edge"
+    for name in ("server", "via", "x-powered-by", "x-protected-by"):
+        if EDGE_SERVER_HINT.search(str(headers.get(name) or headers.get(name.title()) or "")):
+            return "edge"
+    return "unknown"
+
+
 def _field_names(message: str) -> list[str]:
     """Имена параметров, названные в сообщении валидации (не значения)."""
     found = [match.group(1) for pattern in (_FIELD_BEFORE_VERB, _FIELD_ASSIGNMENT)
@@ -129,7 +181,7 @@ def error_meaning(status: int, body: dict[str, Any], headers: dict[str, Any]) ->
     """Смысл ошибки из её собственных слов: баланс, скоуп доступа, лимит, валидация."""
     words = " ".join(part for part in (body.get("code"), body.get("message")) if isinstance(part, str))
     lowered = words.lower()
-    out: dict[str, Any] = {"status": status}
+    out: dict[str, Any] = {"status": status, "rejected_by": classify_rejected_by(status, body, headers)}
     if status in CODE_MEANINGS:
         out["class"], out["meaning"] = CODE_MEANINGS[status]
     header_names = sorted(str(name).lower() for name in headers)
@@ -174,7 +226,8 @@ def error_shapes(rows: list[dict[str, Any]], bodies: dict[str, str]) -> list[dic
         key = (str(row.get("method") or "GET").upper(), path_template(url), status)
         group = groups.setdefault(key, {"method": key[0], "path": key[1], "status": status,
                                        "count": 0, "bodies": Counter(), "codes": Counter(),
-                                       "messages": Counter(), "meanings": {}, "header_names": set()})
+                                       "messages": Counter(), "meanings": {}, "header_names": set(),
+                                       "rejected": Counter()})
         group["count"] += 1
         body = parse_body(bodies.get(str(row.get("id") or "")))
         group["bodies"][body.get("shape") if body.get("kind") == "json" else body.get("kind", "empty")] += 1
@@ -186,9 +239,12 @@ def error_shapes(rows: list[dict[str, Any]], bodies: dict[str, str]) -> list[dic
             group["messages"][body["message"]] += 1
         headers = row.get("headers") if isinstance(row.get("headers"), dict) else {}
         meaning = error_meaning(status, body, headers)
+        rejected = meaning.get("rejected_by", "unknown")
+        group["rejected"][rejected] += 1
         hint = meaning.pop("hint", None)
         if hint:
-            entry = group["meanings"].setdefault(hint, {"hint": hint})
+            entry = group["meanings"].setdefault(hint, {"hint": hint, "rejected": Counter()})
+            entry["rejected"][rejected] += 1
             for field in ("scope_words", "named_parameters", "limit_headers", "hint_note"):
                 if meaning.get(field):
                     entry[field] = meaning[field]
@@ -199,6 +255,7 @@ def error_shapes(rows: list[dict[str, Any]], bodies: dict[str, str]) -> list[dic
             "count": group["count"],
             "body_shapes": [{"shape": name, "count": count}
                             for name, count in group["bodies"].most_common(3)],
+            "rejected_by": group["rejected"].most_common(1)[0][0],
         }
         if group["header_names"]:
             item["response_headers"] = sorted(group["header_names"])[:EVIDENCE_LIMIT]
@@ -208,6 +265,9 @@ def error_shapes(rows: list[dict[str, Any]], bodies: dict[str, str]) -> list[dic
         if group["messages"]:
             item["messages"] = [message for message, _ in group["messages"].most_common(2)]
         meanings = sorted(group["meanings"].values(), key=lambda entry: entry["hint"])
+        for entry in meanings:
+            rejected_counts = entry.pop("rejected")
+            entry["rejected_by"] = rejected_counts.most_common(1)[0][0]
         if meanings:
             item["meaning"] = meanings[0]
             if len(meanings) > 1:

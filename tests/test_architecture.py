@@ -82,8 +82,13 @@ def test_allowed_dependencies_and_own_modules(source):
 # one message branch for the popup's Update button, reusing its own reload command.
 # agent_presence.py is new to this table: the corner-mark geometry became documented
 # constants carried in the installer's CONFIG instead of literals inside the script.
+# 1.27.0 (captcha classification): browser_tools.py went down by one line - the inline
+# "this captcha cannot be solved" block became a call into captcha.unsolved_report, which
+# now names the vendor and the challenge type it saw. The classification lives in
+# captcha_solvers/classify.py and the protocol reader in captcha_solvers/tc_protocol.py,
+# so nothing was added to this file.
 _RATCHET_CEILINGS = {
-    "web_search_neo/browser_tools.py": 8605,
+    "web_search_neo/browser_tools.py": 8604,
     "web_search_neo/main.py": 2822,
     "web_search_neo/page_perception.py": 2720,
     "web_search_neo/chrome_bridge.py": 2090,

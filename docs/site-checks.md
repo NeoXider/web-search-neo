@@ -557,7 +557,10 @@ short result.
 8. When a scenario step fails because the page asked for something it named itself - a
    checkbox, a date format, a moment to finish - `auto_fix {session_id}` applies exactly that
    and reports what it touched; re-run the step. What it refuses (`several_consent_labels`,
-   `several_formats_named`, `no_field_named`) is a decision for you, not for a guess.
+   `several_formats_named`, `no_field_named`) is a decision for you, not for a guess. Run it with
+    `dry_run: true` first on a site you do not own.
+ 9. When a step stops at a captcha, `captcha_challenge {page_url}` names it - vendor, kind, and whether
+    this machine can measure that pair - before anything is spent on an answer.
 
 ## `auto_fix`: when the page says what it wants
 
@@ -583,6 +586,42 @@ Refusals are named and carry the candidates the page offered: `no_consent_word_n
 that the page rejected (its control was gone) is listed in `skipped` with its reason, never
 hidden. `consent=false`, `format_hint=false`, `wait=false` switch a family of fixes off;
 `selector` narrows it to one control. It does not submit, click a button or solve a captcha.
+
+A demand written as prose instead of attached to a control is read too — "please wait a moment",
+"by continuing you agree to our cookies and terms", "enter the date as DD.MM.YYYY", "select these
+in order" become `wait`, `consent`, `field_format` and `ordered_selection`. `dry_run=true` reports
+what it would touch without touching anything; run it first on a site you do not own. `undo=true`
+ticks its own consent click back off, or refuses with `nothing_to_undo`. A sentence naming no
+intent is `no_intent_recognised`; one that could mean two things is `ambiguous_prose` with both
+candidates; an ordering demand is `ordered_selection_needs_agent`, because the order is your
+decision, not a click.
+
+## `captcha_challenge`: name the challenge before spending anything
+
+```json
+{"actions":[{"action":"captcha_challenge","page_url":"https://console.example.com/auth",
+             "site_aid":true}]}
+```
+
+A captcha that is not a slider used to be invisible here. This reads the vendor's own answer —
+Tencent's `cap_union_prehandle`, which replies only to a JSONP GET carrying the page's
+Referer/Origin and refuses a POST with 403 (the reason third-party solvers stall on it) — and
+reports vendor, kind (`slider`, `word_click`, `icon_click`, `image_select`, `checkbox`), the
+instruction text, grid size, subcapclass and the hash-of-the-attempt config. It then measures the
+served picture against a shape built from that instruction and reports the colour bands it tried,
+the best score reached, and whether anything is sure. Nothing is sent.
+
+| Field | What it means |
+| --- | --- |
+| `challenge` | which kind this is; only `slider` on TCaptcha/Geetest is draggable here today |
+| `measurement.sure` | false means no answer should be spent, and `captcha_verify` will not spend one |
+| `measurement.tried_bands`, `best_band`, `boxes` | what the measurement looked at and where it landed |
+| `site_aid` result | the encrypted id blob the site publishes, its encoding, and any plaintext id |
+
+`captcha_verify {page_url, aid, boxes}` spends exactly one attempt, and only when the measurement
+was sure *and* the challenge's hash was solved; either way out is a refusal that sent nothing.
+`captcha`'s unsolved report carries the same naming as `challenge_classification`, including
+`solver_available` and — when false — the sentence saying what would be needed.
 
 The same rule covers a repeated step: an observing action that failed while the page asked to
 wait is tried once more after the pause the page implied; a step that changes the page

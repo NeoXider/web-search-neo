@@ -21,7 +21,11 @@ LEGACY_MAX_LINES = {
     # the duplicated slider attempt inside `captcha` came out, and most of what is
     # left is the behaviour each path now has to state. The pointer and captcha
     # adapter clusters are still worth extracting.
-    "web_search_neo/browser_tools.py": 8605,
+    # Lowered 8605 -> 8604 (2026-10-14) for 1.27.0: the inline "this captcha cannot be
+    # solved" block became one call into captcha.unsolved_report, which now names the
+    # vendor and challenge type. Classification lives in captcha_solvers/classify.py and
+    # the protocol reader in captcha_solvers/tc_protocol.py; nothing was added here.
+    "web_search_neo/browser_tools.py": 8604,
     # Raised 2680 -> 2706 (2026-10-13) for the update_companion action and its tool:
     # the pull, the refusal rules and the reload all live in companion_update.py, so
     # this file only carries the call and what it says it refuses.

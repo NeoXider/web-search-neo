@@ -14,6 +14,48 @@ import web_search_neo.main as main
 from web_search_neo import obstacle_recovery, obstacle_scripts
 
 
+def test_the_reading_script_also_reports_the_pages_plain_prose():
+    script = obstacle_scripts.read_script()
+    assert "out.prose" in script
+    assert "document.body" in script
+
+
+def test_the_untick_script_mirrors_the_tick_script():
+    script = obstacle_scripts.untick_script("#terms")
+    assert "document.querySelector(\"#terms\")" in script
+    assert "the named control is not on the page" in script
+    assert "that control is not a checkbox" in script
+    assert "if (!node.checked) return {success: true, already: true};" in script
+    quoted = obstacle_scripts.untick_script('input[name="a\"] ; alert(1)")')
+    assert quoted.count("document.querySelector(") == 1
+
+
+def test_state_of_keeps_the_prose_but_cuts_it():
+    state = obstacle_scripts.state_of({"prose": "p" * 1500})
+    assert len(state["prose"]) == 1000
+    assert obstacle_scripts.state_of({})["prose"] == ""
+
+
+def test_auto_fix_publishes_dry_run_and_undo_next_to_its_switches():
+    spec = main._ACTIONS.get("auto_fix")
+    assert spec is not None
+    fields = main._argument_model(spec.tool_name).model_fields
+    assert {"dry_run", "undo"} <= set(fields)
+    assert fields["dry_run"].default is False
+    assert fields["undo"].default is False
+
+
+def test_the_new_refusals_are_the_ones_the_contract_promises():
+    from web_search_neo.contract.notes import _ACTION_NOTES
+
+    notes = _ACTION_NOTES["auto_fix"]["refusals"]
+    for refusal in ("ambiguous_prose", "ordered_selection_needs_agent", "several_fields_named",
+                    "nothing_to_undo"):
+        assert refusal in notes, refusal
+    assert "dry_run" in _ACTION_NOTES["auto_fix"]["limits"]
+    assert "undo" in _ACTION_NOTES["auto_fix"]["limits"]
+
+
 def test_the_reading_script_asks_only_for_what_the_page_named_itself():
     script = obstacle_scripts.read_script()
     # Ни одного выдуманного адреса: читаются live-области, чекбоксы и подсказки формата.

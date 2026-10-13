@@ -5706,12 +5706,11 @@ def solve_captcha(
             key: value for key, value in slider.items() if key != "locate"
         }
     if not waited["resolved"]:
-        outcome["error"] = (
-            f"The captcha was still on the page after {waited['waited_seconds']:.0f}s. "
-            "It needs a person to click it in the browser window, or an explicit "
-            "mode='solve' with a solving service configured through "
-            "WEB_SEARCH_NEO_CAPTCHA_KEY."
+        report = captcha.unsolved_report(
+            lambda script: execute_js(script, session_id=session_id),
+            found, slider, status, waited["waited_seconds"],
         )
+        outcome.update(report)
     return outcome
 
 

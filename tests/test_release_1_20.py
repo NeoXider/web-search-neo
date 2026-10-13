@@ -1,4 +1,4 @@
-"""1.20: security_report, perf_report, har_export, test_run, third_party_only, summary=min, isolated default.
+﻿"""1.20: security_report, perf_report, har_export, test_run, third_party_only, summary=min, isolated default.
 
 Everything runs against local fixtures (``security_fixture_site``, ``local_site``):
 no test reaches the internet. Chrome-backed tests skip when Chrome is missing.
@@ -13,6 +13,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import web_search_neo.main as main
+from web_search_neo.contract import budget
 import pytest
 
 import security_fixture_site as fixture_site
@@ -767,7 +769,7 @@ def test_third_party_rows_need_a_page_address():
 
 def test_contract_carries_the_new_actions_and_recipes_within_budget():
     document = main._capabilities()
-    assert len(json.dumps(document)) <= 13_500  # the 14 000 budget with a 500-character margin
+    assert len(json.dumps(document)) <= budget.CONTRACT_BUDGET  # the 14 000 budget with a 500-character margin
     assert {"security_report", "perf_report", "har_export", "test_run"} <= set(document["actions"])
     assert "security_report" in document["actions"]
     assert {"release_check", "form_regression"} <= set(document["recipes"])

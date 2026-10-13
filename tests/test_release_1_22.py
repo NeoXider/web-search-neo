@@ -1,4 +1,4 @@
-"""1.22: secret_scan, SARIF export and baseline regressions.
+﻿"""1.22: secret_scan, SARIF export and baseline regressions.
 
 Pure analysis tests pin the secret patterns (values never leak), the code
 endpoint map, the openapi view, the SARIF shape and the diff; the fixture
@@ -16,6 +16,8 @@ from pathlib import Path
 
 
 
+import web_search_neo.main as main
+from web_search_neo.contract import budget
 import pytest
 
 import secret_fixture_site
@@ -196,7 +198,7 @@ def test_secret_scan_in_the_action_table_and_the_contract():
     assert specs["secret_scan"][1] == "audit"
     assert "secret_scan" in main._ACTIONS
     assert "secret_scan" in param_docs._BY_ACTION and "secret_scan" in notes._ACTION_NOTES
-    assert len(json.dumps(main._capabilities())) <= 13_500
+    assert len(json.dumps(main._capabilities())) <= budget.CONTRACT_BUDGET
 
 
 def test_sarif_and_baseline_in_report_schemas():

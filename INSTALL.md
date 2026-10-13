@@ -2,7 +2,7 @@
 
 This guide installs the MCP server from source and connects it to LM Studio or another stdio-compatible MCP client.
 
-It describes version 1.26.0. The Python package, the server, and the bundled Chrome
+It describes version 1.27.0. The Python package, the server, and the bundled Chrome
 companion carry that same version, and the bridge only accepts a companion that speaks the
 current handshake (bridge protocol 2, since 1.15.0) — see [Updating](#updating) if an older one is already
 installed.
@@ -239,7 +239,7 @@ Earlier revisions tried to perform those clicks for you through Windows UI Autom
 code is gone. It depended on the interface language, on which window happened to have focus,
 and on a folder picker that the automation backend does not even enumerate.
 
-The bundled companion is version 1.26.0 and declares five permissions: `alarms`, `debugger`,
+The bundled companion is version 1.27.0 and declares five permissions: `alarms`, `debugger`,
 `storage`, `tabs`, and `tabGroups`. There are no content scripts and no `host_permissions`;
 page access comes from `debugger`, which attaches the Chrome DevTools Protocol to the tabs
 the agent drives. `alarms` exists because Chrome suspends an idle MV3 service worker after
@@ -540,6 +540,15 @@ Two cases still need the human:
 Confirm with `web_info(topic="browser_status")` that `current_chrome.connected` is `true`
 before continuing.
 
+### Migrating to 1.27: a captcha is named before anything is spent
+
+Nothing to change in your existing calls, and no new environment variable. Two habits are worth changing:
+
+- Before calling anything that answers a captcha, call `captcha_challenge {page_url}` (with `aid=` when the site does not publish its own id, or `site_aid=true` to read the id document the site publishes). It says which vendor and which kind of challenge this is, and whether this machine can measure it. An image-select grid - "click the tiles showing X" - is not a slider, and dragging one was the fastest way to burn its single attempt. `captcha_verify` refuses an unsure measurement or an unsolved hash on its own, so nothing is wasted even if you forget.
+- Run `auto_fix {dry_run: true}` before `auto_fix`. It reports what the page asked for without touching it, and `undo: true` takes a consent click back when the guess was wrong.
+
+`api_report` answers gained two fields that change what a 403 means: every entry in `error_meanings[]` now carries `rejected_by` (`edge` or `application`), and `probe_journal` lists, per host, the `{id}` path templates this host already answered and what each status meant there. Both come from traffic already captured - the audit still sends no probe requests.
+
 ### Migrating to 1.26: a repeated step is now reported, and only an observing one repeats
 
 Nothing to change in your calls. What changed is what an agent may do on its own: an observing step (`wait`, `screenshot`, the `fetch_*` topics) that failed while the page itself said "please wait" is tried once more after the pause the page implied, and the answer names every attempt (`attempts`) and, when repeats stop, why they stopped (`retry_stopped`). A step that changes the page - `submit`, `click`, `fill`, `press_keys` - is still never repeated, so no form submits twice because a timeout looked like a failure. Set `WEB_SEARCH_NEO_RETRY=0` if you want every step attempted exactly once, as before. Every step now also reports `duration_ms`.
@@ -700,7 +709,7 @@ or when `setup_current_chrome` answered `self_update: "unsupported"` or `"timeou
    very directory **Load unpacked** points at, then reload the extension. Restarting the
    daemon does not help and never did after the daemon learned to re-read the token file:
    it already fetches the current secret from disk before calling anything a mismatch.
-3. Check the card's version. It must read 1.26.0; anything older speaks bridge protocol 1
+3. Check the card's version. It must read 1.27.0; anything older speaks bridge protocol 1
    and is refused with `Expected Web Search Neo bridge protocol 2; update and reload the
    companion`, and Chrome only picks up the new manifest on reload.
 4. `%LOCALAPPDATA%\WebSearchNeo\bridge-daemon.log` records the bridge's side: `Rejected a

@@ -1,4 +1,4 @@
-"""1.21: api_report - the map of the page's backend calls and what each response says.
+﻿"""1.21: api_report - the map of the page's backend calls and what each response says.
 
 Pure analysis tests pin the endpoint map, the redaction (values never leak)
 and every check family case by case; the fixture server (``api_fixture_site``)
@@ -16,6 +16,8 @@ import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 
+import web_search_neo.main as main
+from web_search_neo.contract import budget
 import pytest
 
 import api_fixture_site
@@ -322,7 +324,7 @@ def test_api_report_in_the_action_table_and_the_contract():
     assert "api_report" in main._ACTIONS
     assert "api_report" in param_docs._BY_ACTION and "api_report" in notes._ACTION_NOTES
     assert "api_report" in Path(playbook.__file__).read_text(encoding="utf-8")
-    assert len(json.dumps(main._capabilities())) <= 13_500
+    assert len(json.dumps(main._capabilities())) <= budget.CONTRACT_BUDGET
 
 
 def test_security_headers_carry_the_api_set():

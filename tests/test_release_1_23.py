@@ -1,4 +1,4 @@
-"""1.23: active_probe - bounded active checks with the call as consent.
+﻿"""1.23: active_probe - bounded active checks with the call as consent.
 
 Pure analysis tests pin the preflight/method/redirect/reflection verdicts;
 the fixture server (``active_fixture_site``) answers OPTIONS/TRACE, bounces
@@ -13,6 +13,8 @@ import re
 import urllib.request
 from pathlib import Path
 
+import web_search_neo.main as main
+from web_search_neo.contract import budget
 import pytest
 
 import active_fixture_site
@@ -129,7 +131,7 @@ def test_active_probe_in_the_action_table_and_the_contract():
     assert specs["active_probe"][1] == "audit"
     assert "active_probe" in main._ACTIONS
     assert "active_probe" in param_docs._BY_ACTION and "active_probe" in notes._ACTION_NOTES
-    assert len(json.dumps(main._capabilities())) <= 13_500
+    assert len(json.dumps(main._capabilities())) <= budget.CONTRACT_BUDGET
 
 
 def test_probe_params_in_action_schema():

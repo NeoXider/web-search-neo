@@ -11,7 +11,8 @@ import asyncio
 import time
 from typing import Any, Literal
 
-from web_search_neo import audit_actions, browser_tools, frame_capture, frame_health, page_guards
+from web_search_neo import audit_actions, browser_tools, captcha_actions, captcha_aid, frame_capture
+from web_search_neo import frame_health, page_guards
 from web_search_neo import owned_parking, tab_actions
 from web_search_neo.sessions import parking as current_parking
 
@@ -191,6 +192,17 @@ async def browser_look(
     return await asyncio.to_thread(run)
 
 
+async def captcha_challenge(page_url: str = "", aid: str | None = None, site_aid: bool = False) -> dict[str, Any]:
+    """Name a captcha challenge; site_aid reads the app id the site publishes."""
+    return await asyncio.to_thread(_captcha_challenge, page_url, aid, site_aid)
+
+
+def _captcha_challenge(page_url: str, aid: str | None, site_aid: bool) -> dict[str, Any]:
+    if site_aid:
+        return captcha_aid.captcha_aid(page_url)
+    return captcha_actions.captcha_read(page_url, aid=aid)
+
+
 ACTION_SPECS = (
     ("navigate", browser_navigate, "session", "Go to a URL in an open session, keeping its browser and profile."),
     ("dialogs", browser_dialogs, "page", "Read alert/confirm/prompt texts; accept or dismiss the next ones."),
@@ -198,6 +210,10 @@ ACTION_SPECS = (
     ("wait_frames", browser_wait_frames, "game", "Let N animation frames render, e.g. between a click and keys."),
     ("unthrottle", browser_unthrottle, "game", "Un-throttle a background tab; reports raf_fps before/after."),
     ("look", browser_look, "game", "Turn a pointer-locked camera smoothly by dx/dy in steps."),
+    # 1.27.0: one entry, two readings - the challenge's own kind, or the id the site publishes.
+    # `verify` stays off the contract: spending an answer needs a sure measurement first, so
+    # captcha_actions.captcha_verify is reached through web_action only when you ask for it.
+    ("captcha_challenge", captcha_challenge, "page", "Name the captcha challenge; site_aid=true reads its id."),
 ) + audit_actions.ACTION_SPECS + tab_actions.ACTION_SPECS  # 1.20: site checks; tabs of Selenium sessions
 
 
@@ -214,4 +230,5 @@ def register(server: Any, facade: Any = None) -> None:
 
 
 __all__ = ["ACTION_SPECS", "browser_dialogs", "browser_downloads", "browser_look", "browser_navigate",
-           "browser_unthrottle", "browser_wait_frames", "image_to_viewport", "inherited_open_options", "register"]
+           "browser_unthrottle", "browser_wait_frames", "captcha_challenge",
+           "image_to_viewport", "inherited_open_options", "register"]

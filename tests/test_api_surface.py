@@ -87,6 +87,48 @@ def test_an_error_that_says_nothing_about_the_api_gets_no_hint():
     assert "hint" not in meaning
 
 
+# --- кто отказал: ребро/WAF или само приложение ------------------------------
+
+def test_an_empty_body_with_edge_headers_is_an_edge_rejection():
+    body = api_errors.parse_body("")
+    meaning = api_errors.error_meaning(403, body, {"cf-ray": "abc", "server": "cloudflare"})
+    assert meaning["rejected_by"] == "edge"
+    assert "hint" not in meaning  # порядок hint'ов не тронут: пустота ничего не публикует
+
+
+def test_a_json_error_envelope_is_the_application_even_behind_a_cdn():
+    body = api_errors.parse_body('{"code":"FORBIDDEN","msg":"admin access required"}')
+    meaning = api_errors.error_meaning(403, body, {"cf-ray": "abc", "server": "cloudflare"})
+    assert meaning["rejected_by"] == "application"
+    assert meaning["hint"] == "access_scope"
+
+
+def test_a_server_header_alone_can_name_the_edge():
+    body = api_errors.parse_body("<html><h1>403 Forbidden</h1></html>")
+    meaning = api_errors.error_meaning(403, body, {"server": "cloudfront"})
+    assert meaning["rejected_by"] == "edge"
+
+
+def test_without_edge_signals_or_an_envelope_the_rejector_is_unknown():
+    body = api_errors.parse_body("upstream failed")
+    assert api_errors.error_meaning(500, body, {})["rejected_by"] == "unknown"
+    assert api_errors.error_meaning(200, {"kind": "empty"},
+                                    {"x-ratelimit-remaining": "9"})["rejected_by"] == "unknown"
+
+
+def test_error_shapes_carry_the_rejector_per_group_and_per_hint():
+    rows = [_row("/v1/admin", 403, row_id="a", headers={"cf-ray": "x"}),
+            _row("/v1/admin", 403, row_id="b",
+                 headers={"cf-ray": "y", "content-type": "application/json"})]
+    bodies = {"a": "", "b": '{"code":"FORBIDDEN","msg":"admin access required"}'}
+    shapes = api_errors.error_shapes(rows, bodies)
+    assert len(shapes) == 1
+    # группа смешана: большинство решает; hint-запись несёт своё большинство
+    assert shapes[0]["rejected_by"] in {"edge", "application"}
+    assert shapes[0]["meaning"]["hint"] == "access_scope"
+    assert shapes[0]["meaning"]["rejected_by"] == "application"
+
+
 def test_report_carries_errors_and_meanings_without_new_requests():
     rows = [_row("/web/v1/admin/users", 403, row_id="a")]
     report = api.build(rows, page_url=PAGE, bodies={"a": '{"code":"FORBIDDEN","msg":"admin access required"}'})

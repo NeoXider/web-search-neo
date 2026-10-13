@@ -20,6 +20,8 @@ from web_search_neo.audit.api_contract import collect as collect_contract
 from web_search_neo.audit.api_errors import error_shapes
 from web_search_neo.audit.api_parts import EVIDENCE_LIMIT
 from web_search_neo.audit.findings import info
+from web_search_neo.audit.probe_journal import query as journal_query
+from web_search_neo.audit.probe_journal import seed_from_traffic
 from web_search_neo.audit.api_checks import (auth_findings, cache_findings, content_findings, cors_findings,
                                              csrf_findings, error_findings, transport_findings, url_findings)
 from web_search_neo.audit.api_parts import (ENDPOINT_LIMIT, EVIDENCE_LIMIT, channel, cookie_views, endpoint_map, is_own,
@@ -42,8 +44,9 @@ SCOPE_TEXT = (
     "`errors` groups 4xx/5xx by method, path template and status with the body's shape and its error "
     "code, and `error_meanings` names what those responses publish - a role or scope that guards routes, "
     "a balance or plan wall, a rate limit and the headers that carry it, a validation rejection and the "
-    "parameter it named. Error codes and messages are quoted because they are the API's own published "
-    "vocabulary; user data in them is masked."
+     "parameter it named. Error codes and messages are quoted because they are the API's own published "
+     "vocabulary; user data in them is masked. `probe_journal` carries the already-tried-here memory "
+     "(per-host attempts grouped by outcome, seeded from this run's own traffic only)."
 )
 
 
@@ -135,6 +138,12 @@ def build(rows: list[dict[str, Any]], *, page_url: str, jar: list[Any] | None = 
     first = "; ".join(item["title"] for item in order[:3]) or "nothing to fix"
     endpoints = endpoint_map(rows)
     errors = error_shapes(own_rows, bodies or {})
+    try:
+        seeded = seed_from_traffic(error_rows, bodies or {})
+        journal = {host: journal_query(host, limit=ENDPOINT_LIMIT)
+                   for host in seeded["hosts"]}
+    except Exception:  # журнал — память, а не условие отчёта
+        seeded, journal = {"recorded": 0, "hosts": []}, {}
     contract: dict[str, Any] | None = None
     if fetch_spec is not None:
         try:
@@ -161,6 +170,9 @@ def build(rows: list[dict[str, Any]], *, page_url: str, jar: list[Any] | None = 
         "endpoints": endpoints[:ENDPOINT_LIMIT],
         "errors": errors[:ENDPOINT_LIMIT],
         "error_meanings": [item["meaning"] for item in errors if item.get("meaning")][:EVIDENCE_LIMIT],
+        "probe_journal": {"hosts": journal, "seeded_this_run": seeded["recorded"],
+                          "note": ("Already-tried-here memory, seeded from this run's own captured "
+                                   "traffic only — no new requests were sent to fill it.")},
         **({"contract_drift": contract} if contract else {}),
         "auth": {"cookies": cookies, "local_storage": local, "session_storage": session,
                  **({"storage_note": storage_error} if storage_error else {})},

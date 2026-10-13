@@ -16,6 +16,9 @@ _RECIPES = {
         "macro run {name, variables}",
     ],
     "existing_tab": ["browser_tabs", "attach_tab {tab_id}", "page_elements", "act"],
+    # 1.27.0: name the obstacle before acting on it - captcha_challenge says what kind it is,
+    # auto_fix dry_run says what the page itself asked for. Both read, neither touches.
+    "blocked_page": ["captcha_challenge {page_url}", "auto_fix {dry_run: true}", "act on what it named"],
     "canvas_text": ["focus the canvas", "type_text {text, mode: 'keys'}", "verify via screenshot"],
     "lazy_page": ["page_elements (offscreen DOM included)", "scroll {delta_y: positive}",
                   "page_elements; offset until next_offset=null"],
@@ -40,6 +43,9 @@ _PITFALLS = [
     "Locators are plain CSS: never send ref: from page_outline or >>> to actions.",
     "Repeated text is not identity: match href/value/attributes, or click_text exact text + role.",
     "challenge_detected: a CAPTCHA blocks the page; use captcha, never hammer clicks.",
+    # 1.27.0: captcha_challenge names the kind (slider / word_click / image_select / checkbox);
+    # only a slider is measured here, so an unsure measurement must not be verified.
+    "captcha_challenge says which kind it is and if it can be measured; verify only when sure.",
     "find low_confidence=true is guessing: re-query, do not click matches[0].",
     "New sessions open isolated; profile_mode='current' is the user's Chrome and logins (close closes only the agent's tabs).",
     "Parallel agents: own session_id each, agent_label on open; close_all scope='mine' ends only yours.",

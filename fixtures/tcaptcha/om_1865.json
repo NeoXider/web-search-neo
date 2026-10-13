@@ -1,0 +1,37 @@
+{
+  "vendor": "tencent",
+  "challenge": "image_select",
+  "state": 1,
+  "capclass": "1",
+  "subcapclass": "1865",
+  "sess": "s1Rq7JIkiUM929d3ckXh5f-WN7Ts03ITn2qSwKc3QD3by5JdlaaDcKAG0gImWtJf7WKL33CoSUf0XrCLlifbUzD3HGLM1a1suLsPpqKvNaUe12PudEDhXEZ5X-K9IrX_DH6DaM8DXS3myz0TKeWnc8xUYAEDR40xM5TWJjq-Q2kSt7bm6tztTNB19YSvibYYTBqWF0kuT90xTgp-KBa5OAyhycpqB00CXo36OwS7m05T-UZNOsTPf6KiEuREWdNB9-zCSVRvCOpt05xsGeD1fFFiBsuEmhu7WrEogd0dJ3AultNCtqlRMiosLLZzZvScNeipweE103iEp6mX_tWHKP0AK8AwE4YTFwy3m5HgJz1VaYWoYzamw-jQ3aQPnZ5siC6EOXlvSiCiF778lSyM_kGWfHD7IYxOwB7TyDoex1lXNRuBy306UiA6C-iwLzP9LpskGBYFdabb-Cqb1diVHGnK_1xXJ7d9cKkCYiR52xGxT___aAlIYO92wruMHPIwfyc4iDzQbPSgBzzkqABrSuSze8F9QVIauAXAW_lGygPl2FTPQLu5frFBmkou9EGIPyhzIKn80SHCn_2VpSxqLf2pD3Q0px_jlDUPQ6z2-8XUB5iTGMDuH842Wd2yZTHCdWxn2cmjIQVpv5_SJFjNacTKvqPuCdjbrXkxX7bNaYTPGlX74s3B1-Cq6dd8g2_zQ43n8kPacpgPbYDsbdAzluVzcTF-ERjGui5cz-6SEv6TcKz75grCd8m2dv-XOERw-JkE6uJ8K9R1QS3cEEDAtd9GGLzQGg9nGI2gs3JH_tEQ2L0jZH4mUFEn73SqJKzdX4",
+  "sid": "7515887571630276608",
+  "randstr": "",
+  "instruction": "“苹果”",
+  "targets": [
+    "苹果"
+  ],
+  "show_type": "click_image_uncheck",
+  "image_url": "https://t.captcha.qq.com/cap_union_new_getcapbysig?img_index=1&image=024907000088349700000009d004e1312b41&sess=s1Yd_2duqjg0zcEaKBX8EH0CuJ3fktNInuQhCVUV0ncWjn6isbuDe5ENcTVHjmPN1BjSZJJSbW814cB9qf9jh7Lnsl3CCwW5VKYBrcA8XmRezPDJ4mpVdOtPj6x_R0tUQSEYR9xYu-AXi5r7bKdQDD-yjhWYtXeyp-szhbTL0DcYc5AuVGqkEzbfCPb0hZTpk_0jQDuyJs_uGyrf7WFZym8N_Tmtho6WrC8TUrUyck2Uw0Cir-BZ9YRiubpqIKH71UFhsJh4UOEEMojw-Ua5lsfrVSx1UKo62TAecjfw1LwXmPtFE0e_tiQiHrWRVdaPUXbtmbk4UVZdWkwdHg35H0KpLHWCU640y7cNU-T16-t7L-ha0SdAXZFc9TmetzcebrdzX2g9m5Q_irjbxsCEwc7LO0qhNZb4Hk99ZC1egLoG82Rj2BL_17F4rF8LQPX_giCaaNnKlQmc8uK_2TyDswpmxNcBxge62cLNzGv4Lj8hiqt-R7anQyVLWb_hnCp7U1V55x_5d0wt_cfwlx--GM5muozG9vbR77oRGfMmuVloMR57EKSw7a5WSduGijEs1jo-BCdXlR0y4bBjJ-mkFy3l34dCbJuWEKXTbLeMnXy5kfH_tVuk5YQeT4UcJefcNE-YXsmbzbbjH-HZcmlfolEKk_cuL5DV5aX6KAO2w4j1YedOEKn-4zRz7O6HzLnHBIrMXdR9gSK3s6QK19bI2J7FfnftStfm4baxagRT-BO6iutLLvWEhLf5Dd8CzDUxIOEsEzkl3g11x8Xx29u86OG8DmXXtxzJYB4FNrkNgGdcs8lV9CHXLlszCaea4-qHTk",
+  "image_size": [
+    672,
+    480
+  ],
+  "click_cfg": {
+    "mark_style": "mask",
+    "data_type": [
+      "DynAnswerType_UC"
+    ]
+  },
+  "tdc_path": "/tdc.js?app_data=7515887571630276608&t=72475089&appid=196724674&js_data=d04VmvVxV4OJZLS0GMbVHDLWArgd_xSZuOZVIyp-z3m1Y1591p8glZDSKAJd6s5HoYBJDtvIHfWtkZW00_Eq3DJHBINgQ2qoZeMD-8lK1vrKU3psRHsGY8_1rskx0bGaFM428eGd5G8lbPA0IYaRvotRubOoqDaPsZo&a=b",
+  "pow_prefix": "fe5ccd5f03eed181#",
+  "pow_md5": "3fef581a0292761e6cd18fc47c607b87",
+  "answer_type": [
+    "DynAnswerType_UC"
+  ],
+  "pow_answer": {
+    "solved": true,
+    "salt": "9057",
+    "tried": 9058
+  }
+}

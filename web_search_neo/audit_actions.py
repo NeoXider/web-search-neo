@@ -704,6 +704,17 @@ def _apply_fix(session_id: str, selector: str, value: Any, timeout: float) -> di
                                                         if filled.get("errors") else {})}
 
 
+# Что auto_fix сам применил в каждой сессии: откат undo трогает только это.
+_AUTO_FIX_JOURNAL: dict[str, list[dict[str, Any]]] = {}
+
+
+def _revert_fix(session_id: str, selector: str, prior: Any, timeout: float) -> dict[str, Any]:
+    """Один откат: клик согласия снимается, остальное необратимо и говорится прямо."""
+    if not isinstance(prior, bool):
+        return {"success": False, "error": "only a consent click is reversible"}
+    return dict(_script_value(session_id, obstacle_scripts.untick_script(selector), None, timeout) or {})
+
+
 async def browser_auto_fix(
     session_id: str = "default",
     selector: str | None = None,
@@ -711,6 +722,8 @@ async def browser_auto_fix(
     format_hint: bool = True,
     wait: bool = True,
     timeout_seconds: float = 10.0,
+    dry_run: bool = False,
+    undo: bool = False,
 ) -> dict[str, Any]:
     """Fix what the page itself asked for: a checkbox to agree with, a field format, a wait.
 
@@ -719,9 +732,13 @@ async def browser_auto_fix(
     only when the page wrote that format next to it. Two candidate consents or two
     formats are left for you and the answer says why. `selector` limits the fix to
     the control you mean. It never clicks a button and never submits anything.
+    `dry_run` reports `would_apply` (targets, selectors, reasons) and touches
+    nothing. `undo` reverses only what this tool applied in the session (consent
+    clicks; a filled field keeps its text) and applies nothing new.
     """
     if not _session_exists(session_id):
         raise ValueError(f"auto_fix needs an open session; '{session_id}' has none")
+    journal = _AUTO_FIX_JOURNAL.setdefault(session_id, [])
 
     def read() -> dict[str, Any]:
         state = _obstacle_state(session_id, timeout_seconds)
@@ -734,13 +751,17 @@ async def browser_auto_fix(
     def apply(fix_selector: str, value: Any) -> dict[str, Any]:
         return _apply_fix(session_id, fix_selector, value, timeout_seconds)
 
+    def revert(fix_selector: str, prior: Any) -> dict[str, Any]:
+        return _revert_fix(session_id, fix_selector, prior, timeout_seconds)
+
     def locate(needle: str) -> dict[str, Any]:
         found = browser_tools.find_elements(needle, session_id=session_id, limit=1)
         return {"found": bool(found.get("success")) and bool(found.get("matches") or found.get("elements"))}
 
     answer = await asyncio.to_thread(
         obstacle_recovery.auto_fix, locate, read, apply, time.sleep,
-        consent=consent, format_hint=format_hint, wait=wait)
+        consent=consent, format_hint=format_hint, wait=wait, dry_run=dry_run, undo=undo,
+        journal=journal, revert=revert)
     return {"success": True, "session_id": session_id, "selector_filter": selector or None, **answer}
 
 

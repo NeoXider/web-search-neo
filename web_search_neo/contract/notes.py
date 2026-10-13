@@ -231,10 +231,10 @@ _ACTION_NOTES = {
         "result": "success, passed/failed/skipped/total, summary_line, failed_steps first, then steps[] with every check's verdict and duration_ms. stop_on_failure=false runs every step; include_data adds each action's short result.",
     },
     "auto_fix": {
-        "what_it_reads": "The page's own words: a live/status/alert region that asks to wait, the label of each unchecked checkbox, and the hint next to a field (aria-describedby, .field-error, data-format).",
+        "what_it_reads": "The page's own words: a live/status/alert region that asks to wait, the label of each unchecked checkbox, the hint next to a field (aria-describedby, .field-error, data-format), and the visible prose (prose) matched against an explicit intent table (wait, consent, field_format, ordered_selection).",
         "what_it_applies": "consent_checkbox - one click on the single control whose own label asks to agree; field_format - fill_fields with the format the page wrote beside that field; wait_when_asked - a short pause when the page's live region asked to wait. applied lists what it did, skipped names why each rest was left alone.",
-        "refusals": "several_consent_labels, several_formats_named, no_field_named (a hint with no control), no_format_named / no_consent_word_named (nothing to act on). A refusal changes nothing and leaves the choice to you.",
-        "limits": "One checkbox click and one field value: never a button, never a submit. selector limits both to the control you mean; consent/format_hint/wait switch each kind off.",
+        "refusals": "several_consent_labels, several_formats_named, no_field_named (a hint with no control), no_format_named / no_consent_word_named (nothing to act on), ambiguous_prose (its words ask for two different intents, candidates named), ordered_selection_needs_agent (items named in order are your taps), several_fields_named (prose names one thing, the page shows several controls), nothing_to_undo. A refusal changes nothing and leaves the choice to you.",
+        "limits": "One checkbox click and one field value: never a button, never a submit. selector limits both to the control you mean; consent/format_hint/wait switch each kind off. dry_run reports would_apply (targets, selectors, reasons) and touches nothing; undo reverses only its own consent clicks, a filled field keeps its text and a submitted form is not reversible.",
     },
     "execute_js": {
         "arguments": "params.script is the body of an async function: script='return document.title;' - or the bare one-line expression 'document.title', which returns itself. Top-level await works. Same semantics as run_script.",

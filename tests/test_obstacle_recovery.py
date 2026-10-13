@@ -226,3 +226,175 @@ def test_the_wait_is_measured_by_a_real_pause_and_not_reported_as_a_round_trip()
     assert time.monotonic() - started >= 0.5
     assert answer["applied"][0]["waited_seconds"] >= 0.5
     assert page.slept == []
+
+
+def test_prose_consent_words_map_to_the_consent_intent():
+    plan = recovery.classify_prose("I agree to the use of cookies")
+    assert plan["apply"] is True and plan["intent"] == "consent"
+    assert "agree_to_cookies" in plan["matches"]
+    assert "checkbox" in plan["needs"]
+
+
+def test_prose_date_words_map_to_a_format_with_its_value():
+    plan = recovery.classify_prose("Enter the date as DD.MM.YYYY")
+    assert plan["apply"] is True and plan["intent"] == "field_format"
+    assert plan["value"] == "DD.MM.YYYY"
+
+
+def test_prose_wait_words_map_to_the_wait_intent():
+    plan = recovery.classify_prose("Please wait a moment")
+    assert plan["apply"] is True and plan["intent"] == "wait"
+
+
+def test_prose_order_words_name_their_items_but_apply_nothing():
+    plan = recovery.classify_prose("Select in order: A B C")
+    assert plan["apply"] is False
+    assert plan["why"] == "ordered_selection_needs_agent"
+    assert plan["named"] == ["A", "B", "C"]
+    bare = recovery.classify_prose("Choose the items shown above")
+    assert bare["why"] == "ordered_selection_needs_agent" and bare["named"] == []
+
+
+def test_prose_asking_for_two_things_is_refused_with_its_candidates():
+    plan = recovery.classify_prose("Please wait a moment. I agree to the use of cookies")
+    assert plan["apply"] is False
+    assert plan["why"] == "ambiguous_prose"
+    assert plan["candidates"] == ["consent", "wait"]
+    assert recovery.classify_prose("nothing to act on here")["why"] == "no_intent_recognised"
+
+
+def test_prose_consent_ticks_the_pages_single_checkbox():
+    page = _Page([{"waiting_for": "", "consents": [{"label": "Subscribe", "selector": "#sub"}],
+                   "format_hints": [], "prose": "I agree to the use of cookies"}])
+    journal: list[dict] = []
+    answer = recovery.auto_fix(page.locate, page.read, page.apply, page.sleep, journal=journal)
+    assert answer["fixed"] is True
+    assert page.applied == [("#sub", True)]
+    assert answer["applied"][0]["reason"].startswith("Prose ")
+    assert journal == [{"fix": "consent_checkbox", "selector": "#sub", "label": "Subscribe",
+                        "reversible": True, "prior": False}]
+
+
+def test_prose_consent_with_several_boxes_is_left_for_the_agent():
+    page = _Page([{"waiting_for": "", "consents": [{"label": "News", "selector": "#a"},
+                                                  {"label": "Offers", "selector": "#b"}],
+                   "format_hints": [], "prose": "I agree to the use of cookies"}])
+    answer = recovery.auto_fix(page.locate, page.read, page.apply, page.sleep)
+    assert answer["fixed"] is False and page.applied == []
+    assert {item["why"] for item in answer["skipped"]} == {"no_consent_word_named", "several_fields_named",
+                                                           "no_format_named"}
+
+
+def test_prose_format_fills_the_pages_single_field():
+    page = _Page([{"waiting_for": "", "consents": [],
+                   "format_hints": [{"label": "Your birth date", "selector": "#dob"}],
+                   "prose": "Enter the date as DD.MM.YYYY"}])
+    journal = []
+    answer = recovery.auto_fix(page.locate, page.read, page.apply, page.sleep, journal=journal)
+    assert page.applied == [("#dob", "DD.MM.YYYY")]
+    assert answer["applied"][0]["reason"].startswith("Prose ")
+    assert journal[0]["reversible"] is False
+    assert journal[0]["why"] == "field_value_before_fix_unknown"
+
+
+def test_prose_wait_is_taken_when_the_live_region_is_silent():
+    page = _Page([{"waiting_for": "", "prose": "Please wait a moment"},
+                  {"waiting_for": "", "prose": ""}])
+    answer = recovery.auto_fix(page.locate, page.read, page.apply, page.sleep)
+    assert answer["applied"][0]["fix"] == "wait_when_asked"
+    assert page.slept == [recovery.WAIT_STEP_SECONDS]
+
+
+def test_prose_order_and_ambiguity_are_reported_not_applied():
+    for prose, why in (("Select in order: A B C", "ordered_selection_needs_agent"),
+                       ("Please wait a moment. I agree to the use of cookies", "ambiguous_prose")):
+        page = _Page([{"waiting_for": "", "consents": [], "format_hints": [], "prose": prose}])
+        answer = recovery.auto_fix(page.locate, page.read, page.apply, page.sleep)
+        assert answer["fixed"] is False and page.applied == [] and page.slept == []
+        assert answer["skipped"][-1]["why"] == why, prose
+
+
+def test_dry_run_reports_what_would_apply_and_touches_nothing():
+    page = _Page([{"waiting_for": "",
+                   "consents": [{"label": "I agree to the terms", "selector": "#terms"}],
+                   "format_hints": [{"label": "Expected format: DD.MM.YYYY", "selector": "#date"}],
+                   "prose": ""}])
+    journal: list[dict] = []
+    answer = recovery.auto_fix(page.locate, page.read, page.apply, page.sleep,
+                               dry_run=True, journal=journal)
+    assert answer["dry_run"] is True and answer["fixed"] is False
+    assert answer["applied"] == [] and page.applied == [] and page.slept == []
+    assert journal == []
+    would = {item["fix"]: item for item in answer["would_apply"]}
+    assert set(would) == {"consent_checkbox", "field_format"}
+    assert would["consent_checkbox"]["selector"] == "#terms"
+    assert would["field_format"]["format"] == "DD.MM.YYYY"
+    assert all("reason" in item and "selector" in item for item in answer["would_apply"])
+
+
+def test_dry_run_of_a_wait_does_not_pause():
+    page = _Page([{"waiting_for": "Processing, please wait"}])
+    answer = recovery.auto_fix(page.locate, page.read, page.apply, page.sleep, dry_run=True)
+    assert answer["would_apply"][0]["fix"] == "wait_when_asked"
+    assert page.slept == []
+
+
+class _Journal:
+    """Журнал применённого и примитив отката: клик снимается, заливка — нет."""
+
+    def __init__(self) -> None:
+        self.entries: list[dict] = []
+        self.reverted: list[tuple[str, object]] = []
+
+    def revert(self, selector: str, prior: object) -> dict:
+        self.reverted.append((selector, prior))
+        if selector == "#gone":
+            return {"success": False, "error": "the named control is not on the page"}
+        return {"success": True, "checked": False}
+
+
+def test_undo_reverses_only_the_consent_click_it_applied():
+    box = _Journal()
+    box.entries = [{"fix": "consent_checkbox", "selector": "#terms", "label": "I agree",
+                    "reversible": True, "prior": False},
+                   {"fix": "field_format", "selector": "#date", "format": "DD.MM.YYYY",
+                    "reversible": False, "why": "field_value_before_fix_unknown",
+                    "note": "The field's previous text was not recorded, so it cannot be restored."}]
+    answer = recovery.auto_fix(lambda n: {}, lambda: {}, lambda s, v: {}, lambda s: None,
+                               undo=True, journal=box.entries, revert=box.revert)
+    assert answer["undone"] == [{"fix": "consent_checkbox", "selector": "#terms", "reversed": True}]
+    assert box.reverted == [("#terms", False)]
+    assert [item["why"] for item in answer["not_reversed"]] == ["field_value_before_fix_unknown"]
+    assert [entry["fix"] for entry in box.entries] == ["field_format"]  # откаченное вычеркнуто
+
+
+def test_undo_with_no_journal_says_so_instead_of_touching_the_page():
+    calls: list[tuple[str, object]] = []
+
+    def revert(selector: str, prior: object) -> dict:
+        calls.append((selector, prior))
+        return {"success": True}
+
+    answer = recovery.auto_fix(lambda n: {}, lambda: {}, lambda s, v: {}, lambda s: None,
+                               undo=True, journal=[], revert=revert)
+    assert answer["undone"] == [] and answer["not_reversed"] == []
+    assert answer["why"] == "nothing_to_undo" and calls == []
+
+
+def test_undo_reports_a_control_that_is_no_longer_there():
+    box = _Journal()
+    box.entries = [{"fix": "consent_checkbox", "selector": "#gone", "reversible": True, "prior": False}]
+    answer = recovery.auto_fix(lambda n: {}, lambda: {}, lambda s, v: {}, lambda s: None,
+                               undo=True, journal=box.entries, revert=box.revert)
+    assert answer["undone"] == []
+    assert answer["not_reversed"][0]["why"] == "the named control is not on the page"
+    assert len(box.entries) == 1  # неоткаченное остаётся в журнале
+
+
+def test_undo_without_a_revert_primitive_reverses_nothing():
+    entries = [{"fix": "consent_checkbox", "selector": "#terms", "reversible": True, "prior": False}]
+    answer = recovery.auto_fix(lambda n: {}, lambda: {}, lambda s, v: {}, lambda s: None,
+                               undo=True, journal=entries, revert=None)
+    assert answer["undone"] == []
+    assert answer["not_reversed"][0]["why"] == "no_revert_primitive"
+    assert len(entries) == 1

@@ -63,6 +63,8 @@ for (const field of document.querySelectorAll('input[aria-describedby], input[ar
     if (selector) out.format_hints.push({label: text.slice(0, 200), selector: selector});
   }
 }
+// Просьба своими словами: видимый текст целиком, решает уже Python-таблица.
+out.prose = words(document.body || document.documentElement || '').slice(0, 1000);
 return out;
 """
 
@@ -72,6 +74,16 @@ const node = document.querySelector(%s);
 if (!node) return {success: false, error: 'the named control is not on the page'};
 if (node.type !== 'checkbox') return {success: false, error: 'that control is not a checkbox'};
 if (node.checked) return {success: true, already: true};
+(node.labels && node.labels[0] ? node.labels[0] : node).click();
+return {success: true, checked: Boolean(node.checked)};
+"""
+
+# Снять ровно один чекбокс: тот же клик по подписи, что ставит TICK_CONSENT.
+UNTICK_CONSENT = """
+const node = document.querySelector(%s);
+if (!node) return {success: false, error: 'the named control is not on the page'};
+if (node.type !== 'checkbox') return {success: false, error: 'that control is not a checkbox'};
+if (!node.checked) return {success: true, already: true};
 (node.labels && node.labels[0] ? node.labels[0] : node).click();
 return {success: true, checked: Boolean(node.checked)};
 """
@@ -87,11 +99,17 @@ def tick_script(selector: str) -> str:
     return SELECTOR_HELPER + TICK_CONSENT % json.dumps(selector)
 
 
+def untick_script(selector: str) -> str:
+    """Скрипт одного отката; адрес подставляется JSON'ом, а не склейкой."""
+    return SELECTOR_HELPER + UNTICK_CONSENT % json.dumps(selector)
+
+
 def state_of(value: Any) -> dict[str, Any]:
     """Ответ читающего скрипта: только списки подписей и адресов, всё остальное пусто."""
     if not isinstance(value, dict):
         return {}
-    out = {"waiting_for": str(value.get("waiting_for") or "")[:300]}
+    out = {"waiting_for": str(value.get("waiting_for") or "")[:300],
+           "prose": str(value.get("prose") or "")[:1000]}
     for key in ("consents", "format_hints"):
         items = value.get(key)
         out[key] = [item for item in (items if isinstance(items, list) else [])
