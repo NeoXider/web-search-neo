@@ -15,6 +15,8 @@ const releaseChipNode = document.querySelector("#release-chip");
 const messageNode = document.querySelector("#message");
 const checkReleaseButton = document.querySelector("#check-release");
 const openGitHubButton = document.querySelector("#open-github");
+const updateButton = document.querySelector("#update-companion");
+const updateHintNode = document.querySelector("#update-hint");
 const portInput = document.querySelector("#port");
 const savePortButton = document.querySelector("#save-port");
 const resetPortButton = document.querySelector("#reset-port");
@@ -30,6 +32,9 @@ const agentCountNode = document.querySelector("#agent-tabs-count");
 
 const GITHUB_URL = "https://github.com/NeoXider/web-search-neo";
 const RELEASES_API = "https://api.github.com/repos/NeoXider/web-search-neo/releases?per_page=1";
+// Where the newest published release lives, once the check has read it: the
+// Update button opens that page rather than a guess at it.
+let latestReleaseUrl = GITHUB_URL;
 
 // Read-only preview mode for scripts/companion-widget-preview.html: the same
 // production markup and code render simulated state, touching no chrome.* API,
@@ -182,6 +187,7 @@ async function checkRelease() {
       return;
     }
     const latest = releases[0];
+    latestReleaseUrl = String(latest.html_url || GITHUB_URL);
     const remote = String(latest.tag_name || latest.name || "").replace(/^v/i, "");
     const local = versionNode.textContent;
     const comparison = compareVersions(local, remote);
@@ -425,6 +431,36 @@ openGitHubButton.addEventListener("click", () => {
   chrome.tabs.create({url: GITHUB_URL});
 });
 
+// Update: pulling and reinstalling is a shell step this page cannot run, but the
+// half people actually forget is pressing Reload on the extension card - that is
+// what loads the pulled files into the running companion. So the button names the
+// command it cannot run, opens the release that explains it, and does the half it
+// can: reload the companion onto whatever is on disk now.
+updateButton.addEventListener("click", async () => {
+  updateButton.disabled = true;
+  messageNode.textContent = "Updating...";
+  try {
+    await checkRelease();
+    const remote = releaseNode.textContent.replace(/^update v/, "");
+    const behind = releaseNode.dataset.state === "update";
+    if (behind) {
+      updateHintNode.hidden = false;
+      updateHintNode.textContent =
+        `v${remote} is published. In the folder this extension was loaded from, run ` +
+        `"git pull --ff-only" and reinstall the package; this button then reloads the ` +
+        `companion onto those files.`;
+      if (!PREVIEW) chrome.tabs.create({url: latestReleaseUrl});
+    }
+    await send("companion.reloadExtension");
+    messageNode.textContent = behind
+      ? `Reloading the companion for v${remote}...`
+      : "Companion reloaded onto the files in this checkout.";
+  } catch (error) {
+    messageNode.textContent = error.message;
+    updateButton.disabled = false;
+  }
+});
+
 // Test and preview hook: the same render pipeline the popup uses, reachable
 // without Chrome. Production popups never read this property.
 if (typeof window !== "undefined") {
@@ -439,7 +475,7 @@ let previewTabs = 2;
 let previewCap = 8;
 let previewCeiling = 64;
 let previewPort = 8765;
-let previewVersion = "1.24.0";
+let previewVersion = "1.25.0";
 let previewUpdate = null;
 let previewEnabled = true;
 let previewPresence = true;
@@ -515,6 +551,10 @@ function previewSend(type, extra = {}) {
     previewTabs = 0;
     return Promise.resolve({...currentPreviewStatus(), detached_tabs: detached});
   }
+  if (type === "companion.reloadExtension") {
+    // The preview harness has no extension to reload, so it records the intent.
+    return Promise.resolve({reloading: true, version: previewVersion});
+  }
   if (type === "companion.setBridgePort") {
     const port = Number.parseInt(extra.port, 10);
     if (!Number.isFinite(port) || port < 1024 || port > 65535) {
@@ -552,7 +592,7 @@ function startPreview() {
   previewCap = Number.parseInt(params.get("cap"), 10) || 8;
   previewCeiling = Number.parseInt(params.get("ceiling"), 10) || 64;
   previewPort = Number.parseInt(params.get("port"), 10) || 8765;
-  previewVersion = params.get("ver") || "1.24.0";
+  previewVersion = params.get("ver") || "1.25.0";
   const agents = Number.parseInt(params.get("agents"), 10);
   previewAgents = Number.isFinite(agents) ? Math.max(0, agents) : 3;
   refresh().then(checkRelease).then(refreshAgentTabs);

@@ -1694,6 +1694,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     operation = loadEnabled().then(() => reconnectNow());
   } else if (type === "companion.releaseTabs") {
     operation = detachAllTabs().then(detached_tabs => ({...connectionStatus(), detached_tabs}));
+  } else if (type === "companion.reloadExtension") {
+    // The popup's Update button: nothing outside Chrome can press Reload on an
+    // unpacked extension card, and after a pull that is the only step left.
+    operation = Promise.resolve(commands["runtime.reload"]());
   } else if (type === "companion.setBridgePort") {
     operation = loadEnabled().then(() => setBridgePort(message.port));
   } else if (type === "companion.setMaxSessions") {

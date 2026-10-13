@@ -939,7 +939,8 @@ def test_popup_checks_the_release_version_and_opens_github() -> None:
 const callbacks = {{}};
 const ids = [
   "enabled", "presence", "reconnect", "release-tabs", "status", "tabs", "bridge", "version",
-  "release-status", "message", "check-release", "open-github",
+  "release-status", "message", "check-release", "open-github", "update-companion",
+  "update-hint",
   "port", "save-port", "reset-port", "port-default", "next-attempt",
   "max-sessions", "save-max-sessions", "reset-max-sessions", "max-sessions-default",
   "panel", "state-card", "max-sessions-value", "max-sessions-ceiling",
@@ -947,6 +948,7 @@ const ids = [
 ];
 const nodes = new Map(ids.map(id => [id, {{
   textContent: "", title: "", value: "", dataset: {{}}, checked: false, disabled: false,
+  hidden: false,
   style: {{width: ""}},
   addEventListener(type, callback) {{ callbacks[`${{id}}:${{type}}`] = callback; }},
 }}]));
@@ -954,7 +956,7 @@ globalThis.document = {{
   querySelector: selector => nodes.get(selector.slice(1)),
   activeElement: null,
 }};
-let opened = null;
+const openedUrls = [];
 const sent = [];
 // The fake worker remembers what it was told, exactly as the real one does:
 // a status read after a setting change has to report the setting, not the
@@ -982,11 +984,18 @@ globalThis.chrome = {{
       version: "1.3.4",
     }};
   }}}},
-  tabs: {{create: options => {{ opened = options.url; }}}},
+  tabs: {{create: options => {{ openedUrls.push(options.url); }}}},
 }};
+// The check the popup runs on its own says this build is current; the tag is
+// flipped only when Update is pressed, so the state the button acts on is the
+// state under test and nothing else drifts with it.
+let forcedTag = "v1.3.4";
 globalThis.fetch = async () => ({{
   ok: true,
-  json: async () => ([{{tag_name: "v1.3.4", html_url: "https://github.com/NeoXider/web-search-neo/releases/tag/v1.3.4"}}]),
+  json: async () => [{{
+    tag_name: forcedTag,
+    html_url: `https://github.com/NeoXider/web-search-neo/releases/tag/${{forcedTag}}`,
+  }}],
 }});
 globalThis.setInterval = () => 0;
 await import({json.dumps(popup_script)});
@@ -994,6 +1003,11 @@ await new Promise(resolve => setTimeout(resolve, 20));
 await callbacks["open-github:click"]();
 await callbacks["check-release:click"]();
 await new Promise(resolve => setTimeout(resolve, 20));
+const firstCheck = {{
+  release: nodes.get("release-status").textContent,
+  state: nodes.get("release-status").dataset.state,
+  chip: nodes.get("release-chip").dataset.state,
+}};
 nodes.get("port").value = "9001";
 await callbacks["save-port:click"]();
 await new Promise(resolve => setTimeout(resolve, 20));
@@ -1003,11 +1017,21 @@ await new Promise(resolve => setTimeout(resolve, 20));
 nodes.get("presence").checked = false;
 await callbacks["presence:change"]();
 await new Promise(resolve => setTimeout(resolve, 20));
+// Update is pressed last: it re-checks GitHub, and this time a newer release is
+// published, which is the state the button acts on.
+forcedTag = "v999.0.0";
+await callbacks["update-companion:click"]();
+await new Promise(resolve => setTimeout(resolve, 40));
 process.stdout.write(JSON.stringify({{
-  release: nodes.get("release-status").textContent,
-  releaseState: nodes.get("release-status").dataset.state,
-  chipState: nodes.get("release-chip").dataset.state,
-  opened,
+  release: firstCheck.release,
+  releaseState: firstCheck.state,
+  chipState: firstCheck.chip,
+  opened: openedUrls,
+  afterUpdateRelease: nodes.get("release-status").textContent,
+  updateHint: nodes.get("update-hint").textContent,
+  updateHintHidden: nodes.get("update-hint").hidden,
+  updateMessage: nodes.get("message").textContent,
+  updateMessages: sent.filter(item => item.type === "companion.reloadExtension"),
   tabs: nodes.get("tabs").textContent,
   version: nodes.get("version").textContent,
   panelState: nodes.get("panel").dataset.state,
@@ -1037,7 +1061,7 @@ process.stdout.write(JSON.stringify({{
     assert outcome["release"] == "latest"
     assert outcome["releaseState"] == "current"
     assert outcome["chipState"] == "current"
-    assert outcome["opened"] == "https://github.com/NeoXider/web-search-neo"
+    assert outcome["opened"][0] == "https://github.com/NeoXider/web-search-neo"
     # The widget renders only what the worker reported: two controlled tabs of
     # the eight-slot allowance, at this build's own version.
     assert outcome["tabs"] == "2"
@@ -1067,6 +1091,17 @@ process.stdout.write(JSON.stringify({{
         {"type": "companion.setPresence", "presence": False}
     ]
     assert outcome["presenceChecked"] is False
+    # The Update button does the half it can do and names the half it cannot: it
+    # re-checks the release, opens the page that explains what changed, prints the
+    # pull-and-reinstall step it has no shell to run, and asks the worker to reload
+    # the companion onto whatever is on disk now - which is the Reload nobody can
+    # press from outside Chrome.
+    assert outcome["afterUpdateRelease"] == "update v999.0.0"
+    assert "git pull --ff-only" in outcome["updateHint"]
+    assert "v999.0.0" in outcome["updateHint"]
+    assert outcome["updateMessages"] == [{"type": "companion.reloadExtension"}]
+    assert "v999.0.0" in outcome["updateMessage"]
+    assert outcome["opened"][1].endswith("/releases/tag/v999.0.0")
 
 
 @requires_node
