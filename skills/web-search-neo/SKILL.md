@@ -157,6 +157,13 @@ stay reachable, so local services work unchanged.
   bundled build is reloaded automatically, reported as `self_update`. When it does return
   `manual_steps`, show them to the user word for word and wait: nothing can install the
   extension, or reload a build older than 1.3.1, on their behalf.
+- When this checkout is behind and nobody is driving a tab, `update_companion` pulls it,
+  reinstalls if the pull changed an install spec, replaces the bridge daemon when Python code
+  changed, and reloads the companion onto the new files. It refuses rather than forcing -
+  uncommitted tracked work, a branch that diverged from its upstream, a tab an agent is
+  driving, a server installed from a wheel - and `refused` names which. It moves the user's
+  checkout, so ask first; after it runs, read `server_restart_note` before assuming this
+  process picked the new code up (it does not).
 - A tab an agent is driving wears a small slime on its favicon (green while acting, amber
   for 5 quiet minutes after), a ghost cursor glides between the agent's pointer points
   with its name tag and lands a fading ring on every press (red when refused), and the

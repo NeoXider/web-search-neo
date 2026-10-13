@@ -225,6 +225,10 @@ a GitHub release/version check and repository link, a persistent on/off switch,
 **Reconnect**, **Update**, and **Release tabs**. **Update** re-checks GitHub, opens the newer
 release, prints the pull-and-reinstall step, and reloads the companion onto the files on disk —
 the Reload nobody can press from outside Chrome after a `git pull` of an unpacked extension.
+The pull itself is an agent's job: the `update_companion` action fast-forwards this checkout,
+reinstalls when the pull changed an install spec, replaces the bridge daemon and reloads the
+companion onto the new files — and refuses rather than forcing, so a tree with uncommitted work,
+a diverged branch or a tab an agent is driving is left exactly as it was.
 Switching it off also detaches every controlled tab. Its toolbar badge reads `ON` once it has
 connected and authenticated to the [bridge daemon](#the-bridge-daemon). The daemon, not the
 MCP server — it outlives every server process, so the badge says nothing about whether an
@@ -585,6 +589,7 @@ Set these for the MCP server process before it starts.
 | `WEB_SEARCH_NEO_CAPTCHA_KEY` | Key for a paid CAPTCHA solving service (`WEB_SEARCH_NEO_CAPTCHA_HOST`, 2captcha by default). Used only by `captcha` `mode='solve'`, or `mode='auto'` with `WEB_SEARCH_NEO_CAPTCHA_AUTO_SOLVE=1`. |
 | `WEB_SEARCH_NEO_CAPTCHA_LOCAL_SOLVE` | Set to `0` to stop the free local solving of slider captchas (TCaptcha, Geetest). On by default: it spends no money and sends nothing off the machine. Their measurement needs numpy (`pip install "web-search-neo[slider]"`); without it the solve reports that it cannot measure. |
 | `WEB_SEARCH_NEO_CAPTCHA_AUTO_ON_TAB` | Set to `0` to stop the slider drag that a stalled submit or a challenge wait tries by itself on the tab the agent is driving. On by default; `WEB_SEARCH_NEO_CAPTCHA_LOCAL_SOLVE=0` covers it too. |
+| `WEB_SEARCH_NEO_UPDATE_REINSTALL` | Set to `0` so `update_companion` pulls the checkout without running the reinstall, even when the pull changed `pyproject.toml`, a setup file or a requirements file. The pull is reported either way; the note says the installed package may be stale. |
 | `WEB_SEARCH_NEO_LEGACY_TOOLS` | Advertise the former wide tool list instead of the two compact tools. |
 | `WEB_SEARCH_NEO_PLUGINS` | `os.pathsep`-separated plugin `.py` files or directories; plugins may add actions, observation topics, and search providers. |
 

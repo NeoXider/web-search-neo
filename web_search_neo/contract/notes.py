@@ -404,6 +404,26 @@ _ACTION_NOTES = {
         ),
         "wait_seconds": "Raise it right after the user pressed Load unpacked.",
     },
+    "update_companion": {
+        "what_it_runs": (
+            "git status, fetch and pull --ff-only on the checkout this package is installed "
+            "from, a diff of what the pull changed, and pip install -e . only when that diff "
+            "touched an install spec. Commit hashes and changed paths are reported; nothing "
+            "in the checkout is edited by hand."
+        ),
+        "refusals": (
+            "uncommitted_work (nothing is even fetched), not_fast_forward (a branch that "
+            "diverged from its upstream is not merged or rebased), agent_driving_tab (a "
+            "companion reload would detach those sessions, so nothing is pulled either), "
+            "not_a_checkout (installed from a wheel, so there is no branch here). Each names "
+            "itself in refused and says what a person should do instead."
+        ),
+        "afterwards": (
+            "The bridge daemon is replaced when Python code changed, and the companion reloads "
+            "onto the files on disk. This server process still runs the code it was started "
+            "with: read server_restart_note before concluding the update reached this call."
+        ),
+    },
     "http_request": {
         "method": "GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS; anything else is refused.",
         "headers": "Optional {name: value} map sent with the request.",

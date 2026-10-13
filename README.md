@@ -287,7 +287,9 @@ DevTools port cannot be given one later. So three steps stay with the user:
 Keep **Web Search Neo Companion** enabled. Click its toolbar icon to open the
 companion panel: it shows the bridge state and controlled-tab count, and offers
 **Reconnect**, **Update**, **Release tabs**, a GitHub release/version check, a repository link,
-and a persistent on/off switch. Turning the switch
+and a persistent on/off switch. **Update** reloads the companion onto the files in this checkout;
+pulling those files is the `update_companion` action's job, because an extension has no git and
+no filesystem of its own. Turning the switch
 off closes the bridge and detaches every controlled tab. Its toolbar badge reads
 `ON` while the companion is connected and authenticated to the [bridge daemon](#the-bridge-daemon),
 which is between agent calls too, not only while one is running. Nobody has to
