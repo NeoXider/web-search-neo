@@ -128,8 +128,15 @@ for (const [name, spec] of Object.entries(vendors)) {
   const bg = pick(scope, spec.bg, 60, 40) || pick(null, spec.bg, 60, 40);
   const handle = pick(scope, spec.handle, 18, 14) || pick(null, spec.handle, 18, 14);
   let solved = false;
+  // The widget ships its success sprite in the DOM before it is ever shown, so a
+  // bare presence check reads an unsolved puzzle as solved and nothing gets dragged.
   for (const selector of spec.success) {
-    try { if (document.querySelector(selector)) { solved = true; break; } } catch (error) { /* not readable */ }
+    try {
+      for (const mark of Array.from(document.querySelectorAll(selector))) {
+        if (live(mark, 10, 10)) { solved = true; break; }
+      }
+    } catch (error) { /* not readable */ }
+    if (solved) break;
   }
   return {
     vendor: name, live: !solved, solved: solved,
@@ -169,8 +176,11 @@ for (const name of names) {
   const spec = vendors[name];
   if (!spec) continue;
   for (const selector of spec.success) {
-    try { if (document.querySelector(selector)) return {cleared: true, vendor: name, evidence: 'success mark'}; }
-    catch (error) { /* not readable */ }
+    try {
+      for (const mark of Array.from(document.querySelectorAll(selector))) {
+        if (live(mark, 10, 10)) return {cleared: true, vendor: name, evidence: 'success mark'};
+      }
+    } catch (error) { /* not readable */ }
   }
   const selectors = spec.root.concat(spec.frame);
   for (const selector of selectors) {
