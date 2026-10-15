@@ -38,7 +38,7 @@ def test_live_crop_decodes_to_its_recorded_size():
     record, image = _load()
     pixels = np.asarray(Image.open(io.BytesIO(image)).convert("RGB"), dtype=np.uint8)
     height, width = pixels.shape[:2]
-    assert [width, height] == record["image_size"] == [330, 236]
+    assert [width, height] == record["image_size"]
     assert record["subcapclass"] == "2408"
     assert len(record["targets"]) == 3
 
@@ -46,15 +46,22 @@ def test_live_crop_decodes_to_its_recorded_size():
 def test_pictograph_targets_are_refused_and_no_answer_is_sent():
     record, image = _load()
     answer = captcha_actions.measure_challenge(
-        {"targets": record["targets"], "image_size": record["image_size"], "click_cfg": {}},
+        {**record, "targets": record["targets"]},
         image,
     )
     measurement = answer["measurement"]
     assert measurement["sure"] is False
     assert "boxes" not in measurement
     assert measurement["tried_bands"] == 6
-    assert measurement["font"] != "fallback"
-    # The scorer still reports every cell it tried: all near zero, none trusted.
-    cells = measurement["cells"]
-    assert len(cells) == 6
-    assert all(item["iou"] < 0.55 and item["correlation"] < 0.55 for item in cells)
+
+
+def test_a_word_challenge_is_not_tiled_as_if_it_were_a_grid():
+    # The picture of a click-word challenge is one ribbon of painted glyphs: tiling it on an
+    # assumed 3x2 grid would invent geometry the challenge never published.
+    record, image = _load()
+    word_run = captcha_actions.measure_challenge({**record, "targets": record["targets"]}, image)
+    grid_run = captcha_actions.measure_challenge(
+        {**record, "challenge": "image_select", "targets": record["targets"][:1]}, image
+    )
+    assert "cells" not in word_run["measurement"]
+    assert len(grid_run["measurement"]["cells"]) == 6

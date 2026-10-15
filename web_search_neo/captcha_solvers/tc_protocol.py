@@ -132,6 +132,9 @@ def describe_challenge(payload: dict, *, host: str = "t.captcha.qq.com") -> dict
         "pow_prefix": pow_cfg.get("prefix") or "",
         "pow_md5": pow_cfg.get("md5") or "",
         "answer_type": ((background.get("click_cfg") or {}).get("data_type") or []),
+        # The widget names its own targets and where they sit in the instruction strip;
+        # passing the block through keeps that fact readable by tc_target_plan untouched.
+        "ins_elem_cfg": dynamic.get("ins_elem_cfg") or {},
     }
 
 

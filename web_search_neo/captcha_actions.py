@@ -16,7 +16,7 @@ import urllib.request
 from typing import Any, Callable
 
 from web_search_neo import captcha_aid
-from web_search_neo.captcha_solvers import classify, tc_image_solve, tc_protocol
+from web_search_neo.captcha_solvers import classify, tc_image_solve, tc_protocol, tc_target_plan
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -73,7 +73,6 @@ def captcha_read(
     captcha_challenge {site_aid: true}. Nothing here invents a number.
     """
     entry, app_id = _page_origin(page_url, aid)
-    app_id = str(aid or known_aid)
     runner = opener or open_url
     try:
         challenge = tc_image_solve.prepare(runner, entry, aid=app_id, host=host)
@@ -95,7 +94,10 @@ def captcha_read(
         }
     image_bytes = challenge.pop("image_bytes")
     measurement = measure_challenge(challenge, image_bytes)
-    return {"success": True, "page_url": entry, "aid": app_id, **challenge, **measurement}
+    # What the widget declared about its own targets, kept next to the measurement so an
+    # agent sees the order the challenge asked for and never has to infer it.
+    plan = tc_target_plan.target_plan(challenge)
+    return {"success": True, "page_url": entry, "aid": app_id, **challenge, "target_plan": plan, **measurement}
 
 
 def measure_challenge(challenge: dict[str, Any], image_bytes: bytes) -> dict[str, Any]:
@@ -118,10 +120,10 @@ def measure_challenge(challenge: dict[str, Any], image_bytes: bytes) -> dict[str
     height, width = pixels.shape[:2]
     cells: list[tuple[int, int, int, int]] | None = None
     size = challenge.get("image_size") or []
-    # The challenge publishes its own geometry: only trust a grid that tiles the
-    # picture we actually decoded, otherwise fall back to the component hunt.
+    # Only trust a grid that tiles the picture we actually decoded; the kind rule lives in
+    # _published_grid so both measurement paths agree on what has a grid at all.
     if len(size) == 2 and int(size[0]) == width and int(size[1]) == height:
-        cells = word_shape.split_cells(width, height, challenge.get("click_cfg"))
+        cells = _published_grid(word_shape, challenge, width, height)
     attempts: list[dict[str, Any]] = []
     if cells:
         for band in bands:
@@ -312,31 +314,20 @@ return {x: best.x, y: best.y, width: best.width, height: best.height,
 
 
 def _published_grid(word_shape: Any, record: dict[str, Any], width: int, height: int):
-    """The grid cells to score, or None when the picture has no published grid.
+    """The grid cells to score, or None when this picture has no grid to score.
 
-    Fully valid select_regions win; an image_select picture always ships the
-    default 3x2 tiling. Anything else (a word_click caption ribbon, regions that
-    do not tile this picture) falls back to the component hunt, same as
-    measure_challenge does when the protocol size does not match the bytes.
+    Regions the challenge published are used whatever the challenge kind is - they are its own
+    geometry. An even tiling is only assumed for a tile challenge (image_select ships 3x2); a
+    word_click or icon_click picture is a ribbon of painted glyphs, so it keeps the component
+    hunt. One implementation of both rules: word_shape.split_cells reads the published regions and
+    does the tiling, and nothing here repeats its validation.
     """
-    cfg = record.get("click_cfg")
-    regions = None
-    if isinstance(cfg, dict):
-        regions = cfg.get("select_regions") or cfg.get("regions")
+    cfg = record.get("click_cfg") if isinstance(record.get("click_cfg"), dict) else None
+    regions = (cfg or {}).get("select_regions") or (cfg or {}).get("regions")
     if isinstance(regions, list) and regions:
-        boxes: list[tuple[int, int, int, int]] = []
-        for region in regions:
-            try:
-                x, y, w, h = (int(value) for value in list(region)[:4])
-            except (TypeError, ValueError):
-                break
-            if w <= 0 or h <= 0 or x < 0 or y < 0 or x + w > width or y + h > height:
-                break
-            boxes.append((x, y, w, h))
-        else:
-            return boxes
+        return word_shape.split_cells(width, height, cfg) or None
     if str(record.get("challenge") or "") == "image_select":
-        return word_shape.split_cells(width, height, cfg if isinstance(cfg, dict) else None)
+        return word_shape.split_cells(width, height, None)
     return None
 
 
@@ -451,8 +442,10 @@ def _to_page(
 ) -> tuple[list[float], dict[str, float]]:
     """An image-space box and its click centre in page CSS pixels."""
     try:
-        scale_x = float(size[0]) / rect[2]
-        scale_y = float(size[1]) / rect[3]
+        # The picture is `size` pixels wide shown inside a `rect[2]` CSS-pixel box, so one
+        # image pixel is rect/size page pixels - inverting this put clicks far off the widget.
+        scale_x = rect[2] / float(size[0])
+        scale_y = rect[3] / float(size[1])
     except (TypeError, IndexError, ValueError, ZeroDivisionError):
         scale_x = scale_y = 1.0
     x, y, w, h = (float(value) for value in box)
@@ -462,9 +455,11 @@ def _to_page(
         round(w * scale_x, 1),
         round(h * scale_y, 1),
     ]
+    centre_x = rect[0] + (x + w / 2.0) * scale_x
+    centre_y = rect[1] + (y + h / 2.0) * scale_y
     return page_box, {
-        "x": round(rect[0] + (x + w / 2.0) * scale_x, 1),
-        "y": round(rect[1] + (y + h / 2.0) * scale_y, 1),
+        "x": round(min(max(centre_x, rect[0]), rect[0] + rect[2]), 1),
+        "y": round(min(max(centre_y, rect[1]), rect[1] + rect[3]), 1),
     }
 
 

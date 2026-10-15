@@ -29,6 +29,15 @@
   "answer_type": [
     "DynAnswerType_UC"
   ],
+  "ground_truth": {
+    "tile": [
+      448,
+      240,
+      224,
+      240
+    ],
+    "note": "human read of the served 3x2 grid for instruction “苹果” (column 2, row 1), recorded 2026-10-14 from the live prehandle+picture pair; the tests read this field rather than restating a literal"
+  },
   "pow_answer": {
     "solved": true,
     "salt": "9057",

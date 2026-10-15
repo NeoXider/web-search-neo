@@ -1,6 +1,7 @@
 {
   "vendor": "tencent",
   "kind": "click_word",
+  "challenge": "word_click",
   "capclass": "1",
   "subcapclass": "2408",
   "page": "https://console-dev.openmodel.ai/auth",
