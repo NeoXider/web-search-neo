@@ -22,7 +22,7 @@ import pytest
 from PIL import Image
 
 from web_search_neo import captcha_solvers
-from web_search_neo.captcha_solvers.images import crop_png, image_size, match_piece
+from web_search_neo.captcha_solvers.images import crop_png, find_outline_pair, image_size, match_piece
 
 HOLE_X, PIECE_X, PIECE_W, PIECE_H = 178, 4, 52, 56
 WIDGET_W, WIDGET_H = 300, 180
@@ -106,6 +106,49 @@ def test_template_matching_finds_the_hole_when_only_the_hole_is_left():
     assert found["method"] == "template"
     assert abs(found["gap_x"] - HOLE_X) <= 3, found
     assert abs(found["gap_y"] - 30) <= 3, found
+
+
+def _plain_texture(seed: int = 11) -> np.ndarray:
+    """A photo that never reaches the white the widget strokes its shapes with."""
+    rng = np.random.default_rng(seed)
+    tex = rng.integers(40, 150, size=(WIDGET_H, WIDGET_W, 3)).astype("int16")
+    tex[:, 1:] = (tex[:, 1:] + tex[:, :-1]) // 2
+    return tex
+
+
+def test_outline_pair_reads_the_strokes_the_widget_draws_itself():
+    """A live TCaptcha strokes both the piece and its hole with a light line.
+
+    That is a different signature from the notch search and it was the one that
+    measured a real puzzle to the pixel while the edge search under-measured it, so
+    both shapes have to be readable as a pair: same width, same height, same row.
+    """
+    pytest.importorskip("cv2")
+    tex = _plain_texture()
+    _outline(tex, HOLE_X, 30, PIECE_W, PIECE_H, 246)
+    _outline(tex, PIECE_X, 30, PIECE_W, PIECE_H, 240)
+    found = captcha_solvers.detect_gap(_png(tex))
+    assert found["ok"] is True, found
+    assert found["method"] == "outline_pair", found
+    assert abs(found["gap_x"] - HOLE_X) <= 1, found
+    assert abs(found["piece_x"] - PIECE_X) <= 1, found
+    assert abs(found["distance"] - (HOLE_X - PIECE_X)) <= 1, found
+    assert found["confidence"] > 0.9, found
+
+
+def test_a_third_shape_in_the_same_row_is_reported_as_unsure():
+    """A rival pair lowers the outline reading, and an unsure reading does not get forced."""
+    pytest.importorskip("cv2")
+    tex = _plain_texture()
+    _outline(tex, HOLE_X, 30, PIECE_W, PIECE_H, 246)
+    _outline(tex, PIECE_X, 30, PIECE_W, PIECE_H, 240)
+    _outline(tex, HOLE_X + 70, 31, PIECE_W, PIECE_H, 242)
+    outlined = captcha_solvers.images.find_outline_pair(_png(tex))
+    assert outlined["ok"] is True, outlined
+    assert outlined["confidence"] <= 0.6, outlined
+    # With the outline reading unsure, the widget's strokes no longer settle one
+    # answer, so the caller keeps its own inference instead of a forced reading.
+    assert captcha_solvers.detect_gap(_png(tex))["method"] != "outline_pair"
 
 
 def test_a_picture_with_no_hole_says_so_instead_of_guessing():

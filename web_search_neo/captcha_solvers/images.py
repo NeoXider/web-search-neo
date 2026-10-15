@@ -239,6 +239,90 @@ def match_piece(background: bytes, piece: bytes) -> dict[str, Any]:
     }
 
 
+# The outline reading measures the widget's own strokes rather than inferring edges
+# from a photo, so it is trusted at its own floor and only outranks the notch search
+# from there; below it the reading is unsure and the inference gets the vote instead.
+OUTLINE_MIN_CONFIDENCE = 0.9
+
+
+def find_outline_pair(picture: bytes) -> dict[str, Any]:
+    """Find the piece and its hole from the outline the widget paints around both.
+
+    TCaptcha strokes the moving piece and the hole it belongs in with the same light
+    line over the photo, which is a different signature from the notch search: two
+    components of the same size sitting at the same height are almost impossible in
+    a photograph by accident, so agreeing on width, height and height-position is
+    what identifies the pair - no edge energy is needed and no texture can vote.
+
+    The piece is the left shape and the hole is the right one: the widget always parks
+    the piece at the start of its track. When several pairs compete for that role the
+    reading is reported as unsure rather than decided by a tie-break.
+    """
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return {"ok": False, "reason": "OpenCV is not installed"}
+    array = _load(picture)
+    if array is None:
+        return {"ok": False, "reason": "the picture could not be decoded"}
+    light = ((array[:, :, 0] > 165) & (array[:, :, 1] > 165) & (array[:, :, 2] > 165))
+    if int(light.sum()) < 96:
+        return {"ok": False, "reason": "the widget drew no outlines over its picture"}
+    _count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        light.astype("uint8") * 255, connectivity=8
+    )
+    shapes: list[tuple[int, int, int, int, int]] = []
+    for index in range(1, _count):
+        x, y, width, height, area = (int(value) for value in stats[index])
+        if area < 60:
+            continue
+        if MIN_PIECE_WIDTH <= width <= MAX_PIECE_WIDTH and MIN_PIECE_WIDTH <= height <= MAX_PIECE_WIDTH:
+            shapes.append((x, y, width, height, area))
+
+    pairs: list[tuple[tuple[int, int, int, int, int], tuple[int, int, int, int, int]]] = []
+    for first in range(len(shapes)):
+        for second in range(first + 1, len(shapes)):
+            left_shape, right_shape = shapes[first], shapes[second]
+            tolerance_w = max(3, int(round(0.12 * left_shape[2])))
+            tolerance_h = max(3, int(round(0.12 * left_shape[3])))
+            if abs(left_shape[2] - right_shape[2]) > tolerance_w:
+                continue
+            if abs(left_shape[3] - right_shape[3]) > tolerance_h:
+                continue
+            overlap = min(left_shape[3], right_shape[3]) - abs(left_shape[1] - right_shape[1])
+            if overlap < 0.6 * min(left_shape[3], right_shape[3]):
+                continue
+            pairs.append((left_shape, right_shape) if left_shape[0] <= right_shape[0]
+                         else (right_shape, left_shape))
+    if not pairs:
+        return {"ok": False, "reason": "no pair of same-size shapes at one height in this picture"}
+
+    pairs.sort(key=lambda pair: -(pair[0][4] + pair[1][4]))
+    piece_shape, hole_shape = pairs[0]
+    distance = max(1, hole_shape[0] - piece_shape[0])
+    rivals = [
+        other for other in (max(1, right[0] - left[0]) for left, right in pairs[1:])
+        if abs(other - distance) > max(4, int(round(0.05 * distance)))
+    ]
+    # One pair and no rival is a reading the widget itself settled; a rival that far
+    # away means two different shapes in the photo looked like a piece and a hole.
+    confidence = 0.95 if not rivals else round(
+        min(0.9, 0.6 * min(1.0, abs(min(rivals, key=lambda other: abs(other - distance)) - distance)
+                           / float(distance))), 3)
+    return {
+        "ok": True,
+        "method": "outline_pair",
+        "gap_x": int(hole_shape[0]),
+        "piece_x": int(piece_shape[0]),
+        "piece_width": int(piece_shape[2]),
+        "distance": distance,
+        "score": round(float(piece_shape[4] + hole_shape[4]), 2),
+        "confidence": confidence,
+        "image_width": int(array.shape[1]),
+    }
+
+
 def detect_gap(
     picture: bytes,
     piece: bytes | None = None,
@@ -246,12 +330,25 @@ def detect_gap(
     min_width: int = MIN_PIECE_WIDTH,
     max_width: int = MAX_PIECE_WIDTH,
 ) -> dict[str, Any]:
-    """Where the piece goes, by whichever detector the caller's images allow."""
+    """Where the piece goes, by whichever detector the caller's images allow.
+
+    The outline pair is tried first because it reads the widget's own drawing instead
+    of inferring edges from the photo; the notch search answers when the widget leaves
+    no outlines to read, and whichever of the two is surer wins.
+    """
     if piece:
         matched = match_piece(picture, piece)
         if matched.get("ok"):
             return matched
     found = find_notch(picture, min_width=min_width, max_width=max_width)
+    outlined = find_outline_pair(picture)
+    if outlined.get("ok") and (
+        float(outlined["confidence"]) >= OUTLINE_MIN_CONFIDENCE
+        or float(outlined["confidence"]) >= float(found.get("confidence") or 0.0)
+    ):
+        if not found.get("ok"):
+            outlined["notch_note"] = found.get("reason")
+        return outlined
     if not found.get("ok") and piece:
         found["detector_note"] = matched.get("reason")
     return found
