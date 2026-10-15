@@ -1,0 +1,59 @@
+{
+  "vendor": "tencent",
+  "kind": "click_word",
+  "capclass": "1",
+  "subcapclass": "2408",
+  "page": "https://console-dev.openmodel.ai/auth",
+  "aid": "196724674",
+  "instruction": "Select in order: ",
+  "targets": [
+    "abacus-icon",
+    "map-pin-icon",
+    "8-glyph"
+  ],
+  "targets_note": "human reading of the header-answer sprite (img_index=0); first two are pictographs with no text rendering, so the shape layer cannot measure them",
+  "show_template": "template/new_placeholder.html",
+  "image_size": [
+    330,
+    236
+  ],
+  "image_size_native": [
+    672,
+    480
+  ],
+  "css_box": {
+    "x": 555,
+    "y": 298,
+    "w": 330,
+    "h": 236
+  },
+  "dpr": 1,
+  "grid": null,
+  "grid_note": "live Turing widget served click-word (2408), not the legacy 3x2 photo grid (1865); no tile boxes exist for this instance",
+  "glyph_boxes_in_screenshot_pixels": {
+    "abacus-icon": [
+      135,
+      130,
+      60,
+      55
+    ],
+    "map-pin-icon": [
+      250,
+      5,
+      55,
+      55
+    ],
+    "8-glyph": [
+      60,
+      130,
+      45,
+      55
+    ]
+  },
+  "glyph_boxes_note": "approx boxes mapped from native-res sprite match, /2 to screenshot px; human estimate, not a measurement",
+  "confirm": "OK",
+  "error_text_present": "验证错误,请重试",
+  "pow": "present (prefix 738bcff9f1d8cb07#), unsolved by us",
+  "sess": "s0TpEFu6GdBrZTxovz98nPUfEiVZM8rl8J2u--Xa-FPjqufrUudZoqoJrN2yK0xkkrsMlpRjctyJrEoKp3pUyqJ4KjCVcI3VeWX8aEfChhOKXE8aiXoT3TWyaCjXardM2Ge4AWjnpWlCqYn8y7ByLQO598SiHsXG5Iyu8bYb2DBNLH7GQ9SiuHJzJv47Bt0nEJt6Crd3dlObWdwZyoKS7oNVYvH9DIS1fvzPdz87097LVD8dXZsEMFCYrrhFdctYlwXzH3v5U6NXnAiRL8nYS-dLi5CoYQB8DcCctrjBUNThmAFXtZXbEHQMU1y7YncHtxIIL9400pjO-oo_hQrVpFanM5umNsVkW0AID1JlIvxC9eJjUrVxor45GPNNiYNGLl7N5lXQ6nPbJPDEgC14VseFZlym11qwgGAGrLD3738QAmmDRnAhoHIDvVtHX6VQmlNZSiUVyoNrYEHsdbR3Tal9YKkEPAHoq3U8ce4WZDp7X2DZHXPIbODcvvbPjRRHIq",
+  "source": "rendered widget screenshot crop (instance 3, Send-code trigger on console-dev /auth)"
+}

@@ -25,6 +25,14 @@ FONT_CANDIDATES = (
     "fonts/cjk-bold.ttf",
 )
 
+# When no bundled font ships with the repo, a system CJK face is the next honest source:
+# without one, Pillow's default face has no CJK glyphs (tofu boxes) and every score is noise.
+CJK_SYSTEM_FONTS = (
+    "C:/Windows/Fonts/msyh.ttc",
+    "C:/Windows/Fonts/simhei.ttf",
+    "C:/Windows/Fonts/simsun.ttc",
+)
+
 MIN_AGREE = 0.55  # both views must clear this before a candidate is offered
 MIN_LEAD = 0.08  # the winner must beat the runner-up by this much to be trusted
 
@@ -85,8 +93,31 @@ def _load_font(word: str, height: int, font_path: str | None):
                 return ImageFont.truetype(path, height)
             except OSError:
                 continue
-    # No bundled font: the default face still gives a usable shape for CJK blocks.
+    if not font_path:
+        # No bundled face: a system CJK face keeps the glyph real; the default
+        # face would draw tofu boxes for CJK and every comparison would be noise.
+        for path in CJK_SYSTEM_FONTS:
+            if os.path.exists(path):
+                try:
+                    return ImageFont.truetype(path, height)
+                except OSError:
+                    continue
+    # No CJK face at all: the default face still gives a usable shape for CJK blocks.
     return ImageFont.load_default()
+
+
+def font_note(font_path: str | None = None) -> str:
+    """Which face glyph_mask actually renders with: a path, or 'fallback'."""
+    if font_path and os.path.exists(font_path):
+        return os.path.basename(font_path)
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in list(FONT_CANDIDATES):
+        if os.path.exists(os.path.join(here, name)):
+            return os.path.basename(name)
+    for path in CJK_SYSTEM_FONTS:
+        if os.path.exists(path):
+            return os.path.basename(path)
+    return "fallback"
 
 
 def color_mask(pixels: np.ndarray, hue: tuple[float, float], sat_min: float) -> np.ndarray:
@@ -187,19 +218,55 @@ def _without_duplicates(boxes: list[tuple[int, int, int, int]]) -> list[tuple[in
     return unique
 
 
-def match_word_shape(
+def split_cells(
+    img_w: int, img_h: int, click_cfg: dict | None = None, *, cols: int = 3, rows: int = 2
+) -> list[tuple[int, int, int, int]]:
+    """Tile the picture into the grid the challenge publishes.
+
+    Named select_regions in click_cfg win when valid; otherwise an even cols x rows
+    split (image_select ships 3x2) that tiles the picture with no pixel in two cells.
+    """
+    regions = None
+    if isinstance(click_cfg, dict):
+        regions = click_cfg.get("select_regions") or click_cfg.get("regions")
+    if isinstance(regions, list) and regions:
+        boxes: list[tuple[int, int, int, int]] = []
+        for region in regions:
+            try:
+                x, y, w, h = (int(value) for value in list(region)[:4])
+            except (TypeError, ValueError):
+                continue
+            if w > 0 and h > 0 and x >= 0 and y >= 0 and x + w <= img_w and y + h <= img_h:
+                boxes.append((x, y, w, h))
+        if boxes:
+            return boxes
+    cell_w, cell_h = img_w // cols, img_h // rows
+    return [(c * cell_w, r * cell_h, cell_w, cell_h) for r in range(rows) for c in range(cols)]
+
+
+def score_cells(
     pixels: np.ndarray,
     word: str,
+    cells: list[tuple[int, int, int, int]],
     *,
     hue: tuple[float, float],
     sat_min: float = 0.35,
     font_path: str | None = None,
 ) -> list[ShapeMatch]:
-    """Rank every colour region of the picture by how well its shape matches `word`."""
-    mask = color_mask(pixels, hue, sat_min)
-    boxes = candidate_boxes(mask)
-    if not boxes or not word:
+    """Score each published cell as a whole against the target word shape.
+
+    One candidate per cell: colour components are never chased across cell borders,
+    where one tile's background would merge with another tile's caption.
+    """
+    if not cells or not word:
         return []
+    return _ranked(color_mask(pixels, hue, sat_min), cells, word, font_path)
+
+
+def _ranked(
+    mask: np.ndarray, boxes: list[tuple[int, int, int, int]], word: str, font_path: str | None
+) -> list[ShapeMatch]:
+    """Rank boxes by shape fit against the word; the shared core of both scorers."""
     results: list[ShapeMatch] = []
     for x, y, w, h in boxes:
         region = mask[y : y + h, x : x + w]
@@ -220,6 +287,22 @@ def match_word_shape(
         )
     results.sort(key=lambda item: item.score, reverse=True)
     return results
+
+
+def match_word_shape(
+    pixels: np.ndarray,
+    word: str,
+    *,
+    hue: tuple[float, float],
+    sat_min: float = 0.35,
+    font_path: str | None = None,
+) -> list[ShapeMatch]:
+    """Rank every colour region of the picture by how well its shape matches `word`."""
+    mask = color_mask(pixels, hue, sat_min)
+    boxes = candidate_boxes(mask)
+    if not boxes or not word:
+        return []
+    return _ranked(mask, boxes, word, font_path)
 
 
 def choose_ordered(matches: list[ShapeMatch], needed: int) -> dict:

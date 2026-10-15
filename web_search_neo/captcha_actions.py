@@ -16,7 +16,7 @@ import urllib.request
 from typing import Any, Callable
 
 from web_search_neo import captcha_aid
-from web_search_neo.captcha_solvers import tc_image_solve, tc_protocol
+from web_search_neo.captcha_solvers import classify, tc_image_solve, tc_protocol
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -115,7 +115,56 @@ def measure_challenge(challenge: dict[str, Any], image_bytes: bytes) -> dict[str
     from web_search_neo.captcha_solvers import word_shape
 
     bands = ((0.03, 0.14), (0.10, 0.20), (0.75, 0.92), (0.95, 0.06), (0.28, 0.42), (0.45, 0.60))
+    height, width = pixels.shape[:2]
+    cells: list[tuple[int, int, int, int]] | None = None
+    size = challenge.get("image_size") or []
+    # The challenge publishes its own geometry: only trust a grid that tiles the
+    # picture we actually decoded, otherwise fall back to the component hunt.
+    if len(size) == 2 and int(size[0]) == width and int(size[1]) == height:
+        cells = word_shape.split_cells(width, height, challenge.get("click_cfg"))
     attempts: list[dict[str, Any]] = []
+    if cells:
+        for band in bands:
+            matches = word_shape.score_cells(pixels, targets[0], cells, hue=band, sat_min=0.45)
+            decision = word_shape.choose_ordered(matches, needed=len(targets))
+            attempts.append(
+                {
+                    "hue": list(band),
+                    "regions": len(matches),
+                    "top_score": matches[0].score if matches else None,
+                    "top_box": list(matches[0].box) if matches else None,
+                    "sure": bool(decision.get("sure")),
+                }
+            )
+            if decision.get("sure"):
+                return {
+                    "measurement": {
+                        "sure": True,
+                        "hue": list(band),
+                        "boxes": decision["boxes"],
+                        "scores": decision["scores"],
+                        "tried_bands": len(attempts),
+                    }
+                }
+        best = max(attempts, key=lambda item: item["top_score"] or 0.0)
+        detail = [
+            {"box": list(item.box), "iou": item.iou, "correlation": item.correlation}
+            for item in word_shape.score_cells(
+                pixels, targets[0], cells, hue=tuple(best["hue"]), sat_min=0.45
+            )
+        ]
+        return {
+            "measurement": {
+                "sure": False,
+                "why": "no colour band produced a shape match strong enough to trust",
+                "best_band": best["hue"],
+                "best_regions": best["regions"],
+                "best_box": best["top_box"],
+                "cells": detail,
+                "font": word_shape.font_note(),
+                "tried_bands": len(attempts),
+            }
+        }
     for band in bands:
         matches = word_shape.match_word_shape(pixels, targets[0], hue=band, sat_min=0.45)
         decision = word_shape.choose_ordered(matches, needed=len(targets))
@@ -221,3 +270,295 @@ def captcha_verify(
         "why": result.get("why") or "",
         "clicks": result.get("clicks") or [],
     }
+
+
+# Challenges this layer measures from a live page: Tencent's tile family asks for
+# tiles or words in an order, and a slider drag would answer a question nobody asked.
+IMAGE_SELECT_KINDS = ("image_select", "word_click", "icon_click")
+
+# The same colour bands measure_challenge sweeps: one flat caption colour over a
+# photo background, tried from the most common caption hues first.
+_MEASURE_BANDS = ((0.03, 0.14), (0.10, 0.20), (0.75, 0.92), (0.95, 0.06), (0.28, 0.42), (0.45, 0.60))
+
+# The widget picture on the page: the largest image inside the TCaptcha
+# containers the classifier already knows, plus the instruction prose around it.
+# A page script, kept here so the browser module stays a thin caller; it reads
+# geometry and text and changes nothing.
+IMAGE_LOCATE_SCRIPT = """
+const picks = ['#tcaptcha_transform_dy', '#TCaptcha', '[class*="tencent-captcha"]',
+  '#captcha_popup', '[id^="tCaptcha"]'];
+let best = null;
+for (const sel of picks) {
+  let roots = [];
+  try { roots = Array.from(document.querySelectorAll(sel)); } catch (err) { continue; }
+  for (const root of roots.slice(0, 3)) {
+    let imgs = [];
+    try { imgs = Array.from(root.querySelectorAll('img')); } catch (err) { continue; }
+    const text = ((root.innerText || '').trim().slice(0, 200));
+    for (const img of imgs) {
+      const r = img.getBoundingClientRect();
+      if (r.width >= 80 && r.height >= 40
+          && (!best || r.width * r.height > best.area)) {
+        best = {x: r.x, y: r.y, width: r.width, height: r.height,
+          area: r.width * r.height, instruction: text};
+      }
+    }
+  }
+}
+if (!best) return {};
+return {x: best.x, y: best.y, width: best.width, height: best.height,
+  instruction: best.instruction};
+"""
+
+
+def _published_grid(word_shape: Any, record: dict[str, Any], width: int, height: int):
+    """The grid cells to score, or None when the picture has no published grid.
+
+    Fully valid select_regions win; an image_select picture always ships the
+    default 3x2 tiling. Anything else (a word_click caption ribbon, regions that
+    do not tile this picture) falls back to the component hunt, same as
+    measure_challenge does when the protocol size does not match the bytes.
+    """
+    cfg = record.get("click_cfg")
+    regions = None
+    if isinstance(cfg, dict):
+        regions = cfg.get("select_regions") or cfg.get("regions")
+    if isinstance(regions, list) and regions:
+        boxes: list[tuple[int, int, int, int]] = []
+        for region in regions:
+            try:
+                x, y, w, h = (int(value) for value in list(region)[:4])
+            except (TypeError, ValueError):
+                break
+            if w <= 0 or h <= 0 or x < 0 or y < 0 or x + w > width or y + h > height:
+                break
+            boxes.append((x, y, w, h))
+        else:
+            return boxes
+    if str(record.get("challenge") or "") == "image_select":
+        return word_shape.split_cells(width, height, cfg if isinstance(cfg, dict) else None)
+    return None
+
+
+def _cell_of(match: Any) -> dict[str, Any]:
+    return {
+        "box": list(match.box),
+        "iou": match.iou,
+        "correlation": match.correlation,
+        "score": match.score,
+    }
+
+
+def image_select_from_page(
+    read: dict[str, Any] | None,
+    page_bytes: bytes,
+    *,
+    instruction: str | None = None,
+) -> dict[str, Any]:
+    """Score a tile challenge's picture and name the tiles in order, when sure.
+
+    `read` is a challenge record as captcha_read() produces (instruction,
+    targets, click_cfg, challenge); `page_bytes` is the PNG/JPEG of the widget
+    picture captured from the page. `instruction` overrides the record's prose
+    when the caller read fresher text off the widget.
+
+    Returns {"sure", "ordered_boxes", "cells", "why"} plus "picture_size" and
+    the winning "hue" when the picture decoded. "ordered_boxes" is present only
+    when every target cleared the shape gates (MIN_AGREE on both views, MIN_LEAD
+    over the runner-up, one distinct tile per target, in instruction order); a
+    refusal names why and carries no boxes, so there is nothing to click.
+    """
+    record = read or {}
+    text = instruction if instruction is not None else (record.get("instruction") or "")
+    targets = tc_protocol.target_words(text) or [
+        word for word in (str(item) for item in (record.get("targets") or [])) if word
+    ]
+    if not targets:
+        return {"sure": False, "cells": [], "why": "the challenge named no target to look for"}
+    try:
+        import io
+
+        import numpy as np
+        from PIL import Image
+
+        pixels = np.asarray(Image.open(io.BytesIO(page_bytes)).convert("RGB"), dtype=np.uint8)
+    except Exception as missing:  # noqa: BLE001 - optional dependency, reported not crashed
+        return {"sure": False, "cells": [], "why": f"the widget picture could not be decoded: {missing}"}
+    from web_search_neo.captcha_solvers import word_shape
+
+    height, width = pixels.shape[:2]
+    grid = _published_grid(word_shape, record, width, height)
+
+    def score(word: str, band: tuple[float, float]):
+        if grid is not None:
+            return word_shape.score_cells(pixels, word, grid, hue=band, sat_min=0.45)
+        return word_shape.match_word_shape(pixels, word, hue=band, sat_min=0.45)
+
+    first_ranked: list[list[Any]] = []
+    best_band = 0
+    for index, band in enumerate(_MEASURE_BANDS):
+        ranked = [score(word, band) for word in targets]
+        first_ranked.append(ranked[0])
+        if ranked[0] and (
+            not first_ranked[best_band]
+            or ranked[0][0].score > first_ranked[best_band][0].score
+        ):
+            best_band = index
+        decisions = [word_shape.choose_ordered(matches, needed=1) for matches in ranked]
+        if all(decision.get("sure") for decision in decisions):
+            boxes = [tuple(decision["boxes"][0]) for decision in decisions]
+            if len(set(boxes)) == len(boxes):
+                return {
+                    "sure": True,
+                    "ordered_boxes": [list(box) for box in boxes],
+                    "cells": [_cell_of(match) for match in ranked[0]],
+                    "picture_size": [width, height],
+                    "hue": list(band),
+                    "why": (
+                        f"{len(targets)} target(s) matched in the "
+                        f"{band[0]:.2f}-{band[1]:.2f} colour band; click them in order"
+                    ),
+                }
+    return {
+        "sure": False,
+        "cells": [_cell_of(match) for match in first_ranked[best_band]],
+        "picture_size": [width, height],
+        "hue": list(_MEASURE_BANDS[best_band]),
+        "why": "no colour band produced a shape match strong enough to trust",
+    }
+
+
+def _widget_rect(box: Any) -> tuple[float, float, float, float] | None:
+    """A located widget picture as page CSS pixels, or None when it is not one."""
+    if not isinstance(box, dict):
+        return None
+    try:
+        rect = (
+            float(box.get("x")), float(box.get("y")),
+            float(box.get("width")), float(box.get("height")),
+        )
+    except (TypeError, ValueError):
+        return None
+    if any(value != value or value in (float("inf"), float("-inf")) for value in rect):
+        return None
+    if rect[0] < 0 or rect[1] < 0 or rect[2] < 80 or rect[3] < 40:
+        return None
+    return rect
+
+
+def _to_page(
+    box: list[float], rect: tuple[float, float, float, float], size: list[Any]
+) -> tuple[list[float], dict[str, float]]:
+    """An image-space box and its click centre in page CSS pixels."""
+    try:
+        scale_x = float(size[0]) / rect[2]
+        scale_y = float(size[1]) / rect[3]
+    except (TypeError, IndexError, ValueError, ZeroDivisionError):
+        scale_x = scale_y = 1.0
+    x, y, w, h = (float(value) for value in box)
+    page_box = [
+        round(rect[0] + x * scale_x, 1),
+        round(rect[1] + y * scale_y, 1),
+        round(w * scale_x, 1),
+        round(h * scale_y, 1),
+    ]
+    return page_box, {
+        "x": round(rect[0] + (x + w / 2.0) * scale_x, 1),
+        "y": round(rect[1] + (y + h / 2.0) * scale_y, 1),
+    }
+
+
+def _refusal(
+    kind: str, instruction: str, why: str, rect: tuple[float, ...] | None = None
+) -> dict[str, Any]:
+    """The unsure shape: per-cell evidence when there is any, clicks never."""
+    return {
+        "attempted": True,
+        "sure": False,
+        "vendor": "tencent",
+        "challenge": kind,
+        "instruction": instruction,
+        "widget_rect": list(rect) if rect else [],
+        "why": why,
+        "cells": [],
+        "clicks": [],
+    }
+
+
+def measure_page_image_select(
+    run_script: Callable[[str], dict[str, Any]],
+    capture_region: Callable[[tuple[float, float, float, float]], bytes],
+    *,
+    found: Any = None,
+    slider: Any = None,
+    status: Any = None,
+) -> dict[str, Any]:
+    """Measure a Tencent tile challenge from the live page. Nothing is clicked.
+
+    `run_script` runs one page script and returns its answer dict; `capture_region`
+    captures one page-CSS-pixel rect as PNG bytes. Detection reuses the classifier
+    the reporting path already runs; anything but a Tencent image_select,
+    word_click or icon_click is not attempted here (a slider belongs to the drag).
+    Every failure below is a reported refusal with no clicks - this runs inside
+    the captcha solve path, where raising would break the wait that follows.
+    """
+    try:
+        answer = run_script(classify.CLASSIFY_FACTS_SCRIPT) or {}
+    except Exception as stopped:  # noqa: BLE001 - a dead tab reports, never raises
+        return _refusal("unknown", "", f"the page could not be read: {stopped}")
+    facts = answer.get("value") if isinstance(answer, dict) else None
+    named = classify.classify_from_harness(
+        found=found, slider=slider, status=status, facts=facts if isinstance(facts, dict) else {}
+    )
+    kind = str(named.get("challenge") or "unknown")
+    if named.get("vendor") != "tencent" or kind not in IMAGE_SELECT_KINDS:
+        return {"attempted": False, "vendor": named.get("vendor"), "challenge": kind}
+    try:
+        located = run_script(IMAGE_LOCATE_SCRIPT) or {}
+    except Exception as stopped:  # noqa: BLE001 - reported, see above
+        return _refusal(kind, "", f"the widget picture could not be located: {stopped}")
+    box = located.get("value") if isinstance(located, dict) else None
+    rect = _widget_rect(box)
+    instruction = str((box.get("instruction") if isinstance(box, dict) else "") or "")
+    if rect is None:
+        return _refusal(kind, instruction, "no widget picture big enough to be the puzzle was found on the page")
+    try:
+        picture = capture_region(rect)
+    except Exception as stopped:  # noqa: BLE001 - reported, see above
+        return _refusal(kind, instruction, f"the widget picture could not be captured: {stopped}", rect)
+    if not picture:
+        return _refusal(kind, instruction, "the widget picture came back empty", rect)
+    record = {
+        "vendor": "tencent",
+        "challenge": kind,
+        "instruction": instruction,
+        "targets": tc_protocol.target_words(instruction),
+        "image_size": [],
+        "click_cfg": {},
+    }
+    measured = image_select_from_page(record, bytes(picture))
+    size = measured.get("picture_size") or []
+    if measured.get("sure"):
+        ordered: list[list[float]] = []
+        clicks: list[dict[str, float]] = []
+        for item in measured["ordered_boxes"]:
+            page_box, centre = _to_page(item, rect, size)
+            ordered.append(page_box)
+            clicks.append(centre)
+        return {
+            "attempted": True,
+            "sure": True,
+            "vendor": "tencent",
+            "challenge": kind,
+            "instruction": instruction,
+            "widget_rect": list(rect),
+            "picture_size": size,
+            "ordered_boxes": ordered,
+            "clicks": clicks,
+            "next": "click each box in order, then the widget's confirm button; nothing was clicked or verified",
+        }
+    unsure = _refusal(kind, instruction, measured.get("why") or "the tiles could not be measured", rect)
+    unsure["cells"] = measured.get("cells") or []
+    unsure["picture_size"] = size
+    unsure["hue"] = measured.get("hue")
+    return unsure

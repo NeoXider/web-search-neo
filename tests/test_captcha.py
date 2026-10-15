@@ -5,11 +5,15 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
 from web_search_neo import browser_tools
 from web_search_neo import captcha
+
+FIXTURE_IMAGE = Path(__file__).resolve().parents[1] / "fixtures" / "tcaptcha" / "om_1865.jpg"
+WORD = "\u82f9\u679c"
 
 
 class _CannedDriver:
@@ -388,3 +392,109 @@ console.log(JSON.stringify({out, seenThis: globalThis.seenThis, got: app.captcha
     report = json.loads(completed.stdout.strip().splitlines()[-1])
     assert report["seenThis"] == "owner" and report["got"] == "TOKEN"
     assert report["out"]["callbacks"] == 1 and report["out"]["applied"] is True
+
+
+# --- the Tencent tile measurement ------------------------------------------------
+
+_TILE_FACTS = {
+    "texts": ["please select the tiles in order"],
+    "class_names": ["tcaptcha_transform_dy"],
+    "sdk_urls": ["https://t.captcha.qq.com/cap_union_prehandle?aid=196724674"],
+    "aid_present": True,
+}
+
+
+def _tile_scripts(picture: bytes, instruction: str):
+    """An execute_js fake: identity says nameless, classify says Tencent tiles,
+    locate returns the widget rect, everything else answers empty."""
+    seen: list[str] = []
+
+    def fake(script, args=None, session_id="default", **kwargs):
+        seen.append(script)
+        if script is captcha.IDENTIFY_SCRIPT:
+            return {"success": True, "value": dict(NAMELESS)}
+        if "aid_present" in script:
+            return {"success": True, "value": dict(_TILE_FACTS)}
+        if "getBoundingClientRect" in script:
+            return {
+                "success": True,
+                "value": {
+                    "x": 10, "y": 20, "width": 672, "height": 480,
+                    "instruction": instruction,
+                },
+            }
+        return {"success": True, "value": {}}
+
+    return fake, seen
+
+
+def test_an_unsure_tile_measurement_is_reported_with_scores_and_no_clicks(monkeypatch):
+    pytest.importorskip("numpy")
+    pytest.importorskip("PIL")
+    picture = FIXTURE_IMAGE.read_bytes()
+    fake, seen = _tile_scripts(picture, f'"{WORD}"')
+    monkeypatch.setattr(browser_tools, "execute_js", fake)
+    monkeypatch.setattr(
+        browser_tools, "screenshot", lambda **kwargs: picture
+    )
+    monkeypatch.setattr(
+        browser_tools, "_slider_solve",
+        lambda session_id, budget: {"attempted": True, "solved": False, "reason": "unsure"},
+    )
+    _register(_CannedDriver([BLOCKED, CLEAR]), session_id="tile-unsure")
+    result = browser_tools.solve_captcha(
+        mode="auto", session_id="tile-unsure", timeout_seconds=5, poll_seconds=0.05
+    )
+    assert result["mode"] == "wait" and result["success"] is True
+    measured = result["image_select"]
+    assert measured["attempted"] is True and measured["sure"] is False
+    assert measured["challenge"] == "word_click"
+    assert measured["clicks"] == [] and "ordered_boxes" not in measured
+    assert measured["why"]
+    # The top-ranked component sits on the ground-truth tile (col 2, row 1).
+    x, y, w, h = measured["cells"][0]["box"]
+    assert 448 <= x + w / 2 <= 672 and 240 <= y + h / 2 <= 480
+    assert any("aid_present" in script for script in seen)
+    assert any("getBoundingClientRect" in script for script in seen)
+
+
+def test_a_sure_tile_measurement_names_page_boxes_but_still_clicks_nothing(monkeypatch):
+    pytest.importorskip("numpy")
+    pytest.importorskip("PIL")
+    import io
+
+    import numpy as np
+    from PIL import Image
+
+    from web_search_neo.captcha_solvers import word_shape
+
+    # One caption glyph with no gaps in it, painted red on grey: the component
+    # hunt finds it whole and both shape views clear the gate.
+    word = chr(0x56FD)
+    canvas = np.full((480, 672, 3), 128, dtype=np.uint8)
+    canvas[240:480, 448:672][word_shape.glyph_mask(word, (224, 240))] = (255, 0, 0)
+    buffer = io.BytesIO()
+    Image.fromarray(canvas).save(buffer, format="PNG")
+    picture = buffer.getvalue()
+    fake, _ = _tile_scripts(picture, f'click "{word}"')
+    monkeypatch.setattr(browser_tools, "execute_js", fake)
+    monkeypatch.setattr(
+        browser_tools, "screenshot", lambda **kwargs: picture
+    )
+    monkeypatch.setattr(
+        browser_tools, "_slider_solve",
+        lambda session_id, budget: {"attempted": True, "solved": False, "reason": "unsure"},
+    )
+    _register(_CannedDriver([BLOCKED, CLEAR]), session_id="tile-sure")
+    result = browser_tools.solve_captcha(
+        mode="auto", session_id="tile-sure", timeout_seconds=5, poll_seconds=0.05
+    )
+    measured = result["image_select"]
+    assert measured["attempted"] is True and measured["sure"] is True
+    # Image tile (448, 240) through the widget rect at page (10, 20), scale 1.
+    assert measured["ordered_boxes"] == [[458.0, 260.0, 224.0, 240.0]]
+    assert measured["clicks"] == [{"x": 570.0, "y": 380.0}]
+    assert "confirm button" in measured["next"]
+    # Measuring only: the test would error if anything tried a real pointer call,
+    # and the outcome carries no verify of any kind.
+    assert "verified" not in measured and "ticket" not in measured

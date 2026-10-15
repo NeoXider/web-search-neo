@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import io
 import json
+from pathlib import Path
 
 import pytest
 
 from web_search_neo import captcha_actions, captcha_aid
+
+FIXTURE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "tcaptcha"
+# Ground truth on the real OpenModel picture: the tile at column 2, row 1.
+TRUTH_TILE = [448, 240, 224, 240]
 
 PNGISH = b"\x89PNG\r\n\x1a\n" + b"0" * 200
 
@@ -189,3 +195,129 @@ def test_site_aid_lists_every_address_it_tried_when_none_answers():
     assert answer["success"] is False
     assert len(answer["requests_made"]) == len(captcha_aid.AID_PATHS)
     assert all(item["body_shape"] for item in answer["tried"])
+
+
+def _fixture_record() -> tuple[dict, bytes]:
+    record = json.loads((FIXTURE_DIR / "om_1865.json").read_text(encoding="utf-8"))
+    image = (FIXTURE_DIR / "om_1865.jpg").read_bytes()
+    return record, image
+
+
+def _red_tile_png(word: str, col: int = 2, row: int = 1) -> bytes:
+    """One published cell painted with the target's own rendered shape, in red."""
+    import numpy as np
+    from PIL import Image
+
+    from web_search_neo.captcha_solvers import word_shape
+
+    width, height = 672, 480
+    canvas = np.full((height, width, 3), 128, dtype=np.uint8)
+    mask = word_shape.glyph_mask(word, (224, 240))
+    canvas[row * 240 : (row + 1) * 240, col * 224 : (col + 1) * 224][mask] = (255, 0, 0)
+    buffer = io.BytesIO()
+    Image.fromarray(canvas).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def test_image_select_ranks_the_ground_truth_tile_first_but_refuses_it_unsure():
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("PIL")
+    record, image = _fixture_record()
+    answer = captcha_actions.image_select_from_page(record, image)
+    # The real photo grid never clears the dual shape gate: the ranking still
+    # puts the ground-truth tile first, but no boxes may be spent on a verify.
+    assert answer["sure"] is False
+    assert "ordered_boxes" not in answer
+    assert len(answer["cells"]) == 6
+    assert answer["cells"][0]["box"] == TRUTH_TILE
+    assert answer["why"]
+
+
+def test_image_select_names_the_tiles_in_order_only_when_sure():
+    pytest.importorskip("numpy")
+    pytest.importorskip("PIL")
+    word = "\u82f9\u679c"
+    record = {
+        "vendor": "tencent",
+        "challenge": "image_select",
+        "instruction": f'click "{word}"',
+        "targets": [word],
+        "image_size": [672, 480],
+        "click_cfg": {},
+    }
+    answer = captcha_actions.image_select_from_page(record, _red_tile_png(word))
+    assert answer["sure"] is True
+    assert answer["ordered_boxes"] == [TRUTH_TILE]
+    assert answer["cells"] and answer["cells"][0]["box"] == TRUTH_TILE
+    assert answer["why"]
+
+
+def test_image_select_instruction_override_replaces_the_record_prose():
+    pytest.importorskip("numpy")
+    pytest.importorskip("PIL")
+    record, image = _fixture_record()
+    answer = captcha_actions.image_select_from_page(record, image, instruction="click \u4e0d\u5b58\u5728")
+    assert answer["sure"] is False
+    assert "ordered_boxes" not in answer
+    assert answer["why"]
+
+
+def test_image_select_refusals_name_why_and_carry_no_boxes():
+    pytest.importorskip("numpy")
+    pytest.importorskip("PIL")
+    record, image = _fixture_record()
+    # No target anywhere: nothing to score against.
+    answer = captcha_actions.image_select_from_page({"challenge": "image_select"}, image)
+    assert answer == {"sure": False, "cells": [], "why": answer["why"]} and answer["why"]
+    assert "ordered_boxes" not in answer
+    # Bytes that are not a picture: nothing to score.
+    answer = captcha_actions.image_select_from_page(record, PNGISH)
+    assert answer["sure"] is False and "decoded" in answer["why"]
+    assert answer["cells"] == [] and "ordered_boxes" not in answer
+
+
+def test_page_image_select_leaves_a_non_tile_challenge_alone():
+    answer = captcha_actions.measure_page_image_select(
+        lambda script: {"success": True, "value": {"texts": [], "class_names": [], "sdk_urls": []}},
+        lambda rect: b"",
+    )
+    assert answer == {"attempted": False, "vendor": "unknown", "challenge": "unknown"}
+
+
+def test_page_image_select_measures_the_widget_picture_without_clicking():
+    pytest.importorskip("numpy")
+    pytest.importorskip("PIL")
+    _, image = _fixture_record()
+    word = "\u82f9\u679c"
+
+    def run_script(script: str) -> dict:
+        if "aid_present" in script:  # the classifier's fact probe
+            return {
+                "success": True,
+                "value": {
+                    "texts": ["please select the tiles in order"],
+                    "class_names": ["tcaptcha_transform_dy"],
+                    "sdk_urls": ["https://t.captcha.qq.com/cap_union_prehandle?aid=196724674"],
+                    "aid_present": True,
+                },
+            }
+        return {
+            "success": True,
+            "value": {"x": 10, "y": 20, "width": 672, "height": 480, "instruction": f'"{word}"'},
+        }
+
+    seen: list[tuple] = []
+
+    def capture_region(rect: tuple) -> bytes:
+        seen.append(tuple(rect))
+        return image
+
+    answer = captcha_actions.measure_page_image_select(run_script, capture_region)
+    assert answer["attempted"] is True and answer["sure"] is False
+    assert answer["challenge"] == "word_click"
+    assert answer["clicks"] == [] and "ordered_boxes" not in answer
+    # A word_click picture has no published grid, so the cells are colour
+    # components: the top-ranked one still sits on the ground-truth tile.
+    x, y, w, h = answer["cells"][0]["box"]
+    assert 448 <= x + w / 2 <= 672 and 240 <= y + h / 2 <= 480
+    assert seen == [(10.0, 20.0, 672.0, 480.0)]

@@ -5614,6 +5614,17 @@ def _auto_solve_challenge(session_id: str) -> dict[str, Any]:
     return outcome
 
 
+def _measure_image_select(session_id: str, found: Any, slider: Any, status: Any) -> dict[str, Any]:
+    """Measure a Tencent tile challenge from the page; nothing is clicked there."""
+    from web_search_neo import captcha_actions as _captcha_actions
+    return _captcha_actions.measure_page_image_select(
+        lambda script: execute_js(script, session_id=session_id),
+        lambda rect: screenshot(session_id=session_id, mode="region", x=int(rect[0]),
+                                y=int(rect[1]), width=int(rect[2]), height=int(rect[3])),
+        found=found, slider=slider, status=status,
+    )
+
+
 def solve_captcha(
     mode: str = "auto",
     session_id: str = "default",
@@ -5633,12 +5644,12 @@ def solve_captcha(
     the user clears in four seconds costs four seconds, not the whole timeout.
 
     A slider captcha - TCaptcha, Geetest - is handled here rather than bought: it
-    has no sitekey to send anywhere, so ``mode='solve'`` and ``mode='auto'`` measure
-    the hole in its picture and drag the handle into it with a human-shaped path.
-    That costs nothing and needs no key. When the measurement is too unsure to drag
-    on, it says so in ``slider_solve`` and falls back to waiting for a person
-    instead of spending the attempt on a guess. Set
-    WEB_SEARCH_NEO_CAPTCHA_LOCAL_SOLVE=0 to leave every slider to a human.
+    has no sitekey to send anywhere, so ``mode='solve'`` and ``mode='auto'``
+    measure the hole in its picture and drag the handle into it. That costs
+    nothing and needs no key. A Tencent tile captcha (image_select, word_click,
+    icon_click) is measured but never clicked here: ``image_select`` names the
+    tiles in page order when sure, or says why not. An unsure measurement is
+    reported, never spent. WEB_SEARCH_NEO_CAPTCHA_LOCAL_SOLVE=0 leaves both.
     """
     captcha.validate_mode(mode)
     session = _get_session(session_id)
@@ -5656,31 +5667,25 @@ def solve_captcha(
     identity = execute_js(captcha.IDENTIFY_SCRIPT, session_id=session_id)
     found = identity.get("value") or {}
 
-    # No sitekey means nothing to buy. A slider captcha is still solvable here:
-    # measure the hole, drag the handle into it, ask the page whether it left. It
-    # costs CPU and a third party nothing, so mode='auto' may do it unasked - and
-    # it is worth knowing when it tried and failed, because the failure names the
-    # measurement that was unsure rather than hiding behind a timeout.
+    # No sitekey means nothing to buy. A slider is dragged here; Tencent tiles
+    # are only measured, never clicked - both are free, so mode='auto' may do
+    # them unasked, and an unsure measurement is reported rather than spent.
     slider: dict[str, Any] = {}
+    image_select: dict[str, Any] = {}
     if not found.get("vendor") and mode in {"solve", "auto"} and _captcha_solvers.local_solve_enabled():
         try:
             slider = _slider_solve(session_id, min(30.0, max(8.0, float(timeout_seconds))))
         except (ChromeBridgeError, WebDriverException, ValueError) as exc:
-            slider = {
-                "attempted": True,
-                "solved": False,
-                "reason": f"the slider solve stopped: {_brief_error(exc)}",
-            }
+            slider = {"attempted": True, "solved": False,
+                      "reason": f"the slider solve stopped: {_brief_error(exc)}"}
         if slider.get("solved"):
-            return {
-                "success": True,
-                "session_id": session_id,
-                "captcha_present": False,
-                "mode": "solve",
-                "solved_by": "local_slider",
-                "slider": slider,
-                **_challenge_status(session.driver),
-            }
+            return {"success": True, "session_id": session_id, "captcha_present": False,
+                    "mode": "solve", "solved_by": "local_slider", "slider": slider,
+                    **_challenge_status(session.driver)}
+        # A tile challenge is measured, never clicked: image_select names the
+        # tiles in order when sure, or says why they cannot be trusted.
+        if not slider.get("solved"):
+            image_select = _measure_image_select(session_id, found, slider, status)
 
     if captcha.wants_paid_solve(mode, found):
         solved = captcha.solve_and_apply(
@@ -5691,20 +5696,15 @@ def solve_captcha(
         )
         return {"session_id": session_id, **solved}
 
-    # Waiting is what wait_challenge already does, down to holding the session
-    # open and reporting the page it ends on; repeating that loop here would only
-    # give it a second set of edge cases to drift from.
+    # Waiting is what wait_challenge already does; repeating that loop here would
+    # only give it a second set of edge cases to drift from.
     waited = wait_for_challenge_resolution(session_id, timeout_seconds, poll_seconds)
-    outcome = {
-        **waited,
-        "captcha_present": not waited["resolved"],
-        "mode": "wait",
-        "vendor": found.get("vendor"),
-    }
+    outcome = {**waited, "captcha_present": not waited["resolved"], "mode": "wait",
+               "vendor": found.get("vendor")}
     if slider.get("attempted"):
-        outcome["slider_solve"] = {
-            key: value for key, value in slider.items() if key != "locate"
-        }
+        outcome["slider_solve"] = {k: v for k, v in slider.items() if k != "locate"}
+    if image_select.get("attempted"):
+        outcome["image_select"] = image_select
     if not waited["resolved"]:
         report = captcha.unsolved_report(
             lambda script: execute_js(script, session_id=session_id),
