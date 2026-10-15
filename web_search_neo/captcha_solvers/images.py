@@ -266,7 +266,9 @@ def find_outline_pair(picture: bytes) -> dict[str, Any]:
     array = _load(picture)
     if array is None:
         return {"ok": False, "reason": "the picture could not be decoded"}
-    light = ((array[:, :, 0] > 165) & (array[:, :, 1] > 165) & (array[:, :, 2] > 165))
+    # The stroke is light but not white: a real widget draws it over a photo, and
+    # where the photo underneath is dark the anti-aliased edge sits around 150.
+    light = ((array[:, :, 0] > 150) & (array[:, :, 1] > 150) & (array[:, :, 2] > 150))
     if int(light.sum()) < 96:
         return {"ok": False, "reason": "the widget drew no outlines over its picture"}
     _count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
@@ -277,6 +279,11 @@ def find_outline_pair(picture: bytes) -> dict[str, Any]:
         x, y, width, height, area = (int(value) for value in stats[index])
         if area < 60:
             continue
+        # A stroke is a ring: it can never fill most of its own box, while a bright
+        # patch of the photo (sky, a lit wall) does. That keeps texture out of the
+        # running without touching the size window the notch search shares.
+        if area > 0.62 * width * height:
+            continue
         if MIN_PIECE_WIDTH <= width <= MAX_PIECE_WIDTH and MIN_PIECE_WIDTH <= height <= MAX_PIECE_WIDTH:
             shapes.append((x, y, width, height, area))
 
@@ -285,7 +292,10 @@ def find_outline_pair(picture: bytes) -> dict[str, Any]:
         for second in range(first + 1, len(shapes)):
             left_shape, right_shape = shapes[first], shapes[second]
             tolerance_w = max(3, int(round(0.12 * left_shape[2])))
-            tolerance_h = max(3, int(round(0.12 * left_shape[3])))
+            # The cut-out is the same shape on both sides, so its width has to agree.
+            # Its height need not: the stroke's glow and the knob sticking out of one
+            # side stretch that box a little, which a real capture showed at once.
+            tolerance_h = max(3, int(round(0.2 * left_shape[3])))
             if abs(left_shape[2] - right_shape[2]) > tolerance_w:
                 continue
             if abs(left_shape[3] - right_shape[3]) > tolerance_h:

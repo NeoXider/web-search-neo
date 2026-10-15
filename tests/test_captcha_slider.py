@@ -151,6 +151,26 @@ def test_a_third_shape_in_the_same_row_is_reported_as_unsure():
     assert captcha_solvers.detect_gap(_png(tex))["method"] != "outline_pair"
 
 
+def test_photo_highlights_are_not_shapes_and_a_dim_stroke_is_read():
+    """A real photo carries bright patches the size window cannot rule out alone.
+
+    In a live capture the hole's stroke sat around 158 where the photo behind it was
+    dark, and a lit part of the same photo was a solid block the same size as the
+    piece - so the stroke has to be readable below 165, and a patch that fills its
+    own box has to stay out of the pair while a ring does not.
+    """
+    pytest.importorskip("cv2")
+    tex = _plain_texture(seed=5)
+    tex[30:30 + PIECE_H, 240:240 + PIECE_W] = 215
+    _outline(tex, HOLE_X, 30, PIECE_W, PIECE_H + 8, 158)
+    _outline(tex, PIECE_X, 30, PIECE_W, PIECE_H, 158)
+    outlined = find_outline_pair(_png(tex))
+    assert outlined["ok"] is True, outlined
+    assert abs(outlined["distance"] - (HOLE_X - PIECE_X)) <= 1, outlined
+    assert outlined["confidence"] > 0.9, outlined
+    assert captcha_solvers.detect_gap(_png(tex))["method"] == "outline_pair"
+
+
 def test_a_picture_with_no_hole_says_so_instead_of_guessing():
     flat = _png(np.full((WIDGET_H, WIDGET_W, 3), 128, dtype="uint8"))
     found = captcha_solvers.detect_gap(flat)
