@@ -80,7 +80,7 @@ _BY_ACTION: dict[str, dict[str, str]] = {
         "show_values": "With http_session: show cookie values (in http_session, set_cookies, headers), redacted otherwise.",
         "timeout_seconds": "Capped at 120; bounds each read, the whole body gets twice that.",
         "save_to": "Path inside the download folder for the raw bytes; overwrite=true replaces a file.",
-        "vary": "Sweep this request with single changes: {headers: [{name: value}], query: [{name: value}], body: [text]}; the answer is the baseline plus one labelled diff per change.",
+        "vary": "Sweep this request with single changes: {headers: [{name: value}], query: [{name: value}], body: [text], method: [verb]}; the answer is the baseline plus one labelled diff per change; a 405 diff carries allow.",
     },
     "open": {"profile_mode": ("isolated (default for a new session: a clean separate headless browser) | "
                               "current (the user's Chrome, explicit) | temporary | persistent | attach | auto. "

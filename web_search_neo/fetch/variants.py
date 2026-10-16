@@ -29,7 +29,7 @@ SAMPLE_PATHS = 16
 MAX_DEPTH = 4
 LIST_ITEMS = 4
 
-_MUTABLE_KEYS = ("headers", "query", "body")
+_MUTABLE_KEYS = ("headers", "query", "body", "method")
 
 
 def shape(value: Any) -> str:
@@ -154,6 +154,11 @@ def structural_diff(baseline: dict[str, Any], variant: dict[str, Any]) -> dict[s
     variant_headers = {str(name).lower() for name in (variant.get("headers") or {})}
     delta["headers_added"] = sorted(variant_headers - base_headers)
     delta["headers_removed"] = sorted(base_headers - variant_headers)
+    # A 405 names the verbs the route really serves: that list is the map of the
+    # endpoint, so it is reported as its own field, not buried in headers_added.
+    allow = (variant.get("headers") or {}).get("allow") or (variant.get("headers") or {}).get("Allow")
+    if allow:
+        delta["allow"] = str(allow)
 
     base_body, variant_body = _json_body(baseline), _json_body(variant)
     if base_body is None and variant_body is None:
@@ -223,6 +228,16 @@ def _mutations(vary: dict[str, Any]) -> tuple[list[tuple[str, dict[str, Any]]], 
     for item in pairs("query"):
         for param, value in item.items():
             mutations.append((f"query {param}={value}", {"query": {str(param): str(value)}}))
+    methods = vary.get("method") or []
+    if isinstance(methods, str):
+        methods = [methods]
+    if isinstance(methods, list):
+        for verb in methods:
+            if isinstance(verb, str) and verb.strip():
+                mutations.append((f"method {verb.strip().upper()}", {"method": verb.strip().upper()}))
+    else:
+        unsupported.append("method (needs a list of verbs)")
+
     bodies = vary.get("body") or []
     if isinstance(bodies, str):
         bodies = [bodies]
@@ -260,6 +275,8 @@ def run_variants(
             spec["headers"] = merged
         if "query" in change:
             spec["url"] = _apply_query(str(spec.get("url") or ""), change["query"])
+        if "method" in change:
+            spec["method"] = change["method"]
         if "body" in change:
             spec["body"] = change["body"]
             # A body on a GET is a body most servers ignore, so a body mutation

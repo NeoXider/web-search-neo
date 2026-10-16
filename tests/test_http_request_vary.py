@@ -71,3 +71,36 @@ def test_vary_reports_query_diffs(monkeypatch):
     assert sweep["variants_ran"] == 2
     assert {v["label"] for v in sweep["variants"]} == {"query lang=en", "query lang=ru"}
     assert [s["url"].split("?")[-1] for s in seen[1:]] == ["lang=en", "lang=ru"]
+
+def test_vary_sweeps_methods_and_reports_allow(monkeypatch):
+    """A path x method sweep: the 405 answer names the verbs the route serves."""
+    by_method = {
+        "GET": _FakeResponse(status=405, text="nope",
+                             headers={"allow": "GET, DELETE, PATCH"}),
+        "DELETE": _FakeResponse(status=403, text="denied"),
+        "PATCH": _FakeResponse(status=200, text='{"ok": 1}'),
+    }
+
+    seen: list[dict] = []
+
+    def fake(url, **kwargs):
+        method = str(kwargs.get("method"))
+        seen.append({"method": method})
+        return by_method.get(method, _FakeResponse(status=200, text="open"))
+
+    monkeypatch.setattr("web_search_neo.fetch.api.request", fake)
+    result = api.http_request(
+        URL, vary={"method": ["GET", "DELETE", "PATCH", "OPTIONS"]})
+    sweep = result["swept"]
+    assert sweep["variants_ran"] == 4
+    assert {v["label"] for v in sweep["variants"]} == {
+        "method GET", "method DELETE", "method PATCH", "method OPTIONS"}
+    assert [str(s["method"]) for s in seen[1:]] == ["GET", "DELETE", "PATCH", "OPTIONS"]
+    got = {v["label"]: v for v in sweep["variants"]}
+    # the allow list is the route map, surfaced as its own field
+    assert got["method GET"]["allow"] == "GET, DELETE, PATCH"
+    assert got["method DELETE"]["status"] == 403
+    assert got["method PATCH"]["status"] == 200
+    # a verb the fake does not know answers 200: only a real 405 carries allow
+    assert got["method OPTIONS"]["status"] == 200
+    assert "allow" not in got["method OPTIONS"]
