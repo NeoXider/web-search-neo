@@ -40,7 +40,12 @@ SPEC_REQUEST_LIMIT = 6
 
 # Sitemap опублиchaft paths (вторый опубличашы источник). Cap на display: measured
 # openmodel.ai sitemap answered 20 locs; cap stays above that with headroom.
-SITEMAP_PATH_LIMIT = 40
+# 2026-10-16 measured: docs.openmodel.ai/sitemap.xml answered 70 <loc>s and www.openmodel.ai
+# answered 154, so the display cap sits above the smaller site's whole sitemap with headroom.
+SITEMAP_PATH_LIMIT = 80
+# Sibling subdomains whose sitemap may be read: one link from the page is evidence, and two
+# hosts are enough for docs/www without spending the request budget on a crawl.
+SIBLING_HOST_LIMIT = 2
 
 
 def discover_specs(links: Iterable[Any], page_url: str) -> list[dict[str, Any]]:
@@ -297,6 +302,56 @@ def _sitemap_source(page_url: str, fetch: Callable[[str], dict[str, Any]], budge
     return {"attempted": True, "status": status, **({"paths": paths} if paths else {})}
 
 
+def _site_tail(netloc: str) -> str:
+    """The two last dotted parts of a host - the public-suffix heuristic for one site."""
+    parts = str(netloc or "").lower().split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else str(netloc or "").lower()
+
+
+def _sibling_sitemap_sources(links: Iterable[Any], page_url: str,
+                             fetch: Callable[[str], dict[str, Any]], budget: Any) -> dict[str, Any]:
+    """Read `/sitemap.xml` on sibling subdomains the page itself links to.
+
+    Sites publish their documents on a sibling host (docs.<site>); the address came from a
+    link on the page, so following it is evidence rather than a guessed door - and only that
+    host's own published sitemap is read.
+    """
+    base = urlsplit(str(page_url or ""))
+    if base.scheme not in ("http", "https") or not base.netloc:
+        return {"hosts": [], "attempts": 0, "paths": []}
+    tail = _site_tail(base.netloc)
+    hosts: list[str] = []
+    for link in links or []:
+        href = (link or {}).get("href") if isinstance(link, dict) else link
+        if not href:
+            continue
+        parts = urlsplit(str(href))
+        host = parts.netloc.lower()
+        if parts.scheme not in ("http", "https") or not host:
+            continue
+        if _site_tail(host) != tail or host == base.netloc.lower():
+            continue
+        if host not in hosts:
+            hosts.append(host)
+        if len(hosts) >= SIBLING_HOST_LIMIT:
+            break
+    paths: list[str] = []
+    attempts = 0
+    for host in hosts:
+        url = f"{base.scheme}://{host}/sitemap.xml"
+        if budget is not None and not budget.take(f"GET {redact_url(url)}"):
+            break
+        attempts += 1
+        answer = fetch(url)
+        status = int(answer.get("status") or 0)
+        if not answer.get("ok") or status >= 400:
+            continue
+        for path in sitemap_paths(answer.get("text")):
+            if path not in paths:
+                paths.append(path)
+    return {"hosts": hosts, "attempts": attempts, **({"paths": paths} if paths else {})}
+
+
 def collect(page_url: str, rows: list[dict[str, Any]], own_hosts: set[str], links: Iterable[Any],
             fetch: Callable[[str], dict[str, Any]], budget: Any = None) -> dict[str, Any]:
     """Собрать контракт с origin'а страницы и сравнить с трафиком.
@@ -338,6 +393,12 @@ def collect(page_url: str, rows: list[dict[str, Any]], own_hosts: set[str], link
         sitemap = _sitemap_source(page_url, fetch, budget)
         spent += 1 if sitemap.get("attempted") else 0
         published = sitemap.get("paths") or []
+        siblings = _sibling_sitemap_sources(links, page_url, fetch, budget)
+        spent += siblings.get("attempts", 0)
+        for path in siblings.get("paths", []):
+            if path not in published:
+                published.append(path)
+        published = published[:SITEMAP_PATH_LIMIT]
         extra: dict[str, Any] = {}
         if published:
             observed = observed_endpoints(rows, own_hosts)
