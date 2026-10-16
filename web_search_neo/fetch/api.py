@@ -6,6 +6,7 @@ import logging
 from typing import Any
 
 from web_search_neo.fetch import sessions as http_sessions
+from web_search_neo.fetch import variants
 from web_search_neo.fetch.decoding import decode_response
 from web_search_neo.fetch.safety import redact_url, write_download
 from web_search_neo.web_client import clamp_timeout, request, validate_http_url
@@ -30,6 +31,7 @@ def http_request(
     agent_label: str | None = None,
     http_session_clear: bool = False,
     show_values: bool = False,
+    vary: dict[str, Any] | None = None,
     *,
     request_client: Any | None = None,
 ) -> dict[str, Any]:
@@ -47,7 +49,14 @@ def http_request(
     as ``http_session`` - names and flags, values only with ``show_values``.
     ``http_session_clear`` empties that jar before this request is sent.
     Every Set-Cookie of the final response is listed in ``set_cookies``.
+    ``vary`` turns this one request into a delta sweep (see fetch.variants):
+    {"headers": {"X-Test": ["a", "b"]}} sends the baseline plus one request per
+    change, each reported as a structural diff from the baseline. A body delta
+    upgrades GET to POST. Sweep only a host you are allowed to probe.
     """
+    if vary is not None and save_to:
+        raise ValueError("a vary sweep reports several bodies: drop save_to, "
+                         "or send vary=None")
     normalized_method = "GET" if method is None else str(method).strip().upper()
     if normalized_method not in _METHODS:
         raise ValueError(f"method must be one of {sorted(_METHODS)}, not {method!r}")
@@ -70,6 +79,13 @@ def http_request(
         if not any(str(name).lower() == "content-type" for name in sent):
             extra["headers"] = {**sent, "Content-Type": "application/json"}
     normalized_url = validate_http_url(url)
+    baseline_spec = {
+        "url": normalized_url,
+        "method": normalized_method,
+        "headers": dict(extra.get("headers") or {}),
+        "query": dict(extra.get("params") or {}),
+        "body": extra["data"] if "data" in extra else extra.get("json"),
+    }
     session_jar = session_info = None
     if http_session is not None or http_session_clear:
         if http_session is None:
@@ -84,23 +100,57 @@ def http_request(
     log.info("HTTP %s %s", normalized_method, redact_url(normalized_url))
     byte_budget = min(max(1_000_000, int(max_chars) * 8), 10_000_000)
     client = request if request_client is None else request_client
-    try:
-        response = client(
-            normalized_url,
-            method=normalized_method,
-            timeout_seconds=clamp_timeout(timeout_seconds),
-            max_response_bytes=byte_budget,
-            **extra,
-        )
-    except Exception as exc:
-        error_response = getattr(exc, "response", None)
-        if error_response is None or not isinstance(
-            getattr(error_response, "status_code", None), int
-        ):
-            raise
-        response = error_response
+    def _send(spec: dict[str, Any]) -> dict[str, Any]:
+        """Send one spec through this call's client, jar and byte budget."""
+        send_extra = dict(extra)
+        send_extra["headers"] = dict(spec.get("headers") or {})
+        send_extra["params"] = dict(spec.get("query") or {})
+        for key in ("data", "json"):
+            send_extra.pop(key, None)
+        payload = spec.get("body")
+        if isinstance(payload, (dict, list)):
+            send_extra["json"] = payload
+        elif payload is not None:
+            send_extra["data"] = payload
+        send_method = str(spec.get("method") or normalized_method)
+        send_url = str(spec.get("url") or normalized_url)
+        log.info("HTTP %s %s", send_method, redact_url(send_url))
+        try:
+            response = client(
+                send_url,
+                method=send_method,
+                timeout_seconds=clamp_timeout(timeout_seconds),
+                max_response_bytes=byte_budget,
+                **send_extra,
+            )
+        except Exception as exc:
+            error_response = getattr(exc, "response", None)
+            if error_response is None or not isinstance(
+                getattr(error_response, "status_code", None), int
+            ):
+                raise
+            response = error_response
+        return _envelope(response, session_jar, session_info, before,
+                         bool(show_values), save_to=save_to, overwrite=overwrite,
+                         max_chars=max_chars)
+
+    if vary is not None:
+        sweep = variants.run_variants(_send, baseline_spec, vary)
+        return {
+            "success": True,
+            "url": normalized_url,
+            "method": normalized_method,
+            "swept": sweep,
+        }
+    return _send(baseline_spec)
+
+
+def _envelope(response: Any, session_jar: Any, session_info: Any, before: list,
+        show_values: bool, save_to: str | None = None, overwrite: bool = False,
+        max_chars: int = 20_000) -> dict[str, Any]:
+    """One response object as the published http_request envelope."""
     status = int(response.status_code)
-    final_url = getattr(response, "url", None) or normalized_url
+    final_url = getattr(response, "url", None) or ""
     resp_headers = dict(getattr(response, "headers", None) or {})
     # requests folds repeated Set-Cookie headers into one ", "-joined string,
     # which the commas inside Expires make unparseable: keep them apart too.

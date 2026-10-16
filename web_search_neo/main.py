@@ -155,17 +155,17 @@ async def http_request(
     agent_label: str | None = None,
     http_session_clear: bool = False,
     show_values: bool = False,
+    vary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Send any HTTP request without a browser; 4xx/5xx return status and body, not errors.
 
-    save_to is confined to WEB_SEARCH_NEO_DOWNLOAD_DIR (default ./downloads) and
-    needs overwrite=true to replace a file; timeout_seconds is capped at 120.
-    http_session keeps cookies across calls in a jar per (agent_label, name).
+    save_to is confined to WEB_SEARCH_NEO_DOWNLOAD_DIR (default ./downloads) and needs
+    overwrite=true to replace a file; timeout_seconds is capped at 120. http_session keeps
+    cookies in a jar per (agent_label, name); vary sweeps one change per variant.
     """
     return await asyncio.to_thread(
-        fetch_api.http_request, url, method, headers, query, body, body_json, timeout_seconds,
-        max_chars, save_to, overwrite, http_session, agent_label, http_session_clear, show_values,
-    )
+        fetch_api.http_request, url, method, headers, query, body, body_json, timeout_seconds, max_chars,
+        save_to, overwrite, http_session, agent_label, http_session_clear, show_values, vary)
 
 
 @mcp.tool()
@@ -2091,7 +2091,7 @@ _ACTIONS: dict[str, ActionSpec] = {
         ),
         _action("fetch_links", fetch_page_links, "fetch", "List the links of one page without a browser."),
         _action("fetch_many", fetch_urls_text, "fetch", "Read several pages concurrently as text."),
-        _action("http_request", http_request, "fetch", "Send any HTTP request without a browser; 4xx/5xx return status."),
+        _action("http_request", http_request, "fetch", "Send any HTTP request without a browser; 4xx/5xx return status; vary sweeps header/query/body deltas."),
         _action("open", browser_open_page, "session", "Open a URL in a named browser session."),
         _action(
             "open_many", browser_open_pages, "session", "Open several URLs in independent sessions at once."
