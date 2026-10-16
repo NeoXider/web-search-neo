@@ -1480,6 +1480,12 @@ no paths, scans no ports, tries no origins, fuzzes nothing and never gets past a
 CAPTCHA; point it only at sites you own or may test. Cookie values never appear in the
 answer.
 
+`api_report` carries one more section: `probe_journal`, the dead ends this host already
+showed - method, path, status - kept in `downloads/probe_journal/<host>.json` so a later
+round can see which routes were already tried here. It is seeded only from traffic the run
+itself captured (`web_search_neo.audit.probe_journal.seed_from_traffic(rows, bodies)`);
+reading it sends nothing.
+
 ```json
 {"actions":[{"action":"test_run","url":"http://127.0.0.1:8000/signup","session_id":"reg","steps":[
   {"action":"fill","fields":{"#email":"qa@example.com"}},
