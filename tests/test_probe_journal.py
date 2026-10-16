@@ -102,3 +102,14 @@ def test_api_report_seeds_and_exposes_the_journal(tmp_path, monkeypatch):
 def test_record_without_a_host_records_nothing(tmp_path):
     assert record("GET", "not a url", 403, "x", root=tmp_path)["recorded"] is False
     assert record("GET", "data:text/plain,hi", 403, "x", root=tmp_path)["recorded"] is False
+
+def test_a_root_that_is_already_the_journal_dir_does_not_double_nest(tmp_path):
+    from web_search_neo.audit.probe_journal import journal_dir, record, query
+
+    outer = tmp_path
+    inner = tmp_path / "probe_journal"
+    assert journal_dir(inner) == journal_dir(outer)
+    record("GET", "https://api.example.com/v1/nested", 404, "http_404", root=inner)
+    out = query("api.example.com", root=outer)
+    assert any(item["path"] == "/v1/nested" for item in out["entries"])
+    assert not (inner / "probe_journal").exists()

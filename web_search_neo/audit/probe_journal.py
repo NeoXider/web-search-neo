@@ -48,8 +48,16 @@ def _utcnow() -> str:
 
 
 def journal_dir(root: Path | str | None = None) -> Path:
-    """Каталог журнала: подкаталог harness download/state-каталога."""
+    """Каталог журнала: подкаталог harness download/state-каталога.
+
+    Idempotent на root: caller'ов часто pass уже `.../probe_journal` (they copy the
+    path from a report), which used to double-nest silently into
+    `probe_journal/probe_journal/<host>.json`. A root already named like the subdir
+    is used as-is, so one journal per downloads tree.
+    """
     base = Path(root).expanduser() if root is not None else download_root()
+    if base.name == JOURNAL_SUBDIR:
+        return base
     return base / JOURNAL_SUBDIR
 
 
