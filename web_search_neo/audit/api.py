@@ -21,6 +21,7 @@ from web_search_neo.audit.api_errors import error_shapes
 from web_search_neo.audit.api_parts import EVIDENCE_LIMIT
 from web_search_neo.audit.findings import info
 from web_search_neo.audit.probe_journal import query as journal_query
+from web_search_neo.audit.probe_journal import route_oracle
 from web_search_neo.audit.probe_journal import seed_from_traffic
 from web_search_neo.audit.api_checks import (auth_findings, cache_findings, content_findings, cors_findings,
                                              csrf_findings, error_findings, transport_findings, url_findings)
@@ -171,6 +172,8 @@ def build(rows: list[dict[str, Any]], *, page_url: str, jar: list[Any] | None = 
         "errors": errors[:ENDPOINT_LIMIT],
         "error_meanings": [item["meaning"] for item in errors if item.get("meaning")][:EVIDENCE_LIMIT],
         "probe_journal": {"hosts": journal, "seeded_this_run": seeded["recorded"],
+                          "route_verdicts": {host: route_oracle((journal[host] or {}).get("entries", []))
+                                             for host in journal},
                           "note": ("Already-tried-here memory, seeded from this run's own captured "
                                    "traffic only — no new requests were sent to fill it.")},
         **({"contract_drift": contract} if contract else {}),

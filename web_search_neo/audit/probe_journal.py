@@ -125,6 +125,54 @@ def _write(host: str, data: dict[str, Any], root: Path | str | None = None) -> P
     return path
 
 
+ROUTE_ORACLE_CHILDREN = 12
+
+
+def route_oracle(entries: Any) -> list[dict[str, Any]]:
+    """Classify path prefixes by whether unauthenticated answers can read existence.
+
+    A prefix whose every child answers authentication/forbidden (never "route not
+    found") hides its routes behind a gate that runs BEFORE route matching: probing
+    names there proves nothing about which routes exist. A prefix where children split
+    between 404 and other statuses does let existence be read.
+    """
+    groups: dict[str, dict[str, Any]] = {}
+    for entry in entries or ():
+        path = str((entry or {}).get("path") or "")
+        status = (entry or {}).get("status")
+        parts = [part for part in path.split("/") if part]
+        if len(parts) < 2:
+            continue
+        try:
+            code = int(status)
+        except (TypeError, ValueError):
+            continue
+        for depth in (2, 3):
+            if len(parts) < depth:
+                continue
+            prefix = "/" + "/".join(parts[:depth])
+            child = "/".join(parts[depth:]) or "(self)"
+            bucket = groups.setdefault(prefix, {"children": {}, "statuses": set()})
+            bucket["children"][child] = code
+            bucket["statuses"].add(code)
+    out: list[dict[str, Any]] = []
+    for prefix in sorted(groups):
+        bucket = groups[prefix]
+        codes = bucket["statuses"]
+        children = bucket["children"]
+        gated = {401, 403}
+        if len(children) >= 2 and codes and codes <= gated:
+            verdict = "auth_before_matching"
+        elif 404 in codes and any(code != 404 for code in codes):
+            verdict = "existence_discriminates"
+        else:
+            verdict = "insufficient"
+        out.append({"prefix": prefix, "verdict": verdict, "statuses": sorted(codes),
+                    "children_total": len(children),
+                    "children": sorted(children)[:ROUTE_ORACLE_CHILDREN]})
+    return out
+
+
 def meaning_code(meaning: Any) -> str:
     """Код смысла одной строкой: hint важнее class, иначе 'http_<status>'/''."""
     if isinstance(meaning, dict):

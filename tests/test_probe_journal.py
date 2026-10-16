@@ -113,3 +113,18 @@ def test_a_root_that_is_already_the_journal_dir_does_not_double_nest(tmp_path):
     out = query("api.example.com", root=outer)
     assert any(item["path"] == "/v1/nested" for item in out["entries"])
     assert not (inner / "probe_journal").exists()
+
+def test_the_route_oracle_names_a_gate_that_hides_existence(tmp_path):
+    from web_search_neo.audit.probe_journal import route_oracle
+
+    entries = [{"path": "/web/v1/orders/refunds", "status": 401},
+               {"path": "/web/v1/orders/promotions", "status": 401},
+               {"path": "/web/v1/orders/cancel", "status": 403},
+               {"path": "/web/v1/refunds", "status": 401},
+               {"path": "/web/v1/promotions", "status": 404},
+               {"path": "/web/v1/usage", "status": 200}]
+    verdicts = {item["prefix"]: item["verdict"] for item in route_oracle(entries)}
+    assert verdicts["/web/v1/orders"] == "auth_before_matching"
+    assert verdicts["/web/v1"] == "existence_discriminates"
+    assert any(item["children_total"] >= 3 and item["verdict"] == "auth_before_matching"
+               for item in route_oracle(entries))
