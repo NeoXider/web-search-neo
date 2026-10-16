@@ -86,6 +86,24 @@ def preflight_findings(url: str, origin: str, headers: dict[str, Any] | None) ->
                    "including custom headers your API may treat as privileged.",
             fix="List exactly the methods and headers your front end needs.",
             evidence={"url": safe_url(url), "methods": methods, "headers": heads}))
+    simple_headers = {"accept", "accept-language", "content-type", "content-language",
+                      "origin", "range"}
+    declared = [h.strip() for h in heads.split(",") if h.strip()]
+    custom = [h for h in declared if h != "*" and h.lower() not in simple_headers]
+    verbs = [m.strip().upper() for m in methods.split(",") if m.strip()]
+    extra_verbs = [v for v in verbs if v != "*" and v not in {"GET", "HEAD", "OPTIONS"}]
+    if custom or extra_verbs:
+        out.append(info(
+            "active-cors-declared-access", "cors",
+            f"The preflight names {len(custom)} custom header(s) and {len(extra_verbs)} "
+            f"non-simple method(s)",
+            detail="Custom request headers are where an API front end honours privileged "
+                   "behaviour: the names listed here are exactly what a browser may send "
+                   "cross-origin, so they are worth reading in the route's own code. "
+                   "Nothing here is a defect on its own.",
+            evidence={"url": safe_url(url),
+                      "headers": clip_list(custom, 12),
+                      "methods": clip_list(extra_verbs, 8)}))
     return out
 
 
