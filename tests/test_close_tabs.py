@@ -146,6 +146,28 @@ def test_a_tab_that_survives_is_reported_as_failed(wired, monkeypatch):
     assert [entry["tab_id"] for entry in result["failed"]] == [1]
 
 
+def test_a_tab_that_survives_the_first_try_is_retried_once(wired, monkeypatch):
+    """A remove racing the tab's own navigation used to come back failed.
+
+    The acknowledgement says nothing (see above), so the only honest signal
+    is the fresh tab list - and a tab still listed right after its own
+    navigation is worth one more attempt before calling it a failure.
+    """
+    attempts = []
+
+    def flaky(method, params=None, timeout=5.0):
+        attempts.append(int((params or {})["tabId"]))
+        if len(attempts) == 1:
+            return {"removed": True, "id": 1}  # acked, but the tab is still there
+        wired.removed.append(1)
+
+    monkeypatch.setattr(wired, "request", flaky)
+    result = chrome_bridge.close_current_chrome_tabs([1])
+    assert attempts == [1, 1]
+    assert [entry["tab_id"] for entry in result["closed"]] == [1]
+    assert result["failed"] == []
+
+
 def test_ids_are_deduplicated_and_junk_is_reported(wired):
     result = chrome_bridge.close_current_chrome_tabs([1, 1, "nonsense"])
     assert wired.removed == [1]

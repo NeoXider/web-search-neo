@@ -142,7 +142,7 @@ _ACTION_NOTES = {
     },
 "run_script": {
         "scope": "Runs in the top document of the session's current tab; frame_selector runs it inside one frame (same- or cross-origin).",
-        "args": "args arrive as arguments[0..n]; only JSON-serialisable values can cross into the page.",
+        "args": "args arrive as arguments[0..n]; only JSON-serialisable values can cross into the page. A script that reads an arguments[n] nothing provides is refused before it runs: an unset index is `undefined`, which pastes as the text 'undefined'.",
         "body": "One semantics for run_script, execute_js and wait.script: the script is the body of an async function - await works at top level, `return <value>;` returns, and a one-line expression without return returns itself (document.title). A statement without return comes back as null with value_note. A SyntaxError fails at once (syntax_error=true); a thrown error or rejected promise is a script error.",
         "result": "value is the JSON-serialisable return value; returned promises are awaited. A value over max_chars (default 18000) comes back as a window: truncated=true, total_length (characters, items or JSON characters), offset, next_offset - strings by characters, arrays by whole items, objects as a slice of value_json. save_to='x.json' writes the whole value to the download folder instead. attempts reports how many tries the call took.",
         "retry": "Single-shot by default (retry_on_uncaught=false). An exception may follow a completed mutation. Only enable retries for scripts safe to repeat; retries=2, retry_delay_ms=300. wait_ready=true additionally settles readiness first.",

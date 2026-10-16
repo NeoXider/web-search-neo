@@ -1995,18 +1995,18 @@ def close_current_chrome_tabs(
             continue
         targets.append(tab_id)
 
-    for tab_id in targets:
-        try:
-            bridge.request("tabs.remove", {"tabId": tab_id}, timeout=5.0)
-        except Exception as exc:  # noqa: BLE001 - the listing below decides, not this
-            LOGGER.warning(
-                "Closing tab %s failed: %s: %s", tab_id, type(exc).__name__, exc
-            )
-
-    after = list_current_chrome_tabs(0.0)
-    still_open = {
-        tab.get("id") for tab in (after.get("tabs") or []) if isinstance(tab, dict)
-    }
+    from web_search_neo import tab_close as _tab_close
+    # A remove that raced the tab's own navigation still lists the tab right
+    # after; those are retried once here, and the outcome below is still
+    # decided against the fresh tab list rather than the acknowledgement.
+    still_open = _tab_close.close_with_retry(
+        lambda tab_id: bridge.request("tabs.remove", {"tabId": tab_id}, timeout=5.0),
+        lambda: {
+            tab.get("id") for tab in (list_current_chrome_tabs(0.0).get("tabs") or [])
+            if isinstance(tab, dict)
+        },
+        targets,
+    )
     closed: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
     for tab_id in targets:

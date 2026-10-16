@@ -5,6 +5,7 @@ import glob
 import json
 import logging
 import os
+import re
 from pathlib import Path
 import shutil
 import signal
@@ -307,6 +308,40 @@ def clear_target_state(session: Any, step: PageSteps) -> None:
     session.stealth_identifier = None
 
 
+_SCRIPT_ARG_INDEX = re.compile(r"arguments\s*\[\s*(\d+)\s*\]")
+_SCRIPT_QUOTED = re.compile(r"""'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|`(?:\\.|[^`\\])*`""")
+
+
+def check_args(script: str, args: list[Any] | None) -> None:
+    """Fail fast when a script reads an `arguments[n]` nothing provides.
+
+    Every runtime applies only `args` (the async wrapper hides the transport's
+    own trailing callback), so an index past the end is `undefined` - and an
+    undefined written to a clipboard or a form arrives as the text
+    'undefined', which reads like the tool misbehaved. Quoted text is not
+    code: a message that merely mentions arguments[0] does not trip this.
+    """
+    code = _SCRIPT_QUOTED.sub('""', str(script or ""))
+    indices = sorted({int(match.group(1)) for match in _SCRIPT_ARG_INDEX.finditer(code)})
+    if not indices:
+        return
+    have = len(list(args or []))
+    missing = [index for index in indices if index >= have]
+    if not missing:
+        return
+    first = missing[0]
+    if not have:
+        raise ValueError(
+            f"script reads arguments[{first}] but no `args` were passed: pass the value "
+            f"in `args` (it arrives as arguments[{first}]). An unset index is `undefined`."
+        )
+    raise ValueError(
+        f"script reads arguments[{first}] but only {have} "
+        f"`args` {'item was' if have == 1 else 'items were'} passed: "
+        f"extend `args` so index {first} exists."
+    )
+
+
 def execute(
     driver: Any, script: str, args: list[Any] | None = None, *,
     await_promise: bool = False, user_gesture: bool = False,
@@ -322,6 +357,7 @@ def execute(
     Readiness, page reporting, and error formatting are injected explicitly.
     Retrying is opt-in because a thrown error may follow a completed mutation.
     """
+    check_args(script, args)
     max_attempts = 1 + max(0, int(retries)) if retry_on_uncaught else 1
     for attempt in range(1, max_attempts + 1):
         try:

@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- `run_script`/`execute_js` refuse a script that reads an `arguments[n]` no passed `args` provides, before touching the page: every runtime applies only `args`, so the index was `undefined` - and an undefined written to a clipboard or a form arrived as the text 'undefined'. Quoted text that merely mentions `arguments[0]` is not code and does not trip it.
+- `close_tabs` retries once a tab Chrome still lists right after removing it: a remove racing the tab's own navigation used to come back `failed` although the next attempt closes it. A tab still listed after the retry is reported failed as before.
+
 ## 1.27.0
 
 The captcha layer got eyes: before this release the tool could drag a slider it could see, but it had no way to say what kind of challenge it was looking at, and an image-select challenge (the "click the tiles that show X" grid Tencent serves on OpenModel's login) was invisible to it. Everything here reads what the widget already publishes; nothing forces an answer.
