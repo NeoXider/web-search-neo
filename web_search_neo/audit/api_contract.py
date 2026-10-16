@@ -38,6 +38,10 @@ BODY_LIMIT = 400_000
 # страницей ссылки. Потолок маленький, потому что это проверка наличия документа.
 SPEC_REQUEST_LIMIT = 6
 
+# Sitemap опублиchaft paths (вторый опубличашы источник). Cap на display: measured
+# openmodel.ai sitemap answered 20 locs; cap stays above that with headroom.
+SITEMAP_PATH_LIMIT = 40
+
 
 def discover_specs(links: Iterable[Any], page_url: str) -> list[dict[str, Any]]:
     """Ссылки страницы, которые объявляют контракт API: rel или имя пути говорят об этом."""
@@ -74,6 +78,41 @@ def spec_urls(page_url: str) -> list[str]:
             [root + "/" + suffix for suffix in _MCP_SUFFIXES]
     # /foo//bar/openapi.json (и пустой base) дают двойные слеши: чистим перед запросом.
     return sorted({re.sub(r"(?<!:)//+", "/", path) for path in paths})
+
+
+def sitemap_paths(xml_text: Any) -> list[str]:
+    """Публизь шуя из sitemap.xml (вторый опубличашы источник, weaker than a contract).
+
+    Sitemap опублиchaft paths без спецификации о methods/parameters: это вторый
+    верифied source публышы путями (first — openapi/swagger/mcp document). Шуя из
+    sitemap только path, нет method, поэтому сравится к трафику по path nom only.
+    """
+    raw = str(xml_text or "")
+    if "<loc>" not in raw.lower() and "<loc " not in raw.lower():
+        return []
+    found: list[str] = []
+    home = None
+    for match in re.finditer(r"<loc>\s*([^<\s]+)\s*</loc>", raw, flags=re.I):
+        parts = urlsplit(match.group(1))
+        if parts.scheme not in ("http", "https"):
+            continue
+        # Sitemap публышы путями на ONE origin: первый loc fixat netloc, others skip.
+        if home is None:
+            home = (parts.scheme, parts.netloc)
+        elif (parts.scheme, parts.netloc) != home:
+            continue
+        found.append(parts.path or "/")
+    return sorted(set(found))[:SITEMAP_PATH_LIMIT]
+
+
+def compare_paths_to_sitemap(observed: dict[Any, Any], published: list[str]) -> list[dict[str, Any]]:
+    """Трафику путями, which the published sitemap set does not name."""
+    named = set(published)
+    out = []
+    for (method, path) in observed:
+        if path not in named:
+            out.append({"method": method, "path": path})
+    return sorted(out, key=lambda item: (item["path"], item["method"]))[:SITEMAP_PATH_LIMIT]
 
 
 def declared_parameters(operations: Any) -> list[str]:
@@ -238,6 +277,26 @@ def compare(specs: list[dict[str, Any]], rows: list[dict[str, Any]], own_hosts: 
     }
 
 
+def _sitemap_source(page_url: str, fetch: Callable[[str], dict[str, Any]], budget: Any) -> dict[str, Any]:
+    """Read `/sitemap.xml` as the SECOND published-paths source (weaker than a contract).
+
+    Sitemap опублиchaft только путями (no methods, no parameters), поэтому его
+    сравится к трафику по path nom only and never calls itself a contract.
+    """
+    parts = urlsplit(str(page_url or ""))
+    if parts.scheme not in ("http", "https"):
+        return {"attempted": False}
+    url = f"{parts.scheme}://{parts.netloc}/sitemap.xml"
+    if budget is not None and not budget.take(f"GET {redact_url(url)}"):
+        return {"attempted": False, "why": "request_budget_exhausted"}
+    answer = fetch(url)
+    status = int(answer.get("status") or 0)
+    if not answer.get("ok") or status >= 400:
+        return {"attempted": True, "status": status}
+    paths = sitemap_paths(answer.get("text"))
+    return {"attempted": True, "status": status, **({"paths": paths} if paths else {})}
+
+
 def collect(page_url: str, rows: list[dict[str, Any]], own_hosts: set[str], links: Iterable[Any],
             fetch: Callable[[str], dict[str, Any]], budget: Any = None) -> dict[str, Any]:
     """Собрать контракт с origin'а страницы и сравнить с трафиком.
@@ -276,12 +335,23 @@ def collect(page_url: str, rows: list[dict[str, Any]], own_hosts: set[str], link
             specs.append({**parsed, "url": candidate["url"], "kind": candidate["kind"]})
     comparison = compare(specs, rows, own_hosts)
     if not specs:
+        sitemap = _sitemap_source(page_url, fetch, budget)
+        spent += 1 if sitemap.get("attempted") else 0
+        published = sitemap.get("paths") or []
+        extra: dict[str, Any] = {}
+        if published:
+            observed = observed_endpoints(rows, own_hosts)
+            extra["published_paths_from_sitemap"] = {
+                "paths": published,
+                "observed_not_published": compare_paths_to_sitemap(observed, published),
+            }
         return {"found": False, "probed": probed[:12], "requests_made": spent,
                 "note": ("No published API contract was found on this origin (no openapi/swagger/mcp link or "
                          "standard document answered). Contract drift needs a published specification; without "
                          "one the endpoint map and error meanings in this report are still the truth about "
                          "what was called."),
-                **({"spec_candidates_probed": len(probed)} if probed else {})}
+                **({"spec_candidates_probed": len(probed)} if probed else {}),
+                **extra}
     return {"found": True, "requests_made": spent,
             "sources": [{"url": spec["url"], "kind": spec.get("kind"),
                                         **({"title": spec["title"]} if spec.get("title") else {}),

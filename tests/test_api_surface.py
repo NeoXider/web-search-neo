@@ -281,3 +281,33 @@ def test_the_drift_check_never_breaks_the_report():
 @pytest.mark.parametrize("page", ["not a url", "ftp://example.com/x"])
 def test_a_page_that_is_not_http_gets_no_candidates(page):
     assert api_contract.spec_urls(page) == []
+
+# --- sitemap как вторый опубличашы источник ---------------------------------
+
+def test_sitemap_paths_are_read_from_the_document():
+    xml = ('<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+           "<url><loc>https://api.example.com/model-pricing/deepseek</loc></url>"
+           "<url><loc>not-a-url</loc></url>"
+           "<url><loc>https://other.example.net/x</loc></url></urlset>")
+    assert api_contract.sitemap_paths(xml) == ["/model-pricing/deepseek"]
+    assert api_contract.sitemap_paths("") == []
+
+
+def test_the_sitemap_cannot_pass_its_cap_silently():
+    xml = "".join(f"<url><loc>https://api.example.com/p/{i}</loc></url>" for i in range(60))
+    got = api_contract.sitemap_paths(xml)
+    assert len(got) == api_contract.SITEMAP_PATH_LIMIT
+
+
+def test_no_contract_but_a_sitemap_still_publishes_paths():
+    def fetch(url: str) -> dict:
+        if url.endswith("/sitemap.xml"):
+            return {"ok": True, "status": 200, "content_type": "application/xml",
+                    "text": '<urlset><url><loc>https://console.example.com/docs/a</loc></url></urlset>'}
+        return {"ok": False, "status": 404, "why": "http_404", "text": ""}
+    budget = _Budget(limit=40)
+    out = api_contract.collect(PAGE, [_row("/web/v1/me/keys", 200)], {"example.com"}, [], fetch, budget)
+    assert out["found"] is False and "No published API contract" in out["note"]
+    srcs = out["published_paths_from_sitemap"]
+    assert srcs["paths"] == ["/docs/a"]
+    assert [(item["method"], item["path"]) for item in srcs["observed_not_published"]] == [("GET", "/web/v1/me/keys")]
