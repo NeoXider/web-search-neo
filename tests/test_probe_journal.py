@@ -128,3 +128,13 @@ def test_the_route_oracle_names_a_gate_that_hides_existence(tmp_path):
     assert verdicts["/web/v1"] == "existence_discriminates"
     assert any(item["children_total"] >= 3 and item["verdict"] == "auth_before_matching"
                for item in route_oracle(entries))
+
+def test_the_route_oracle_caps_its_child_list(tmp_path):
+    from web_search_neo.audit.probe_journal import ROUTE_ORACLE_CHILDREN, route_oracle
+
+    entries = [{"path": f"/web/v1/orders/name{i}", "status": 401} for i in range(30)]
+    rows = [item for item in route_oracle(entries) if item["prefix"] == "/web/v1/orders"]
+    assert len(rows) == 1
+    assert rows[0]["children_total"] == 30
+    assert len(rows[0]["children"]) == ROUTE_ORACLE_CHILDREN
+    assert rows[0]["verdict"] == "auth_before_matching"
