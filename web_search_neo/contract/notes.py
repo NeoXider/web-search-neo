@@ -17,6 +17,7 @@ _INFO_TOPICS = {
     "execute_js": "Run page JavaScript (async body) and read its value.",
     "screenshot": "PNG viewport, full-page, or exact page-region image.",
     "game_probe": "Canvas/WebGL surfaces, FPS, frame_health (throttling), focus, console, held input.",
+    "screen_state": "What's on screen now: title, focused control, open modals with text and buttons.",
     "browser_status": "Chrome availability and every session: owner, tab, last page, idle, busy, cap.",
     "browser_tabs": "Tabs open in the user's Chrome, with ids and groups.",
     "search_status": "Search providers, live availability, latency, cooldowns.",

@@ -14,8 +14,8 @@ from web_search_neo.contract.notes import _SERVER_INSTRUCTIONS, _ARGUMENT_RECOVE
 from web_search_neo.contract.param_docs import annotate as annotate_params
 from web_search_neo import bridge_daemon
 from web_search_neo import browser_tools
-from web_search_neo import chrome_bridge, companion_update, extra_actions, persist_actions, tab_actions
-from web_search_neo import macros
+from web_search_neo import chrome_bridge, companion_update, extra_actions, persist_actions, screen_state, tab_actions
+from web_search_neo import macro_files, macros
 from web_search_neo import msp_date_time
 from web_search_neo import msp_search
 from web_search_neo import plugins
@@ -653,6 +653,12 @@ async def browser_page_text(
     return await asyncio.to_thread(functools.partial(
         browser_tools.get_page_text, session_id=session_id, max_chars=max_chars, mode=mode,
         include_links=include_links, frame_selector=frame_selector, offset=offset))
+
+
+@mcp.tool()
+async def browser_screen_state(session_id: str = "default") -> dict[str, Any]:
+    """What's on screen now: title, focused control, open modals with text and buttons."""
+    return await asyncio.to_thread(screen_state.read, session_id)
 
 
 @mcp.tool()
@@ -1494,19 +1500,6 @@ def _declared_variables(payload: Any) -> dict[str, Any] | None:
     return None
 
 
-def _unreadable(name: str, path: Any, error: str, fix: str) -> dict[str, Any]:
-    """One shape for every reason a file could not be checked at all."""
-    return {
-        "success": False,
-        "macro": name,
-        "valid": False,
-        "path": str(path),
-        "errors": [{"error": error, "fix": fix}],
-        "warnings": [],
-        "executed": False,
-    }
-
-
 def _validate_macro_file(name: str, project_root: str | None = None) -> dict[str, Any]:
     """Check a macro file without running a single step of it.
 
@@ -1525,7 +1518,7 @@ def _validate_macro_file(name: str, project_root: str | None = None) -> dict[str
     warnings: list[dict[str, Any]] = []
 
     if not path.exists():
-        return _unreadable(
+        return macro_files.unreadable(
             validated_name,
             path,
             f"No macro file at {path}.",
@@ -1534,14 +1527,14 @@ def _validate_macro_file(name: str, project_root: str | None = None) -> dict[str
     try:
         payload = macros.raw_payload(validated_name, project_root)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        return _unreadable(
+        return macro_files.unreadable(
             validated_name,
             path,
             f"{path} is not readable JSON: {exc}",
             "Fix the JSON syntax: a macro file is a JSON object or a JSON array of steps.",
         )
     except OSError as exc:
-        return _unreadable(
+        return macro_files.unreadable(
             validated_name,
             path,
             f"{path} could not be read: {exc}",
@@ -1552,7 +1545,7 @@ def _validate_macro_file(name: str, project_root: str | None = None) -> dict[str
     try:
         record = macros.record_from_payload(payload, validated_name, path)
     except ValueError as exc:
-        return _unreadable(
+        return macro_files.unreadable(
             validated_name,
             path,
             str(exc),
@@ -2293,7 +2286,7 @@ _ACTION_NAME_ALIASES = {"attach": "attach_tab"}
 # page code and game_probe drains the console cursor, so neither is repeated.
 _READ_TOPICS_AFTER_TAB_FOLLOW = frozenset({
     "page_outline", "page_text", "element_text", "find", "page_elements",
-    "console", "network", "network_body", "screenshot",
+    "console", "network", "network_body", "screenshot", "screen_state",
 })
 
 
@@ -2540,6 +2533,7 @@ _TOPIC_HANDLERS = {
     "network_body": browser_network_body,
     "execute_js": browser_execute_js,
     "game_probe": browser_game_probe,
+    "screen_state": browser_screen_state,
     "screenshot": browser_screenshot,
 }
 
@@ -2567,6 +2561,7 @@ async def web_info(
         "network_body",
         "execute_js",
         "game_probe",
+        "screen_state",
         "screenshot",
     ] = "capabilities",
     params: dict[str, Any] | None = None,

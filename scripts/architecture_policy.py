@@ -23,13 +23,16 @@ LEGACY_MAX_LINES = {
     # adapter clusters are still worth extracting.
     # Lowered 8605 -> 8604 (2026-10-14) for 1.27.0: the inline "this captcha cannot be
     # solved" block became one call into captcha.unsolved_report, which now names the
-    # vendor and challenge type. Classification lives in captcha_solvers/classify.py and
+    # vendor and the challenge type. Classification lives in captcha_solvers/classify.py and
     # the protocol reader in captcha_solvers/tc_protocol.py; nothing was added here.
     "web_search_neo/browser_tools.py": 8604,
     # Raised 2680 -> 2706 (2026-10-13) for the update_companion action and its tool:
     # the pull, the refusal rules and the reload all live in companion_update.py, so
     # this file only carries the call and what it says it refuses.
-    "web_search_neo/main.py": 2706,
+    # Lowered 2706 -> 2701: the macro-validation shape helper moved to
+    # web_search_neo/macro_files.py, and the freed lines carry the new
+    # screen_state topic wiring (wrapper, registry entry, Literal entry).
+    "web_search_neo/main.py": 2701,
     # Raised 2681 -> 2686 for the aria-hidden majority hint in page_text exclusions.
     "web_search_neo/page_perception.py": 2686,
     # Raised 2070 -> 2075 (2026-10-13, from upstream 96427c0): a tab create on a busy

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- New `web_info` topic `screen_state`: what's on screen now - title, focused control, open modals with text and buttons. page_text can miss a modal that arrived after the read, and a text search can miss its buttons for the same reason; this read goes back to the live DOM and reports only the foreground, so the next click targets what is actually up. Wiring paid for by extracting the macro-validation shape helper to `web_search_neo/macro_files.py` (ratchet lowered 2706 -> 2701); the collector itself lives in `web_search_neo/screen_state.py`.
 - `run_script`/`execute_js` refuse a script that reads an `arguments[n]` no passed `args` provides, before touching the page: every runtime applies only `args`, so the index was `undefined` - and an undefined written to a clipboard or a form arrived as the text 'undefined'. Quoted text that merely mentions `arguments[0]` is not code and does not trip it.
 - `close_tabs` retries once a tab Chrome still lists right after removing it: a remove racing the tab's own navigation used to come back `failed` although the next attempt closes it. A tab still listed after the retry is reported failed as before.
 
