@@ -122,7 +122,12 @@ def captcha_read(
     # What the widget declared about its own targets, kept next to the measurement so an
     # agent sees the order the challenge asked for and never has to infer it.
     plan = tc_target_plan.target_plan(challenge)
-    return {"success": True, "page_url": entry, "aid": app_id, **challenge, "target_plan": plan, **measurement}
+    # A pictograph challenge names no target text, so the band measurement above has nothing to
+    # look for. The strip the icons are drawn from is still published, so that is what gets read.
+    extra = {} if (measurement.get("measurement") or {}).get("sure") else measure_from_sprite(
+        runner, entry, app_id, host, challenge, image_bytes, plan)
+    return {"success": True, "page_url": entry, "aid": app_id, **challenge, "target_plan": plan,
+            **measurement, **extra}
 
 
 def measure_challenge(challenge: dict[str, Any], image_bytes: bytes) -> dict[str, Any]:
@@ -221,6 +226,61 @@ def measure_challenge(challenge: dict[str, Any], image_bytes: bytes) -> dict[str
             "best_band": best["hue"],
             "best_regions": best["regions"],
             "tried_bands": len(attempts),
+        }
+    }
+
+
+
+def measure_from_sprite(
+    opener: Callable[[str, dict[str, str]], tuple[int, bytes]],
+    entry: str,
+    aid: str,
+    host: str,
+    challenge: dict[str, Any],
+    image_bytes: bytes,
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    """Match the glyphs the challenge declared in its own strip to the tiles of its picture.
+
+    "Select in order" served as icons names no target text, so the colour-band measurement has
+    nothing to look for even though the widget published both the order and the strip those icons
+    are drawn from. Stroke distance between each declared glyph and each tile answers it; this is
+    only called when that band measurement was not sure, and it never sends a verify by itself.
+    """
+    urls = [str(url).strip() for url in (plan.get("sprite_urls") or []) if str(url).strip()]
+    boxes = plan.get("boxes") or []
+    if not urls or not boxes:
+        return {"sprite_match": {"sure": False, "why": "the challenge published no target strip to match"}}
+    status, sprite = opener(tc_protocol._absolute(urls[0], host), {"Referer": entry})
+    if status != 200 or len(sprite) < 32:
+        return {"sprite_match": {"sure": False, "why": f"the target strip came back as HTTP {status}"}}
+    try:
+        import io
+
+        from PIL import Image
+
+        width, height = Image.open(io.BytesIO(image_bytes)).size
+    except Exception as missing:  # noqa: BLE001 - optional dependency, reported not crashed
+        return {"sprite_match": {"sure": False, "why": f"the picture could not be decoded: {missing}"}}
+    from web_search_neo.captcha_solvers import shape_match, word_shape
+
+    cells = _published_grid(word_shape, challenge, width, height)
+    reading = shape_match.match_sprite_tiles(image_bytes, sprite, boxes, cells=cells)
+    if not reading.get("ok"):
+        return {"sprite_match": {"sure": False, "why": reading.get("reason") or "the strip could not be matched"}}
+    return {
+        "sprite_match": {
+            "sure": bool(reading.get("all_sure")),
+            "boxes": [list(box) for box in (reading.get("boxes_in_order") or [])],
+            "glyphs": reading.get("glyphs"),
+            "shapes": reading.get("shapes"),
+            "strip_ink": reading.get("strip_ink"),
+            "strip_scale": reading.get("strip_scale"),
+            "rows": [
+                {"order": row["order"], "tile_box": row["tile_box"], "score": row["best_score"],
+                 "lead": row["lead"], "sure": row["sure"]}
+                for row in reading["rows"]
+            ],
         }
     }
 

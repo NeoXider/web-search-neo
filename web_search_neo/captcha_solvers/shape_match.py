@@ -153,3 +153,152 @@ def match_glyph_shapes(picture: bytes, strip_box: tuple[int, int, int, int],
         "all_sure": all(row["sure"] for row in rows),
     }
 
+def _load_sprite(picture: bytes, strip_threshold: int) -> tuple[np.ndarray, str] | None:
+    """An ink mask for the widget's own target strip: 1.0 where the glyph is drawn.
+
+    A target strip is usually dark glyphs on a transparent ground; then the alpha channel IS
+    the glyph and thresholding the pixels would smear it into the ground. An opaque strip falls
+    back to ink darkness instead. Which one was used is reported, because it changes how much
+    of the reading an agent can trust.
+    """
+    try:
+        from PIL import Image
+        import io
+
+        image = Image.open(io.BytesIO(picture))
+    except Exception:  # noqa: BLE001 - a missing decoder is reported, not crashed
+        return None
+    if image.mode in {'P', 'L', 'RGB'}:
+        gray = np.asarray(image.convert('L'), dtype='uint8')
+        return (gray < strip_threshold).astype('float32'), 'ink'
+    try:
+        rgba = np.asarray(image.convert('RGBA'), dtype='uint8')
+    except Exception:  # noqa: BLE001
+        return None
+    alpha = rgba[:, :, 3]
+    if int(alpha.min()) >= 250:  # nothing transparent: read the ink itself
+        gray = rgba[:, :, :3].mean(axis=2).astype('uint8')
+        return (gray < strip_threshold).astype('float32'), 'ink'
+    gray = rgba[:, :, :3].mean(axis=2).astype('uint8')
+    ink = (alpha > 16) & ((gray < strip_threshold) | (alpha < 250))
+    return ink.astype('float32'), 'alpha'
+
+
+def _tight(mask: np.ndarray) -> tuple[np.ndarray, tuple[int, int, int, int]] | None:
+    """Crop an ink mask to its own bounding box, or refuse when it is too thin to read."""
+    ys, xs = np.nonzero(mask > 0.5)
+    if len(ys) < 20:
+        return None
+    y0, y1, x0, x1 = int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
+    if not 8 <= (x1 - x0) <= 160 or not 8 <= (y1 - y0) <= 160:
+        return None
+    return mask[y0:y1, x0:x1].astype("float32"), (x0, y0, x1 - x0, y1 - y0)
+
+
+def match_sprite_tiles(picture: bytes, sprite: bytes, glyph_boxes: list[list[int]], *,
+                       cells: list[list[int]] | None = None, picture_box: tuple[int, int, int, int] | None = None,
+                       scale: float = 1.0, picture_threshold: int = 95, strip_threshold: int = 200) -> dict[str, Any]:
+    """Match the glyphs the challenge declared in its own strip to the tiles of its picture.
+
+    `glyph_boxes` is the order the challenge asked for (``tc_target_plan`` reads it out of the
+    prehandle), `sprite` is the image that strip is drawn from, `cells` are the picture's own
+    tile boxes. Each declared glyph gets its candidates ranked by stroke distance in that order;
+    a row is sure only inside the score ceiling and ahead of the runner-up by MIN_LEAD. Glyphs
+    that carry no ink are dropped and counted - never replaced by a placeholder.
+    """
+    try:
+        _cv2()
+    except ImportError:
+        return {"ok": False, "reason": "OpenCV is not installed"}
+    if not glyph_boxes:
+        return {"ok": False, "reason": "the challenge declared no glyphs to match"}
+    gray = _load(picture)
+    if gray is None:
+        return {"ok": False, "reason": "the capture could not be decoded"}
+    strip = _load_sprite(sprite, strip_threshold)
+    if strip is None:
+        return {"ok": False, "reason": "the target strip could not be decoded"}
+    ink_strip, strip_mode = strip
+    height, width = ink_strip.shape[:2]
+    boxes = [[int(round(box[0] * scale)), int(round(box[1] * scale)),
+              int(round(box[2] * scale)), int(round(box[3] * scale))] for box in glyph_boxes]
+    reach_x = max(box[0] + box[2] for box in boxes)
+    reach_y = max(box[1] + box[3] for box in boxes)
+    strip_scale = 1.0
+    if reach_x > width or reach_y > height:
+        # Only the device-pixel scales a widget really draws at are tried, largest first, and
+        # the one that was used is reported. A factor that fits nothing is a refusal, not a guess.
+        for candidate in (0.75, 2 / 3, 0.5, 1 / 3, 0.25):
+            scaled = [[int(box[0] * candidate), int(box[1] * candidate),
+                       int(box[2] * candidate), int(box[3] * candidate)] for box in boxes]
+            if max(b[0] + b[2] for b in scaled) <= width and max(b[1] + b[3] for b in scaled) <= height:
+                boxes, strip_scale = scaled, candidate
+                break
+        else:
+            return {"ok": False, "reason": f"the declared glyphs reach {reach_x}x{reach_y} but the strip is "
+                                           f"{width}x{height}; no device-pixel scale fits them"}
+
+    glyphs: list[np.ndarray] = []
+    dropped = 0
+    for box in boxes:
+        x, y, w, h = box
+        crop = ink_strip[max(0, y):max(0, y + h), max(0, x):max(0, x + w)]
+        tight = _tight(crop) if crop.size else None
+        if tight is None:
+            dropped += 1
+            continue
+        glyphs.append(tight[0])
+    if not glyphs:
+        return {"ok": False, "reason": "no declared glyph carried enough ink to match"}
+
+    shapes: list[dict[str, Any]] = []
+    if cells:
+        for cell in cells:
+            x, y, w, h = (int(value) for value in cell)
+            sub = gray[max(0, y):max(0, y + h), max(0, x):max(0, x + w)]
+            if sub.size == 0:
+                continue
+            tight = _tight((sub < picture_threshold).astype("float32"))
+            if tight is None:
+                continue
+            shapes.append({"box": [x + tight[1][0], y + tight[1][1], tight[1][2], tight[1][3]],
+                           "stroke": tight[0]})
+    else:
+        box = picture_box or (0, 0, gray.shape[1], gray.shape[0])
+        shapes = [{"box": list(shape["box"]), "stroke": shape["stroke"]}
+                  for shape in _ink_components(gray, box, picture_threshold, 24, 95)]
+    if not shapes:
+        return {"ok": False, "reason": "the picture holds no candidate tile ink"}
+
+    rows = []
+    for order, glyph in enumerate(glyphs):
+        ranked = sorted(
+            [(_best_chamfer(glyph, shape["stroke"]), shape) for shape in shapes],
+            key=lambda scored: scored[0],
+        )
+        best_score, best_shape = ranked[0]
+        runner_up = ranked[1][0] if len(ranked) > 1 else 99.0
+        rows.append({
+            "order": order,
+            "box": boxes[order],
+            "sure": bool(best_score <= SCORE_CEILING and (runner_up - best_score) >= MIN_LEAD),
+            "best_score": round(best_score, 2),
+            "lead": round(min(runner_up, 99.0) - best_score, 2),
+            "tile_box": best_shape["box"],
+            "candidates": [{"box": shape["box"], "score": round(score, 2)} for score, shape in ranked[:3]],
+        })
+    out: dict[str, Any] = {
+        "ok": True,
+        "method": "sprite_declared",
+        "glyphs": len(glyphs),
+        "shapes": len(shapes),
+        "rows": rows,
+        "all_sure": all(row["sure"] for row in rows),
+        "boxes_in_order": [row["tile_box"] for row in rows if row["sure"]] if all(r["sure"] for r in rows) else [],
+    }
+    if dropped:
+        out["dropped_glyphs"] = dropped
+    if strip_scale != 1.0:
+        out["strip_scale"] = round(strip_scale, 4)
+    out["strip_ink"] = strip_mode
+    return out

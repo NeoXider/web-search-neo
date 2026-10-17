@@ -616,6 +616,8 @@ the best score reached, and whether anything is sure. Nothing is sent.
 | `challenge` | which kind this is; only `slider` on TCaptcha/Geetest is draggable here today |
 | `measurement.sure` | false means no answer should be spent, and `captcha_verify` will not spend one |
 | `measurement.tried_bands`, `best_band`, `boxes` | what the measurement looked at and where it landed |
+| `target_plan` | the order, boxes and strip URLs the challenge published for its own targets |
+| `sprite_match` | the reading built from that strip: per-glyph `tile_box`, `score`, `lead`, `sure`; `boxes` only when every row is sure |
 | `site_aid` result | the encrypted id blob the site publishes, its encoding, and any plaintext id |
 
 `captcha_verify {page_url, aid, boxes}` spends exactly one attempt, and only when the measurement

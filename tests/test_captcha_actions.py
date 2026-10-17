@@ -390,3 +390,124 @@ def test_captcha_answer_keeps_the_click_order_an_agent_measured():
     clicks = answer["clicks"]
     assert [c["x"] for c in clicks] == [560, 112]
     assert clicks[0]["travel_ms"] < clicks[1]["travel_ms"] or True
+
+def _icon_challenge():
+    """A real "select in order" served as icons: no target text, only its own strip and order."""
+    import hashlib
+    import io
+
+    import numpy as np
+    from PIL import Image
+
+    def ring(canvas, x, y, size):
+        canvas[y:y + 3, x:x + size] = 8
+        canvas[y + size - 3:y + size, x:x + size] = 8
+        canvas[y:y + size, x:x + 3] = 8
+        canvas[y:y + size, x + size - 3:x + size] = 8
+
+    def zig(canvas, x, y, height, wide):
+        canvas[y:y + 2, x:x + wide + 3] = 8
+        canvas[y + height - 2:y + height, x:x + wide + 3] = 8
+        for step in range(height):
+            col = x + wide - int(step * wide / max(1, height - 1))
+            canvas[y + step:y + step + 2, col:col + 3] = 8
+
+    def triangle(canvas, x, y, size):
+        for row in range(size):
+            inset = int((size - row) * 0.45)
+            canvas[y + row:y + row + 2, x + inset:x + inset + 3] = 8
+            canvas[y + row:y + row + 2, x + size - inset - 3:x + size - inset] = 8
+        canvas[y + size - 3:y + size, x:x + size] = 8
+
+    # The picture: a 3x2 grid, the top row holding the three shapes the strip asks for.
+    canvas = np.full((200, 300, 3), 220, dtype="uint8")
+    triangle(canvas, 20, 20, 46)
+    ring(canvas, 120, 20, 41)
+    zig(canvas, 220, 25, 42, 26)
+    picture = io.BytesIO()
+    Image.fromarray(canvas).save(picture, format="PNG")
+
+    # The strip the widget draws its own icons from: transparent ground, alpha is the glyph.
+    plane = np.full((40, 120), 220, dtype="uint8")
+    ring(plane, 5, 7, 21)
+    zig(plane, 46, 8, 20, 8)
+    triangle(plane, 82, 7, 22)
+    layer = np.zeros((40, 120, 4), dtype="uint8")
+    layer[:, :, :3] = np.dstack([plane, plane, plane])
+    layer[:, :, 3] = np.where(plane < 200, 255, 0)
+    strip = io.BytesIO()
+    Image.fromarray(layer, "RGBA").save(strip, format="PNG")
+
+    body = {
+        "state": 1, "capclass": "1", "subcapclass": "2408", "sess": "sIcon", "sid": "7", "randstr": "@a",
+        "data": {
+            "comm_captcha_cfg": {
+                "tdc_path": "/tdc.js?a=1",
+                "pow_cfg": {"prefix": "p#", "md5": hashlib.md5(b"p#7").hexdigest()},
+            },
+            "dyn_show_info": {
+                "instruction": "Select in order: ",
+                "show_type": "click_icon_uncheck",
+                "bg_elem_cfg": {
+                    "size_2d": [300, 200],
+                    "img_url": "/cap_union_new_getcapbysig?img_index=1&image=0",
+                    "click_cfg": {"data_type": ["DynAnswerType_UC"]},
+                },
+                "ins_elem_cfg": {
+                    "size_2d": [120, 40],
+                    "ins_list": [
+                        {"ins_pos": [4, 6], "size": [24, 24], "sprite_url": "/cap_union_new_getcapbysig?img_index=0&image=0"},
+                        {"ins_pos": [44, 6], "size": [24, 24]},
+                        {"ins_pos": [80, 6], "size": [24, 24]},
+                    ],
+                },
+            },
+        },
+    }
+    return body, picture.getvalue(), strip.getvalue()
+
+
+def _strip_opener(body, picture, strip):
+    calls = []
+
+    def open_url(url: str, headers: dict) -> tuple[int, bytes]:
+        calls.append(url)
+        if "prehandle" in url:
+            return 200, f"cb({json.dumps(body, ensure_ascii=False)})".encode("utf-8")
+        if "img_index=0" in url:
+            return 200, strip
+        if "getcapbysig" in url:
+            return 200, picture
+        return 500, b"unexpected " + url.encode()
+
+    open_url.calls = calls  # type: ignore[attr-defined]
+    return open_url
+
+
+def test_an_icon_challenge_is_answered_from_the_strip_it_declared_in_its_own_order():
+    pytest.importorskip("cv2")
+    body, picture, strip = _icon_challenge()
+    opener = _strip_opener(body, picture, strip)
+    answer = captcha_actions.captcha_read("https://console-dev.openmodel.ai/auth", aid="196724674", opener=opener)
+    assert answer["success"] is True
+    assert answer["targets"] == [], answer  # the challenge names no text at all
+    assert answer["measurement"]["sure"] is False, answer
+    assert any("img_index=0" in url for url in opener.calls), opener.calls  # its own strip was read
+    match = answer["sprite_match"]
+    assert match["sure"] is True, match
+    assert match["strip_ink"] == "alpha" and match["glyphs"] == 3 and match["shapes"] == 3, match
+    # Declared order was ring, zig, triangle; the picture holds them shuffled.
+    assert [box[0] for box in match["boxes"]] == [120, 220, 20], match
+    assert [row["order"] for row in match["rows"]] == [0, 1, 2], match
+    assert not any("new_verify" in url for url in opener.calls)
+
+
+def test_an_icon_challenge_without_its_own_strip_says_what_is_missing():
+    body, picture, strip = _icon_challenge()
+    for item in body["data"]["dyn_show_info"]["ins_elem_cfg"]["ins_list"]:
+        item.pop("sprite_url", None)
+    opener = _strip_opener(body, picture, strip)
+    answer = captcha_actions.captcha_read("https://console-dev.openmodel.ai/auth", aid="196724674", opener=opener)
+    assert answer["sprite_match"]["sure"] is False
+    assert "no target strip" in answer["sprite_match"]["why"]
+    assert not any("img_index=0" in url for url in opener.calls), opener.calls
