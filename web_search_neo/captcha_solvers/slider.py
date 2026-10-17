@@ -195,6 +195,48 @@ return {cleared: true, vendor: wanted, evidence: 'no live slider widget on the p
 """ % json.dumps(SLIDER_VENDORS)
 
 
+# The drag TCaptcha actually scores. Its slider listens to pointer/mouse events on
+# the handle, but Chrome DevTools Protocol Input.dispatchMouseEvent coalesces rapid
+# moves: a 100 px CDP drag advances the groove only a fraction, so the piece never
+# reaches the hole and the attempt is spent. Dispatching the same path as in-page
+# PointerEvents (with a small pause between steps so the vendor sees a moving hand,
+# not a teleport) drives the handle the whole way. The path is the caller's
+# human_trajectory, handed in as JSON so the geometry stays in Python.
+SLIDER_DRAG_SCRIPT = """
+(async () => {
+const handleSelector = arguments[0];
+const startX = arguments[1];
+const startY = arguments[2];
+const path = arguments[3];
+const handle = document.querySelector(handleSelector);
+if (!handle) return {dragged: false, reason: 'handle vanished before the drag'};
+function fire(type, x, y) {
+  const buttons = type === 'pointerup' ? 0 : 1;
+  const pointer = new PointerEvent(type, {
+    pointerId: 1, pointerType: 'mouse', isPrimary: true, button: 0, buttons,
+    bubbles: true, cancelable: true, clientX: x, clientY: y, pointerEvents: 1,
+  });
+  handle.dispatchEvent(pointer);
+  handle.dispatchEvent(new MouseEvent(type.replace('pointer', 'mouse'), {
+    button: 0, buttons, bubbles: true, cancelable: true, clientX: x, clientY: y,
+  }));
+}
+const wait = (ms) => new Promise((done) => setTimeout(done, ms));
+fire('pointerdown', startX, startY);
+let lastX = startX, lastY = startY;
+for (const step of path) {
+  const x = startX + step[0];
+  const y = startY + step[1];
+  fire('pointermove', x, y);
+  lastX = x; lastY = y;
+  await wait(Math.max(4, Math.round((step[2] || 0) * 1000)));
+}
+fire('pointerup', lastX, lastY);
+return {dragged: true, end_x: lastX, end_y: lastY, steps: path.length};
+})()
+"""
+
+
 def local_solve_enabled() -> bool:
     """Whether the free local slider solve is allowed (it is, unless switched off)."""
     return (os.getenv(LOCAL_SOLVE_ENV) or "1").strip().lower() not in {"0", "false", "no", "off"}

@@ -34,6 +34,7 @@ from web_search_neo.captcha_solvers.classify import (
 from web_search_neo.captcha_solvers.images import crop_png, detect_gap
 from web_search_neo.captcha_solvers.slider import (
     SLIDER_CLEARED_SCRIPT,
+    SLIDER_DRAG_SCRIPT,
     SLIDER_LOCATE_SCRIPT,
     SLIDER_VENDORS,
     local_solve_enabled,
@@ -44,6 +45,7 @@ from web_search_neo.captcha_solvers.trajectory import human_trajectory
 __all__ = [
     "CLASSIFY_FACTS_SCRIPT",
     "SLIDER_CLEARED_SCRIPT",
+    "SLIDER_DRAG_SCRIPT",
     "SLIDER_LOCATE_SCRIPT",
     "SLIDER_VENDORS",
     "classify_captcha",

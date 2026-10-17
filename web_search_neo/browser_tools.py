@@ -5527,6 +5527,7 @@ def _slider_solve(session_id: str, budget_seconds: float) -> dict[str, Any]:
         value = answer.get("value") or {}
         if isinstance(value, dict) and value.get("vendor"):
             seen["vendor"] = str(value["vendor"])
+            seen["handle_selector"] = value.get("handle_selector")
             return value
         return {}
 
@@ -5534,30 +5535,29 @@ def _slider_solve(session_id: str, budget_seconds: float) -> dict[str, Any]:
         return screenshot(session_id=session_id)
 
     def drag(start: tuple[float, float], path: list[tuple[float, float, float]]) -> None:
+        # TCaptcha's slider starves on CDP Input.dispatchMouseEvent: a 100 px drag
+        # advances the groove a fraction, never reaching the hole. The same path as
+        # in-page PointerEvents drives it the whole way; CDP is the fallback.
+        selector = seen.get("handle_selector")
+        if selector:
+            answer = execute_js(
+                _captcha_solvers.SLIDER_DRAG_SCRIPT, session_id=session_id,
+                args=[selector, start[0], start[1], [list(step) for step in path]],
+                await_promise=True)
+            if (answer.get("value") or {}).get("dragged"):
+                return
         with session.lock:
             frame_map, viewport = _pointer_context(session.driver, None)
-            _pointer_dispatch(
-                session, "press", start[0], start[1], viewport, frame_map=frame_map
-            )
+            _pointer_dispatch(session, "press", start[0], start[1], viewport, frame_map=frame_map)
             for dx, dy, pause in path:
-                # Clamped rather than refused: a handle near the right edge of a
-                # narrow window has nowhere to go, and a move outside the viewport
-                # is a pointer event into nothing.
-                move_x = max(0.0, min(start[0] + dx, float(viewport["width"]) - 1.0))
-                move_y = max(0.0, min(start[1] + dy, float(viewport["height"]) - 1.0))
                 _pointer_dispatch(
-                    session, "move", move_x, move_y, viewport, frame_map=frame_map
-                )
+                    session, "move", max(0.0, min(start[0] + dx, viewport["width"] - 1.0)),
+                    max(0.0, min(start[1] + dy, viewport["height"] - 1.0)), viewport, frame_map=frame_map)
                 time.sleep(pause)
             last_x, last_y, _ = path[-1]
             _pointer_dispatch(
-                session,
-                "release",
-                max(0.0, min(start[0] + last_x, float(viewport["width"]) - 1.0)),
-                max(0.0, min(start[1] + last_y, float(viewport["height"]) - 1.0)),
-                viewport,
-                frame_map=frame_map,
-            )
+                session, "release", max(0.0, min(start[0] + last_x, viewport["width"] - 1.0)),
+                max(0.0, min(start[1] + last_y, viewport["height"] - 1.0)), viewport, frame_map=frame_map)
 
     def cleared() -> dict[str, Any]:
         answer = execute_js(

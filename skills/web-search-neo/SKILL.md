@@ -473,7 +473,10 @@ solve. `mode=auto` waits for the user; it solves only if the operator also set
 A slider captcha — Tencent TCaptcha (`#tcaptcha_transform_dy`, `tencent-captcha-dy__*`),
 Geetest — has no sitekey, so there is nothing to buy: `mode=solve` and `mode=auto` capture
 its picture, find the hole in it and drag the handle along a human-shaped path, free and
-locally (`WEB_SEARCH_NEO_CAPTCHA_LOCAL_SOLVE=0` turns that off). If the measurement is not
+locally (`WEB_SEARCH_NEO_CAPTCHA_LOCAL_SOLVE=0` turns that off). That drag is dispatched as
+in-page PointerEvents, not the DevTools pointer: TCaptcha ignores rapid CDP mouse moves (a 100 px
+CDP drag moved its groove 22 px), so the path is replayed inside the page where the widget
+actually listens; the CDP pointer is the fallback for cross-origin frames. If the measurement is not
 confident nothing is dragged and `slider_solve` says why; then it waits for a person.
 
 The same drag happens unasked where a captcha blocks the agent's own work: a click that sent
