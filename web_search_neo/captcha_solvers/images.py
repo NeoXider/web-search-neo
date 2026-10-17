@@ -199,7 +199,12 @@ def find_notch(
     }
 
 
-def match_piece(background: bytes, piece: bytes) -> dict[str, Any]:
+def match_piece(
+    background: bytes,
+    piece: bytes,
+    *,
+    piece_at: tuple[int, int] | None = None,
+) -> dict[str, Any]:
     """Template-match a cut-out piece against the background it belongs in.
 
     The classical route - Canny on both images so the texture does not vote, then
@@ -221,6 +226,18 @@ def match_piece(background: bytes, piece: bytes) -> dict[str, Any]:
     if piece_edges.shape[0] >= bg_edges.shape[0] or piece_edges.shape[1] >= bg_edges.shape[1]:
         return {"ok": False, "reason": "the piece is not smaller than the background"}
     result = cv2.matchTemplate(bg_edges, piece_edges, cv2.TM_CCOEFF_NORMED)
+    if piece_at is not None:
+        # The moving piece is painted inside the very picture it is matched
+        # against: left unmasked, the template finds the piece on top of itself
+        # and reports a hole where the piece already sits.
+        mask = np.ones(result.shape, dtype="float32")
+        ph, pw = piece_edges.shape[:2]
+        x0 = max(0, int(piece_at[0]) - 6)
+        y0 = max(0, int(piece_at[1]) - 6)
+        x1 = min(result.shape[1], int(piece_at[0]) + pw + 6)
+        y1 = min(result.shape[0], int(piece_at[1]) + ph + 6)
+        mask[y0:y1, x0:x1] = 0.0
+        result = result * mask
     _, best, _, location = cv2.minMaxLoc(result)
     if best <= 0.2:
         return {"ok": False, "reason": f"no confident match (score {best:.2f})"}
@@ -232,7 +249,8 @@ def match_piece(background: bytes, piece: bytes) -> dict[str, Any]:
         "gap_y": y,
         "piece_width": int(piece_edges.shape[1]),
         "piece_height": int(piece_edges.shape[0]),
-        "distance": x,
+        "piece_x": int(piece_at[0]) if piece_at is not None else 0,
+        "distance": x - (int(piece_at[0]) if piece_at is not None else 0),
         "score": round(float(best), 4),
         "confidence": round(float(best), 3),
         "image_width": int(bg_edges.shape[1]),
@@ -339,6 +357,7 @@ def detect_gap(
     *,
     min_width: int = MIN_PIECE_WIDTH,
     max_width: int = MAX_PIECE_WIDTH,
+    piece_at: tuple[int, int] | None = None,
 ) -> dict[str, Any]:
     """Where the piece goes, by whichever detector the caller's images allow.
 
@@ -347,7 +366,7 @@ def detect_gap(
     no outlines to read, and whichever of the two is surer wins.
     """
     if piece:
-        matched = match_piece(picture, piece)
+        matched = match_piece(picture, piece, piece_at=piece_at)
         if matched.get("ok"):
             return matched
     found = find_notch(picture, min_width=min_width, max_width=max_width)

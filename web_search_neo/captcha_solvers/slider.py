@@ -56,6 +56,7 @@ SLIDER_VENDORS = {
             "#tcaptcha_drag_button", "[class*='slider-block']", "[class*='slider-groove']",
             "[class*='slider-bar']",
         ],
+        "piece": ["[class*='fg-item']", "[class*='jigsaw-piece']", "[class*='puzzle-piece']"],
         "success": ["[class*='verify-status-img--success']"],
     },
     "geetest4": {
@@ -63,6 +64,7 @@ SLIDER_VENDORS = {
         "frame": ["iframe[src*='geetest.com']"],
         "bg": [".geetest_canvas_bg", "[class*='geetest_bg']", "canvas[class*='bg']"],
         "handle": [".geetest_slider_button", "[class*='slider_button']", "[class*='btn_slide']"],
+        "piece": ["[class*='slice']", "[class*='gap_img']"],
         "success": ["[class*='geetest_result']", "[class*='tip_success']"],
     },
 }
@@ -127,6 +129,7 @@ for (const [name, spec] of Object.entries(vendors)) {
   const scope = root || null;
   const bg = pick(scope, spec.bg, 60, 40) || pick(null, spec.bg, 60, 40);
   const handle = pick(scope, spec.handle, 18, 14) || pick(null, spec.handle, 18, 14);
+  const piece = pick(scope, spec.piece || [], 18, 14) || pick(null, spec.piece || [], 18, 14);
   let solved = false;
   // The widget ships its success sprite in the DOM before it is ever shown, so a
   // bare presence check reads an unsolved puzzle as solved and nothing gets dragged.
@@ -143,6 +146,7 @@ for (const [name, spec] of Object.entries(vendors)) {
     root: root ? box(root) : null, frame: frame ? box(frame) : null,
     bg: bg ? bg.box : null, bg_selector: bg ? bg.selector : null,
     handle: handle ? handle.box : null, handle_selector: handle ? handle.selector : null,
+    piece: piece ? piece.box : null,
     dpr: window.devicePixelRatio || 1, viewport: [window.innerWidth, window.innerHeight],
     url: location.href,
   };
@@ -305,7 +309,20 @@ def solve_slider(
                 "solved": False, "vendor": found["vendor"], "locate": last,
                 "reason": "the capture or the crop of the widget came back empty",
             }
-        gap = detect_gap(picture)
+        # The widget paints the moving piece inside the same picture it asks
+        # about. Reading the hole with the piece in hand - and its own position
+        # masked out - is what separates the hole from the piece sitting on it.
+        piece_crop = None
+        piece_at = None
+        piece_box = found.get("piece")
+        if piece_box and crop_png:
+            piece_crop = crop_png(shot, piece_box[0], piece_box[1], piece_box[2], piece_box[3], scale)
+            if piece_crop:
+                size_piece = image_size(piece_crop) or (piece_box[2], piece_box[3])
+                factor = (float(size_piece[0]) / float(piece_box[2])) if piece_box[2] else 1.0
+                piece_at = (int(round((piece_box[0] - bg_box[0]) * factor)),
+                            int(round((piece_box[1] - bg_box[1]) * factor)))
+        gap = detect_gap(picture, piece_crop, piece_at=piece_at)
         last["gap"] = gap
         last["capture_scale"] = round(scale, 3)
         if not gap.get("ok"):

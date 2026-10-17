@@ -112,6 +112,18 @@ def _answer_string(answer: dict) -> str:
     return f"dyn_clicks^{joined}" if joined else "dyn_clicks^"
 
 
+def _post(open_url, url: str, headers: dict, body: bytes):
+    """POST when the caller opener can carry a body, None when it cannot."""
+    import inspect
+    try:
+        params = inspect.signature(open_url).parameters
+    except (TypeError, ValueError):
+        return None
+    if len(params) < 3:
+        return None
+    return open_url(url, headers, body)
+
+
 def finish(
     open_url: UrlOpener,
     challenge: dict,
@@ -131,19 +143,30 @@ def finish(
         return {"ok": False, "why": "no pow answer was solved"}
     answer = collect_payload(boxes, image_size=tuple(challenge.get("image_size") or (0, 0)))
     params = verify_params(challenge, {**answer, "pow_answer": salt}, entry_url)
-    url = f"https://{host}{tc_protocol.VERIFY_PATH}?{urllib.parse.urlencode(params)}"
-    status, raw = open_url(url, {"Referer": entry_url})
+    form = urllib.parse.urlencode(params)
+    url = f"https://{host}{tc_protocol.VERIFY_PATH}"
+    # Tencent answers the verify only to a POST form; the same URL asked as a GET is a 404.
+    posted = _post(open_url, url, {"Referer": entry_url, "Origin": tc_protocol._origin(entry_url),
+                                  "Content-Type": "application/x-www-form-urlencoded"}, form.encode())
+    if posted is None:
+        status, raw = open_url(f"{url}?{form}", {"Referer": entry_url})
+    else:
+        status, raw = posted
     if status != 200:
         return {"ok": False, "why": f"verify refused with HTTP {status}"}
     payload = tc_protocol._unwrap_jsonp(raw.decode("utf-8", "replace")) or {}
     # Tencent answers with a flat object (state/ticket/randstr/ec), not a nested "verify" key;
     # accept either shape so a real answer is never mistaken for an empty one.
     verify = payload.get("verify") if isinstance(payload.get("verify"), dict) else payload
-    ok = bool(verify.get("ticket")) and str(verify.get("state", verify.get("ec"))) == "1"
+    code = str(verify.get("errorCode") or verify.get("error_code")
+             or verify.get("state") or verify.get("ec") or "")
+    ok = bool(verify.get("ticket")) and code in {"", "0", "1"}
     return {
         "ok": ok,
         "ticket": verify.get("ticket") or "",
         "randstr": verify.get("randstr") or "",
-        "why": verify.get("msg") or verify.get("error_msg") or ("" if ok else "no ticket returned"),
+        "code": code,
+        "why": verify.get("errMessage") or verify.get("msg") or verify.get("error_msg")
+               or ("" if ok else "no ticket returned"),
         "clicks": answer["clicks"],
     }

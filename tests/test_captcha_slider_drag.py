@@ -59,7 +59,7 @@ def _install(monkeypatch, *, handle_selector, dragged):
     monkeypatch.setattr(browser_tools, "_pointer_context", lambda driver, _ctx: ({}, {"width": 1000, "height": 800}))
     monkeypatch.setattr(browser_tools, "screenshot", lambda session_id="default": b"png")
     from web_search_neo.captcha_solvers import slider as _slider
-    monkeypatch.setattr(_slider, "detect_gap", lambda picture: {
+    monkeypatch.setattr(_slider, "detect_gap", lambda picture, piece=None, **kwargs: {
         "ok": True, "distance": 150.0, "image_width": 300.0, "confidence": 0.9, "method": "notch",
     })
     monkeypatch.setattr(_slider, "crop_png", lambda shot, *a, **k: b"crop")
