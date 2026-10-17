@@ -330,3 +330,63 @@ def test_page_image_select_measures_the_widget_picture_without_clicking():
         assert word_shape.font_note() == "fallback", "the truth tile ranked second with a real font"
         pytest.skip("no CJK face available on this platform")
     assert seen == [(10.0, 20.0, 672.0, 480.0)]
+
+def _verify_runner(opener, ticket: str = "tk"):
+    """Answer the verify address the way Tencent does; everything else goes to the stub."""
+    body = json.dumps({"state": 1, "ticket": ticket, "randstr": "@r"}).encode()
+
+    def runner(url: str, headers: dict) -> tuple[int, bytes]:
+        if "new_verify" in url:
+            opener.calls.append(url)
+            return 200, body
+        return opener(url, headers)
+
+    return runner
+
+
+def test_captcha_answer_spends_the_challenge_that_was_just_read():
+    opener = _opener(_prehandle(), picture=(200, _png(672, 480)))
+    runner = _verify_runner(opener)
+    read = captcha_actions.captcha_read("https://example.test/login", aid="1", opener=runner)
+    assert read["success"] is True
+    answer = captcha_actions.captcha_answer("https://example.test/login", aid="1",
+                                            boxes=[(10, 10, 30, 20)], opener=runner)
+    assert answer["verified"] is True and answer["ticket"] == "tk"
+    # One challenge served both steps: the answer went to the challenge that was read, not a new one.
+    assert sum(1 for url in opener.calls if "prehandle" in url) == 1
+    assert answer["boxes_used"] == [[10, 10, 30, 20]]
+    assert answer["answer_order"] == "the order given"
+
+
+def test_captcha_answer_refuses_when_no_boxes_were_given_and_the_kept_challenge_is_unsure():
+    opener = _opener(_prehandle(), picture=(200, _png(672, 480)))
+    captcha_actions.captcha_read("https://example.test/login", aid="1", opener=opener)
+    answer = captcha_actions.captcha_answer("https://example.test/login", aid="1", opener=opener)
+    assert answer["verified"] is False
+    assert "boxes" in answer["why"]
+    assert not any("new_verify" in url for url in opener.calls)
+
+
+def test_captcha_answer_for_another_page_reads_its_own_challenge():
+    opener = _opener(_prehandle(), picture=(200, _png(672, 480)))
+    runner = _verify_runner(opener)
+    captcha_actions.captcha_read("https://example.test/login", aid="1", opener=runner)
+    answer = captcha_actions.captcha_answer("https://other.test/start", aid="2",
+                                            boxes=[(5, 5, 20, 20)], opener=runner)
+    assert answer["verified"] is True
+    assert answer["aid"] == "2"
+    # The kept challenge belonged to another page, so this one was read before being answered:
+    # one prehandle per page, and the second one carries the other page's app id.
+    prehandles = [url for url in opener.calls if "prehandle" in url]
+    assert len(prehandles) == 2 and any("aid=2" in url for url in prehandles)
+
+
+def test_captcha_answer_keeps_the_click_order_an_agent_measured():
+    opener = _opener(_prehandle(), picture=(200, _png(672, 480)))
+    runner = _verify_runner(opener)
+    captcha_actions.captcha_read("https://example.test/login", aid="1", opener=runner)
+    answer = captcha_actions.captcha_answer("https://example.test/login", aid="1",
+                                            boxes=[(448, 240, 224, 240), (0, 0, 224, 240)], opener=runner)
+    clicks = answer["clicks"]
+    assert [c["x"] for c in clicks] == [560, 112]
+    assert clicks[0]["travel_ms"] < clicks[1]["travel_ms"] or True

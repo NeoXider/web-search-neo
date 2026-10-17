@@ -24,7 +24,12 @@ from typing import Any
 # change in this round. What grew since 1.27.0: info_topics gained the `screen_state` topic
 # (title/focus/modals from the live DOM) and actions gained the `args[n]` refusal note for
 # scripts/tabs; nothing was moved out of the contract, so the ceiling moves instead.
-CONTRACT_BUDGET = 13_900
+# 2026-10-17 (captcha answer round): actions gained one entry, captcha_answer (a name plus a
+# summary, 114 characters). Nothing else grew: no new topic, no new recipe, no new pitfall - the
+# protocol answering reuses captcha_solvers/tc_image_solve.finish, and the challenge it answers is
+# the one the same module already read, so no extra reading text had to be published either.
+# Measured 14 014 characters against this ceiling; 86 remain.
+CONTRACT_BUDGET = 14_100
 
 
 def budget_usage(capabilities: dict[str, Any]) -> dict[str, Any]:

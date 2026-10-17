@@ -4,13 +4,15 @@
 what kind of challenge this is, and whether it can be measured at all. It sends only the
 requests the widget would have sent anyway (its own prehandle and its own picture URL), so it
 adds no new surface to the site under test. `captcha_verify` is the deliberate second half:
-it spends one answer when a measurement was sure.
+it spends one answer when a measurement was sure. captcha_answer is the third shape:
+it answers the very challenge this module just read, with the boxes an agent measured itself.
 
 Network primitives are injected, per the leaf-module rule; nothing here imports the browser.
 """
 
 from __future__ import annotations
 
+import time
 import urllib.parse
 import urllib.request
 from typing import Any, Callable
@@ -32,6 +34,28 @@ def open_url(url: str, headers: dict[str, str]) -> tuple[int, bytes]:
             return response.status, response.read()
     except urllib.error.HTTPError as refused:
         return refused.code, refused.read()
+
+
+_RECENT: dict[str, Any] = {}
+RECENT_TTL_S = 900.0
+
+
+def _remember(entry: str, aid: str, host: str, challenge: dict[str, Any]) -> None:
+    """Keep the challenge just read, so an answer can be sent to that one and not a new one."""
+    _RECENT.clear()
+    _RECENT.update({"entry": entry, "aid": aid, "host": host,
+                    "challenge": dict(challenge), "read_at": time.monotonic()})
+
+
+def _recent(entry: str, aid: str, host: str) -> dict[str, Any] | None:
+    """The kept challenge for this page/aid/host, or None when it is stale or a different one."""
+    if not _RECENT:
+        return None
+    if (_RECENT.get("entry"), _RECENT.get("aid"), _RECENT.get("host")) != (entry, aid, host):
+        return None
+    if time.monotonic() - float(_RECENT.get("read_at") or 0) > RECENT_TTL_S:
+        return None
+    return _RECENT
 
 
 def _page_origin(page_url: str, aid: str | None = None) -> tuple[str, str]:
@@ -92,6 +116,7 @@ def captcha_read(
             "why": str(aborted),
             "note": "the challenge was read but its picture could not be measured",
         }
+    _remember(entry, app_id, host, challenge)
     image_bytes = challenge.pop("image_bytes")
     measurement = measure_challenge(challenge, image_bytes)
     # What the widget declared about its own targets, kept next to the measurement so an
@@ -311,6 +336,67 @@ if (!best) return {};
 return {x: best.x, y: best.y, width: best.width, height: best.height,
   instruction: best.instruction};
 """
+
+
+def captcha_answer(
+    page_url: str = "",
+    *,
+    aid: str | None = None,
+    host: str = "t.captcha.qq.com",
+    boxes: list[tuple[int, int, int, int]] | None = None,
+    opener: Callable[[str, dict[str, str]], tuple[int, bytes]] | None = None,
+    fresh: bool = False,
+) -> dict[str, Any]:
+    """Answer the challenge this module just read - that one, not a freshly drawn one.
+
+    oxes are regions (x, y, w, h) in the picture's own pixels, clicked in the order given; an
+    agent that measured the puzzle itself passes them and its reading is what gets spent. With no
+    boxes the library measures the kept picture and answers only when that measurement is sure:
+    an unsure answer is refused, never sent. resh=True draws a new challenge instead.
+    """
+    entry, known_aid = _page_origin(page_url, aid)
+    app_id = str(aid or known_aid)
+    runner = opener or open_url
+    record = None if fresh else _recent(entry, app_id, host)
+    if record is None:
+        read = captcha_read(entry, aid=app_id, host=host, opener=runner)
+        if not read.get("success"):
+            return {**read, "verified": False}
+        record = _recent(entry, app_id, host)
+        if record is None:
+            return {"success": False, "verified": False, "page_url": entry, "aid": app_id,
+                    "why": "the challenge that was read was not kept for answering",
+                    "note": "nothing was verified"}
+    challenge = dict(record["challenge"])
+    image_bytes = challenge.pop("image_bytes", b"") or b""
+    measurement = measure_challenge(challenge, image_bytes)
+    chosen = boxes or (measurement.get("boxes") if measurement.get("sure") else None)
+    if not chosen:
+        return {"success": False, "verified": False, "page_url": entry, "aid": app_id,
+                "why": "no boxes were given and the kept challenge was not measured sure",
+                "note": "nothing was verified; pass boxes=[[x, y, w, h], ...] in picture pixels",
+                "measurement": measurement}
+    pow_record = challenge.get("pow_answer") or {}
+    if isinstance(pow_record, dict):
+        if not pow_record.get("solved"):
+            return {"success": False, "verified": False, "page_url": entry, "aid": app_id,
+                    "why": pow_record.get("why") or "the challenge's hash was not solved",
+                    "note": "no answer was sent: an unsolved hash is not worth one attempt"}
+        salt = str(pow_record.get("salt") or "")
+    else:
+        salt = str(pow_record)
+    if not salt:
+        return {"success": False, "verified": False, "page_url": entry, "aid": app_id,
+                "why": "the challenge's hash was not solved",
+                "note": "no answer was sent: an unsolved hash is not worth one attempt"}
+    challenge["pow_answer"] = salt
+    result = tc_image_solve.finish(runner, challenge, [tuple(b) for b in chosen], entry, host=host)
+    return {"success": bool(result.get("ok")), "verified": bool(result.get("ok")),
+            "page_url": entry, "aid": app_id, "ticket": result.get("ticket") or "",
+            "randstr": result.get("randstr") or "", "code": result.get("code") or "",
+            "why": result.get("why") or "", "clicks": result.get("clicks") or [],
+            "boxes_used": [list(b) for b in chosen], "answer_order": "the order given",
+            "challenge_age_s": round(time.monotonic() - float(record.get("read_at") or 0), 1)}
 
 
 def _published_grid(word_shape: Any, record: dict[str, Any], width: int, height: int):

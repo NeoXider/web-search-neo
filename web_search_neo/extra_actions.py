@@ -197,6 +197,14 @@ async def captcha_challenge(page_url: str = "", aid: str | None = None, site_aid
     return await asyncio.to_thread(_captcha_challenge, page_url, aid, site_aid)
 
 
+async def captcha_answer(page_url: str = "", aid: str | None = None,
+                         boxes: list[list[int]] | None = None) -> dict[str, Any]:
+    """Answer the captcha challenge this session just read; boxes are picture pixels, in click order."""
+    return await asyncio.to_thread(
+        captcha_actions.captcha_answer, page_url, aid=aid,
+        boxes=[tuple(b) for b in boxes] if boxes else None)
+
+
 def _captcha_challenge(page_url: str, aid: str | None, site_aid: bool) -> dict[str, Any]:
     if site_aid:
         return captcha_aid.captcha_aid(page_url)
@@ -214,6 +222,9 @@ ACTION_SPECS = (
     # `verify` stays off the contract: spending an answer needs a sure measurement first, so
     # captcha_actions.captcha_verify is reached through web_action only when you ask for it.
     ("captcha_challenge", captcha_challenge, "page", "Name the captcha challenge; site_aid=true reads its id."),
+    # 1.28: the answer half, so a measured puzzle can be answered without re-reading a new one.
+    ("captcha_answer", captcha_answer, "page",
+     "Answer the challenge just read: boxes are [x,y,w,h] in picture pixels, clicked in order."),
 ) + audit_actions.ACTION_SPECS + tab_actions.ACTION_SPECS  # 1.20: site checks; tabs of Selenium sessions
 
 
@@ -230,5 +241,5 @@ def register(server: Any, facade: Any = None) -> None:
 
 
 __all__ = ["ACTION_SPECS", "browser_dialogs", "browser_downloads", "browser_look", "browser_navigate",
-           "browser_unthrottle", "browser_wait_frames", "captcha_challenge",
+           "browser_unthrottle", "browser_wait_frames", "captcha_answer", "captcha_challenge",
            "image_to_viewport", "inherited_open_options", "register"]
