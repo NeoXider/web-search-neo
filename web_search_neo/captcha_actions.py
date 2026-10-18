@@ -26,9 +26,14 @@ USER_AGENT = (
 )
 
 
-def open_url(url: str, headers: dict[str, str]) -> tuple[int, bytes]:
-    """The one place this module touches the network."""
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, **headers})
+def open_url(url: str, headers: dict[str, str], body: bytes | None = None) -> tuple[int, bytes]:
+    """The one place this module touches the network.
+
+    A body is sent as a POST form. Tencent answers `cap_union_new_verify` only to the POST the
+    widget itself makes - the same address as a GET is a 404 "Not found" - so an opener that
+    cannot carry a body would turn every answer into a refusal that looks like a wrong reply.
+    """
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, **headers}, data=body)
     try:
         with urllib.request.urlopen(request, timeout=25) as response:
             return response.status, response.read()

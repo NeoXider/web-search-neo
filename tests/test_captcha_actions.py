@@ -511,3 +511,39 @@ def test_an_icon_challenge_without_its_own_strip_says_what_is_missing():
     assert answer["sprite_match"]["sure"] is False
     assert "no target strip" in answer["sprite_match"]["why"]
     assert not any("img_index=0" in url for url in opener.calls), opener.calls
+
+def test_the_module_opener_carries_a_verify_body_as_a_post(monkeypatch):
+    """Tencent answers the verify only to a POST; a body pushed onto a GET url reads as 404."""
+    seen = {}
+
+    class FakeResponse:
+        status = 200
+
+        def read(self):
+            return b'{"state":1}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def fake_urlopen(request, timeout=None):
+        seen["method"] = request.get_method()
+        seen["data"] = request.data
+        return FakeResponse()
+
+    monkeypatch.setattr(captcha_actions.urllib.request, "urlopen", fake_urlopen)
+    status, raw = captcha_actions.open_url("https://t.captcha.qq.com/cap_union_new_verify",
+                                           {"Referer": "https://console.example.test/auth"}, b"sess=s1")
+    assert (status, raw) == (200, b'{"state":1}')
+    assert seen["method"] == "POST" and seen["data"] == b"sess=s1", seen
+
+    seen.clear()
+    captcha_actions.open_url("https://t.captcha.qq.com/cap_union_prehandle?aid=1", {"Referer": "x"})
+    assert seen["method"] == "GET" and seen["data"] is None, seen
+
+    from web_search_neo.captcha_solvers import tc_image_solve
+    posted = tc_image_solve._post(captcha_actions.open_url, "https://t.captcha.qq.com/cap_union_new_verify",
+                                  {"Referer": "x"}, b"sess=s1")
+    assert posted == (200, b'{"state":1}'), posted
