@@ -15,6 +15,8 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 from mcp.types import CallToolResult, TextContent
 
+from web_search_neo.contract.action_schema import action_envelope
+
 
 def _mcp_version() -> str:
     try:
@@ -44,6 +46,24 @@ def registered_tool(server: FastMCP, name: str) -> Any:
     if name not in tools:
         raise KeyError(name)
     return tools[name]
+
+
+def publish_action_envelope(server: FastMCP, legacy: FastMCP, actions: dict[str, Any],
+                            aliases: tuple[str, ...]) -> None:
+    """Enrich published metadata while retaining permissive runtime validation.
+
+    A missing action must reach our actionable batch error, and alias-only calls
+    remain accepted. Changing the argument model would reject both too early.
+    """
+    envelope = action_envelope(
+        ((name, registered_tool(legacy, spec.tool_name).parameters) for name, spec in actions.items()), aliases,
+    )
+    parameters = registered_tool(server, "web_action").parameters
+    parameters["properties"]["actions"]["items"] = envelope
+    # A $ref is rooted in the complete tool schema, not in actions.items.
+    definitions = envelope.pop("$defs", None)
+    if definitions:
+        parameters.setdefault("$defs", {}).update(definitions)
 
 
 def _payload_of(result: Any) -> Any:

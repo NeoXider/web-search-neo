@@ -21,7 +21,8 @@ from web_search_neo import msp_search
 from web_search_neo import plugins
 from web_search_neo import shim_bypass
 from web_search_neo.log_setup import configure_server_log
-from web_search_neo.mcp_compat import ReportingFastMCP, registered_tool
+from web_search_neo.mcp_compat import ReportingFastMCP, registered_tool, publish_action_envelope
+from web_search_neo.action_calls import ACTION_KEY_ALIASES, unsupported_action_error
 from web_search_neo.web_client import clamp_timeout, request
 from web_search_neo.fetch import api as fetch_api
 from web_search_neo.fetch import content as fetch_content
@@ -1390,7 +1391,8 @@ async def browser_action_index(group: str | None = None) -> dict[str, Any]:
         "action_groups": {key: sorted(value) for key, value in sorted(groups.items())},
         "info_topics": _INFO_TOPICS,
         "next": (
-            "Optional parameter names, types, and defaults are not here. Read one with "
+            "web_action(actions=[...]): each object requires canonical action; other keys are its parameters. "
+            "type/name/tool/command/op/operation/method aliases are accepted. Parameter types/defaults: "
             "web_info(topic='action_schema', params={'action': '<action or topic>'})."
         ),
     }
@@ -2279,7 +2281,7 @@ def _parameter_names(tool_name: str) -> tuple[list[str], list[str]]:
     return required, optional
 
 
-_ACTION_KEY_ALIASES = ("type", "name", "tool", "command", "op", "operation", "method")
+_ACTION_KEY_ALIASES = ACTION_KEY_ALIASES
 # Natural spellings of an action, accepted as the action itself.
 _ACTION_NAME_ALIASES = {"attach": "attach_tab"}
 # The web_info topics that are pure reads of the page. execute_js runs arbitrary
@@ -2291,31 +2293,8 @@ _READ_TOPICS_AFTER_TAB_FOLLOW = frozenset({
 
 
 def _unsupported_action_error(action_name: str, arguments: dict[str, Any]) -> str:
-    """Explain a bad action well enough that the caller fixes it on the next try.
-
-    A weaker model that writes ``{"type": "open"}`` will otherwise repeat the
-    same call forever, because "unsupported action" does not say what to change.
-    """
-    if not action_name:
-        misplaced = [key for key in _ACTION_KEY_ALIASES if key in arguments]
-        if misplaced:
-            key = misplaced[0]
-            return (
-                f"Every action object needs an \"action\" key; this one used "
-                f"\"{key}\": {arguments[key]!r}. Rename it to \"action\". "
-                f"Available actions: {sorted(_ACTIONS)}."
-            )
-        return (
-            "Every action object needs an \"action\" key, for example "
-            '{"action": "open", "url": "https://example.com"}. '
-            f"Available actions: {sorted(_ACTIONS)}."
-        )
-    close = [name for name in _ACTIONS if name.startswith(action_name[:3])]
-    suggestion = f" Did you mean {close}?" if close else ""
-    return (
-        f"Unsupported action: {action_name}.{suggestion} "
-        f"Available actions: {sorted(_ACTIONS)}."
-    )
+    """Explain a bad action without echoing argument values or the whole registry."""
+    return unsupported_action_error(action_name, arguments, _ACTIONS)
 
 
 def _validate_arguments(tool_name: str, label: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -2472,8 +2451,10 @@ def _capabilities(action_name: str | None = None, full_schemas: bool = False) ->
         "public_tools": ["web_info", "web_action"],
         "how": (
             "web_info(topic=...) reads state; web_action(actions=[...]) runs 1-32 "
-            "ordered actions. One session_id is one page. This contract is complete; "
-            "no external skill is needed."
+            "ordered objects, each with required canonical action from web_info(topic='actions'); "
+            "other keys are its parameters (url, session_id, ...). "
+            "type/name/tool/command/op/operation/method aliases are accepted. "
+            "One session_id is one page. No external skill is needed."
         ),
         "info_topics": _INFO_TOPICS,
         "actions": _action_index(),
@@ -2628,14 +2609,20 @@ async def web_action(
     continue_on_error: bool = False,
     summary: Literal["full", "min"] = "full",
 ) -> dict[str, Any]:
-    """Execute 1-32 ordered actions. Read web_info action_schema before unfamiliar
-    actions or after validation errors. fill uses fields={CSS_selector: value}.
+    """Execute 1-32 ordered objects in actions, each with required canonical action
+    from web_info(topic='actions'); other keys are its parameters (url, session_id, ...).
+    type/name/tool/command/op/operation/method aliases are accepted; prefer action.
+    Read web_info action_schema before unfamiliar actions or validation errors.
+    fill uses fields={CSS_selector: value}.
     Use a unique session_id per task/agent; never close another agent's tabs.
     summary='min' (or "summary": "min" in one action) returns short results.
     """
     if not actions or len(actions) > 32:
         raise ValueError("Provide 1-32 actions")
     return await _execute_actions(actions, continue_on_error, summary)
+
+
+publish_action_envelope(mcp, legacy_mcp, _ACTIONS, _ACTION_KEY_ALIASES)
 
 
 async def _execute_actions(
@@ -2688,6 +2675,7 @@ def main() -> None:
     # topics, and search providers before the surface is published; the bridge
     # daemon above publishes no MCP surface and never loads them.
     plugins.load_plugins()
+    publish_action_envelope(mcp, legacy_mcp, _ACTIONS, _ACTION_KEY_ALIASES)
     browser_tools.start_current_chrome_bridge()
     active_mcp = (
         legacy_mcp

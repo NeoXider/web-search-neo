@@ -19,8 +19,19 @@ RESOURCE_TIMING_BUFFER = 250  # Chrome's default; the page cannot be made to kee
 # reads the buffered LCP and layout-shift entries through a PerformanceObserver.
 PERF_SCRIPT = r"""
 const waitMs = Math.max(0, Math.min(Number(arguments[0]) || 0, 30000));
+const deadline = performance.now() + waitMs;
 if (document.readyState !== 'complete' && waitMs) {
-  await new Promise(done => { addEventListener('load', done, {once: true}); setTimeout(done, waitMs); });
+  await new Promise(done => {
+    let timer;
+    const finish = () => { clearTimeout(timer); removeEventListener('load', finish); done(); };
+    addEventListener('load', finish, {once: true});
+    timer = setTimeout(finish, Math.max(0, deadline - performance.now()));
+  });
+}
+while (waitMs && !performance.getEntriesByType('paint').some(p => p.name === 'first-contentful-paint')) {
+  const remaining = deadline - performance.now();
+  if (remaining <= 0) break;
+  await new Promise(done => setTimeout(done, Math.min(20, remaining)));
 }
 const observe = (type) => new Promise(resolve => {
   let seen = [];

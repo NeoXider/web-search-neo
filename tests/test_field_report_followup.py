@@ -1123,7 +1123,10 @@ def test_a_click_that_never_happened_disarms_its_probe(monkeypatch):
 
 
 def test_the_contract_keeps_a_real_margin_under_its_budget():
-    assert len(json.dumps(main._capabilities())) < 14_000
+    from web_search_neo.contract.budget import CONTRACT_BUDGET
+
+    # Keep room under the reviewed budget shared by the release contract tests.
+    assert len(json.dumps(main._capabilities())) < CONTRACT_BUDGET - 100
 
 
 

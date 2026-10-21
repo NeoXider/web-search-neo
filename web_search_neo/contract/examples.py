@@ -35,6 +35,8 @@ _RECIPES = {
 }
 
 _PITFALLS = [
+    "web_action(actions=[...]) takes a JSON array of objects; EACH needs action from web_info(topic='actions'); other keys are its parameters. type/name/tool/command/op/operation/method are accepted aliases; prefer action. Genuine parameters such as method/op/name remain parameters of the selected action.",
+    "Every action object needs an \"action\" key can mean client schema-pruning removed it. Check web_action actions.items.properties.action; refresh/reconnect cached tools. Read web_info(topic='action_schema', params={'action':'fetch_text'}) for that action's parameters.",
     "Noisy page: page_elements category='interactive', visible_only, role/text_pattern (filter before paging).",
     "web_action success=true is not task success: check every results[i].success.",
     "Never repeat a click or submit on verified=false/null or after a timeout: read the page first - it may have gone through. Only an observation repeats on its own, while the page asks to wait.",

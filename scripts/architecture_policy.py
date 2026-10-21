@@ -32,7 +32,8 @@ LEGACY_MAX_LINES = {
     # Lowered 2706 -> 2701: the macro-validation shape helper moved to
     # web_search_neo/macro_files.py, and the freed lines carry the new
     # screen_state topic wiring (wrapper, registry entry, Literal entry).
-    "web_search_neo/main.py": 2701,
+    # Lowered 2701 -> 2689: action discriminator diagnostics moved to action_calls.py.
+    "web_search_neo/main.py": 2689,
     # Raised 2681 -> 2686 for the aria-hidden majority hint in page_text exclusions.
     "web_search_neo/page_perception.py": 2686,
     # Raised 2070 -> 2075 (2026-10-13, from upstream 96427c0): a tab create on a busy

@@ -14,6 +14,7 @@ import time
 from typing import Any
 
 from web_search_neo import browser_tools, obstacle_recovery, tab_actions
+from web_search_neo.action_calls import resolve_action_call
 from web_search_neo.perception import min_summary
 
 # Repeated once after the session followed a tab Chrome replaced, because they
@@ -167,11 +168,11 @@ async def execute_actions(facade: Any, actions: list[dict[str, Any]], continue_o
     for index, raw_action in enumerate(actions):
         if not isinstance(raw_action, dict):
             raise ValueError(f"Action {index} must be an object")
-        arguments = dict(raw_action)
-        action_name = str(arguments.pop("action", "")).strip().lower()
-        action_name = facade._ACTION_NAME_ALIASES.get(action_name, action_name)
+        action_name, arguments, error = resolve_action_call(facade, raw_action)
         spec = facade._ACTIONS.get(action_name)
-        if spec is None:
+        if error is not None:
+            results.append({"index": index, "action": action_name or None, "success": False, "error": error})
+        elif spec is None:
             results.append(_unknown_action(facade, index, action_name, arguments))
         else:
             results.append(await _run_one(facade, index, spec, action_name, arguments, summary))

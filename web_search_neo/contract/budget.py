@@ -29,7 +29,12 @@ from typing import Any
 # protocol answering reuses captcha_solvers/tc_image_solve.finish, and the challenge it answers is
 # the one the same module already read, so no extra reading text had to be published either.
 # Measured 14 014 characters against this ceiling; 86 remain.
-CONTRACT_BUDGET = 14_100
+# 2026-10-21 (web_action transport repair): the how/pitfalls sections now name the
+# mandatory action envelope, accepted aliases, and recovery from client schema pruning.
+# No existing advice was removed: these rules were previously absent, and belong in the
+# eager contract so an agent can form its first call. Action parameter details remain
+# on demand in action_schema; only transport recovery increases the contract ceiling.
+CONTRACT_BUDGET = 14_900
 
 
 def budget_usage(capabilities: dict[str, Any]) -> dict[str, Any]:

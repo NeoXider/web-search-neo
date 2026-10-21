@@ -613,6 +613,7 @@ def test_frame_health_names_a_hidden_page():
 
 def test_look_turns_a_locked_camera_by_exactly_the_asked_amount(local_site):
     import asyncio
+    from selenium.webdriver.support.ui import WebDriverWait
 
     from web_search_neo import extra_actions
 
@@ -620,10 +621,18 @@ def test_look_turns_a_locked_camera_by_exactly_the_asked_amount(local_site):
     acquired = browser_tools.pointer_lock("acquire", "look", selector="#pad")
     if not acquired["locked"]:
         pytest.skip(f"Pointer lock is unavailable in this browser: {acquired}")
+    WebDriverWait(session.driver, 3, poll_frequency=0.02).until(
+        lambda driver: driver.execute_script("return window.__input.locked === true")
+    )
     before = session.driver.execute_script("return [window.__input.lockDelta.x, window.__input.lockDelta.y]")
     turned = asyncio.run(extra_actions.browser_look(403, -51, session_id="look", steps=7, duration_ms=70))
     assert turned["moved_x"] == 403 and turned["moved_y"] == -51 and turned["pointer_locked"] is True
-    after = session.driver.execute_script("return [window.__input.lockDelta.x, window.__input.lockDelta.y]")
+    def observed_delta(driver):
+        values = driver.execute_script("return [window.__input.lockDelta.x, window.__input.lockDelta.y]")
+        return values if values == [before[0] + 403, before[1] - 51] else False
+
+    # CDP acknowledges each event before the renderer processes its movement.
+    after = WebDriverWait(session.driver, 3, poll_frequency=0.02).until(observed_delta)
     assert [after[0] - before[0], after[1] - before[1]] == [403, -51]
     moves = session.driver.execute_script("return window.__input.lockMoves")
     assert moves >= 7

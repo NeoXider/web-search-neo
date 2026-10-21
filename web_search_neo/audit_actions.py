@@ -149,7 +149,10 @@ async def browser_perf_report(
 
     With url and no open session_id: a cold load in a fresh isolated browser,
     closed afterwards unless keep_open. With session_id alone: the page already
-    open there. wait_seconds bounds the wait for the load event.
+    open there. wait_seconds is one shared budget for load and first contentful
+    paint (0 skips readiness waiting); buffered LCP/CLS collection adds 2 x 60 ms.
+    Paint absent when metrics are sampled remains null; paint arriving during
+    the observer windows can be reported.
     """
     if url is None and not session_id:
         raise ValueError("perf_report needs url (a fresh isolated load) or the session_id of an open page")

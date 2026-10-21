@@ -104,6 +104,9 @@ _BY_ACTION: dict[str, dict[str, str]] = {
         "har_to": "File name for the session journal as HAR 1.2 beside the JSON report (download folder).",
         "overwrite": "Replace an existing save_to/har_to file instead of refusing.",
     },
+    "perf_report": {
+        "wait_seconds": "Shared readiness budget for load and first contentful paint (0 = no readiness wait, max 30 s). Buffered LCP/CLS collection adds 2 x 60 ms; missing paint stays null.",
+    },
     "secret_scan": {
         "url": "The page to scan: a cold load in a fresh isolated session (closed unless keep_open).",
         "hosts": "Your other hosts, <= 10 (same rules as scope): their scripts count as own too.",
