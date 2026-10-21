@@ -34,7 +34,12 @@ from typing import Any
 # No existing advice was removed: these rules were previously absent, and belong in the
 # eager contract so an agent can form its first call. Action parameter details remain
 # on demand in action_schema; only transport recovery increases the contract ceiling.
-CONTRACT_BUDGET = 14_900
+# Raised 14 900 -> 15 100 (2026-10-21, LAN nodes): measured 14 750 before and 14 900 after.
+# What grew: info_topics gained `nodes` (this PC's IP/location and the other computers) and
+# actions gained `nodes` (save/remove/ping one) - 150 characters for both summaries. What was
+# kept out: the routing, pairing and sharing rules live in the topic's action_schema notes, and
+# `node=` itself is described by the web_action/web_info tool schemas, not by this contract.
+CONTRACT_BUDGET = 15_100
 
 
 def budget_usage(capabilities: dict[str, Any]) -> dict[str, Any]:

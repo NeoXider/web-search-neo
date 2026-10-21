@@ -23,6 +23,7 @@ import pytest
 from web_search_neo import agent_presence
 from web_search_neo import browser_tools
 from web_search_neo import main
+from web_search_neo import presence_badge, presence_live, presence_overlay
 
 
 class _PresenceDriver:
@@ -508,20 +509,30 @@ def test_cursor_payload_refuses_non_finite_positions():
 
 def test_the_installer_draws_a_ghost_cursor_and_press_rings():
     source = agent_presence.install_source()
-    assert 'setAttribute("data-wsn-presence", "cursor")' in source
+    # Every overlay host is tagged the one way the readers, the click verifier
+    # and the screenshot hiding all recognise.
+    assert 'host.setAttribute("data-wsn-presence", kind)' in source
+    for kind in ("cursor", "caption", "trail"):
+        assert f'overlayHost("{kind}"' in source
     assert 'setAttribute("data-wsn-presence", "ripple")' in source
     # An inline SVG arrow: no external image a page CSP could refuse.
     assert "createElementNS" in source
     assert "moveCursor" in source
     assert "showEphemeral" in source
+    # The splice point is gone: the overlay really is inside the installer.
+    assert "__WSN_PRESENCE_OVERLAY__" not in source
 
 
 def test_the_installer_carries_the_cursor_timings():
     source = agent_presence.install_source()
-    assert f'"glideMs": {agent_presence.CURSOR_GLIDE_MS}' in source
+    assert f'"glideMinMs": {presence_overlay.GLIDE_MIN_MS}' in source
+    assert f'"glideMaxMs": {presence_overlay.GLIDE_MAX_MS}' in source
     assert f'"rippleMs": {agent_presence.RIPPLE_MS}' in source
-    assert f'"chipMs": {agent_presence.CURSOR_CHIP_MS}' in source
+    assert f'"captionMs": {agent_presence.CAPTION_MS}' in source
     assert agent_presence.RIPPLE_MS <= 1000
+    # Eased and distance-scaled, within the band the brief asks for: never a
+    # teleport, never a crawl.
+    assert 100 <= presence_overlay.GLIDE_MIN_MS < presence_overlay.GLIDE_MAX_MS <= 500
 
 
 def test_note_moves_the_cursor_after_a_pointer_action(monkeypatch):
@@ -609,3 +620,117 @@ def test_dom_click_target_is_captured_separately_from_relative_input_origin():
 def test_frame_selector_never_resolves_against_unrelated_main_document():
     payload = agent_presence.payload_for("click", {"selector": "#go", "frame_selector": "#frame"})
     assert "cursorTarget" not in payload
+
+
+# --- captions, holds and leads -------------------------------------------------
+
+
+def test_payload_says_when_a_button_is_still_held():
+    held = agent_presence.payload_for(
+        "pointer", {"pointer_action": "press", "x": 1, "y": 2}, pointer=(1.0, 2.0), held=True
+    )
+    assert held["held"] is True and held["caption"] == "Press"
+    assert "held" not in agent_presence.payload_for("pointer", {"pointer_action": "release"})
+
+
+def test_the_note_reports_held_buttons(monkeypatch):
+    _presence_env(monkeypatch)
+    driver = _PresenceDriver(installed=True)
+    session = _register(driver, "presence-held")
+    session.pointer_x, session.pointer_y = 50.0, 60.0
+    session.held_buttons.add("left")
+    browser_tools.note_agent_activity("presence-held", "pointer", {"pointer_action": "move", "x": 50, "y": 60})
+    assert driver.scripts[0][1][0]["held"] is True
+
+
+def test_a_slow_step_is_captioned_before_it_runs(monkeypatch):
+    _presence_env(monkeypatch)
+    driver = _PresenceDriver(installed=True)
+    _register(driver, "presence-lead", agent_label="ag-mail")
+    assert presence_live.lead_action(
+        browser_tools._get_session, "presence-lead", "wait", {"selector": "#results", "timeout_seconds": 12}
+    )
+    (_script, (payload,)), = driver.scripts
+    assert payload["caption"] == "Waiting for #results"
+    assert payload["flash"] is False and payload["label"] == "ag-mail"
+    # The badge keeps pulsing for as long as the wait may take.
+    assert payload["inFlightMs"] == 12_000
+
+
+def test_only_slow_steps_are_led_and_a_lead_never_installs(monkeypatch):
+    _presence_env(monkeypatch)
+    driver = _PresenceDriver(installed=False)
+    _register(driver, "presence-lead-none")
+    assert not presence_live.lead_action(browser_tools._get_session, "presence-lead-none", "click", {})
+    assert driver.scripts == []
+    # Not installed: one cheap ping, no installer; the step's own note installs it.
+    assert not presence_live.lead_action(browser_tools._get_session, "presence-lead-none", "wait", {})
+    assert len(driver.scripts) == 1 and "presence.note(" in driver.scripts[0][0]
+    assert not presence_live.lead_action(browser_tools._get_session, "presence-missing", "wait", {})
+
+
+def test_the_note_that_ends_a_led_step_is_never_throttled(monkeypatch):
+    # Otherwise a wait that finished inside a second would leave the badge
+    # pulsing for the whole of its time limit.
+    _presence_env(monkeypatch)
+    driver = _PresenceDriver(installed=True)
+    _register(driver, "presence-led-end")
+    assert presence_live.lead_action(browser_tools._get_session, "presence-led-end", "wait", {"seconds": 0.2})
+    assert browser_tools.note_agent_activity("presence-led-end", "wait", {"seconds": 0.2}) is True
+    # An unled quiet step right after is throttled as before.
+    assert browser_tools.note_agent_activity("presence-led-end", "wait", {"seconds": 0.2}) is False
+
+
+def test_the_dispatcher_leads_a_wait_but_not_a_click(monkeypatch):
+    led: list[tuple] = []
+    monkeypatch.setattr(presence_live, "lead_action", lambda *args: led.append(args[1:]) or True)
+    monkeypatch.setattr(browser_tools, "note_agent_activity", lambda *args: True)
+    asyncio.run(main._execute_actions([
+        {"action": "wait", "seconds": 0, "session_id": "presence-none"},
+        {"action": "click", "session_id": "presence-none"},
+    ], continue_on_error=True))
+    assert [item[1] for item in led] == ["wait"]
+    assert led[0][0] == "presence-none"
+
+
+def test_a_dom_click_sets_the_cursor_off_before_the_click_lands(monkeypatch):
+    _presence_env(monkeypatch)
+    driver = _PresenceDriver(installed=True)
+    session = _register(driver, "presence-dom-lead")
+    session.presence_click_point = (240.0, 135.0)
+    assert presence_live.lead_gesture(session, "click", None, session.presence_click_point)
+    (_script, (payload,)), = driver.scripts
+    assert payload["cursor"] == {"x": 240.0, "y": 135.0, "tap": True}
+    assert payload["lead"] == {"tap": True}
+    assert payload["caption"] == "Click" and payload["captionTarget"] is True
+    # A lead is not a mark of its own: no flash, and nothing without a target.
+    assert payload["flash"] is False
+    assert not presence_live.lead_gesture(session, "click", None, None)
+
+
+# --- the badge states ----------------------------------------------------------
+
+
+def test_the_badge_has_three_states_told_apart_by_more_than_colour():
+    source = agent_presence.install_source()
+    # Every state moves in its own rhythm, painted as frames and swapped on one
+    # timer: a fast ring pulse while working, a slow breath (halo + bob) while
+    # active, a slower doze (a drifting z) while recent. Reduced motion gets the
+    # still version of each state, a still ring for working.
+    assert 'show(phase + ":" + state.frame)' in source
+    assert 'show(phase === "busy" ? "busy:-1" : phase)' in source
+    assert "prefers-reduced-motion: reduce" in source
+    assert "function drawBreath(" in source and "function drawDoze(" in source
+    assert f'"busyMs": {presence_badge.BUSY_MS}' in source
+    assert f'"pulseFrameMs": {presence_badge.PULSE_FRAME_MS}' in source
+    assert f'"breatheFrameMs": {presence_badge.BREATHE_FRAME_MS}' in source
+    assert f'"dozeFrameMs": {presence_badge.DOZE_FRAME_MS}' in source
+    assert (presence_badge.PULSE_FRAME_MS < presence_badge.BREATHE_FRAME_MS
+            < presence_badge.DOZE_FRAME_MS), "working must look busier than the quiet states"
+    # Active and recent: awake green, asleep amber - then the page's own icon.
+    assert 'const awake = phase !== "recent";' in source
+    assert "restoreIcon();" in source
+    assert presence_badge.BUSY_MS < agent_presence.ACTIVE_MS < agent_presence.RECENT_MS
+    # The animation timer is the only repeating one, and it stops itself the
+    # moment its state is over (or the badge is gone).
+    assert "if (!phase || phase !== state.phase) return;" in source

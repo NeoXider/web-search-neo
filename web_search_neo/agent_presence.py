@@ -2,17 +2,19 @@
 
 Three signals, all aimed at the person watching rather than at the caller:
 
-* a badge painted onto the tab's favicon while an agent is working in it, and
-  for a few minutes after it stopped - the tab strip is where someone looks
-  first, and the ``[session] `` title prefix in ``browser_tools`` only says
-  *whose* tab it is, never *whether anything is happening in it right now*;
+* a badge painted onto the tab's favicon - pulsing while an agent is working
+  in it, green for a minute after, amber for the rest of five minutes
+  (``presence_badge``) - because the tab strip is where someone looks first,
+  and the ``[session] `` title prefix in ``browser_tools`` only says *whose*
+  tab it is, never *whether anything is happening in it right now*;
 * a short flash over the element the last action touched, so a burst of thirty
   clicks reads as thirty visible taps instead of a page that mutates on its own;
-* a ghost cursor that follows the agent's virtual pointer - synthetic CDP input
-  moves no OS mouse - with a name tag and a fading ring on every press.
+* a ghost cursor that glides after the agent's virtual pointer - synthetic CDP
+  input moves no OS mouse - with a caption saying what the agent is doing, a
+  ring on every press and a trail while a button is held (``presence_overlay``).
 
 This module holds the script and payload builders. Session plumbing lives in
-``browser_tools`` so payloads can be tested independently of a browser.
+``presence_live`` so payloads can be tested independently of a browser.
 """
 
 from __future__ import annotations
@@ -22,16 +24,20 @@ import math
 import os
 from typing import Any
 
+from web_search_neo import presence_badge, presence_captions, presence_overlay
+from web_search_neo.presence_overlay import CAPTION_MS, MAX_RIPPLES, RIPPLE_MS  # noqa: F401
+
 # Bumping this makes an already-installed script in a live page stand down and
 # reinstall itself. Without it a long-lived tab would keep running whatever
 # version was current when it first loaded, and a fix here would only reach
 # pages opened afterwards.
-PRESENCE_VERSION = 8
+PRESENCE_VERSION = 9
 
 PRESENCE_ENV = "WEB_SEARCH_NEO_AGENT_PRESENCE"
 
-# How long a single action keeps the badge in its bright "working now" state.
-# A minute, because that is how long a person watching the tab strip needs to
+# How long a single action keeps the badge green, its first few seconds
+# pulsing (presence_badge.BUSY_MS). A minute, because that is how long a person
+# watching the tab strip needs to
 # still see "the model was here" after the agent paused to think: a few seconds
 # made a busy tab flip to amber between two actions, which read as "nobody is
 # driving this". Matches the companion's toolbar badge (agent-activity.js).
@@ -46,14 +52,6 @@ FLASH_MS = 250
 # Enough concurrent flashes to see a burst, few enough that a runaway loop
 # cannot fill the DOM with overlays.
 MAX_FLASHES = 6
-# Glide, ring life and name-tag life for the ghost cursor. A ring outlives the
-# flash so a press is seen after the fact, but dies before a burst smears.
-CURSOR_GLIDE_MS = 90
-# A press ring lives long enough to be seen after the fact and dies fast
-# enough that a burst stays a sequence rather than a smear.
-RIPPLE_MS = 700
-MAX_RIPPLES = 8
-CURSOR_CHIP_MS = 1500
 
 _ACTIVE_COLOR = "#2fbf5c"
 _RECENT_COLOR = "#e2a03f"
@@ -126,10 +124,8 @@ def _config() -> dict[str, Any]:
         "slimeOrigin": list(SLIME_ORIGIN),
         "slimeScale": SLIME_SCALE,
         "slimeAlpha": SLIME_ALPHA,
-        "glideMs": CURSOR_GLIDE_MS,
-        "rippleMs": RIPPLE_MS,
-        "maxRipples": MAX_RIPPLES,
-        "chipMs": CURSOR_CHIP_MS,
+        **presence_badge.config(),
+        **presence_overlay.config(),
     }
 
 
@@ -162,8 +158,13 @@ def payload_for(
     ok: bool = True,
     label: str | None = None,
     pointer: tuple[float, float] | None = None,
+    held: bool = False,
 ) -> dict[str, Any]:
-    """Build a page-side indicator; pointer coordinates use the main viewport."""
+    """Build a page-side indicator; pointer coordinates use the main viewport.
+
+    ``held`` says a mouse button is still down after the action (a drag in
+    progress), which the cursor shows as a grip and a trail.
+    """
     name = str(action or "").strip().lower()
     source = dict(arguments or {})
     payload: dict[str, Any] = {
@@ -172,6 +173,13 @@ def payload_for(
         "ok": bool(ok),
         "flash": name not in QUIET_ACTIONS,
     }
+    caption, named = presence_captions.caption_for(name, source)
+    if caption:
+        payload["caption"] = caption
+        if named:
+            payload["captionTarget"] = True
+    if held:
+        payload["held"] = True
     if name in {"click", "click_text"} and not source.get("frame_selector"):
         payload["cursorTarget"] = True
         payload["cursorTap"] = True
@@ -180,7 +188,8 @@ def payload_for(
         if isinstance(value, str) and value.strip():
             payload["selector"] = value.strip()
             break
-    for key in _TEXT_KEYS:
+    # Only a click's text names a target; type_text's is what was typed.
+    for key in _TEXT_KEYS if name in {"click", "click_text"} else ():
         value = source.get(key)
         if isinstance(value, str) and value.strip():
             payload["text"] = value.strip()[:80]
@@ -199,8 +208,10 @@ def payload_for(
 
 
 def install_source() -> str:
-    """The full installer, with this build's constants baked in."""
-    return _INSTALL_TEMPLATE.replace("__WSN_PRESENCE_CONFIG__", json.dumps(_config()))
+    """The full installer, with this build's overlay and constants baked in."""
+    source = _INSTALL_TEMPLATE.replace("__WSN_PRESENCE_BADGE__", presence_badge.SOURCE)
+    source = source.replace("__WSN_PRESENCE_OVERLAY__", presence_overlay.SOURCE)
+    return source.replace("__WSN_PRESENCE_CONFIG__", json.dumps(_config()))
 
 
 def ping_script() -> str:
@@ -227,8 +238,9 @@ RESTORE_SCRIPT = (
 
 # A flash lasts 250 ms and a screenshot inside that window would hand the agent
 # a picture of a box its own click drew. Every capture hides the overlays first
-# - flashes and rings are removed, the cursor is shown again right after - and
-# the favicon badge is untouched: it is not in the picture.
+# - flashes and rings are removed; the cursor, its trail and the caption are
+# hidden and shown again right after - and the favicon badge is untouched: it
+# is not in the picture.
 HIDE_FLASHES_SCRIPT = (
     "(() => { const presence = window.__wsnPresence;"
     " if (presence && typeof presence.hideFlashes === 'function') presence.hideFlashes();"
@@ -267,259 +279,22 @@ _INSTALL_TEMPLATE = r"""
     version: CONFIG.version,
     phase: null,
     timer: null,
+    pulse: null,
+    frame: 0,
+    busyUntil: 0,
     activeUntil: 0,
     recentUntil: 0,
     ownLink: null,
     hidden: [],
-    baseHref: null,
     painted: {},
-    loading: {},
+    waiting: [],
     flashes: [],
     cursor: null,
     ripples: [],
   };
   window[KEY] = state;
 
-  // ---------------------------------------------------------------- favicon
-
-  function iconLinks() {
-    if (!document.querySelectorAll) return [];
-    const links = [];
-    const all = document.querySelectorAll("link");
-    for (let index = 0; index < all.length; index += 1) {
-      const link = all[index];
-      if (link === state.ownLink) continue;
-      const rel = (link.getAttribute("rel") || "").toLowerCase();
-      if (/(^|\s)(icon|shortcut icon|apple-touch-icon)(\s|$)/.test(rel)) links.push(link);
-    }
-    return links;
-  }
-
-  function baseIconHref() {
-    const links = iconLinks();
-    for (let index = links.length - 1; index >= 0; index -= 1) {
-      const href = links[index].href;
-      if (href) return href;
-    }
-    try {
-      return new URL("/favicon.ico", location.href).href;
-    } catch (error) {
-      return null;
-    }
-  }
-
-  // The mark is the project's slime, drawn opaque into the bottom-right corner
-  // over the page's own favicon, so the tab keeps its identity and gains a
-  // companion that is actually visible. Active: awake, green, for a minute
-  // after the last action; recent: amber and asleep until five minutes are up.
-  function slimeBody(context) {
-    context.beginPath();
-    context.moveTo(1.5, 15);
-    context.bezierCurveTo(0, 9, 3, 3.5, 8, 3.5);
-    context.bezierCurveTo(13, 3.5, 16, 9, 14.5, 15);
-    context.closePath();
-  }
-
-  function drawSlime(context, phase) {
-    const active = phase === "active";
-    context.save();
-    // 16 units drawn at full size in the bottom-right corner: half the tab
-    // icon, fully opaque. The site keeps its own identity, and the mark is
-    // readable at strip size instead of reading as a faint dot. Green while an
-    // action is recent (a minute), amber for the rest of the five minutes.
-    context.translate(CONFIG.slimeOrigin[0], CONFIG.slimeOrigin[1]);
-    context.scale(CONFIG.slimeScale, CONFIG.slimeScale);
-    context.globalAlpha = CONFIG.slimeAlpha;
-    // A light halo keeps the slime readable on dark favicons, the dark edge on
-    // light ones; which one the page has is unknowable here.
-    slimeBody(context);
-    context.lineWidth = 2;
-    context.strokeStyle = "rgba(255,255,255,0.9)";
-    context.stroke();
-    slimeBody(context);
-    context.lineWidth = 0.8;
-    context.strokeStyle = "rgba(10,30,18,0.8)";
-    context.stroke();
-    context.fillStyle = active ? CONFIG.activeColor : CONFIG.recentColor;
-    context.fill();
-    context.beginPath();
-    context.arc(8, 3.4, 1.2, 0, Math.PI * 2);
-    context.fill();
-    context.beginPath();
-    context.ellipse(5, 7, 1.6, 0.9, -0.6, 0, Math.PI * 2);
-    context.fillStyle = "rgba(255,255,255,0.55)";
-    context.fill();
-    context.fillStyle = "#10261a";
-    context.strokeStyle = "#10261a";
-    context.lineWidth = 0.9;
-    context.lineCap = "round";
-    if (active) {
-      for (const x of [5.6, 10.4]) {
-        context.beginPath();
-        context.arc(x, 9.6, 1.5, 0, Math.PI * 2);
-        context.fillStyle = "#ffffff";
-        context.fill();
-        context.beginPath();
-        context.arc(x + 0.2, 9.8, 0.8, 0, Math.PI * 2);
-        context.fillStyle = "#10261a";
-        context.fill();
-      }
-      context.beginPath();
-      context.arc(8, 11.6, 1.6, 0.15 * Math.PI, 0.85 * Math.PI);
-      context.stroke();
-    } else {
-      for (const x of [5.6, 10.4]) {
-        context.beginPath();
-        context.arc(x, 9.4, 1.2, 0.1 * Math.PI, 0.9 * Math.PI);
-        context.stroke();
-      }
-      context.beginPath();
-      context.moveTo(7.2, 12.6);
-      context.lineTo(8.8, 12.6);
-      context.stroke();
-    }
-    context.restore();
-  }
-
-  function paint(phase, baseImage) {
-    try {
-      const canvas = document.createElement("canvas");
-      canvas.width = 32;
-      canvas.height = 32;
-      const context = canvas.getContext("2d");
-      if (!context) return null;
-      // No favicon at all leaves the canvas transparent: only the corner mark
-      // shows, so an iconless tab gains a dot instead of a replacement.
-      if (baseImage) context.drawImage(baseImage, 0, 0, 32, 32);
-      drawSlime(context, phase);
-      return canvas.toDataURL("image/png");
-    } catch (error) {
-      // A cross-origin favicon without CORS taints the canvas and toDataURL
-      // throws. Leave the page's icon as it is rather than swap it for
-      // something else: the companion's toolbar badge still marks the tab.
-      return null;
-    }
-  }
-
-  function applyIcon(dataUrl) {
-    if (!dataUrl || !document.head) return;
-    // Chrome honours the last icon link in the document, but a page that
-    // rewrites its own favicon after us would win on the next reflow. Parking
-    // the page's rel attribute makes ours the only icon link there is.
-    const links = iconLinks();
-    for (let index = 0; index < links.length; index += 1) {
-      const link = links[index];
-      if (link.hasAttribute("data-wsn-rel")) continue;
-      link.setAttribute("data-wsn-rel", link.getAttribute("rel") || "icon");
-      link.setAttribute("rel", "wsn-parked-icon");
-      state.hidden.push(link);
-    }
-    if (!state.ownLink) {
-      state.ownLink = document.createElement("link");
-      state.ownLink.setAttribute("rel", "icon");
-      state.ownLink.setAttribute("data-wsn-presence", "icon");
-    }
-    // Inserted after the parking and re-inserted on every change: Chrome keeps
-    // the page's icon when ours was already in place before the page's link
-    // stopped being an icon, and re-reads the list only when a link is added.
-    if (state.ownLink.parentNode) state.ownLink.parentNode.removeChild(state.ownLink);
-    state.ownLink.setAttribute("href", dataUrl);
-    document.head.appendChild(state.ownLink);
-  }
-
-  function repaint(phase) {
-    const cached = state.painted[phase];
-    if (cached) {
-      applyIcon(cached);
-      return;
-    }
-    // Painting is asynchronous - the page's own favicon has to load first - and
-    // a burst of actions would otherwise start one image load per action for
-    // the same picture.
-    if (state.loading[phase]) return;
-    state.loading[phase] = true;
-    const declared = state.baseHref || (state.baseHref = baseIconHref());
-    const finish = function (image) {
-      state.loading[phase] = false;
-      const dataUrl = paint(phase, image);
-      if (!dataUrl) return;
-      state.painted[phase] = dataUrl;
-      if (state.phase === phase) applyIcon(dataUrl);
-    };
-    let fallback = null;
-    try { fallback = new URL("/favicon.ico", location.href).href; } catch (error) {}
-    const candidates = [declared];
-    if (fallback && fallback !== declared) candidates.push(fallback);
-    const attempt = function (index) {
-      const href = candidates[index];
-      if (!href) {
-        // Nothing readable. A page that declares an icon still has one on
-        // screen (Chrome fetches it without CORS), so it stays; only a page
-        // with no icon at all gets the corner mark on its own.
-        state.loading[phase] = false;
-        if (iconLinks().length || state.hidden.length) return;
-        finish(null);
-        return;
-      }
-      try {
-        const image = new Image();
-        image.crossOrigin = "anonymous";
-        image.onload = function () { finish(image); };
-        image.onerror = function () { attempt(index + 1); };
-        image.src = href;
-      } catch (error) {
-        attempt(index + 1);
-      }
-    };
-    attempt(0);
-  }
-
-  function restoreIcon() {
-    for (let index = 0; index < state.hidden.length; index += 1) {
-      const link = state.hidden[index];
-      try {
-        const rel = link.getAttribute("data-wsn-rel");
-        if (rel) link.setAttribute("rel", rel);
-        link.removeAttribute("data-wsn-rel");
-      } catch (error) {}
-    }
-    state.hidden = [];
-    if (state.ownLink && state.ownLink.parentNode) {
-      try { state.ownLink.parentNode.removeChild(state.ownLink); } catch (error) {}
-    }
-    state.ownLink = null;
-    state.phase = null;
-  }
-
-  function schedule() {
-    if (state.timer) {
-      try { clearTimeout(state.timer); } catch (error) {}
-      state.timer = null;
-    }
-    const now = Date.now();
-    let delay;
-    if (now < state.activeUntil) {
-      delay = state.activeUntil - now;
-    } else if (now < state.recentUntil) {
-      delay = state.recentUntil - now;
-    } else {
-      restoreIcon();
-      return;
-    }
-    state.timer = setTimeout(function () {
-      state.timer = null;
-      const phase = Date.now() < state.activeUntil
-        ? "active"
-        : (Date.now() < state.recentUntil ? "recent" : null);
-      if (!phase) {
-        restoreIcon();
-        return;
-      }
-      state.phase = phase;
-      repaint(phase);
-      schedule();
-    }, Math.max(50, delay));
-  }
+__WSN_PRESENCE_BADGE__
 
   // ------------------------------------------------------------------ flash
 
@@ -584,14 +359,6 @@ _INSTALL_TEMPLATE = r"""
     return null;
   }
 
-  function chipText(payload) {
-    const parts = [];
-    if (payload.label) parts.push(payload.label);
-    if (payload.action) parts.push(payload.action);
-    const text = parts.join(" ") || "agent";
-    return payload.ok === false ? text + " ✕" : text;
-  }
-
   function dropFlash(host) {
     if (host && host.parentNode) {
       try { host.parentNode.removeChild(host); } catch (error) {}
@@ -614,6 +381,9 @@ _INSTALL_TEMPLATE = r"""
     const parent = document.body || document.documentElement;
     if (!parent || !document.createElement) return;
     const rect = targetRect(payload);
+    // Nothing to point at - a scroll, a key press, a navigation: the caption
+    // says what landed, and an empty box would add nothing to it.
+    if (!rect) return;
     const color = payload.ok === false ? "#e2584d" : CONFIG.activeColor;
 
     const host = document.createElement("div");
@@ -629,36 +399,19 @@ _INSTALL_TEMPLATE = r"""
       root = host;
     }
 
+    // An outline only: what the action was is the caption's job, and a label
+    // that lives 250 ms cannot be read anyway.
     const box = document.createElement("div");
-    const base =
+    box.style.cssText =
       "position:fixed;box-sizing:border-box;pointer-events:none;" +
-      "font:600 11px/1.4 ui-sans-serif,system-ui,Segoe UI,sans-serif;" +
-      "opacity:1;transition:opacity " + CONFIG.flashMs + "ms ease-out;";
-    if (rect) {
-      box.style.cssText =
-        base +
-        "left:" + Math.round(rect.left - 2) + "px;" +
-        "top:" + Math.round(rect.top - 2) + "px;" +
-        "width:" + Math.round(rect.width + 4) + "px;" +
-        "height:" + Math.round(rect.height + 4) + "px;" +
-        "border:2px solid " + color + ";border-radius:4px;" +
-        "box-shadow:0 0 0 2px rgba(0,0,0,0.25),0 0 12px " + color + ";";
-    } else {
-      // Nothing to point at - a scroll, a key press, a navigation. The chip
-      // alone still says an action landed, which beats a silent page.
-      box.style.cssText = base + "right:12px;top:12px;left:auto;";
-    }
+      "opacity:1;transition:opacity " + CONFIG.flashMs + "ms ease-out;" +
+      "left:" + Math.round(rect.left - 2) + "px;" +
+      "top:" + Math.round(rect.top - 2) + "px;" +
+      "width:" + Math.round(rect.width + 4) + "px;" +
+      "height:" + Math.round(rect.height + 4) + "px;" +
+      "border:2px solid " + color + ";border-radius:4px;" +
+      "box-shadow:0 0 0 2px rgba(0,0,0,0.25),0 0 12px " + color + ";";
     root.appendChild(box);
-
-    const chip = document.createElement("div");
-    chip.textContent = chipText(payload);
-    chip.style.cssText =
-      "position:absolute;white-space:nowrap;padding:1px 6px;border-radius:3px;" +
-      "color:#ffffff;background:" + color + ";" +
-      "font:600 11px/1.5 ui-sans-serif,system-ui,Segoe UI,sans-serif;" +
-      (rect ? "left:-2px;top:-19px;" : "right:0;top:0;");
-    box.appendChild(chip);
-
     parent.appendChild(host);
     state.flashes.push(host);
     trimFlashes();
@@ -676,121 +429,28 @@ _INSTALL_TEMPLATE = r"""
     setTimeout(remove, CONFIG.flashMs + 120);
   }
 
-  // ---------------------------------------------------------- ghost cursor
-
-  // CDP input never moves the OS mouse: one arrow per document follows the
-  // virtual pointer, with the agent's name tag, and presses land fading rings.
-  function shadowed(host) {
-    try {
-      if (host.attachShadow) return host.attachShadow({mode: "open"});
-    } catch (error) {}
-    return host;
-  }
-
-  function cursorEntry() {
-    if (state.cursor) {
-      if (!state.cursor.host.isConnected) {
-        const parent = document.documentElement || document.body;
-        if (parent) parent.appendChild(state.cursor.host);
-      }
-      return state.cursor;
-    }
-    const parent = document.documentElement || document.body;
-    if (!parent || !document.createElement) return null;
-    const host = document.createElement("div");
-    host.setAttribute("aria-hidden", "true");
-    host.setAttribute("data-wsn-presence", "cursor");
-    host.style.cssText = "all:initial;position:fixed;left:0;top:0;width:0;height:0;z-index:2147483646;pointer-events:none;display:none;transition:left " + CONFIG.glideMs + "ms linear,top " + CONFIG.glideMs + "ms linear;";
-    const root = shadowed(host);
-    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    svg.setAttribute("width", "22"); svg.setAttribute("height", "22");
-    svg.setAttribute("viewBox", "0 0 22 22");
-    svg.style.cssText = "position:absolute;left:-4px;top:-4px;display:block;overflow:visible;";
-    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-    path.setAttribute("d", "M6 3 L6 15.5 L9.6 12.3 L11.6 17.6 L13.8 16.6 L11.8 11.4 L15.8 11.4 Z");
-    path.setAttribute("fill", CONFIG.activeColor);
-    path.setAttribute("stroke", "#ffffff"); path.setAttribute("stroke-width", "1.6"); path.setAttribute("stroke-linejoin", "round");
-    svg.appendChild(path); root.appendChild(svg);
-    const chip = document.createElement("div");
-    chip.style.cssText = "position:absolute;left:20px;top:18px;white-space:nowrap;padding:1px 6px;border-radius:3px;color:#ffffff;background:" + CONFIG.activeColor + ";font:600 11px/1.5 ui-sans-serif,system-ui,Segoe UI,sans-serif;opacity:0;transition:opacity 300ms ease-out;";
-    root.appendChild(chip); parent.appendChild(host);
-    return (state.cursor = {host: host, chip: chip, timer: null, visible: false});
-  }
-
-  function moveCursor(point, payload) {
-    if (!point || !isFinite(point.x) || !isFinite(point.y)) return;
-    const entry = cursorEntry();
-    if (!entry) return;
-    const off = point.x < 0 || point.y < 0 || point.x > window.innerWidth || point.y > window.innerHeight;
-    entry.visible = !off;
-    entry.host.style.display = off ? "none" : "block";
-    if (off) return;
-    entry.host.style.left = Math.round(point.x) + "px";
-    entry.host.style.top = Math.round(point.y) + "px";
-    if (!payload) return;
-    entry.chip.textContent = chipText(payload);
-    entry.chip.style.opacity = "1";
-    if (entry.timer) { try { clearTimeout(entry.timer); } catch (error) {} }
-    entry.timer = setTimeout(function () { entry.timer = null; entry.chip.style.opacity = "0"; }, CONFIG.chipMs);
-  }
-
-  function ripple(point, ok) {
-    const parent = document.body || document.documentElement;
-    if (!parent || !document.createElement || !point) return;
-    if (!isFinite(point.x) || !isFinite(point.y)) return;
-    if (point.x < 0 || point.y < 0 || point.x > window.innerWidth || point.y > window.innerHeight) return;
-    const color = ok === false ? "#e2584d" : CONFIG.activeColor;
-    const host = document.createElement("div");
-    host.setAttribute("aria-hidden", "true");
-    host.setAttribute("data-wsn-presence", "ripple");
-    host.style.cssText = "all:initial;position:fixed;left:" + Math.round(point.x) + "px;top:" + Math.round(point.y) + "px;width:0;height:0;z-index:2147483646;pointer-events:none;";
-    const ring = document.createElement("div");
-    ring.style.cssText = "position:absolute;left:-9px;top:-9px;width:18px;height:18px;box-sizing:border-box;border-radius:50%;border:3px solid " + color + ";box-shadow:0 0 8px " + color + ";opacity:0.95;pointer-events:none;transform:scale(1);transition:transform " + CONFIG.rippleMs + "ms ease-out,opacity " + CONFIG.rippleMs + "ms ease-out;";
-    shadowed(host).appendChild(ring);
-    parent.appendChild(host);
-    state.ripples.push(host);
-    while (state.ripples.length > CONFIG.maxRipples) dropFlash(state.ripples.shift());
-    requestAnimationFrame(function () { requestAnimationFrame(function () { ring.style.transform = "scale(2.8)"; ring.style.opacity = "0"; }); });
-    setTimeout(function () { const i = state.ripples.indexOf(host); if (i !== -1) state.ripples.splice(i, 1); dropFlash(host); }, CONFIG.rippleMs + 120);
-  }
+__WSN_PRESENCE_OVERLAY__
 
   // ------------------------------------------------------------------ entry
 
   state.note = function (payload) {
     const data = payload && typeof payload === "object" ? payload : {};
-    const now = Date.now();
-    state.activeUntil = now + CONFIG.activeMs;
-    state.recentUntil = now + CONFIG.recentMs;
-    if (state.phase !== "active") {
-      state.phase = "active";
-      repaint("active");
-    } else if (!state.ownLink) {
-      repaint("active");
-    }
-    schedule();
+    try { badgeNote(data); } catch (error) {}
+    try { overlayNote(data); } catch (error) {}
     if (data.flash !== false) {
       try { flash(data); } catch (error) {}
-    }
-    let point = data.cursor;
-    if (!point && data.cursorTarget) {
-      const rect = targetRect(data);
-      if (rect) point = {x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, tap: data.cursorTap};
-    }
-    if (point) {
-      try { moveCursor(point, data); if (point.tap) ripple(point, data.ok); } catch (error) {}
     }
     return true;
   };
 
   state.hideFlashes = function () {
     clearFlashes();
-    for (const host of state.ripples.splice(0)) dropFlash(host);
-    if (state.cursor) state.cursor.host.style.display = "none";
+    overlayHide();
     return true;
   };
 
   state.showEphemeral = function () {
-    if (state.cursor && state.cursor.visible) state.cursor.host.style.display = "block";
+    overlayShow();
     return true;
   };
 
@@ -799,16 +459,12 @@ _INSTALL_TEMPLATE = r"""
       try { clearTimeout(state.timer); } catch (error) {}
       state.timer = null;
     }
+    state.busyUntil = 0;
     state.activeUntil = 0;
     state.recentUntil = 0;
     restoreIcon();
     clearFlashes();
-    for (const host of state.ripples.splice(0)) dropFlash(host);
-    if (state.cursor) {
-      if (state.cursor.timer) { try { clearTimeout(state.cursor.timer); } catch (error) {} }
-      dropFlash(state.cursor.host);
-      state.cursor = null;
-    }
+    overlayRestore();
     try { delete window[KEY]; } catch (error) { window[KEY] = undefined; }
   };
 

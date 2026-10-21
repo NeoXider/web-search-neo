@@ -23,6 +23,8 @@ import {createBackgroundCapture} from "./background-capture.js";
 import {createTabFollower} from "./tab-follow.js";
 import {selfCodeHash} from "./code-hash.js";
 import {PROTOCOL_VERSION, advanceHandshake, bytesToHex, loadBridgeToken, newNonce} from "./bridge-auth.js";
+import {controlMessage, pauseState, refuseWhilePaused} from "./control.js";
+import {createNodeRelay} from "./nodes.js";
 
 export {loadBridgeToken, parseBridgeToken} from "./bridge-auth.js";
 
@@ -35,8 +37,8 @@ const PORT_KEY = "companion_bridge_port";
 // MCP server, so the setting rides the channel that was there rather than
 // needing one of its own.
 const MAX_SESSIONS_KEY = "companion_max_sessions";
-const DEFAULT_MAX_SESSIONS = 8;
-const MAX_SESSIONS_CEILING = 64;
+const DEFAULT_MAX_SESSIONS = 30;
+const MAX_SESSIONS_CEILING = 999; // 0 is "no limit"; the server takes any number
 let maxSessions = DEFAULT_MAX_SESSIONS;
 // The in-page signals - favicon badge, action flash, ghost cursor - are painted
 // by the server through the debugger, so this is the one place that can refuse
@@ -61,9 +63,9 @@ function bridgeUrl() {
 
 function normalizeMaxSessions(value) {
   const count = Number.parseInt(value, 10);
-  // One is the floor because zero would refuse every open and tell the caller to
-  // close something that cannot exist; the ceiling only catches a typo.
-  if (!Number.isFinite(count) || count < 1 || count > MAX_SESSIONS_CEILING) return null;
+  // 0 lifts the cap entirely (the server reads it as unlimited); the ceiling
+  // only catches a typo in the field - the environment can say any number.
+  if (!Number.isFinite(count) || count < 0 || count > MAX_SESSIONS_CEILING) return null;
   return count;
 }
 
@@ -661,6 +663,7 @@ async function resolveFrame(tabId, selector) {
 
 const captureBackground = createBackgroundCapture(chrome.debugger);
 const tabFollower = createTabFollower(chrome.tabs, chrome.storage?.session);
+const nodeRelay = createNodeRelay(() => (isLiveConnection(socket) ? socket : null));
 const commands = {
   async "tabs.resolve"({tabId}) {
     return tabFollower.resolve(tabId);
@@ -1096,10 +1099,7 @@ chrome.tabs.onRemoved.addListener(tabId => forgetTab(tabId));
 // current by then would hand page contents to a peer that has not proved it
 // knows the companion token yet.
 export function isLiveConnection(connection) {
-  return Boolean(connection)
-    && connection === socket
-    && verified
-    && connection.readyState === WebSocket.OPEN;
+  return Boolean(connection) && connection === socket && verified && connection.readyState === WebSocket.OPEN;
 }
 
 function sendResult(connection, id, payload) {
@@ -1126,6 +1126,7 @@ export async function handleCommand(connection, message) {
   let params = raw;
   try {
     await restoreState();
+    await refuseWhilePaused(method); // the popup's Take over: the person drives, agents wait
     params = method === "tabs.resolve" ? raw : await tabFollower.redirect(raw);
     const handler = commands[method];
     if (!handler) throw new Error(`Unknown bridge method: ${method}`);
@@ -1190,7 +1191,7 @@ async function loadMaxSessions() {
 async function setMaxSessions(value) {
   const count = normalizeMaxSessions(value);
   if (count === null) {
-    throw new Error(`Parallel sessions must be a whole number between 1 and ${MAX_SESSIONS_CEILING}.`);
+    throw new Error(`Parallel sessions must be a whole number from 0 (no limit) to ${MAX_SESSIONS_CEILING}.`);
   }
   if (count === maxSessions) return connectionStatus();
   maxSessions = count;
@@ -1262,6 +1263,7 @@ function connectionStatus() {
     version: chrome.runtime.getManifest().version,
     state: deriveState(connected),
     failure_kind: lastFailure,
+    ...pauseState(),
   };
 }
 
@@ -1616,7 +1618,7 @@ export async function connect() {
       });
       return;
     }
-    if (message.type !== "command") return;
+    if (message.type !== "command") return void nodeRelay.deliver(message);
     const {id, method} = message;
     if (typeof id !== "string" && typeof id !== "number") return;
     if (typeof method !== "string") {
@@ -1704,8 +1706,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     operation = loadEnabled().then(() => setMaxSessions(message.max_sessions));
   } else if (type === "companion.setPresence") {
     operation = loadEnabled().then(() => setPresence(message.presence));
-  } else if (String(type).startsWith("companion.") && (operation = agentMessage(message))) {
-    // Agent activity list and focus requests from the popup.
+  } else if (String(type).startsWith("companion.")
+    && (operation = agentMessage(message) || nodeRelay.message(message) || controlMessage(message))) {
+    // Agent activity, the Computers tab (nodes.js) and Take over (control.js) from the popup.
   } else {
     return false;
   }

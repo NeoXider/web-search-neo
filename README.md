@@ -39,6 +39,7 @@ where another finds hits is tried last and named in `unreliable_engines`.
 - [Extending Web Search Neo](docs/extending.md) — plugin actions, observation topics, and search providers
 - [Why Web Search Neo](#why-web-search-neo) — the capability table
 - [Connect your already-open Chrome](#connect-your-already-open-chrome) · [The bridge daemon](#the-bridge-daemon) · [Bridge authentication](#bridge-authentication)
+- [**Other computers on your network**](#other-computers-on-your-network) — `node=` runs a call in another PC's Chrome; IP and location of each · [the long version](docs/remote-nodes.md)
 - [Search behavior](#search-behavior) · [HTTP requests without a browser](#http-requests-without-a-browser) · [CAPTCHA and challenge modes](#captcha-and-challenge-modes)
 - [Current Chrome automation](#current-chrome-automation) · [Chrome profile modes](#chrome-profile-modes)
 - [Reading a page](#reading-a-page) · [Locators](#locators)
@@ -348,9 +349,20 @@ Keep the companion enabled in one Chrome profile at a time. The bridge holds exa
 The toolbar popup (also on **Alt+Shift+N**, its suggested shortcut) is where the
 companion is switched on, watched, and configured. It is a compact, icon-first
 widget: one live status line with a pulse marker — `Connected`, `Connecting`,
-`Waiting` plus the retry countdown, `Disabled`, or an error state — then three
-figures: controlled tabs, the parallel-session limit against its ceiling with a
-small capacity meter, and the bridge endpoint. Icon buttons carry accessible
+`Waiting` plus the retry countdown, `Disabled`, `Paused`, or an error state — and a
+**Take over** button beside it. Take over (or **Alt+Shift+P** anywhere in Chrome)
+pauses every agent in this browser at once: commands that would change a page or a
+tab are refused with a message telling the agent to wait, the toolbar badge reads
+`II`, and **Resume** hands control back. Below it three tabs: **Overview** — three
+figures (controlled tabs, tabs held against the parallel-session limit - or ∞ - with a
+small capacity meter, the bridge endpoint), this computer's IP and place in one
+strip, and the agent tabs; **Computers** — [other computers on your
+network](#other-computers-on-your-network), sharing this one, pairing and sending a
+tab; **Settings**. While agents work, the toolbar icon animates, the logo in the panel
+turns, each agent tab row shows a bar draining over its five-minute afterglow, and every
+tab group holding a driven tab is coloured by state: green while an agent acted in the
+last minute, yellow for the afterglow, orange while you have taken over — then it gets
+its own colour back. Icon buttons carry accessible
 names (`aria-label`/`title`): release check, repository link, apply/reset port,
 apply/reset session limit. A version chip and a GitHub release check round off
 the top; **Settings** holds the port and session limit. Everything renders from the
@@ -568,6 +580,30 @@ during which such a process finds something listening. Close it deliberately wit
 `python main.py --bridge --stop`, or quit Chrome and let it close itself: a daemon with
 neither a companion nor a client attached exits after fifteen minutes
 (`WEB_SEARCH_NEO_BRIDGE_IDLE_SECONDS`, `0` disables the timer).
+
+## Other computers on your network
+
+Every computer with Chrome and the companion is shared by default — its bridge starts a
+LAN node when the companion connects, and the popup's **Share this computer** switch
+turns that off. This MCP can then drive that computer's Chrome too: add `node` to any
+call.
+
+```json
+{"tool": "web_action", "arguments": {"node": "office-pc", "actions": [
+  {"action": "open", "url": "https://example.com", "session_id": "office-1", "profile_mode": "current"}
+]}}
+```
+
+`web_info(topic="nodes")` shows this computer — LAN addresses, public IP, and the city,
+region, country and network operator registries attach to that IP — and every other
+computer: online, unpaired or offline, with its IPs, location, latency and whether its
+Chrome is linked. `params.discover=true` scans the LAN. Pair a computer once with
+`web_action nodes op='add'` (name, address, the pairing key that computer shows) or in
+the popup's **Computers** tab, which also sends the tab you are looking at to another
+computer. Requests are HMAC-signed and replay-proof; the key never crosses the network,
+but the traffic is not encrypted, so share on a trusted LAN or a VPN.
+[docs/remote-nodes.md](docs/remote-nodes.md) has pairing, the security model and every
+setting.
 
 ## Search behavior
 
@@ -1791,7 +1827,7 @@ One more is about the server rather than the bridge:
 
 | Variable | Effect |
 | --- | --- |
-| `WEB_SEARCH_NEO_MAX_SESSIONS` | Browser sessions one server holds at once, default `8`, capped at `64`. Per process, so agents running in parallel share the allowance; the refusal at the cap names this variable. Set here it wins over the companion popup's **Parallel sessions** setting, which is where a user without access to the server's environment changes the same number. |
+| `WEB_SEARCH_NEO_MAX_SESSIONS` | Browser sessions one server holds at once, default `30`; any number is accepted, and `0` (or `unlimited`) removes the cap. Per process, so agents running in parallel share the allowance; the refusal at the cap names this variable. Set here it wins over the companion popup's **Parallel sessions** setting, which is where a user without access to the server's environment changes the same number. |
 
 Only use a proxy you are authorized to use. HTTP sessions use desktop browser headers, connection pooling, bounded response sizes, and conservative retry/backoff. Rendered pages use the installed Chrome's native matching User-Agent unless explicitly overridden.
 

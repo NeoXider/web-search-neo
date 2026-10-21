@@ -1,0 +1,445 @@
+"""The tab-strip badge: the slime painted onto the favicon, in three states.
+
+``agent_presence`` splices this script into its installer at
+``__WSN_PRESENCE_BADGE__``; it shares that closure (``CONFIG``, ``state``). The
+tab strip is where a person looks first, so the states are told apart by shape
+and motion, not by shade alone:
+
+* **working** - an action is in flight, or landed in the last few seconds:
+  the green, awake slime inside a ring that pulses outward, about seven frames
+  a second;
+* **active** - the agent acted within the last minute: green and awake, and
+  breathing - it bobs gently under a soft halo that swells and fades;
+* **recent** - quiet for more than a minute: amber and asleep, a small "z"
+  drifting up beside it, until five minutes after the last action, when the
+  page's own favicon comes back.
+
+Each state has its own rhythm - fast for working, slow for the others - so the
+strip reads at a glance even in peripheral vision. ``prefers-reduced-motion``
+gets the still version of every state (a still ring for working). The motion
+stays cheap: a handful of 32x32 frames painted once per document and swapped on
+one timer, which stops with the badge; Chrome's own throttling slows it further
+in a background tab.
+
+A slow step announced before it runs (``presence_live.lead_action``) carries
+``inFlightMs``, its own time limit, so the ring keeps pulsing through a long
+wait; the step's own note afterwards ends it a few seconds later.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+# How long after an action the badge keeps pulsing.
+BUSY_MS = 4000
+# A led step pulses for at most this long without an answer, however long its
+# own time limit is: a wait that died with its caller must not pulse for ever.
+IN_FLIGHT_MAX_MS = 60_000
+PULSE_FRAMES = 6
+PULSE_FRAME_MS = 150
+# The quiet states move too, much slower: a 2 s breath, a 4 s doze.
+BREATHE_FRAMES = 6
+BREATHE_FRAME_MS = 340
+DOZE_FRAMES = 4
+DOZE_FRAME_MS = 1000
+BUSY_COLOR = "#5dff8f"
+
+
+def config() -> dict[str, Any]:
+    """The badge's constants, merged into the installer's CONFIG."""
+    return {
+        "busyMs": BUSY_MS,
+        "inFlightMaxMs": IN_FLIGHT_MAX_MS,
+        "pulseFrames": PULSE_FRAMES,
+        "pulseFrameMs": PULSE_FRAME_MS,
+        "breatheFrames": BREATHE_FRAMES,
+        "breatheFrameMs": BREATHE_FRAME_MS,
+        "dozeFrames": DOZE_FRAMES,
+        "dozeFrameMs": DOZE_FRAME_MS,
+        "busyColor": BUSY_COLOR,
+    }
+
+
+SOURCE = r"""
+  // ---------------------------------------------------------------- favicon
+
+  function iconLinks() {
+    if (!document.querySelectorAll) return [];
+    const links = [];
+    const all = document.querySelectorAll("link");
+    for (let index = 0; index < all.length; index += 1) {
+      const link = all[index];
+      if (link === state.ownLink) continue;
+      const rel = (link.getAttribute("rel") || "").toLowerCase();
+      if (/(^|\s)(icon|shortcut icon|apple-touch-icon)(\s|$)/.test(rel)) links.push(link);
+    }
+    return links;
+  }
+
+  function baseIconHref() {
+    const links = iconLinks();
+    for (let index = links.length - 1; index >= 0; index -= 1) {
+      const href = links[index].href;
+      if (href) return href;
+    }
+    try {
+      return new URL("/favicon.ico", location.href).href;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  // The mark is the project's slime, drawn opaque into the bottom-right corner
+  // over the page's own favicon, so the tab keeps its identity and gains a
+  // companion that is actually visible.
+  function slimeBody(context) {
+    context.beginPath();
+    context.moveTo(1.5, 15);
+    context.bezierCurveTo(0, 9, 3, 3.5, 8, 3.5);
+    context.bezierCurveTo(13, 3.5, 16, 9, 14.5, 15);
+    context.closePath();
+  }
+
+  function drawSlime(context, phase, lift) {
+    const awake = phase !== "recent";
+    context.save();
+    // 16 units drawn at full size in the bottom-right corner: half the tab
+    // icon, fully opaque. The site keeps its own identity, and the mark is
+    // readable at strip size instead of reading as a faint dot. `lift` raises
+    // it a little for the breathing frames.
+    context.translate(CONFIG.slimeOrigin[0], CONFIG.slimeOrigin[1] - (lift || 0));
+    context.scale(CONFIG.slimeScale, CONFIG.slimeScale);
+    context.globalAlpha = CONFIG.slimeAlpha;
+    // A light halo keeps the slime readable on dark favicons, the dark edge on
+    // light ones; which one the page has is unknowable here.
+    slimeBody(context);
+    context.lineWidth = 2;
+    context.strokeStyle = "rgba(255,255,255,0.9)";
+    context.stroke();
+    slimeBody(context);
+    context.lineWidth = 0.8;
+    context.strokeStyle = "rgba(10,30,18,0.8)";
+    context.stroke();
+    context.fillStyle = awake ? CONFIG.activeColor : CONFIG.recentColor;
+    context.fill();
+    context.beginPath();
+    context.arc(8, 3.4, 1.2, 0, Math.PI * 2);
+    context.fill();
+    context.beginPath();
+    context.ellipse(5, 7, 1.6, 0.9, -0.6, 0, Math.PI * 2);
+    context.fillStyle = "rgba(255,255,255,0.55)";
+    context.fill();
+    context.fillStyle = "#10261a";
+    context.strokeStyle = "#10261a";
+    context.lineWidth = 0.9;
+    context.lineCap = "round";
+    if (awake) {
+      for (const x of [5.6, 10.4]) {
+        context.beginPath();
+        context.arc(x, 9.6, 1.5, 0, Math.PI * 2);
+        context.fillStyle = "#ffffff";
+        context.fill();
+        context.beginPath();
+        context.arc(x + 0.2, 9.8, 0.8, 0, Math.PI * 2);
+        context.fillStyle = "#10261a";
+        context.fill();
+      }
+      context.beginPath();
+      context.arc(8, 11.6, 1.6, 0.15 * Math.PI, 0.85 * Math.PI);
+      context.stroke();
+    } else {
+      for (const x of [5.6, 10.4]) {
+        context.beginPath();
+        context.arc(x, 9.4, 1.2, 0.1 * Math.PI, 0.9 * Math.PI);
+        context.stroke();
+      }
+      context.beginPath();
+      context.moveTo(7.2, 12.6);
+      context.lineTo(8.8, 12.6);
+      context.stroke();
+    }
+    context.restore();
+  }
+
+  // "Working right now": a ring behind the slime that swells and fades over
+  // the pulse frames. Frame -1 is the still ring reduced motion gets.
+  function drawRing(context, frame) {
+    const t = frame < 0 ? 0.3 : frame / CONFIG.pulseFrames;
+    const cx = CONFIG.slimeOrigin[0] + 8 * CONFIG.slimeScale;
+    const cy = CONFIG.slimeOrigin[1] + 9.5 * CONFIG.slimeScale;
+    context.save();
+    context.globalAlpha = frame < 0 ? 1 : 1 - 0.7 * t;
+    context.beginPath();
+    context.arc(cx, cy, (9 + 4.5 * t) * CONFIG.slimeScale, 0, Math.PI * 2);
+    context.lineWidth = 3.4;
+    context.strokeStyle = "rgba(10,30,18,0.75)";
+    context.stroke();
+    context.lineWidth = 2;
+    context.strokeStyle = CONFIG.busyColor;
+    context.stroke();
+    context.restore();
+  }
+
+  // A soft halo behind the slime; `t` (0..1) is how far it has swollen. At
+  // strip size (16 px) a glow that grows and fades is what still reads as
+  // motion, where finer detail is lost.
+  function drawHalo(context, color, t, base, swell) {
+    const cx = CONFIG.slimeOrigin[0] + 8 * CONFIG.slimeScale;
+    const cy = CONFIG.slimeOrigin[1] + 9.5 * CONFIG.slimeScale;
+    context.save();
+    context.globalAlpha = base + 0.5 * t;
+    context.beginPath();
+    context.arc(cx, cy, (10 + swell * t) * CONFIG.slimeScale, 0, Math.PI * 2);
+    context.fillStyle = color;
+    context.fill();
+    context.restore();
+  }
+
+  function breath(frame, frames) {
+    return 0.5 - 0.5 * Math.cos((frame / frames) * Math.PI * 2);
+  }
+
+  // "Active": the green halo swells and fades, and the slime rises with it.
+  function drawBreath(context, frame) {
+    const t = breath(frame, CONFIG.breatheFrames);
+    drawHalo(context, CONFIG.activeColor, t, 0.3, 3);
+    return 1.4 * t;
+  }
+
+  // "Recent": a slower amber glow behind the sleeping slime...
+  function drawDozeGlow(context, frame) {
+    drawHalo(context, CONFIG.recentColor, breath(frame, CONFIG.dozeFrames), 0.15, 2);
+  }
+
+  // ...and a z drifting up and fading beside it.
+  function drawDoze(context, frame) {
+    const t = frame / CONFIG.dozeFrames;
+    context.save();
+    context.globalAlpha = 1 - 0.5 * t;
+    context.font = "900 " + (9 + 3 * t).toFixed(1) + "px sans-serif";
+    context.lineWidth = 2.5;
+    context.strokeStyle = "rgba(10,30,18,0.9)";
+    context.fillStyle = "#ffd27a";
+    const x = CONFIG.slimeOrigin[0] - 5 + 3 * t;
+    const y = CONFIG.slimeOrigin[1] + 5 - 6 * t;
+    context.strokeText("z", x, y);
+    context.fillText("z", x, y);
+    context.restore();
+  }
+
+  // `key` is a state, or "<state>:<frame>" for one frame of its motion.
+  function paint(key, baseImage) {
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = 32;
+      canvas.height = 32;
+      const context = canvas.getContext("2d");
+      if (!context) return null;
+      // No favicon at all leaves the canvas transparent: only the corner mark
+      // shows, so an iconless tab gains a mark instead of a replacement.
+      if (baseImage) context.drawImage(baseImage, 0, 0, 32, 32);
+      const parts = String(key).split(":");
+      const frame = parts.length > 1 ? Number(parts[1]) : null;
+      let lift = 0;
+      if (parts[0] === "busy") drawRing(context, frame);
+      if (parts[0] === "active" && frame !== null) lift = drawBreath(context, frame);
+      if (parts[0] === "recent" && frame !== null) drawDozeGlow(context, frame);
+      drawSlime(context, parts[0], lift);
+      if (parts[0] === "recent" && frame !== null) drawDoze(context, frame);
+      return canvas.toDataURL("image/png");
+    } catch (error) {
+      // A cross-origin favicon without CORS taints the canvas and toDataURL
+      // throws. Leave the page's icon as it is rather than swap it for
+      // something else: the companion's toolbar badge still marks the tab.
+      return null;
+    }
+  }
+
+  function applyIcon(dataUrl) {
+    if (!dataUrl || !document.head) return;
+    // Chrome honours the last icon link in the document, but a page that
+    // rewrites its own favicon after us would win on the next reflow. Parking
+    // the page's rel attribute makes ours the only icon link there is.
+    const links = iconLinks();
+    for (let index = 0; index < links.length; index += 1) {
+      const link = links[index];
+      if (link.hasAttribute("data-wsn-rel")) continue;
+      link.setAttribute("data-wsn-rel", link.getAttribute("rel") || "icon");
+      link.setAttribute("rel", "wsn-parked-icon");
+      state.hidden.push(link);
+    }
+    if (!state.ownLink) {
+      state.ownLink = document.createElement("link");
+      state.ownLink.setAttribute("rel", "icon");
+      state.ownLink.setAttribute("data-wsn-presence", "icon");
+    }
+    // Inserted after the parking and re-inserted on every change: Chrome keeps
+    // the page's icon when ours was already in place before the page's link
+    // stopped being an icon, and re-reads the list only when a link is added.
+    if (state.ownLink.parentNode) state.ownLink.parentNode.removeChild(state.ownLink);
+    state.ownLink.setAttribute("href", dataUrl);
+    document.head.appendChild(state.ownLink);
+  }
+
+  // The page's own icon, loaded once per document and shared by every state
+  // and frame. undefined: not asked yet; null: the page has none, so the mark
+  // goes on its own; false: unreadable, and the page's icon is left alone.
+  function withBase(done) {
+    if (state.base !== undefined) { done(state.base); return; }
+    state.waiting.push(done);
+    if (state.waiting.length > 1) return;
+    const settle = function (value) {
+      state.base = value;
+      const waiting = state.waiting.splice(0);
+      for (let index = 0; index < waiting.length; index += 1) waiting[index](value);
+    };
+    const declared = baseIconHref();
+    let fallback = null;
+    try { fallback = new URL("/favicon.ico", location.href).href; } catch (error) {}
+    const candidates = [declared];
+    if (fallback && fallback !== declared) candidates.push(fallback);
+    const attempt = function (index) {
+      const href = candidates[index];
+      if (!href) {
+        // Nothing readable. A page that declares an icon still has one on
+        // screen (Chrome fetches it without CORS), so it stays; only a page
+        // with no icon at all gets the corner mark on its own.
+        settle(iconLinks().length || state.hidden.length ? false : null);
+        return;
+      }
+      try {
+        const image = new Image();
+        image.crossOrigin = "anonymous";
+        image.onload = function () { settle(image); };
+        image.onerror = function () { attempt(index + 1); };
+        image.src = href;
+      } catch (error) {
+        attempt(index + 1);
+      }
+    };
+    attempt(0);
+  }
+
+  function show(key) {
+    state.shown = key;
+    const cached = state.painted[key];
+    if (cached) {
+      applyIcon(cached);
+      return;
+    }
+    withBase(function (image) {
+      if (image === false) return;
+      const dataUrl = paint(key, image);
+      if (!dataUrl) {
+        state.base = false;
+        return;
+      }
+      state.painted[key] = dataUrl;
+      if (state.shown === key) applyIcon(dataUrl);
+    });
+  }
+
+  function stopPulse() {
+    if (state.pulse) {
+      try { clearTimeout(state.pulse); } catch (error) {}
+      state.pulse = null;
+    }
+  }
+
+  function restoreIcon() {
+    stopPulse();
+    for (let index = 0; index < state.hidden.length; index += 1) {
+      const link = state.hidden[index];
+      try {
+        const rel = link.getAttribute("data-wsn-rel");
+        if (rel) link.setAttribute("rel", rel);
+        link.removeAttribute("data-wsn-rel");
+      } catch (error) {}
+    }
+    state.hidden = [];
+    if (state.ownLink && state.ownLink.parentNode) {
+      try { state.ownLink.parentNode.removeChild(state.ownLink); } catch (error) {}
+    }
+    state.ownLink = null;
+    state.phase = null;
+    state.shown = null;
+  }
+
+  function badgePhase(now) {
+    if (now < state.busyUntil) return "busy";
+    if (now < state.activeUntil) return "active";
+    return now < state.recentUntil ? "recent" : null;
+  }
+
+  function stillBadge() {
+    try {
+      return !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+    } catch (error) {
+      return false;
+    }
+  }
+
+  // Each state's frame count and frame time: fast for working, slow for the rest.
+  function motionOf(phase) {
+    if (phase === "busy") return [CONFIG.pulseFrames, CONFIG.pulseFrameMs];
+    if (phase === "active") return [CONFIG.breatheFrames, CONFIG.breatheFrameMs];
+    return [CONFIG.dozeFrames, CONFIG.dozeFrameMs];
+  }
+
+  // The one repeating timer: it animates whichever state the badge is in and
+  // stops itself the moment that state is over (schedule() starts the next).
+  function pulse() {
+    state.pulse = null;
+    const phase = badgePhase(Date.now());
+    if (!phase || phase !== state.phase) return;
+    const motion = motionOf(phase);
+    state.frame = (state.frame + 1) % motion[0];
+    show(phase + ":" + state.frame);
+    state.pulse = setTimeout(pulse, motion[1]);
+  }
+
+  function enter(phase) {
+    const changed = phase !== state.phase;
+    if (changed || !phase) stopPulse();
+    if (!phase) {
+      restoreIcon();
+      return;
+    }
+    const lost = !state.ownLink || !state.ownLink.isConnected;
+    state.phase = phase;
+    if (!stillBadge()) {
+      if (changed) state.frame = -1;
+      if (!state.pulse) pulse();
+    } else if (changed || lost) {
+      show(phase === "busy" ? "busy:-1" : phase);
+    }
+  }
+
+  function schedule() {
+    if (state.timer) {
+      try { clearTimeout(state.timer); } catch (error) {}
+      state.timer = null;
+    }
+    const now = Date.now();
+    const phase = badgePhase(now);
+    enter(phase);
+    if (!phase) return;
+    const end = phase === "busy" ? state.busyUntil : (phase === "active" ? state.activeUntil : state.recentUntil);
+    state.timer = setTimeout(function () {
+      state.timer = null;
+      schedule();
+    }, Math.max(50, end - now));
+  }
+
+  // Every note lights the badge: working now (longer when a slow step says
+  // how long it may take), green for the minute, amber for the five.
+  function badgeNote(data) {
+    const now = Date.now();
+    const flight = typeof data.inFlightMs === "number" && isFinite(data.inFlightMs)
+      ? Math.max(0, Math.min(data.inFlightMs, CONFIG.inFlightMaxMs)) : 0;
+    state.busyUntil = now + flight + CONFIG.busyMs;
+    state.activeUntil = Math.max(now + CONFIG.activeMs, state.busyUntil);
+    state.recentUntil = Math.max(now + CONFIG.recentMs, state.activeUntil);
+    schedule();
+  }
+"""

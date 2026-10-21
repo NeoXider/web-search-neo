@@ -8,6 +8,7 @@
 // to the global ON/OFF badge. The map is mirrored into chrome.storage.session
 // and a one-minute alarm sweeps it, so expiry survives MV3 worker eviction.
 import {
+  activityPhase,
   badgeFor,
   expireActivity,
   forgetActivity,
@@ -16,6 +17,7 @@ import {
   normalizeTabId,
   recordActivity,
 } from "./agent-activity.js";
+import {pulseToolbar, syncGroups} from "./tab-status.js";
 
 const STORAGE_KEY = "agent_activity";
 export const AGENT_ALARM = "agent-activity-sweep";
@@ -26,6 +28,10 @@ let activity = {};
 // colour or the title).
 let retired = new Set();
 let globalBadge = {text: "", color: "#64748b", title: "Web Search Neo Companion"};
+// Laid over the ON/OFF badge while the user has taken over (control.js), so a
+// reconnect repainting ON cannot hide that agents are paused.
+let badgeOverride = null;
+const shownBadge = () => ({...globalBadge, ...(badgeOverride || {})});
 let loadPromise = null;
 let sweepTimer = null;
 // null: unknown (a fresh worker may inherit an armed alarm from its predecessor).
@@ -61,9 +67,10 @@ function persist() {
 }
 
 function showGlobal(tabId) {
-  action("setBadgeText", {tabId, text: globalBadge.text});
-  action("setBadgeBackgroundColor", {tabId, color: globalBadge.color});
-  action("setTitle", {tabId, title: globalBadge.title});
+  const shown = shownBadge();
+  action("setBadgeText", {tabId, text: shown.text});
+  action("setBadgeBackgroundColor", {tabId, color: shown.color});
+  action("setTitle", {tabId, title: shown.title});
 }
 
 function paint(tabId, now) {
@@ -104,6 +111,7 @@ export async function sweep(now = Date.now()) {
   for (const key of Object.keys(activity)) paint(Number(key), now);
   persist();
   schedule(now);
+  syncGroups(activity, now, activityPhase);
 }
 
 // Called for every verified command the bridge relays. Never throws: a badge
@@ -119,6 +127,8 @@ export function noteAgentCommand(message, params, payload) {
     activity = recordActivity(activity, tabId, agent, now, extra);
     retired.delete(tabId);
     paint(tabId, now);
+    pulseToolbar();
+    syncGroups(activity, now, activityPhase);
     load().then(() => {
       persist();
       schedule(Date.now());
@@ -131,10 +141,17 @@ export function noteAgentCommand(message, params, payload) {
 // The global ON/OFF badge. Tabs that mirror it follow along.
 export function applyGlobalBadge(next) {
   globalBadge = {...globalBadge, ...next};
-  action("setBadgeBackgroundColor", {color: globalBadge.color});
-  action("setBadgeText", {text: globalBadge.text});
-  action("setTitle", {title: globalBadge.title});
+  const shown = shownBadge();
+  action("setBadgeBackgroundColor", {color: shown.color});
+  action("setBadgeText", {text: shown.text});
+  action("setTitle", {title: shown.title});
   for (const tabId of retired) showGlobal(tabId);
+}
+
+// null lifts the override and shows the plain ON/OFF badge again.
+export function setBadgeOverride(next) {
+  badgeOverride = next || null;
+  applyGlobalBadge({});
 }
 
 function forget(tabId) {
@@ -145,6 +162,7 @@ function forget(tabId) {
     retired.delete(id);
     persist();
     schedule(Date.now());
+    syncGroups(activity, Date.now(), activityPhase);
   });
 }
 

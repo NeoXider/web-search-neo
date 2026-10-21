@@ -36,7 +36,7 @@ import time
 from typing import Any
 import uuid
 
-from web_search_neo import bridge_auth
+from web_search_neo import bridge_auth, node_link
 from web_search_neo.bridge_claims import claim_is_own, js_number_tab_id
 from web_search_neo.bridge_handshake import TOKEN_MISMATCH_REASON, authenticate_peer  # noqa: F401
 from web_search_neo.process_probe import process_alive
@@ -833,12 +833,9 @@ class BridgeDaemon:
                     name="web-search-neo-bridge-evict",
                     daemon=True,
                 ).start()
-            websocket.send(
-                json.dumps(
-                    {"type": "hello_ack", "protocol": PROTOCOL}
-                )
-            )
+            websocket.send(json.dumps({"type": "hello_ack", "protocol": PROTOCOL}))
             self._broadcast_state()
+            node_link.ensure_shared_node_soon()  # sharing is on by default (popup turns it off)
             for raw_message in websocket:
                 try:
                     message = json.loads(raw_message)
@@ -853,6 +850,8 @@ class BridgeDaemon:
                     self._deliver_result(websocket, message)
                 elif message_type == "ping":
                     websocket.send(json.dumps({"type": "pong", "at": time.time()}))
+                elif message_type == "nodes":  # the popup's Computers tab (node_link.py)
+                    node_link.handle(websocket.send, message, self.version)
                 else:
                     LOGGER.warning("Ignored unknown bridge frame type %r", message_type)
         except Exception as exc:

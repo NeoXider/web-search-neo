@@ -6,7 +6,7 @@ const releaseButton = document.querySelector("#release-tabs");
 const statusNode = document.querySelector("#status");
 const tabsNode = document.querySelector("#tabs");
 const sessionsValueNode = document.querySelector("#max-sessions-value");
-const sessionsCeilingNode = document.querySelector("#max-sessions-ceiling");
+const sessionsUsedNode = document.querySelector("#sessions-used");
 const meterFillNode = document.querySelector("#meter-fill");
 const bridgeNode = document.querySelector("#bridge");
 const versionNode = document.querySelector("#version");
@@ -29,6 +29,18 @@ const nextAttemptNode = document.querySelector("#next-attempt");
 const agentListNode = document.querySelector("#agent-tab-list");
 const agentEmptyNode = document.querySelector("#agent-tabs-empty");
 const agentCountNode = document.querySelector("#agent-tabs-count");
+const takeOverButton = document.querySelector("#take-over");
+const takeOverLabelNode = document.querySelector("#take-over-label");
+// Overview / Computers / Settings: one panel visible at a time, remembered per browser.
+const TAB_IDS = ["tab-overview", "tab-computers", "tab-settings"];
+const tabButtons = TAB_IDS.map(id => document.querySelector(`#${id}`));
+const tabPanels = {
+  "tab-overview": document.querySelector("#panel-overview"),
+  "tab-computers": document.querySelector("#panel-computers"),
+  "tab-settings": document.querySelector("#panel-settings"),
+};
+const TAB_STORAGE = "wsn-popup-tab";
+const AFTERGLOW_MS = 5 * 60 * 1000; // agent-activity.js RECENT_MS
 
 const GITHUB_URL = "https://github.com/NeoXider/web-search-neo";
 const RELEASES_API = "https://api.github.com/repos/NeoXider/web-search-neo/releases?per_page=1";
@@ -68,6 +80,8 @@ function countdown(timestamp) {
 // older worker. A closed port is "waiting", never "connected": the widget
 // only repeats a verified handshake, it does not guess one.
 function deriveState(state) {
+  // Take over outranks the link state: whatever the socket does, agents are on hold.
+  if (state.paused && state.enabled !== false) return "paused";
   if (typeof state.state === "string") {
     return state.enabled === false ? "disabled" : state.state;
   }
@@ -84,6 +98,7 @@ const STATE_TEXT = {
   waiting: "Waiting",
   error: "Blocked",
   disabled: "Disabled",
+  paused: "Paused - you have control",
   loading: "Starting...",
 };
 
@@ -95,6 +110,7 @@ const STATE_SUBTEXT = {
   waiting: state => (state.next_attempt_at ? `retry ${countdown(state.next_attempt_at)}` : "now"),
   error: () => "setup_current_chrome",
   disabled: () => "switch on to connect",
+  paused: () => "agents wait until you press Resume",
   loading: () => "...",
 };
 
@@ -122,18 +138,22 @@ function render(state) {
   if (state.default_max_sessions) {
     maxSessionsDefaultNode.textContent = String(state.default_max_sessions);
   }
-  const ceiling = Number(state.max_sessions_ceiling) || 64;
-  const limit = Number(state.max_sessions) || 0;
-  sessionsCeilingNode.textContent = String(ceiling);
-  sessionsValueNode.textContent = limit ? String(limit) : "-";
+  const ceiling = Number(state.max_sessions_ceiling) || 999;
+  // 0 is "no limit"; a worker that sent nothing shows a dash.
+  const known = state.max_sessions !== undefined && state.max_sessions !== null;
+  const limit = known ? Number(state.max_sessions) || 0 : null;
+  const used = Number(state.controlled_tabs) || 0;
+  if (sessionsUsedNode) sessionsUsedNode.textContent = String(used);
+  sessionsValueNode.textContent = limit === null ? "-" : limit === 0 ? "∞" : String(limit);
   maxSessionsInput.max = String(ceiling);
-  if (document.activeElement !== maxSessionsInput && limit) {
+  if (document.activeElement !== maxSessionsInput && limit !== null) {
     maxSessionsInput.value = String(limit);
   }
-  // Capacity animation: the configured parallel-session limit against its
-  // hard ceiling, so the number is felt as well as read.
-  const fill = ceiling ? Math.max(0, Math.min(100, (limit / ceiling) * 100)) : 0;
+  // How full the allowance is: tabs held against the limit, so a cap about to
+  // bite is seen before an agent is refused. No limit leaves the bar empty.
+  const fill = limit ? Math.max(0, Math.min(100, (used / limit) * 100)) : 0;
   meterFillNode.style.width = `${fill.toFixed(1)}%`;
+  meterFillNode.dataset.level = fill >= 90 ? "full" : fill >= 70 ? "high" : "ok";
   panelNode.dataset.state = view;
   statusNode.dataset.state = view;
   statusNode.textContent = STATE_TEXT[view] || STATE_TEXT.loading;
@@ -144,9 +164,49 @@ function render(state) {
     view === "connected" ? bridgeNode.textContent
     : view === "connecting" || view === "disabled" ? "-"
     : STATE_SUBTEXT[view](state);
+  renderTakeOver(state);
   nextAttemptNode.title = view === "error"
     ? "The bridge refused this companion's credentials; run setup_current_chrome"
     : "Next connection attempt";
+}
+
+function renderTakeOver(state) {
+  if (!takeOverButton || !takeOverLabelNode) return; // a host page without the button
+  const paused = Boolean(state.paused);
+  takeOverButton.dataset.paused = String(paused);
+  takeOverButton.disabled = state.enabled === false;
+  takeOverLabelNode.textContent = paused ? "Resume" : "Take over";
+  takeOverButton.title = paused
+    ? "Resume: hand the browser back to the agents (Alt+Shift+P)"
+    : "Take over: pause every agent in this browser (Alt+Shift+P)";
+}
+
+function selectTab(id, focus = false) {
+  const chosen = TAB_IDS.includes(id) ? id : TAB_IDS[0];
+  for (const button of tabButtons) {
+    const selected = button?.id === chosen;
+    button?.setAttribute?.("aria-selected", String(selected));
+    button?.setAttribute?.("tabindex", selected ? "0" : "-1");
+    if (selected && focus) button?.focus?.();
+  }
+  for (const [tabId, panel] of Object.entries(tabPanels)) {
+    if (panel) panel.hidden = tabId !== chosen;
+  }
+  panelNode.dataset.tab = chosen;
+  try {
+    localStorage.setItem(TAB_STORAGE, chosen);
+  } catch (error) {
+    // No storage (preview harness, tests): the choice simply is not remembered.
+  }
+  if (typeof window !== "undefined") window.dispatchEvent?.(new CustomEvent("wsn-tab", {detail: chosen}));
+}
+
+function savedTab() {
+  try {
+    return localStorage.getItem(TAB_STORAGE) || TAB_IDS[0];
+  } catch (error) {
+    return TAB_IDS[0];
+  }
 }
 
 function versionParts(value) {
@@ -262,8 +322,13 @@ async function refresh() {
 // "Agent tabs": every tab an agent acted on in the last five minutes, as the
 // service worker tracks it (chrome-extension/agent-badges.js). A row focuses
 // its tab. Text only goes through textContent: tab titles are page-controlled.
+// Rows are rebuilt every second; only a tab not listed before slides in.
+const seenAgentTabs = new Set();
+
 function agentRow(row) {
   const item = document.createElement("li");
+  if (!seenAgentTabs.has(row.tab_id)) item.className = "fresh";
+  seenAgentTabs.add(row.tab_id);
   const button = document.createElement("button");
   button.type = "button";
   button.className = "agent-row";
@@ -281,7 +346,14 @@ function agentRow(row) {
   const details = document.createElement("span");
   details.className = "agent-meta";
   details.textContent = meta;
-  button.append(dot, title, details);
+  // How much of the five-minute afterglow is left: full while working, draining after.
+  const life = document.createElement("span");
+  life.className = "agent-life";
+  life.setAttribute("aria-hidden", "true");
+  const left = Math.max(0, Math.min(1, 1 - (Number(row.age_ms) || 0) / AFTERGLOW_MS));
+  life.style.width = `${(row.phase === "active" ? 1 : left) * 100}%`;
+  life.style.animationDelay = `-${Date.now() % 1400}ms`; // the sweep survives the rebuild
+  button.append(dot, title, details, life);
   button.addEventListener("click", () => focusAgentTab(row.tab_id));
   item.append(button);
   return item;
@@ -289,6 +361,8 @@ function agentRow(row) {
 
 function renderAgentTabs(rows) {
   const list = Array.isArray(rows) ? rows : [];
+  // The whole widget breathes while any agent is working right now.
+  panelNode.dataset.busy = String(list.some(row => row.phase === "active"));
   agentCountNode.textContent = String(list.length);
   agentEmptyNode.hidden = list.length > 0;
   if (typeof document.createElement !== "function" || !agentListNode.replaceChildren) return;
@@ -396,8 +470,9 @@ async function applyMaxSessions(value) {
   try {
     const state = await send("companion.setMaxSessions", {max_sessions: value});
     render(state);
+    const shown = Number(state.max_sessions) === 0 ? "no limit" : state.max_sessions;
     messageNode.textContent =
-      `Parallel sessions set to ${state.max_sessions}; the MCP server picks it up on reconnect.`;
+      `Parallel sessions set to ${shown}; the MCP server picks it up on reconnect.`;
   } catch (error) {
     messageNode.textContent = error.message;
     await refresh();
@@ -423,6 +498,34 @@ resetPortButton.addEventListener("click", () => {
 });
 portInput.addEventListener("keydown", event => {
   if (event.key === "Enter") applyPort(portInput.value);
+});
+
+tabButtons.forEach((button, index) => {
+  button?.addEventListener("click", () => selectTab(button.id));
+  // Arrow keys move along the tab strip, as the tablist role promises.
+  button?.addEventListener("keydown", event => {
+    const step = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
+    if (!step) return;
+    event.preventDefault?.();
+    selectTab(TAB_IDS[(index + step + TAB_IDS.length) % TAB_IDS.length], true);
+  });
+});
+selectTab(savedTab());
+
+takeOverButton?.addEventListener("click", async () => {
+  const pause = takeOverButton.dataset.paused !== "true";
+  takeOverButton.disabled = true;
+  messageNode.textContent = pause ? "Taking over..." : "Resuming...";
+  try {
+    await send("companion.setPaused", {paused: pause});
+    await refresh();
+    messageNode.textContent = pause
+      ? "You have control: agents are paused and told to wait. Resume hands it back."
+      : "Agents resumed.";
+  } catch (error) {
+    messageNode.textContent = error.message;
+    takeOverButton.disabled = false;
+  }
 });
 
 checkReleaseButton.addEventListener("click", checkRelease);
@@ -465,7 +568,7 @@ updateButton.addEventListener("click", async () => {
 // Test and preview hook: the same render pipeline the popup uses, reachable
 // without Chrome. Production popups never read this property.
 if (typeof window !== "undefined") {
-  window.__wsn = {render, deriveState, countdown, compareVersions, renderAgentTabs};
+  window.__wsn = {render, deriveState, countdown, compareVersions, renderAgentTabs, selectTab};
 }
 
 /* Read-only preview driver: deterministic fake state, no browser APIs.
@@ -473,24 +576,25 @@ if (typeof window !== "undefined") {
    touch a not-yet-initialized binding (temporal dead zone). */
 
 let previewTabs = 2;
-let previewCap = 8;
-let previewCeiling = 64;
+let previewCap = 30;
+let previewCeiling = 999;
 let previewPort = 8765;
 let previewVersion = "1.27.0";
 let previewUpdate = null;
 let previewEnabled = true;
 let previewPresence = true;
 let previewAgents = 3;
+let previewPaused = false;
 
 // Sample rows in the exact shape the worker's companion.agentTabs returns.
 function previewAgentTabs() {
   const rows = [
     {tab_id: 101, title: "Pull request #42 - review", agent: "claude#4120", phase: "active",
-     status_text: "active now", claim: "main.py#4120", url: "https://example.com/pr/42"},
+     status_text: "active now", claim: "main.py#4120", url: "https://example.com/pr/42", age_ms: 4000},
     {tab_id: 102, title: "chrome://extensions", agent: "codex#5230", phase: "recent",
-     status_text: "2 min ago", claim: null, url: "chrome://extensions"},
+     status_text: "2 min ago", claim: null, url: "chrome://extensions", age_ms: 120000},
     {tab_id: 103, title: "Quarterly report.pdf", agent: "main.py#6008", phase: "recent",
-     status_text: "4 min ago", claim: "main.py#6008", url: "file:///report.pdf"},
+     status_text: "4 min ago", claim: "main.py#6008", url: "file:///report.pdf", age_ms: 240000},
   ];
   return {tabs: previewEnabled ? rows.slice(0, previewAgents) : [], now: Date.now()};
 }
@@ -505,12 +609,13 @@ function baseState() {
     bridge_port: previewPort,
     default_bridge_port: 8765,
     max_sessions: previewCap,
-    default_max_sessions: 8,
+    default_max_sessions: 30,
     max_sessions_ceiling: previewCeiling,
     presence: previewPresence,
     next_attempt_at: 0,
     version: previewVersion,
     failure_kind: null,
+    paused: previewPaused,
   };
 }
 
@@ -545,6 +650,14 @@ function previewSend(type, extra = {}) {
     return Promise.resolve(currentPreviewStatus());
   }
   if (type === "companion.reconnect") return Promise.resolve(currentPreviewStatus());
+  if (type === "companion.setPaused") {
+    previewPaused = Boolean(extra.paused);
+    return Promise.resolve({paused: previewPaused, paused_since: previewPaused ? Date.now() : 0});
+  }
+  // The Computers tab's fake network lives beside its renderer (popup-computers.js).
+  if (String(type).startsWith("companion.node") && typeof window.__wsnPreviewNodes === "function") {
+    return window.__wsnPreviewNodes(type, extra);
+  }
   if (type === "companion.agentTabs") return Promise.resolve(previewAgentTabs());
   if (type === "companion.focusAgentTab") return Promise.resolve({focused: extra.tab_id});
   if (type === "companion.releaseTabs") {
@@ -566,9 +679,9 @@ function previewSend(type, extra = {}) {
   }
   if (type === "companion.setMaxSessions") {
     const count = Number.parseInt(extra.max_sessions, 10);
-    if (!Number.isFinite(count) || count < 1 || count > previewCeiling) {
+    if (!Number.isFinite(count) || count < 0 || count > previewCeiling) {
       return Promise.reject(
-        new Error(`Parallel sessions must be a whole number between 1 and ${previewCeiling}.`),
+        new Error(`Parallel sessions must be a whole number from 0 (no limit) to ${previewCeiling}.`),
       );
     }
     previewCap = count;
@@ -590,12 +703,14 @@ function previewReleases() {
 function startPreview() {
   const params = new URLSearchParams(location.search);
   previewTabs = Number.parseInt(params.get("tabs"), 10) || 2;
-  previewCap = Number.parseInt(params.get("cap"), 10) || 8;
-  previewCeiling = Number.parseInt(params.get("ceiling"), 10) || 64;
+  const cap = Number.parseInt(params.get("cap"), 10);
+  previewCap = Number.isFinite(cap) ? cap : 30;
+  previewCeiling = Number.parseInt(params.get("ceiling"), 10) || 999;
   previewPort = Number.parseInt(params.get("port"), 10) || 8765;
   previewVersion = params.get("ver") || "1.27.0";
   const agents = Number.parseInt(params.get("agents"), 10);
   previewAgents = Number.isFinite(agents) ? Math.max(0, agents) : 3;
+  previewPaused = params.get("paused") === "1";
   refresh().then(checkRelease).then(refreshAgentTabs);
   setInterval(() => refresh().then(refreshAgentTabs), 1000);
 }

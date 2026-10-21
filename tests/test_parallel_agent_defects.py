@@ -141,6 +141,21 @@ def test_a_nonsense_popup_value_never_becomes_the_cap(monkeypatch, value):
     assert 1 <= cap <= browser_tools.MAX_SESSIONS_CEILING
 
 
+def test_the_popup_can_lift_the_cap_and_the_roster_says_so(monkeypatch):
+    """0 in the popup means no limit, and the roster reports it in words."""
+    monkeypatch.delenv("WEB_SEARCH_NEO_MAX_SESSIONS", raising=False)
+
+    class _Bridge:
+        def browser_info(self) -> dict[str, object]:
+            return {"max_sessions": 0}
+
+    monkeypatch.setattr(browser_tools, "get_chrome_bridge", lambda: _Bridge())
+    assert browser_tools.effective_max_sessions() == (browser_tools.UNLIMITED_SESSIONS, "companion")
+    overview = browser_tools.sessions_overview()
+    assert overview["max_sessions"] == "unlimited" and overview["sessions_free"] == "unlimited"
+    assert "of unlimited browser sessions" in overview["sessions_summary"]
+
+
 def test_a_bridge_that_cannot_be_asked_is_not_an_answer_of_zero(monkeypatch):
     monkeypatch.delenv("WEB_SEARCH_NEO_MAX_SESSIONS", raising=False)
 

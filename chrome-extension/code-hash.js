@@ -15,6 +15,9 @@ export const CODE_FILES = [
   "background-capture.js",
   "tab-follow.js",
   "bridge-auth.js",
+  "control.js",
+  "nodes.js",
+  "tab-status.js",
   "code-hash.js",
 ];
 

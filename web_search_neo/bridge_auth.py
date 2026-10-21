@@ -223,6 +223,16 @@ def _write_private(path: Path, text: str, *, exclusive: bool = False) -> None:
         raise
 
 
+def write_private(path: Path, text: str) -> None:
+    """Atomically replace ``path`` with ``text``, readable by this account only.
+
+    The public face of :func:`_write_private` for other per-user secrets (the
+    LAN node pairing key and the saved node list), so they get the same
+    lock-down-before-write treatment as the bridge token.
+    """
+    _write_private(path, text)
+
+
 def _read_token(path: Path) -> str | None:
     """The stored token, ``None`` when the file does not exist, ``""`` when unusable.
 

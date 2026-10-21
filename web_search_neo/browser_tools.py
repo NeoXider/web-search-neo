@@ -33,7 +33,8 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as conditions
 from selenium.webdriver.support.ui import Select, WebDriverWait
 
-from web_search_neo import agent_presence
+from web_search_neo import agent_presence, pointer_motion as _pointer_motion, presence_live as _presence_live
+from web_search_neo.actions import pointer_path as _pointer_path
 from web_search_neo.presence_targets import remember_click_target as _remember_presence_click_target
 from web_search_neo.chrome_bridge import (
     CHROME_EXTENSION_ID,
@@ -112,18 +113,39 @@ from web_search_neo.sessions.context import (
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_MAX_SESSIONS = 8
-# A typo is the only thing this ceiling still catches. It is deliberately far
-# above any real fan-out: 64 tabs under a debugger will run a desktop out of
-# memory long before the number itself refuses anything, whereas "6400" typed
-# into the setting is caught here instead of at the swap file.
-MAX_SESSIONS_CEILING = 64
+DEFAULT_MAX_SESSIONS = 30
+# What "no cap" counts as. The cap is the user's to set: any positive number is
+# taken as given, and 0, "unlimited", "none", "off" or "inf" lift it entirely -
+# the machine's memory is then the only limit, which is the user's call to make.
+UNLIMITED_SESSIONS = 1_000_000
+MAX_SESSIONS_CEILING = UNLIMITED_SESSIONS
+_UNLIMITED_WORDS = frozenset({"0", "unlimited", "none", "off", "inf", "infinity", "no", "max"})
+
+
+def parse_session_cap(raw: Any) -> int | None:
+    """A cap from the environment or the popup; None when it is not a number at all."""
+    if isinstance(raw, bool) or raw is None:
+        return None
+    text = str(raw).strip().lower()
+    if text in _UNLIMITED_WORDS:
+        return UNLIMITED_SESSIONS
+    try:
+        wanted = int(float(text))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return UNLIMITED_SESSIONS if wanted <= 0 else min(wanted, UNLIMITED_SESSIONS)
+
+
+def session_cap_label(cap: int) -> int | str:
+    """The cap as reported: the number, or "unlimited"."""
+    return "unlimited" if cap >= UNLIMITED_SESSIONS else cap
 
 
 def _max_sessions() -> int:
     """How many browser sessions this process will hold at once.
 
-    Eight is the default. Four was chosen when a session meant a Chrome process;
+    Thirty is the default (it was eight, and four before that), and 0 means no
+    cap. Four was chosen when a session meant a Chrome process;
     in ``profile_mode="current"`` - the mode every agent actually uses - a session
     is one tab of the user's already-running Chrome, and a tab costs tens of
     megabytes, not hundreds. Four turned out to be a wall real work hit: a run of
@@ -138,13 +160,8 @@ def _max_sessions() -> int:
     at import, since raising it under a running server would not free the memory
     the old number was protecting - the companion setting below is the live one.
     """
-    try:
-        wanted = int(os.getenv("WEB_SEARCH_NEO_MAX_SESSIONS", "") or DEFAULT_MAX_SESSIONS)
-    except ValueError:
-        return DEFAULT_MAX_SESSIONS
-    # One session is the floor: zero would refuse every open with a message about
-    # closing something first, and there would be nothing to close.
-    return max(1, min(wanted, MAX_SESSIONS_CEILING))
+    configured = (os.getenv("WEB_SEARCH_NEO_MAX_SESSIONS") or "").strip()
+    return (parse_session_cap(configured) if configured else None) or DEFAULT_MAX_SESSIONS
 
 
 MAX_SESSIONS = _max_sessions()
@@ -180,13 +197,9 @@ def _companion_max_sessions() -> int | None:
     except Exception:  # A bridge that cannot be asked is not an answer of zero.
         return None
     raw = info.get("max_sessions")
-    if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+    if not isinstance(raw, (int, float, str)):
         return None
-    try:
-        wanted = int(raw)
-    except (TypeError, ValueError):
-        return None
-    return max(1, min(wanted, MAX_SESSIONS_CEILING))
+    return parse_session_cap(raw)  # the popup's 0 means no cap, like the environment's
 
 
 def effective_max_sessions() -> tuple[int, str]:
@@ -889,7 +902,7 @@ def _create_session(
                         "{scope: 'all', idle_for_seconds: 600} (closes only sessions idle "
                         "that long, whoever owns them), or close {session_id} by name."
                         + " The cap counts every session in this MCP server, so parallel "
-                        "agents share it; raise it with WEB_SEARCH_NEO_MAX_SESSIONS in the "
+                        "agents share it; raise it (0 removes the cap) with WEB_SEARCH_NEO_MAX_SESSIONS in the "
                         "server's environment, or in the companion extension's popup under "
                         "Settings, if they all genuinely need a page at once. Sessions idle "
                         "past WEB_SEARCH_NEO_SESSION_IDLE_TTL (default 30m) are reaped "
@@ -2664,90 +2677,12 @@ def _apply_tab_activity(session: BrowserSession, session_id: str, *, label_tab: 
     _apply_tab_activity_impl(session, session_id, label_tab=label_tab, enabled=_tab_activity_enabled())
 
 
-def _presence_applies(session: BrowserSession) -> bool:
-    """Visible normal-mode sessions qualify; frozen/headless pages skip overlays."""
-    return (
-        bool(agent_presence.enabled())
-        and not session.headless
-        and session.render_mode == "normal"
-    )
-
-
-def _remove_agent_presence(session: BrowserSession) -> None:
-    """Give the favicon back and drop the installed script. Best-effort.
-
-    Called from teardown paths where the driver may already be half gone; a
-    badge left on a tab that is closing is cosmetic and never worth an error.
-    Caller holds the session lock.
-    """
-    if session.presence_script_id:
-        try:
-            session.driver.execute_cdp_cmd(
-                "Page.removeScriptToEvaluateOnNewDocument",
-                {"identifier": session.presence_script_id},
-            )
-        except Exception:
-            pass
-        session.presence_script_id = None
-    if not session.last_presence_ping:
-        return  # never painted: a handed-back tab must come back untouched
-    session.last_presence_ping = 0.0
-    try:
-        session.driver.execute_script(agent_presence.RESTORE_SCRIPT)
-    except Exception:
-        pass
-
-
-def _apply_agent_presence(session: BrowserSession, session_id: str) -> None:
-    """Arm the presence script for every document this session will open.
-
-    Registration alone marks nothing: the script installs the machinery and
-    waits, and it is ``note_agent_activity`` after each action that lights the
-    badge. Caller holds the session lock.
-    """
-    if not _presence_applies(session):
-        _remove_agent_presence(session)
-        return
-    if session.presence_script_id:
-        return
-    try:
-        result = session.driver.execute_cdp_cmd(
-            "Page.addScriptToEvaluateOnNewDocument",
-            {"source": agent_presence.install_source()},
-        )
-    except Exception as exc:
-        # No CDP on this backend, or a bridge that refused: the per-action ping
-        # installs the script itself when it finds none, so the signals still
-        # work, they just do not survive a navigation for free.
-        logger.debug(
-            "Agent presence for session '%s' was not pre-registered: %s: %s",
-            session_id,
-            type(exc).__name__,
-            exc,
-        )
-        return
-    session.presence_script_id = str((result or {}).get("identifier") or "")
-
-
-# How long a drawing-nothing action stays silent after the last mark. Well under
-# the five minutes the badge lives, so no throttled step can let it lapse.
-_PRESENCE_QUIET_SECONDS = 1.0
-
-
-def _hide_presence_overlays(driver: Any, hide: bool = True) -> None:
-    """Take the action flashes off the page before it is photographed.
-
-    A flash lives 250 ms, and a screenshot taken inside that window would hand
-    an agent a picture of a box its own click drew - which it would then read as
-    something the page did. Cheap enough to run before every capture, and a
-    no-op in a page that has no overlay up. The ghost cursor and press rings go
-    with them; pass ``hide=False`` after the capture to bring the cursor back.
-    """
-    script = agent_presence.HIDE_FLASHES_SCRIPT if hide else agent_presence.SHOW_EPHEMERAL_SCRIPT
-    try:
-        driver.execute_script(script)
-    except Exception:
-        pass
+# Arming, marking, leading and hiding the in-page presence signals live in
+# presence_live.py; these names stay for the callers and tests that use them.
+_presence_applies = _presence_live.applies
+_remove_agent_presence = _presence_live.remove
+_apply_agent_presence = _presence_live.apply
+_hide_presence_overlays = _presence_live.hide_overlays
 
 
 def note_agent_activity(
@@ -2763,40 +2698,7 @@ def note_agent_activity(
         session = _get_session(session_id)
     except Exception:
         return False
-    if not _presence_applies(session):
-        return False
-    payload = agent_presence.payload_for(
-        action,
-        arguments,
-        ok=ok,
-        label=session.agent_label or session_id,
-        pointer=(session.pointer_x, session.pointer_y),
-    )
-    if action == "click" and "cursor" not in payload and ok and session.presence_click_point:
-        x, y = session.presence_click_point
-        payload["cursor"] = {"x": x, "y": y, "tap": True}
-    if action == "click":
-        session.presence_click_point = None
-    now = time.monotonic()
-    if not payload["flash"] and now - session.last_presence_ping < _PRESENCE_QUIET_SECONDS:
-        # A step that draws nothing only refreshes the badge's five minutes, and
-        # the badge cannot tell one second from the next. A polling loop would
-        # otherwise pay a round trip per iteration for no visible difference.
-        return False
-    session.last_presence_ping = now
-    try:
-        with session.lock:
-            driver = session.driver
-            marked = driver.execute_script(agent_presence.ping_script(), payload)
-            if marked:
-                return True
-            # Nothing installed in this document - a navigation the registration
-            # did not cover, or a backend without CDP. Install it here and mark
-            # the page in the same call rather than skipping the signal.
-            driver.execute_script(agent_presence.install_source())
-            return bool(driver.execute_script(agent_presence.ping_script(), payload))
-    except Exception:
-        return False
+    return _presence_live.note(session, session_id, action, arguments, ok)
 
 
 # Shares the perception helpers so a selector, a visibility verdict and the
@@ -3826,7 +3728,7 @@ def click(
             y,
             session_id=session_id,
             wait_seconds=wait_seconds,
-            frame_selector=frame_selector,
+            frame_selector=frame_selector, _approach=True,
         )
     if selector is None:
         raise ValueError("provide selector, text, or x/y to click")
@@ -3892,6 +3794,8 @@ def click(
                     map_frame=lambda: _pointer_context(session.driver, frame_selector)[0],
                     restore_frame=lambda: _enter_action_frame(session.driver, frame_selector, selector),
                 )
+                # The ghost cursor sets off for the element as the click is sent.
+                _presence_live.lead_gesture(session, "click", None, session.presence_click_point if top_level else None)
             if top_level:
                 pre_click = _verification.arm_click_probe(session.driver)
             if trusted:
@@ -3969,6 +3873,7 @@ def _click_trusted(
         float(center["y"]),
         viewport,
         frame_map=frame_map,
+        approach=True,
     )
 
 
@@ -4096,6 +4001,7 @@ def click_text(
             float(match["y"]),
             viewport,
             frame_map=frame_map,
+            approach=True,
         )
         _auto_advance_render_after_input(session)
         _wait_after_action(driver, wait_seconds)
@@ -6011,8 +5917,9 @@ def _pointer_dispatch(
     coordinate_mode: str = "absolute",
     delta_x: float = 0.0,
     delta_y: float = 0.0,
+    approach: bool = False,
 ) -> dict[str, Any]:
-    """Validate and dispatch one pointer action against an already-resolved frame."""
+    """Validate and dispatch one pointer action; ``approach`` glides there first (pointer_motion)."""
     driver = session.driver
     requested_action = action.strip().lower()
     allowed_actions = {
@@ -6107,6 +6014,10 @@ def _pointer_dispatch(
         )
 
     held_mask = sum(button_bits[item] for item in session.held_buttons)
+    _pointer_motion.approach(
+        session, requested_action, (start_x, start_y), (finish_x, finish_y), mapping, duration,
+        lambda gx, gy: dispatch("mouseMoved", gx, gy, buttons=held_mask),
+        glide=selected_coordinate_mode == "absolute" and (approach or (selected_action == "drag" and duration > 0)))
     if selected_action == "wheel":
         dispatch(
             "mouseWheel",
@@ -6169,15 +6080,10 @@ def _pointer_dispatch(
             clickCount=1,
         )
         steps = max(2, min(30, int(duration * 30) or 2))
-        for step in range(1, steps + 1):
-            ratio = step / steps
-            dispatch(
-                "mouseMoved",
-                start_x + (finish_x - start_x) * ratio,
-                start_y + (finish_y - start_y) * ratio,
-                button=selected_button,
-                buttons=held_mask | button_bits[selected_button],
-            )
+        # Straight, as asked, but eased: slow off the mark, slow onto the end.
+        for step_x, step_y in _pointer_path.drag_points((start_x, start_y), (finish_x, finish_y), steps):
+            dispatch("mouseMoved", step_x, step_y, button=selected_button,
+                     buttons=held_mask | button_bits[selected_button])
             if duration:
                 time.sleep(duration / steps)
         dispatch(
@@ -6230,8 +6136,13 @@ def pointer_action(
     delta_y: float = 0.0,
     include_summary: bool = True,
     _advance_frame: bool = True,
+    _approach: bool = False,
 ) -> dict[str, Any]:
     """Dispatch pointer movement, taps, drag, wheel, or held buttons.
+
+    ``hover`` (and ``click``'s x/y form, through ``_approach``) glides the
+    pointer from where it was, and so does a drag given time; the other verbs,
+    the game hot path, land directly (``pointer_motion``).
 
     ``coordinate_mode='relative'`` skips the viewport bounds check and moves the
     pointer by a delta without clamping, which is what a pointer-locked game
@@ -6261,6 +6172,7 @@ def pointer_action(
             coordinate_mode=coordinate_mode,
             delta_x=delta_x,
             delta_y=delta_y,
+            approach=_approach or str(action).strip().lower() == "hover",
         )
         if _advance_frame:
             _auto_advance_render_after_input(session)
@@ -7982,11 +7894,11 @@ def sessions_overview() -> dict[str, Any]:
         **({"parked_sessions": parked} if parked else {}),
         **({"parked_expired": expired} if expired else {}),
         "sessions_open": len(rows),
-        "max_sessions": cap,
+        "max_sessions": session_cap_label(cap),
         "max_sessions_source": cap_source,
-        "sessions_free": max(0, cap - len(rows)),
+        "sessions_free": "unlimited" if cap >= UNLIMITED_SESSIONS else max(0, cap - len(rows)),
         "sessions_in_use": sorted(busy),
-        "sessions_summary": f"{len(rows)} of {cap} browser sessions open, {len(busy)} busy right now.",
+        "sessions_summary": f"{len(rows)} of {session_cap_label(cap)} browser sessions open, {len(busy)} busy right now.",
         "sessions_page_note": (
             "last_url/last_title are where each session was last seen, not a fresh "
             "read: another agent's tab is not touched to answer this."

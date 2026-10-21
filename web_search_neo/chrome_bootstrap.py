@@ -55,7 +55,8 @@ def expected_extension_version() -> str:
 # them; a changed helper is changed code as much as a changed worker.
 CODE_FILES = (
     "service-worker.js", "events.js", "agent-badges.js", "agent-activity.js",
-    "background-capture.js", "tab-follow.js", "bridge-auth.js", "code-hash.js",
+    "background-capture.js", "tab-follow.js", "bridge-auth.js", "control.js", "nodes.js",
+    "tab-status.js", "code-hash.js",
 )
 
 

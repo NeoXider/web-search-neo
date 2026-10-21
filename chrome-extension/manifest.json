@@ -39,6 +39,13 @@
         "mac": "Alt+Shift+N"
       },
       "description": "Open the Web Search Neo companion panel"
+    },
+    "take-over": {
+      "suggested_key": {
+        "default": "Alt+Shift+P",
+        "mac": "Alt+Shift+P"
+      },
+      "description": "Take over: pause or resume every agent in this browser"
     }
   }
 }

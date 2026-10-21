@@ -49,6 +49,7 @@ packages = [
     "web_search_neo.captcha_solvers",
     "web_search_neo.contract",
     "web_search_neo.fetch",
+    "web_search_neo.nodes",
     "web_search_neo.perception",
     "web_search_neo.sessions",
     "web_search_neo.chrome_extension",

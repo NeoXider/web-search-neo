@@ -13,7 +13,7 @@ import os
 import time
 from typing import Any
 
-from web_search_neo import browser_tools, obstacle_recovery, tab_actions
+from web_search_neo import browser_tools, obstacle_recovery, presence_live, tab_actions
 from web_search_neo.action_calls import resolve_action_call
 from web_search_neo.perception import min_summary
 
@@ -80,6 +80,40 @@ async def mark_agent_presence(facade: Any, tool_name: str, action_name: str, arg
         pass
 
 
+async def lead_agent_presence(facade: Any, tool_name: str, action_name: str, arguments: dict[str, Any]) -> None:
+    """Say what a slow step is doing while it runs ("Waiting for #results").
+
+    Only ``presence_live.LEAD_ACTIONS`` - waits, navigation, the captcha - are
+    led: a lead is one page round trip, which the hot-path input actions never
+    pay. Never raises; the action's own mark still follows it.
+    """
+    if action_name not in presence_live.LEAD_ACTIONS:
+        return
+    session_id = facade._step_session(tool_name, arguments)
+    if not session_id:
+        return
+    try:
+        await asyncio.to_thread(presence_live.lead_action, browser_tools._get_session, session_id,
+                                action_name, arguments)
+    except Exception:
+        pass
+
+
+async def mark_page_read(topic: str, session_id: str | None, arguments: dict[str, Any] | None = None) -> None:
+    """Mark a ``web_info`` page read ("Reading the page") the way an action is marked.
+
+    For the reader topics (page_text, page_outline, element_text, page_elements,
+    screen_state, game_probe) a caller may await this after a successful read.
+    Never raises.
+    """
+    if not session_id:
+        return
+    try:
+        await asyncio.to_thread(browser_tools.note_agent_activity, session_id, topic, dict(arguments or {}), True)
+    except Exception:
+        pass
+
+
 async def run_following_tab(facade: Any, spec: Any, action_name: str, validated: dict[str, Any]) -> Any:
     """Run one handler; after Chrome replaced the session's tab, repeat a safe step once."""
     session_id = facade._step_session(spec.tool_name, validated)
@@ -131,6 +165,7 @@ async def _attempt(facade: Any, index: int, spec: Any, action_name: str, argumen
     try:
         step_summary = min_summary.step_mode(arguments, facade._argument_model(spec.tool_name).model_fields, summary)
         validated = facade._validate_arguments(spec.tool_name, f"action '{action_name}'", arguments)
+        await lead_agent_presence(facade, spec.tool_name, action_name, validated)
         # Keys, typing, waits: a page may open a tab on those too (new_tabs, tab_actions.py).
         data = await tab_actions.observe_step(action_name, facade._step_session(spec.tool_name, validated),
                                               run_following_tab(facade, spec, action_name, validated))

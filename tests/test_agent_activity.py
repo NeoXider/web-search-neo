@@ -411,7 +411,8 @@ process.exit(0);
     out = json.loads(completed.stdout)
     assert out["count"] == "1" and out["emptyHidden"] is True
     assert out["phase"] == "active"
-    assert out["texts"] == ["", "<img src=x onerror=alert(1)>", "claude · active now · claimed by main.py#1"]
+    # dot, title, meta, and the afterglow bar (no text)
+    assert out["texts"] == ["", "<img src=x onerror=alert(1)>", "claude · active now · claimed by main.py#1", ""]
     assert out["label"].startswith("Focus <img")
     assert out["focusMessage"] == {"type": "companion.focusAgentTab", "tab_id": 5}
     assert out["usedInnerHtml"] is False

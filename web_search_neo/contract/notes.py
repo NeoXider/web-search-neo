@@ -21,6 +21,7 @@ _INFO_TOPICS = {
     "browser_status": "Chrome availability and every session: owner, tab, last page, idle, busy, cap.",
     "browser_tabs": "Tabs open in the user's Chrome, with ids and groups.",
     "search_status": "Search providers, live availability, latency, cooldowns.",
+    "nodes": "This PC's IP/location and other computers (node=<name>).",
 }
 
 # Repeated verbatim on every hot-path action, because a model reads one schema.
@@ -291,7 +292,7 @@ _ACTION_NOTES = {
     "close_all": {
         "browser_gone": "A list of session ids left alone because their Chrome is gone; closed_all stays true, since nothing of ours was left to leak.",
         "scope": "Defaults to scope='mine': only the sessions opened with your agent_label (or, with no label, the unlabelled ones). kept_sessions names what was left running and who owns it. scope='all' closes every agent's sessions in this MCP server - that is the old behaviour, and it ends other subagents' work.",
-        "orphans": "idle_for_seconds=N closes only sessions untouched for N seconds and never one a thread is inside; with scope='all' it releases orphaned slots whoever owns them. The session-cap error lists every holder (session, agent, tab, age, idle, busy, url); sessions idle past WEB_SEARCH_NEO_SESSION_IDLE_TTL (default 30m) are also reaped automatically at the cap, and WEB_SEARCH_NEO_MAX_SESSIONS (or the companion popup) raises the cap up to 64.",
+        "orphans": "idle_for_seconds=N closes only sessions untouched for N seconds and never one a thread is inside; with scope='all' it releases orphaned slots whoever owns them. The session-cap error lists every holder (session, agent, tab, age, idle, busy, url); sessions idle past WEB_SEARCH_NEO_SESSION_IDLE_TTL (default 30m) are also reaped automatically at the cap, and WEB_SEARCH_NEO_MAX_SESSIONS (or the companion popup) sets the cap (default 30; 0 or 'unlimited' removes it).",
     },
     "mock": {
         "pattern": "url_pattern is a CDP-style wildcard ('*' matches anything) matched against the full request URL; the first matching stub wins and everything else reaches the network untouched.",
@@ -444,6 +445,12 @@ _ACTION_NOTES = {
         "vary": "Turns this call into a delta sweep: {\"headers\": [{\"X-Test\": \"a\"}], \"query\": [{\"lang\": \"ru\"}], \"body\": [\"{}\"]} sends the baseline once, then one request per single change, each reported as a structural diff from the baseline (status_changed, bytes_delta, headers_added, paths_added, values_changed; values as shapes only). A body delta asks as POST. method: [\"DELETE\", \"PATCH\"] sweeps verbs: a 405 answers with an allow header naming the verbs the route really serves, surfaced as its own allow field (the route map). Up to 12 variants; the answer is {success, url, method, swept} instead of the usual envelope, and vary cannot be combined with save_to.",
         "http_session": "Opt-in cookie jar: http_session='login' keeps cookies per (agent_label, name) in this server process (idle TTL WEB_SEARCH_NEO_HTTP_SESSION_TTL, default 1800 s; 32 jars, least recently used dropped). Cookies match by domain/path/secure/expiry, redirect hops feed the jar and a cross-origin hop still strips credentials. The answer's http_session block lists sent_cookies/received_cookies per hop with flags; values only with show_values=true (Set-Cookie values are redacted otherwise). A Cookie header and http_session are mutually exclusive; http_session_clear empties the jar first.",
     },
+    "nodes": {
+        "routing": "node='<name>' (or an IP) on web_action/web_info sends the whole call to that computer: its Chrome, sessions, files and network. Dict results come back with via_node. session_id and agent_label rules apply there as they do here.",
+        "pairing": "Each computer has a pairing key: `wsn --node --key` there, or the companion popup's Computers tab. op='add' saves name, address and key; a node without its own key is called with this machine's key (WEB_SEARCH_NEO_NODE_KEY or its node-key file), so one key copied to every computer pairs them all.",
+        "sharing": "A computer answers only while `wsn --node` runs there or its popup Share switch is on (HTTP 8766, LAN discovery UDP 8767; allow both in its firewall). Requests are HMAC-signed and replay-proof but not encrypted: use a trusted LAN or VPN. update_companion is refused remotely (WEB_SEARCH_NEO_NODE_DENY).",
+        "states": "online: paired and answering; unpaired: answering but the key is missing or differs; offline: nothing answers at that address.",
+    },
 }
 
 
@@ -459,7 +466,8 @@ _SERVER_INSTRUCTIONS = (
         "another agent's tab. After a zero-match click inspect fresh page_elements/find "
         "and frame context before retrying; React portals alone do not explain missing text. In step render "
         "mode an input action applies all mixed keyboard and pointer changes before "
-        "advancing exactly one frame."
+        "advancing exactly one frame. node='<name>' on web_action/web_info runs the call on "
+        "another computer (web_info topic nodes lists them)."
     )
 
 _ARGUMENT_RECOVERY = {

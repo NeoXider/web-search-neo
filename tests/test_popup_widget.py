@@ -316,7 +316,7 @@ await import({json.dumps((EXTENSION_DIR / "popup.js").as_uri())});
 await new Promise(resolve => setTimeout(resolve, 20));
 
 const snap = () => Object.fromEntries(["panel", "status", "next-attempt", "tabs",
-  "max-sessions-value", "max-sessions-ceiling", "meter-fill", "message", "version"]
+  "max-sessions-value", "sessions-used", "meter-fill", "message", "version"]
   .map(id => {{
     const node = nodes.get(id);
     return [id.replace(/-/g, "_"), node && {{
@@ -359,6 +359,11 @@ return results;
             "enabled": True, "connected": True, "connecting": False,
             "state": "connected", "failure_kind": None, "controlled_tabs": 7,
             "max_sessions": 32, "max_sessions_ceiling": 64, "next_attempt_at": 0,
+        },
+        "unlimited": {
+            "enabled": True, "connected": True, "connecting": False,
+            "state": "connected", "failure_kind": None, "controlled_tabs": 40,
+            "max_sessions": 0, "max_sessions_ceiling": 999, "next_attempt_at": 0,
         },
         "presence_off": {
             "enabled": True, "connected": True, "connecting": False,
@@ -410,8 +415,9 @@ def test_the_widget_renders_each_real_state_from_the_worker() -> None:
     assert initial["status"]["text"] == "Connected"
     assert initial["tabs"]["text"] == "2"
     assert initial["max_sessions_value"]["text"] == "8"
-    assert initial["max_sessions_ceiling"]["text"] == "64"
-    assert initial["meter_fill"]["width"] == "12.5%"
+    # The bar is how full the allowance is: two tabs held of eight.
+    assert initial["sessions_used"]["text"] == "2"
+    assert initial["meter_fill"]["width"] == "25.0%"
     assert initial["version"]["text"] == main.__version__
     # Connected means nothing to count down to: the subtext says where it is.
     assert initial["next_attempt"]["text"] == "127.0.0.1:8765"
@@ -434,7 +440,11 @@ def test_the_widget_renders_each_real_state_from_the_worker() -> None:
     capacity = result["capacity"]
     assert capacity["tabs"]["text"] == "7"
     assert capacity["max_sessions_value"]["text"] == "32"
-    assert capacity["meter_fill"]["width"] == "50.0%"
+    assert capacity["sessions_used"]["text"] == "7"
+    assert capacity["meter_fill"]["width"] == "21.9%"
+    # 0 is no limit: an infinity sign and an empty bar, never a refusal.
+    assert result["unlimited"]["max_sessions_value"]["text"] == "∞"
+    assert result["unlimited"]["meter_fill"]["width"] == "0.0%"
 
     # The switch is on unless the worker says otherwise; an older worker that
     # sends no flag leaves it on too.

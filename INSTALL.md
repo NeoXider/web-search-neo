@@ -590,7 +590,7 @@ Set these for the MCP server process before it starts.
 | `WEB_SEARCH_NEO_PROXY` | Proxy for HTTP fetches, search, and browser sessions. |
 | `WEB_SEARCH_NEO_BROWSER_USER_AGENT` | Override the User-Agent of rendered sessions. |
 | `WEB_SEARCH_NEO_PROFILE_ROOT` | Root directory for `persistent` Chrome profiles. |
-| `WEB_SEARCH_NEO_MAX_SESSIONS` | How many browser sessions one server holds at once, default `8`, capped at `64`. The cap is per process and parallel agents share it, so raise it when several agents each need a page of their own. |
+| `WEB_SEARCH_NEO_MAX_SESSIONS` | How many browser sessions one server holds at once, default `30`; any number is accepted, and `0` (or `unlimited`) removes the cap. The cap is per process and parallel agents share it, so raise it when several agents each need a page of their own. |
 | `WEB_SEARCH_NEO_DEBUGGER_ADDRESS` | Default DevTools address for `attach` mode. |
 | `WEB_SEARCH_NEO_BRIDGE_PORT` | Loopback port of the companion bridge, default `8765`. Shared by the daemon and every MCP server; set the companion's own port in its popup under Settings. |
 | `WEB_SEARCH_NEO_BRIDGE_IDLE_SECONDS` | How long the bridge daemon stays up with neither a companion nor a client attached, default `900`. `0` disables the timer. |

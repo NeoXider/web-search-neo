@@ -6,13 +6,13 @@ import functools
 import json
 import os
 import sys
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from mcp.server.fastmcp import FastMCP, Image
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
 
 from web_search_neo.contract.notes import _SERVER_INSTRUCTIONS, _ARGUMENT_RECOVERY
 from web_search_neo.contract.param_docs import annotate as annotate_params
-from web_search_neo import bridge_daemon
+from web_search_neo import bridge_daemon, node_actions, run_modes
 from web_search_neo import browser_tools
 from web_search_neo import chrome_bridge, companion_update, extra_actions, persist_actions, screen_state, tab_actions
 from web_search_neo import macro_files, macros
@@ -2516,6 +2516,7 @@ _TOPIC_HANDLERS = {
     "game_probe": browser_game_probe,
     "screen_state": browser_screen_state,
     "screenshot": browser_screenshot,
+    "nodes": node_actions.browser_nodes,
 }
 
 
@@ -2544,8 +2545,10 @@ async def web_info(
         "game_probe",
         "screen_state",
         "screenshot",
+        "nodes",
     ] = "capabilities",
     params: dict[str, Any] | None = None,
+    node: Annotated[str | None, Field(description=node_actions.NODE_PARAM_HELP)] = None,
 ) -> Any:
     """Read the contract, the page, the console, the network, or search/browser state.
 
@@ -2554,6 +2557,8 @@ async def web_info(
     payloads) also carries the current local date/time and UTC-offset region
     under the top-level ``now`` key.
     """
+    if node_actions.wants_remote(node):  # the whole read runs on that computer
+        return await node_actions.forward(node, "web_info", {"topic": topic, "params": params})
     arguments = dict(params or {})
     if topic == "capabilities":
         unknown = set(arguments) - {"full_schemas"}
@@ -2608,6 +2613,7 @@ async def web_action(
     actions: list[dict[str, Any]],
     continue_on_error: bool = False,
     summary: Literal["full", "min"] = "full",
+    node: Annotated[str | None, Field(description=node_actions.NODE_PARAM_HELP)] = None,
 ) -> dict[str, Any]:
     """Execute 1-32 ordered objects in actions, each with required canonical action
     from web_info(topic='actions'); other keys are its parameters (url, session_id, ...).
@@ -2619,6 +2625,9 @@ async def web_action(
     """
     if not actions or len(actions) > 32:
         raise ValueError("Provide 1-32 actions")
+    if node_actions.wants_remote(node):
+        return await node_actions.forward(node, "web_action", {
+            "actions": actions, "continue_on_error": continue_on_error, "summary": summary})
     return await _execute_actions(actions, continue_on_error, summary)
 
 
@@ -2643,34 +2652,14 @@ def _step_session(tool_name: str, arguments: dict[str, Any]) -> str | None:
     return dispatch.step_session(sys.modules[__name__], tool_name, arguments)
 
 
-def stop_bridge_daemon() -> int:
-    """Ask a running daemon to exit; the answer to "why is my edit not live?"."""
-    # Not the shared instance: stopping a daemon must never start one first.
-    bridge = chrome_bridge.ChromeBridge(spawn=False)
-    try:
-        if bridge.stop_daemon("stopped from the command line"):
-            print("The bridge daemon was asked to stop.")
-            return 0
-        problem = getattr(bridge, "stop_problem", None)
-        if problem:  # a listener that is not (or not yet) our daemon: say so
-            print(f"Could not stop the bridge daemon: {problem}.")
-            return 1
-        print(f"No bridge daemon is listening on {bridge.host}:{bridge.port}.")
-        return 0
-    finally:
-        bridge.shutdown()
+stop_bridge_daemon = run_modes.stop_bridge_daemon
 
 
 def main() -> None:
     shim_bypass.ensure_direct()
-    arguments = sys.argv[1:]
-    if "--bridge" in arguments:
-        if "--stop" in arguments:
-            raise SystemExit(stop_bridge_daemon())
-        # The daemon behind the companion port, run from the same file every MCP
-        # config already points at. It speaks no MCP and touches no stdio: an
-        # agent's browser calls reach it over the loopback bridge instead.
-        raise SystemExit(bridge_daemon.run_forever(__version__))
+    mode_exit = run_modes.run(sys.argv[1:], __version__)  # --bridge [--stop], --node [--stop|--key]
+    if mode_exit is not None:
+        raise SystemExit(mode_exit)
     # Plugins (WEB_SEARCH_NEO_PLUGINS or entry points) may add actions, info
     # topics, and search providers before the surface is published; the bridge
     # daemon above publishes no MCP surface and never loads them.

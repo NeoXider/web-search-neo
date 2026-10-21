@@ -83,6 +83,9 @@ def _unused_port() -> int:
 # one this machine's own Chrome companion is using: only the tests that mean it
 # start a daemon, and the default port points where nobody is listening.
 os.environ["WEB_SEARCH_NEO_BRIDGE_AUTOSPAWN"] = "0"
+# Sharing is on by default, and a daemon under test that meets a fake companion
+# would otherwise start a real LAN node process.
+os.environ["WEB_SEARCH_NEO_NODE_AUTOSTART"] = "0"
 os.environ.setdefault("WEB_SEARCH_NEO_BRIDGE_PORT", str(_unused_port()))
 # Persistent (parked) session records are per user; a test run gets its own file
 # so it never re-attaches to, or forgets, a tab the real companion parked.

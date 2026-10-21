@@ -19,6 +19,12 @@ and explicit callbacks instead of importing either facade or accessing its globa
   session-handling MCP wrappers live in the top-level `audit_actions.py`, which main hands its
   own module to (`extra_actions.register`).
 
+- `nodes/`: other computers on the LAN - the node list and pairing key files, the signed
+  HTTP transport and its UDP discovery answer, this machine's LAN/public IP and location,
+  and the combined overview. It touches no browser; `node_actions.py` connects it to the
+  facade (`node=` forwarding, the `nodes` topic and action, `wsn --node`) and
+  `node_link.py` answers the companion popup inside the bridge daemon.
+
 Top-level helpers extracted from the facades: `dispatch.py` is the ordered-action loop behind
 `web_action`, macro replays and test_run (main keeps a thin `_execute_actions` that passes
 itself as the facade, so the loop reads main's registry and validator at call time), and

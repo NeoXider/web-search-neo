@@ -19,160 +19,311 @@
         <span id="version" class="chip" title="Companion and server version">-</span>
       </header>
 
-      <section id="state-card" class="card" aria-live="polite">
+      <section id="state-card" class="card state-card" aria-live="polite">
         <div class="state-row">
           <span id="pulse" class="pulse" aria-hidden="true"><i></i></span>
-          <p id="status" class="status" role="status" data-state="loading">Starting</p>
-        </div>
-        <p id="next-attempt" class="sub">&nbsp;</p>
-      </section>
-
-      <section class="tiles" aria-label="Live status">
-        <div class="tile">
-          <span class="key">Tabs</span>
-          <span id="tabs" title="Tabs this companion currently controls">-</span>
-        </div>
-        <div class="tile">
-          <span class="key">Sessions</span>
-          <span class="pair"
-            ><span id="max-sessions-value" title="Configured parallel-session limit">-</span
-            ><span class="of" aria-hidden="true">/</span
-            ><span id="max-sessions-ceiling" title="Hard ceiling">64</span></span>
-          <span class="meter" aria-hidden="true"><i id="meter-fill"></i></span>
-        </div>
-        <div class="tile wide">
-          <span class="key">Bridge</span>
-          <span id="bridge" title="Local bridge endpoint">-</span>
+          <div class="state-text">
+            <p id="status" class="status" role="status" data-state="loading">Starting</p>
+            <p id="next-attempt" class="sub">&nbsp;</p>
+          </div>
+          <button id="take-over" type="button" class="btn takeover" data-paused="false"
+                  aria-label="Take over: pause every agent in this browser (Alt+Shift+P)"
+                  title="Take over: pause every agent (Alt+Shift+P)">
+            <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" focusable="false">
+              <path class="icon-pause" d="M4 2.5h3v11H4zm5 0h3v11H9z" fill="currentColor"/>
+              <path class="icon-play" d="M4 2.5v11l9-5.5Z" fill="currentColor"/>
+            </svg>
+            <span id="take-over-label">Take over</span>
+          </button>
         </div>
       </section>
 
-      <section id="agent-tabs" class="card agent-tabs" aria-labelledby="agent-tabs-title">
-        <h2 id="agent-tabs-title" class="section-title">
-          Agent tabs
-          <span id="agent-tabs-count" class="chip" title="Tabs an agent used in the last 5 minutes">0</span>
-        </h2>
-        <ul id="agent-tab-list" class="agent-list" aria-live="polite"></ul>
-        <p id="agent-tabs-empty" class="hint">No agent activity in the last 5 minutes.</p>
-      </section>
+      <nav class="tabs-nav" role="tablist" aria-label="Companion sections">
+        <button id="tab-overview" type="button" role="tab" class="tab" data-panel="panel-overview"
+                aria-controls="panel-overview" aria-selected="true">Overview</button>
+        <button id="tab-computers" type="button" role="tab" class="tab" data-panel="panel-computers"
+                aria-controls="panel-computers" aria-selected="false">
+          Computers <span id="nodes-count" class="count" title="Other computers online">0</span>
+        </button>
+        <button id="tab-settings" type="button" role="tab" class="tab" data-panel="panel-settings"
+                aria-controls="panel-settings" aria-selected="false">Settings</button>
+      </nav>
 
-      <section id="release-chip" class="release-row" title="Latest GitHub release vs this build">
-        <span id="release-status">Checking</span>
-        <button id="check-release" type="button" class="icon-btn"
-                aria-label="Check GitHub for a newer release" title="Check update">
-          <svg viewBox="0 0 20 20" width="15" height="15" aria-hidden="true" focusable="false">
-            <path d="M10 3a7 7 0 0 1 6.3 4H14v2h6V3l-2.2 2.2A9 9 0 0 0 1.5 8H3.6A7 7 0 0 1 10 3Zm-6.3 10H6v-2H0v6l2.2-2.2A9 9 0 0 0 18.5 12h-2.1A7 7 0 0 1 3.7 13Z"
+      <!-- Overview ------------------------------------------------------------ -->
+      <section id="panel-overview" class="tab-panel" role="tabpanel" aria-labelledby="tab-overview">
+        <section class="tiles" aria-label="Live status">
+          <div class="tile">
+            <span class="key">Tabs</span>
+            <span id="tabs" title="Tabs this companion currently controls">-</span>
+          </div>
+          <div class="tile">
+            <span class="key">Sessions</span>
+            <span class="pair"
+              ><span id="sessions-used" title="Tabs agents hold right now">0</span
+              ><span class="of" aria-hidden="true">/</span
+              ><span id="max-sessions-value" title="Parallel-session limit (∞: no limit)">-</span></span>
+            <span class="meter" aria-hidden="true"><i id="meter-fill"></i></span>
+          </div>
+          <div class="tile wide">
+            <span class="key">Bridge</span>
+            <span id="bridge" title="Local bridge endpoint">-</span>
+          </div>
+        </section>
+
+        <button id="self-summary" type="button" class="net-strip"
+                aria-label="This computer's network address and location; open the Computers tab"
+                title="This computer on the network - click for details">
+          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
+            <path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1Zm4.9 6h-2.1a11 11 0 0 0-.9-3.9A5.5 5.5 0 0 1 12.9 7ZM8 2.6c.6.8 1.2 2.4 1.3 4.4H6.7C6.8 5 7.4 3.4 8 2.6ZM6.1 3.1A11 11 0 0 0 5.2 7H3.1a5.5 5.5 0 0 1 3-3.9ZM3.1 9h2.1c.1 1.4.4 2.8.9 3.9A5.5 5.5 0 0 1 3.1 9Zm4.9 4.4c-.6-.8-1.2-2.4-1.3-4.4h2.6c-.1 2-.7 3.6-1.3 4.4Zm1.9-.5c.5-1.1.8-2.5.9-3.9h2.1a5.5 5.5 0 0 1-3 3.9Z"
                   fill="currentColor"/>
           </svg>
+          <span id="self-summary-text">Locating this computer...</span>
         </button>
-        <button id="open-github" type="button" class="icon-btn"
-                aria-label="Open the project repository on GitHub" title="Open GitHub">
-          <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" focusable="false">
-            <path d="M8 0a8 8 0 0 0-2.53 15.59c.4.07.55-.17.55-.38v-1.34c-2.23.48-2.7-1.07-2.7-1.07-.36-.93-.89-1.18-.89-1.18-.73-.5.05-.49.05-.49.8.06 1.23.83 1.23.83.72 1.23 1.88.87 2.33.67.07-.52.28-.88.5-1.08-1.77-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.66 7.66 0 0 1 4 0c1.53-1.03 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.28.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48v2.19c0 .21.15.46.55.38A8 8 0 0 0 8 0Z"
-                  fill="currentColor"/>
-          </svg>
-        </button>
-      </section>
 
-      <label class="switch-row">
-        <span class="switch-text">
-          <strong>Enabled</strong>
-          <small>Let the local MCP drive Chrome tabs</small>
-        </span>
-        <input id="enabled" type="checkbox" role="switch"
-               aria-label="Enable the companion" title="Enable the companion" disabled>
-      </label>
+        <section id="agent-tabs" class="card agent-tabs" aria-labelledby="agent-tabs-title">
+          <h2 id="agent-tabs-title" class="section-title">
+            Agent tabs
+            <span id="agent-tabs-count" class="chip" title="Tabs an agent used in the last 5 minutes">0</span>
+          </h2>
+          <ul id="agent-tab-list" class="agent-list" aria-live="polite"></ul>
+          <p id="agent-tabs-empty" class="hint">No agent activity in the last 5 minutes.</p>
+        </section>
 
-      <label class="switch-row">
-        <span class="switch-text">
-          <strong>Agent presence</strong>
-          <small>Favicon badge, ghost cursor and action flashes in driven tabs</small>
-        </span>
-        <input id="presence" type="checkbox" role="switch" checked
-               aria-label="Show agent presence in driven tabs" title="Agent presence" disabled>
-      </label>
+        <label class="switch-row">
+          <span class="switch-text">
+            <strong>Enabled</strong>
+            <small>Let the local MCP drive Chrome tabs</small>
+          </span>
+          <input id="enabled" type="checkbox" role="switch"
+                 aria-label="Enable the companion" title="Enable the companion" disabled>
+        </label>
 
-      <div class="actions">
-        <button id="reconnect" type="button" class="btn"
-                aria-label="Reconnect to the bridge now" title="Reconnect">Reconnect</button>
-        <button id="update-companion" type="button" class="btn secondary"
-                aria-label="Update the companion: reload it onto the newest files and open the newer release"
-                title="Update">Update</button>
-        <button id="release-tabs" type="button" class="btn secondary"
-                aria-label="Detach every controlled tab" title="Release tabs">Release tabs</button>
-      </div>
-      <p id="update-hint" class="hint" hidden></p>
+        <label class="switch-row">
+          <span class="switch-text">
+            <strong>Agent presence</strong>
+            <small>Favicon badge, ghost cursor, action captions and flashes in driven tabs</small>
+          </span>
+          <input id="presence" type="checkbox" role="switch" checked
+                 aria-label="Show agent presence in driven tabs" title="Agent presence" disabled>
+        </label>
 
-      <details id="settings">
-        <summary>
-          <span class="gear" aria-hidden="true">
-            <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true" focusable="false">
-              <path d="M11.2 1l.5 2.2c.5.2 1 .4 1.4.8l2.1-.7 1.8 3-1.6 1.5a6 6 0 0 1 0 1.6l1.6 1.5-1.8 3-2.1-.7c-.4.4-.9.6-1.4.8L11.2 17H8.8l-.5-2.2c-.5-.2-1-.4-1.4-.8l-2.1.7-1.8-3 1.6-1.5a6 6 0 0 1 0-1.6L3 6.9l1.8-3 2.1.7c.4-.4.9-.6 1.4-.8L8.8 1h2.4ZM10 7a3 3 0 1 0 0 6 3 3 0 0 0 0-6Z"
+        <div class="actions">
+          <button id="reconnect" type="button" class="btn"
+                  aria-label="Reconnect to the bridge now" title="Reconnect">Reconnect</button>
+          <button id="update-companion" type="button" class="btn secondary"
+                  aria-label="Update the companion: reload it onto the newest files and open the newer release"
+                  title="Update">Update</button>
+          <button id="release-tabs" type="button" class="btn secondary"
+                  aria-label="Detach every controlled tab" title="Release tabs">Release tabs</button>
+        </div>
+        <p id="update-hint" class="hint" hidden></p>
+
+        <section id="release-chip" class="release-row" title="Latest GitHub release vs this build">
+          <span id="release-status">Checking</span>
+          <button id="check-release" type="button" class="icon-btn"
+                  aria-label="Check GitHub for a newer release" title="Check update">
+            <svg viewBox="0 0 20 20" width="15" height="15" aria-hidden="true" focusable="false">
+              <path d="M10 3a7 7 0 0 1 6.3 4H14v2h6V3l-2.2 2.2A9 9 0 0 0 1.5 8H3.6A7 7 0 0 1 10 3Zm-6.3 10H6v-2H0v6l2.2-2.2A9 9 0 0 0 18.5 12h-2.1A7 7 0 0 1 3.7 13Z"
                     fill="currentColor"/>
             </svg>
+          </button>
+          <button id="open-github" type="button" class="icon-btn"
+                  aria-label="Open the project repository on GitHub" title="Open GitHub">
+            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" focusable="false">
+              <path d="M8 0a8 8 0 0 0-2.53 15.59c.4.07.55-.17.55-.38v-1.34c-2.23.48-2.7-1.07-2.7-1.07-.36-.93-.89-1.18-.89-1.18-.73-.5.05-.49.05-.49.8.06 1.23.83 1.23.83.72 1.23 1.88.87 2.33.67.07-.52.28-.88.5-1.08-1.77-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.66 7.66 0 0 1 4 0c1.53-1.03 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.28.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48v2.19c0 .21.15.46.55.38A8 8 0 0 0 8 0Z"
+                    fill="currentColor"/>
+            </svg>
+          </button>
+        </section>
+      </section>
+
+      <!-- Computers ----------------------------------------------------------- -->
+      <section id="panel-computers" class="tab-panel" role="tabpanel" aria-labelledby="tab-computers" hidden>
+        <section class="card self-card" aria-labelledby="self-title">
+          <h2 id="self-title" class="section-title">
+            This computer
+            <span id="self-name" class="chip" title="Node name others see">-</span>
+          </h2>
+          <dl class="facts">
+            <dt>LAN</dt>
+            <dd>
+              <span id="self-lan" class="mono">-</span>
+              <button id="copy-lan" type="button" class="icon-btn mini" data-copy="self-lan"
+                      aria-label="Copy the LAN address" title="Copy">
+                <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true" focusable="false">
+                  <path d="M5 1h8a2 2 0 0 1 2 2v8h-2V3H5Zm-3 3h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Zm0 2v8h8V6Z" fill="currentColor"/>
+                </svg>
+              </button>
+            </dd>
+            <dt>Public</dt>
+            <dd>
+              <span id="self-public" class="mono">-</span>
+              <button id="copy-public" type="button" class="icon-btn mini" data-copy="self-public"
+                      aria-label="Copy the public IP address" title="Copy">
+                <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true" focusable="false">
+                  <path d="M5 1h8a2 2 0 0 1 2 2v8h-2V3H5Zm-3 3h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Zm0 2v8h8V6Z" fill="currentColor"/>
+                </svg>
+              </button>
+            </dd>
+            <dt>Place</dt>
+            <dd><a id="self-place" class="place" target="_blank" rel="noopener noreferrer">-</a></dd>
+            <dt>Network</dt>
+            <dd id="self-isp" class="muted">-</dd>
+          </dl>
+        </section>
+
+        <label class="switch-row">
+          <span class="switch-text">
+            <strong>Share this computer</strong>
+            <small>On by default: computers that know this one's pairing key can drive
+              this Chrome. Switch off to refuse them.</small>
           </span>
-          Settings
-        </summary>
-
-        <div class="setting">
-          <label for="port"><strong>Port</strong></label>
-          <p class="hint">
-            Must match <code>WEB_SEARCH_NEO_BRIDGE_PORT</code>; default
-            <span id="port-default">8765</span>.
-          </p>
-          <div class="setting-row">
-            <input id="port" type="number" min="1024" max="65535" step="1" inputmode="numeric"
-                   aria-label="Bridge port">
-            <button id="save-port" type="button" class="icon-btn"
-                    aria-label="Apply bridge port" title="Apply">
-              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
-                <path d="M6.5 11.5 3 8l1.4-1.4 2.1 2.1L11.6 3.6 13 5Z" fill="currentColor"/>
+          <input id="share" type="checkbox" role="switch"
+                 aria-label="Share this computer with paired computers on the network"
+                 title="Share this computer" disabled>
+        </label>
+        <section id="share-details" class="card share-card" hidden>
+          <p class="hint">On the other computer: Computers &rarr; Add, with this address and key.</p>
+          <div class="kv">
+            <span class="key">Address</span>
+            <span id="share-address" class="mono">-</span>
+            <button id="copy-share-address" type="button" class="icon-btn mini" data-copy="share-address"
+                    aria-label="Copy this computer's node address" title="Copy">
+              <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true" focusable="false">
+                <path d="M5 1h8a2 2 0 0 1 2 2v8h-2V3H5Zm-3 3h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Zm0 2v8h8V6Z" fill="currentColor"/>
               </svg>
             </button>
-            <button id="reset-port" type="button" class="icon-btn secondary"
-                    aria-label="Reset bridge port to the default" title="Default">
-              <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true" focusable="false">
+          </div>
+          <div class="kv">
+            <span class="key">Pairing key</span>
+            <span id="pair-key" class="mono secret" data-revealed="false">-</span>
+            <button id="reveal-pair-key" type="button" class="icon-btn mini"
+                    aria-label="Show or hide the pairing key" title="Show / hide">
+              <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true" focusable="false">
+                <path d="M8 3C4.4 3 1.7 5.4 1 8c.7 2.6 3.4 5 7 5s6.3-2.4 7-5c-.7-2.6-3.4-5-7-5Zm0 8a3 3 0 1 1 0-6 3 3 0 0 1 0 6Zm0-1.6a1.4 1.4 0 1 0 0-2.8 1.4 1.4 0 0 0 0 2.8Z" fill="currentColor"/>
+              </svg>
+            </button>
+            <button id="copy-pair-key" type="button" class="icon-btn mini" data-copy="pair-key"
+                    aria-label="Copy the pairing key" title="Copy">
+              <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true" focusable="false">
+                <path d="M5 1h8a2 2 0 0 1 2 2v8h-2V3H5Zm-3 3h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Zm0 2v8h8V6Z" fill="currentColor"/>
+              </svg>
+            </button>
+            <button id="rotate-pair-key" type="button" class="icon-btn mini secondary"
+                    aria-label="Make a new pairing key; paired computers must be given it again"
+                    title="New key">
+              <svg viewBox="0 0 20 20" width="12" height="12" aria-hidden="true" focusable="false">
                 <path d="M10 3a7 7 0 1 1-6.3 4H1.5A9 9 0 1 0 4 4.6L6.5 7H0V.5Z" fill="currentColor"/>
               </svg>
             </button>
           </div>
-        </div>
+        </section>
 
-        <div class="setting">
-          <label for="max-sessions"><strong>Sessions</strong></label>
-          <p class="hint">
-            Tabs the MCP may drive at once; default
-            <span id="max-sessions-default">8</span>. Applies on reconnect;
-            the server environment wins.
-          </p>
-          <div class="setting-row">
-            <input id="max-sessions" type="number" min="1" max="64" step="1" inputmode="numeric"
-                   aria-label="Parallel session limit">
-            <button id="save-max-sessions" type="button" class="icon-btn"
-                    aria-label="Apply parallel session limit" title="Apply">
-              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
-                <path d="M6.5 11.5 3 8l1.4-1.4 2.1 2.1L11.6 3.6 13 5Z" fill="currentColor"/>
-              </svg>
-            </button>
-            <button id="reset-max-sessions" type="button" class="icon-btn secondary"
-                    aria-label="Reset session limit to the default" title="Default">
-              <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true" focusable="false">
-                <path d="M10 3a7 7 0 1 1-6.3 4H1.5A9 9 0 1 0 4 4.6L6.5 7H0V.5Z" fill="currentColor"/>
-              </svg>
-            </button>
+        <section class="card nodes-card" aria-labelledby="nodes-title">
+          <h2 id="nodes-title" class="section-title">
+            Other computers
+            <button id="scan-nodes" type="button" class="btn ghost small"
+                    aria-label="Scan this network for computers running Web Search Neo"
+                    title="Scan the LAN">Scan</button>
+          </h2>
+          <ul id="node-list" class="node-list" aria-live="polite"></ul>
+          <p id="nodes-empty" class="hint">No other computers yet. Share one with
+            <code>wsn --node</code> (or its Share switch), then Scan or Add it here.</p>
+        </section>
+
+        <details id="add-node-panel" class="add-node">
+          <summary>
+            <span class="plus" aria-hidden="true">+</span>
+            Add a computer
+          </summary>
+          <div class="add-form">
+            <input id="node-name" type="text" placeholder="Name (e.g. office-pc)" autocomplete="off"
+                   aria-label="Computer name" maxlength="32" spellcheck="false">
+            <input id="node-address" type="text" placeholder="Address (e.g. 192.168.1.115)"
+                   autocomplete="off" aria-label="Computer address" spellcheck="false">
+            <input id="node-key" type="password" placeholder="Pairing key from that computer"
+                   autocomplete="off" aria-label="Pairing key" spellcheck="false">
+            <button id="add-node" type="button" class="btn" aria-label="Save and check this computer"
+                    title="Add">Add and check</button>
+          </div>
+        </details>
+      </section>
+
+      <!-- Settings ------------------------------------------------------------ -->
+      <section id="panel-settings" class="tab-panel" role="tabpanel" aria-labelledby="tab-settings" hidden>
+        <div id="settings" class="card settings-card">
+          <div class="setting">
+            <label for="port"><strong>Port</strong></label>
+            <p class="hint">
+              Must match <code>WEB_SEARCH_NEO_BRIDGE_PORT</code>; default
+              <span id="port-default">8765</span>.
+            </p>
+            <div class="setting-row">
+              <input id="port" type="number" min="1024" max="65535" step="1" inputmode="numeric"
+                     aria-label="Bridge port">
+              <button id="save-port" type="button" class="icon-btn"
+                      aria-label="Apply bridge port" title="Apply">
+                <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
+                  <path d="M6.5 11.5 3 8l1.4-1.4 2.1 2.1L11.6 3.6 13 5Z" fill="currentColor"/>
+                </svg>
+              </button>
+              <button id="reset-port" type="button" class="icon-btn secondary"
+                      aria-label="Reset bridge port to the default" title="Default">
+                <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true" focusable="false">
+                  <path d="M10 3a7 7 0 1 1-6.3 4H1.5A9 9 0 1 0 4 4.6L6.5 7H0V.5Z" fill="currentColor"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+
+          <div class="setting">
+            <label for="max-sessions"><strong>Sessions</strong></label>
+            <p class="hint">
+              Tabs the MCP may drive at once; default
+              <span id="max-sessions-default">30</span>, <strong>0 = no limit</strong>.
+              Applies on reconnect; the server environment
+              (<code>WEB_SEARCH_NEO_MAX_SESSIONS</code>, any number or 0) wins.
+            </p>
+            <div class="setting-row">
+              <input id="max-sessions" type="number" min="0" max="999" step="1" inputmode="numeric"
+                     aria-label="Parallel session limit">
+              <button id="save-max-sessions" type="button" class="icon-btn"
+                      aria-label="Apply parallel session limit" title="Apply">
+                <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
+                  <path d="M6.5 11.5 3 8l1.4-1.4 2.1 2.1L11.6 3.6 13 5Z" fill="currentColor"/>
+                </svg>
+              </button>
+              <button id="reset-max-sessions" type="button" class="icon-btn secondary"
+                      aria-label="Reset session limit to the default" title="Default">
+                <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true" focusable="false">
+                  <path d="M10 3a7 7 0 1 1-6.3 4H1.5A9 9 0 1 0 4 4.6L6.5 7H0V.5Z" fill="currentColor"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+
+          <div class="setting">
+            <strong>Shortcuts</strong>
+            <p class="hint">
+              <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>N</kbd> opens this panel;
+              <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> takes over (pauses every agent) or resumes.
+              Change them at chrome://extensions/shortcuts.
+            </p>
+          </div>
+
+          <div class="setting">
+            <strong>Protocol access</strong>
+            <p class="hint" id="cdp-note">
+              Only the DevTools methods this MCP issues are forwarded; anything else
+              is refused inside the extension.
+            </p>
           </div>
         </div>
-
-        <div class="setting">
-          <strong>Protocol access</strong>
-          <p class="hint" id="cdp-note">
-            Only the DevTools methods this MCP issues are forwarded; anything else
-            is refused inside the extension.
-          </p>
-        </div>
-      </details>
+      </section>
 
       <p id="message" class="message" aria-live="polite"></p>
     </main>
     <script src="popup.js"></script>
+    <script src="popup-computers.js"></script>
   </body>
 </html>

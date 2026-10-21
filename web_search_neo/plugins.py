@@ -143,12 +143,15 @@ def _re_register_web_info() -> None:
     original = m.web_info
     values = _web_info_topic_values()
 
+    node_hint = typing.get_type_hints(original, include_extras=True).get("node", str | None)
+
     async def web_info(  # noqa: D401 - signature is the contract, keep it bare
         topic: typing.Literal[tuple(values)] = "capabilities",  # type: ignore[valid-type]
         params: dict[str, Any] | None = None,
+        node: node_hint = None,  # type: ignore[valid-type]
     ) -> Any:
         """Read one observation; plugin topics included."""
-        return await original(topic, params)
+        return await original(topic, params, node)
 
     # FastMCP deliberately keeps the first tool on a duplicate add, so use its
     # public removal API before publishing the wrapper with the widened schema.

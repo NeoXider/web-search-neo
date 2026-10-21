@@ -12,7 +12,7 @@ import time
 from typing import Any, Literal
 
 from web_search_neo import audit_actions, browser_tools, captcha_actions, captcha_aid, frame_capture
-from web_search_neo import frame_health, page_guards
+from web_search_neo import frame_health, node_actions, page_guards
 from web_search_neo import owned_parking, tab_actions
 from web_search_neo.sessions import parking as current_parking
 
@@ -226,6 +226,7 @@ ACTION_SPECS = (
     ("captcha_answer", captcha_answer, "page",
      "Answer the challenge just read: boxes are [x,y,w,h] in picture pixels, clicked in order."),
 ) + audit_actions.ACTION_SPECS + tab_actions.ACTION_SPECS  # 1.20: site checks; tabs of Selenium sessions
+ACTION_SPECS += node_actions.ACTION_SPECS  # other computers on the LAN (node=)
 
 
 def register(server: Any, facade: Any = None) -> None:
@@ -236,8 +237,10 @@ def register(server: Any, facade: Any = None) -> None:
     """
     for _name, wrapper, _group, _summary in ACTION_SPECS:
         server.tool()(wrapper)
+    server.tool()(node_actions.browser_nodes)  # the `nodes` web_info topic
     if facade is not None:
         audit_actions.bind(facade)
+        node_actions.bind(facade)
 
 
 __all__ = ["ACTION_SPECS", "browser_dialogs", "browser_downloads", "browser_look", "browser_navigate",

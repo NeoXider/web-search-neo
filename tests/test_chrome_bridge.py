@@ -943,7 +943,7 @@ const ids = [
   "update-hint",
   "port", "save-port", "reset-port", "port-default", "next-attempt",
   "max-sessions", "save-max-sessions", "reset-max-sessions", "max-sessions-default",
-  "panel", "state-card", "max-sessions-value", "max-sessions-ceiling",
+  "panel", "state-card", "max-sessions-value", "max-sessions-ceiling", "sessions-used",
   "meter-fill", "release-chip",
 ];
 const nodes = new Map(ids.map(id => [id, {{
@@ -1041,7 +1041,7 @@ process.stdout.write(JSON.stringify({{
   portMessages: sent.filter(item => item.type === "companion.setBridgePort"),
   maxSessions: nodes.get("max-sessions").value,
   maxSessionsValue: nodes.get("max-sessions-value").textContent,
-  maxSessionsCeiling: nodes.get("max-sessions-ceiling").textContent,
+  sessionsUsed: nodes.get("sessions-used").textContent,
   meterFill: nodes.get("meter-fill").style.width,
   maxSessionsDefault: nodes.get("max-sessions-default").textContent,
   maxSessionsMessages: sent.filter(item => item.type === "companion.setMaxSessions"),
@@ -1083,8 +1083,9 @@ process.stdout.write(JSON.stringify({{
     assert outcome["maxSessions"] == "12"
     assert outcome["maxSessionsDefault"] == "8"
     assert outcome["maxSessionsValue"] == "12"
-    assert outcome["maxSessionsCeiling"] == "64"
-    assert outcome["meterFill"] == "18.8%"
+    # The bar is the allowance in use: two tabs held of the twelve now allowed.
+    assert outcome["sessionsUsed"] == "2"
+    assert outcome["meterFill"] == "16.7%"
     # The presence switch is asked of the worker like the other settings, then
     # re-rendered from whatever the worker says it now holds.
     assert outcome["presenceMessages"] == [
@@ -4090,7 +4091,12 @@ def test_the_popup_and_its_script_describe_the_same_page() -> None:
     throws on load with an empty panel and nothing in the log a user would find.
     """
     markup = (EXTENSION_DIR / "popup.html").read_text(encoding="utf-8")
-    script = (EXTENSION_DIR / "popup.js").read_text(encoding="utf-8")
+    # The Computers tab has its own script; both describe the one page.
+    script = "\n".join(
+        (EXTENSION_DIR / name).read_text(encoding="utf-8")
+        for name in re.findall(r'<script src="([a-z-]+\.js)"', markup)
+    )
+    assert "popup.js" in markup and "popup-computers.js" in markup
     styles = (EXTENSION_DIR / "popup.css").read_text(encoding="utf-8")
 
     ids = set(re.findall(r'id="([^"]+)"', markup))

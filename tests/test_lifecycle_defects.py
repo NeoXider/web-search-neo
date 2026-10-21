@@ -511,18 +511,22 @@ def test_the_session_cap_is_a_setting_because_agents_outnumber_it(monkeypatch):
     so five subagents hit a wall that has nothing to do with any of them."""
     monkeypatch.setenv("WEB_SEARCH_NEO_MAX_SESSIONS", "9")
     assert browser_tools._max_sessions() == 9
-    # A floor, because zero would refuse every open and tell the caller to close
-    # something that cannot exist.
-    monkeypatch.setenv("WEB_SEARCH_NEO_MAX_SESSIONS", "0")
-    assert browser_tools._max_sessions() == 1
+    # Zero (or "unlimited", or a negative number) lifts the cap: the user decides
+    # how many tabs this machine can carry, and any positive number is taken as is.
+    for unlimited in ("0", "unlimited", "-1", "inf"):
+        monkeypatch.setenv("WEB_SEARCH_NEO_MAX_SESSIONS", unlimited)
+        assert browser_tools._max_sessions() == browser_tools.UNLIMITED_SESSIONS
+    monkeypatch.setenv("WEB_SEARCH_NEO_MAX_SESSIONS", "500")
+    assert browser_tools._max_sessions() == 500
     monkeypatch.setenv("WEB_SEARCH_NEO_MAX_SESSIONS", "not a number")
-    assert browser_tools._max_sessions() == 8
+    assert browser_tools._max_sessions() == 30
     monkeypatch.delenv("WEB_SEARCH_NEO_MAX_SESSIONS")
-    # Eight, not four: a session in the mode agents actually use is one tab of a
-    # Chrome that is already running, and four of them turned five parallel
-    # agents into four working agents and one that could not open a page at all.
-    assert browser_tools._max_sessions() == 8
-    assert browser_tools.DEFAULT_MAX_SESSIONS == 8
+    # Thirty, not eight (and eight was not four): a session in the mode agents
+    # actually use is one tab of a Chrome that is already running, and a low cap
+    # turned parallel agents into a queue with one that could not open a page.
+    assert browser_tools._max_sessions() == 30
+    assert browser_tools.DEFAULT_MAX_SESSIONS == 30
+    assert browser_tools.session_cap_label(browser_tools.UNLIMITED_SESSIONS) == "unlimited"
 
 
 def test_the_full_session_cap_names_the_setting_that_lifts_it(monkeypatch):

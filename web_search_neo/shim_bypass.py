@@ -87,6 +87,8 @@ def _long_running(argv: list[str]) -> bool:
     """
     if "--bridge" in argv:
         return "--stop" not in argv
+    if "--node" in argv:  # the LAN node server stays up like the daemon
+        return "--stop" not in argv and "--key" not in argv
     return len(argv) == 0
 
 

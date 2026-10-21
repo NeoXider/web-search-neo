@@ -71,6 +71,10 @@ outcome happened. After navigation or rerender, discard old selectors, refs, and
   `attach_tab` is recorded only from the claim onwards. `dropped` counts what the 500-entry
   buffer evicted, so an empty list plus a high `dropped` is not a quiet page.
 - `screenshot`, `game_probe`, `browser_status`, `browser_tabs`, `search_status`.
+- `nodes`: this computer's LAN/public IP and location, and the other computers running
+  `wsn --node` (online / unpaired / offline; `discover=true` scans the LAN). Add
+  `node="<name or IP>"` to any `web_action` or `web_info` call to run it in that
+  computer's Chrome; pair one with the `nodes` action (`op="add"`, address, key).
 - `execute_js`: run a JavaScript snippet in a session's page and read its JSON-serialisable
   return value. The escape hatch for state the DOM reads do not expose — `localStorage`,
   virtualised rows, framework stores — and for mutations without an input-shaped

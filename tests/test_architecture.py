@@ -87,12 +87,15 @@ def test_allowed_dependencies_and_own_modules(source):
 # now names the vendor and the challenge type it saw. The classification lives in
 # captcha_solvers/classify.py and the protocol reader in captcha_solvers/tc_protocol.py,
 # so nothing was added to this file.
+# 2026-10-21 (LAN nodes, Take over): service-worker.js raised by three lines - the pause
+# check before every command, the nodes-answer hand-off and the paused status field. The
+# relay to the bridge (nodes.js) and the pause gate (control.js) are their own modules.
 _RATCHET_CEILINGS = {
     "web_search_neo/browser_tools.py": 8604,
     "web_search_neo/main.py": 2822,
     "web_search_neo/page_perception.py": 2720,
     "web_search_neo/chrome_bridge.py": 2090,
-    "chrome-extension/service-worker.js": 1738,
+    "chrome-extension/service-worker.js": 1741,
     "web_search_neo/bridge_daemon.py": 1166,
     "web_search_neo/macros.py": 849,
     "web_search_neo/agent_presence.py": 817,
