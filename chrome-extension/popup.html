@@ -38,6 +38,10 @@
         </div>
       </section>
 
+      <!-- Another computer asks to pair: answered here or in its Chrome notification. -->
+      <section id="pair-requests" class="pair-requests" aria-live="assertive"
+               aria-label="Pairing requests" hidden></section>
+
       <nav class="tabs-nav" role="tablist" aria-label="Companion sections">
         <button id="tab-overview" type="button" role="tab" class="tab" data-panel="panel-overview"
                 aria-controls="panel-overview" aria-selected="true">Overview</button>
@@ -175,15 +179,23 @@
         <label class="switch-row">
           <span class="switch-text">
             <strong>Share this computer</strong>
-            <small>On by default: computers that know this one's pairing key can drive
-              this Chrome. Switch off to refuse them.</small>
+            <small>On by default: computers you paired with can drive this Chrome.
+              Switch off to refuse them all.</small>
           </span>
           <input id="share" type="checkbox" role="switch"
                  aria-label="Share this computer with paired computers on the network"
                  title="Share this computer" disabled>
         </label>
         <section id="share-details" class="card share-card" hidden>
-          <p class="hint">On the other computer: Computers &rarr; Add, with this address and key.</p>
+          <p class="hint">On the other computer: Computers &rarr; Scan &rarr; Pair, then press
+            Allow here. No key to copy.</p>
+          <div id="firewall-row" class="firewall-row" data-state="checking" hidden>
+            <span class="fw-dot" aria-hidden="true"></span>
+            <span id="firewall-text" class="fw-text">Checking Windows Firewall...</span>
+            <button id="open-firewall" type="button" class="btn small"
+                    aria-label="Let other computers on this network reach this one (Windows asks first)"
+                    title="Windows asks for permission first" hidden>Allow in firewall</button>
+          </div>
           <div class="kv">
             <span class="key">Address</span>
             <span id="share-address" class="mono">-</span>
@@ -226,9 +238,16 @@
                     aria-label="Scan this network for computers running Web Search Neo"
                     title="Scan the LAN">Scan</button>
           </h2>
+          <div id="pairing-box" class="pairing-box" aria-live="polite" hidden>
+            <p class="pairing-head"><span class="spinner" aria-hidden="true"></span>
+              <span id="pairing-title">Pairing...</span></p>
+            <p id="pairing-code" class="pairing-code" title="Compare with the other screen">--- ---</p>
+            <p id="pairing-hint" class="hint">Press Allow on the other computer if it shows this code.</p>
+            <button id="pairing-cancel" type="button" class="btn ghost small">Cancel</button>
+          </div>
           <ul id="node-list" class="node-list" aria-live="polite"></ul>
-          <p id="nodes-empty" class="hint">No other computers yet. Share one with
-            <code>wsn --node</code> (or its Share switch), then Scan or Add it here.</p>
+          <p id="nodes-empty" class="hint">No other computers yet. Press Scan: computers on this
+            network running Web Search Neo show up here, ready to Pair.</p>
         </section>
 
         <details id="add-node-panel" class="add-node">
@@ -241,10 +260,10 @@
                    aria-label="Computer name" maxlength="32" spellcheck="false">
             <input id="node-address" type="text" placeholder="Address (e.g. 192.168.1.115)"
                    autocomplete="off" aria-label="Computer address" spellcheck="false">
-            <input id="node-key" type="password" placeholder="Pairing key from that computer"
+            <input id="node-key" type="password" placeholder="Pairing key (empty: pair by button)"
                    autocomplete="off" aria-label="Pairing key" spellcheck="false">
-            <button id="add-node" type="button" class="btn" aria-label="Save and check this computer"
-                    title="Add">Add and check</button>
+            <button id="add-node" type="button" class="btn" aria-label="Pair with or save this computer"
+                    title="Add">Pair / add</button>
           </div>
         </details>
       </section>

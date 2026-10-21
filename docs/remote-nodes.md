@@ -53,13 +53,47 @@ public services and cached for 15 minutes. It is never the device's own position
 ## Pair two computers
 
 On the computer to be controlled (say `192.168.1.115`) nothing has to be started:
-with Chrome and its companion running, its node is up. Its popup shows the address and
-the **pairing key** under **Computers → Share this computer**, with copy buttons; the
-same switch turns sharing off (and back on), and the choice is remembered. From a
-terminal, `wsn --node --key` prints the key and `wsn --node` runs a node by hand, which
-prints the addresses it listens on and the key.
+with Chrome and its companion running, its node is up, and the popup's
+**Computers → Share this computer** switch turns sharing off (and back on).
 
-On the computer that controls it, save it once — from an agent:
+### By button (no key to copy)
+
+1. On the computer that will drive the other one, open **Computers**, press **Scan**,
+   and press **Pair** on the computer that shows up (or type its address under **Add a
+   computer** and leave the key empty).
+2. The popup shows a six-digit code. The other computer shows a Chrome notification -
+   and a banner at the top of its popup - with this computer's name, address and the
+   same code, and **Allow** / **Deny**.
+3. Press **Allow** there if the codes match. The key is handed over, saved, and the
+   computer turns online in the list. Closing the popup in between loses nothing: the
+   bridge waits for the answer for three minutes.
+
+An agent does the same with two calls:
+
+```json
+{"tool": "web_action", "arguments": {"actions": [{"action": "nodes", "op": "pair",
+  "address": "192.168.1.115"}]}}
+```
+
+The first returns `code` and asks the user to allow it on that computer; the second
+(same arguments, after they pressed Allow) waits up to 90 seconds for the answer and
+returns `state: "paired"` with the saved entry.
+
+How it stays safe: both computers run an ephemeral Diffie-Hellman exchange (RFC 3526
+group 14) and derive the code from the shared secret and both public values. The asking
+computer commits to its value before it sees the other one, so a machine in the middle
+cannot steer the two codes to match; it gets them equal by luck one time in a million.
+Nothing is handed over until a person presses Allow, the key then travels once, sealed
+with the shared secret, and answering a request takes that computer's own key and a
+loopback connection. Requests expire after three minutes, at most four wait at once,
+and one address may start one every two seconds.
+
+### By key
+
+The popup also shows the **pairing key** under **Share this computer**, with copy
+buttons; `wsn --node --key` prints it in a terminal and `wsn --node` runs a node by
+hand, printing the addresses it listens on and the key. On the computer that controls
+it, save it once — from an agent:
 
 ```json
 {"tool": "web_action", "arguments": {"actions": [{"action": "nodes", "op": "add",
@@ -74,6 +108,20 @@ A computer saved without a key of its own is called with this machine's key
 same key — set `WEB_SEARCH_NEO_NODE_KEY` everywhere — pairs them all at once, and a
 computer found by **Scan** works immediately.
 
+## Windows Firewall
+
+Windows asks once whether Python may accept connections; on a network marked Public -
+the usual state of a home Ethernet link - the default answer leaves the node
+unreachable, and the computer that wants to drive it finds nothing on **Scan**. While a
+computer is shared, its **Computers** tab says whether other computers on its network
+can reach it, read from the rules that apply to its LAN's profile (no rights needed).
+When they cannot, **Allow in firewall** adds two rules, `web-search-neo node` (TCP 8766)
+and `web-search-neo discovery` (UDP 8767), admitting the local subnet only, and turns
+off inbound block rules for the node's own Python (Windows writes those when its first
+prompt is dismissed, and they would beat any allow rule). It runs through Windows' own
+UAC prompt: nothing changes unless the person accepts it. `web_info(topic="nodes")`
+reports the same verdict as `sharing.firewall` (`open`, `blocked`, `checking`).
+
 ## From the popup
 
 - **Overview** shows this computer's LAN address, public IP and place in one strip.
@@ -81,12 +129,15 @@ computer found by **Scan** works immediately.
   place, the network operator), the Share switch with the address and pairing key,
   and every other computer with a coloured state dot, its IP, place, latency and
   whether its Chrome is linked. An online row has **Send this tab**: the page you are
-  looking at opens in that computer's Chrome and stays there. Forgetting a computer
-  takes two clicks.
+  looking at opens in that computer's Chrome and stays there; an unpaired one has
+  **Pair**. Forgetting a computer takes two clicks.
+- A pairing request from another computer appears at the top of the popup, on every
+  tab, with its code and **Allow** / **Deny**.
 
 ## Security model
 
-- The pairing key never crosses the network. Every request carries an HMAC-SHA256
+- The pairing key crosses the network once at most, during button pairing, sealed
+  with a Diffie-Hellman secret after a person allowed it. Every request carries an HMAC-SHA256
   over its method, path, time, a one-time nonce and the body digest; the node refuses
   a signature that does not match, a time more than two minutes off its own clock,
   and a nonce it has already seen. Every answer is signed over the request's nonce,
@@ -102,6 +153,20 @@ computer found by **Scan** works immediately.
   comma-separated list of actions a node refuses (empty allows everything).
 - A node does not relay: a call that names another node from inside a node is refused.
 - `POST /wsn/stop` is accepted only from the node's own machine.
+
+## Updating a computer
+
+In the folder Web Search Neo was cloned to:
+
+```powershell
+python main.py --update
+```
+
+pulls the checkout and moves every long-running part onto it: it stops the node and the
+bridge daemon, starts a fresh daemon and reloads the Chrome companion, and the daemon
+starts the node again once the companion is back. A `git pull` alone leaves all three
+running the old code. It does not cut off agents driving tabs unless given `--force`;
+an MCP server already running keeps its code until its client restarts it.
 
 ## Settings
 

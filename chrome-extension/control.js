@@ -17,11 +17,12 @@ const PAUSED_BADGE = {
   text: "II", color: "#d97706",
   title: "Web Search Neo: you took over - agents are paused. Alt+Shift+P or the panel resumes them.",
 };
-// Commands that change nothing: tab metadata, buffered console/network, and the
-// release of a debugger the agent no longer needs.
+// Commands that change nothing: tab metadata, buffered console/network, the
+// release of a debugger the agent no longer needs, and a pairing question that
+// only the person at this computer can answer.
 const ALLOWED_WHILE_PAUSED = new Set([
   "tabs.get", "tabs.list", "tabs.resolve", "frames.resolve", "console.get", "events.get",
-  "network.body", "mock.list", "debugger.detach",
+  "network.body", "mock.list", "debugger.detach", "companion.pairRequest",
 ]);
 const storage = () => chrome.storage?.session || chrome.storage?.local;
 

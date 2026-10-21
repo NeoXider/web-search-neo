@@ -5,11 +5,20 @@
 // request becomes one {"type": "nodes", id, op, ...} frame and the daemon
 // (web_search_neo/node_link.py) answers {"type": "nodes_result", id, result|error}.
 // Nothing here reaches the network on its own.
+//
+// It also owns the pairing notification: when another computer asks to pair,
+// this computer's node sends "companion.pairRequest" through the bridge and a
+// Chrome notification shows the asking computer and its code, with Allow and
+// Deny. Either button answers through the same socket.
 
 const REQUEST_TIMEOUT_MS = 20000;
 // Starting a node server waits for it to come up, and a LAN scan probes every answer.
-const SLOW_OPS = new Set(["share", "rotate_key", "send_tab"]);
+const SLOW_OPS = new Set(["share", "rotate_key", "send_tab", "pair"]);
 const SLOW_TIMEOUT_MS = 45000;
+// Windows' UAC prompt waits for the person; the daemon gives up after 150 s.
+const OP_TIMEOUT_MS = {firewall: 160000};
+const PAIR_NOTICE = "wsn-pair-";
+const SOCKET_WAIT_MS = 6000;
 
 export function createNodeRelay(liveSocket) {
   const pending = new Map();
@@ -28,7 +37,7 @@ export function createNodeRelay(liveSocket) {
       const timer = setTimeout(() => {
         pending.delete(id);
         reject(new Error("The bridge did not answer in time; an older bridge may not know computers yet."));
-      }, SLOW_OPS.has(op) ? SLOW_TIMEOUT_MS : REQUEST_TIMEOUT_MS);
+      }, OP_TIMEOUT_MS[op] || (SLOW_OPS.has(op) ? SLOW_TIMEOUT_MS : REQUEST_TIMEOUT_MS));
       pending.set(id, {resolve, reject, timer});
       try {
         socket.send(JSON.stringify({type: "nodes", id, op, ...params}));
@@ -74,10 +83,65 @@ export function createNodeRelay(liveSocket) {
         return request("rotate_key");
       case "companion.nodeSendTab":
         return activeTabUrl().then(url => request("send_tab", {node: msg.node || "", url}));
+      case "companion.nodePair":
+        return request("pair", {address: msg.address || "", node: msg.node || ""});
+      case "companion.nodePairPoll":
+        return request("pair_poll", {attempt: msg.attempt || ""});
+      case "companion.nodePairCancel":
+        return request("pair_cancel", {attempt: msg.attempt || ""});
+      case "companion.nodePairDecide":
+        return decide(String(msg.request || ""), msg.allow === true);
+      case "companion.nodeFirewall":
+        return request("firewall");
       default:
         return null;
     }
   }
 
-  return {message, deliver, request};
+  // A click on a notification can wake this worker before its socket is back.
+  async function whenConnected() {
+    const until = Date.now() + SOCKET_WAIT_MS;
+    while (!liveSocket() && Date.now() < until) await new Promise(done => setTimeout(done, 300));
+  }
+
+  async function decide(requestId, allow) {
+    await whenConnected();
+    const answer = await request("pair_decide", {request: requestId, allow});
+    chrome.notifications?.clear?.(PAIR_NOTICE + requestId);
+    return answer;
+  }
+
+  // The bridge command a pairing request arrives as; strings are shown, never parsed.
+  async function showPairRequest(params = {}) {
+    const requestId = String(params.request || "");
+    if (!/^[0-9a-f]{8,32}$/.test(requestId)) throw new Error("pairing request id is malformed");
+    const name = String(params.name || "Another computer").slice(0, 32);
+    const address = String(params.address || "").slice(0, 64);
+    const code = String(params.code || "").slice(0, 8);
+    if (!chrome.notifications?.create) return {shown: false};
+    await chrome.notifications.create(PAIR_NOTICE + requestId, {
+      type: "basic",
+      iconUrl: "icons/slime-128.png",
+      title: `${name} wants to drive this Chrome`,
+      message: `Code ${code}. Allow only if ${name} shows the same code.`,
+      contextMessage: `${address} · Web Search Neo pairing`,
+      buttons: [{title: "Allow"}, {title: "Deny"}],
+      requireInteraction: true,
+      priority: 2,
+    });
+    return {shown: true};
+  }
+
+  chrome.notifications?.onButtonClicked?.addListener((noticeId, index) => {
+    if (!String(noticeId).startsWith(PAIR_NOTICE)) return;
+    decide(String(noticeId).slice(PAIR_NOTICE.length), index === 0).catch(error => {
+      console.warn("companion: pairing answer failed", error);
+      chrome.action?.openPopup?.().catch(() => {});
+    });
+  });
+  chrome.notifications?.onClicked?.addListener(noticeId => {
+    if (String(noticeId).startsWith(PAIR_NOTICE)) chrome.action?.openPopup?.().catch(() => {});
+  });
+
+  return {message, deliver, request, commands: {"companion.pairRequest": showPairRequest}};
 }

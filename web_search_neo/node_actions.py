@@ -15,12 +15,13 @@ import logging
 import os
 import sys
 import threading
+import time
 from typing import Any, Literal
 
 from mcp.server.fastmcp import Image
 
 from web_search_neo import browser_tools, plugins
-from web_search_neo.nodes import client, config, identity, overview
+from web_search_neo.nodes import client, config, identity, overview, pairing
 from web_search_neo.nodes.server import NodeServer
 
 LOGGER = logging.getLogger("web_search_neo.nodes")
@@ -32,6 +33,7 @@ NODE_PARAM_HELP = (
     "Run this whole call on another computer: a node name from web_info topic 'nodes', "
     "or its IP. Omit for this computer."
 )
+PAIR_WAIT_SECONDS = 90.0
 _ACTION_KEYS = ("actions", "continue_on_error", "summary")
 _INFO_KEYS = ("topic", "params")
 _facade: Any = None
@@ -188,18 +190,44 @@ async def browser_nodes(
     )
 
 
+def _pair(target: str) -> dict[str, Any]:
+    """op='pair': the first call asks and returns the code, the next one waits for the answer."""
+    address = config.resolve(target).address
+    attempt = pairing.attempt_for(address)
+    if attempt is None:
+        started = pairing.begin(address)
+        return {"success": True, **started, "next": (
+            f"Tell the user the code {started['code']}. On {started['name'] or address} a Chrome "
+            "notification (and its companion panel) asks whether to allow this computer; when they "
+            "press Allow on a matching code, call nodes op='pair' again to finish.")}
+    deadline = time.monotonic() + PAIR_WAIT_SECONDS
+    while True:
+        answer = pairing.check(attempt)
+        if answer.get("state") != "waiting" or time.monotonic() > deadline:
+            break
+        time.sleep(1.5)
+    if answer.get("state") == "paired":
+        answer["status"] = overview.probe(config.resolve(answer["saved"]["name"]))
+    return {"success": answer.get("state") == "paired", **answer}
+
+
 async def browser_node_manage(
-    op: Literal["add", "remove", "list", "ping"] = "list",
+    op: Literal["add", "remove", "list", "ping", "pair"] = "list",
     name: str | None = None,
     address: str | None = None,
     key: str | None = None,
 ) -> dict[str, Any]:
-    """Save, forget, list, or check another computer that node='<name>' runs calls on.
+    """Save, forget, list, check, or pair with another computer that node='<name>' runs calls on.
 
     add needs address (IP or host[:port], default port 8766) and the key shown by that
     computer's `wsn --node` or companion popup; name defaults to the address.
+    pair needs no key: it returns a code, the user allows it on that computer, call again.
     """
     def run() -> dict[str, Any]:
+        if op == "pair":
+            if not (name or address):
+                raise ValueError("nodes op='pair' needs address (e.g. 192.168.1.115) or name")
+            return _pair(str(name or address))
         if op == "list":
             return {"success": True, "nodes": [entry.public() for entry in config.known_nodes()]}
         if op == "add":
@@ -223,7 +251,7 @@ async def browser_node_manage(
 
 
 ACTION_SPECS = (
-    ("nodes", browser_node_manage, "session", "Save/remove/ping a computer for node='<name>'."),
+    ("nodes", browser_node_manage, "session", "Pair/save/remove/ping a computer for node='<name>'."),
 )
 
 
@@ -245,6 +273,19 @@ def _banner(server: NodeServer, key: str) -> str:
     return "\n".join(lines)
 
 
+def _ask_companion(request: dict[str, Any]) -> None:
+    """Show a pairing request as a Chrome notification here; the popup lists it either way."""
+
+    def run() -> None:
+        try:
+            browser_tools.get_chrome_bridge().request("companion.pairRequest", dict(request),
+                                                      timeout=10.0)
+        except Exception as exc:
+            LOGGER.info("Pairing notification not shown: %s: %s", type(exc).__name__, exc)
+
+    threading.Thread(target=run, name="wsn-node-pair-notice", daemon=True).start()
+
+
 def serve(arguments: list[str]) -> int:
     """``wsn --node``: publish this machine's tools to the LAN until stopped."""
     if "--stop" in arguments:
@@ -264,7 +305,7 @@ def serve(arguments: list[str]) -> int:
         LOGGER.warning("Node starts without the Chrome bridge: %s: %s", type(exc).__name__, exc)
     server = NodeServer(call=node_call(loop), info=local_status, key=key, name=config.node_name(),
                         version=_version(), host=config.listen_host(), port=config.listen_port(),
-                        discovery_port=config.discovery_port())
+                        discovery_port=config.discovery_port(), on_pair_request=_ask_companion)
     try:
         server.start()
     except OSError as exc:

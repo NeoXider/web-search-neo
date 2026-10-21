@@ -9,8 +9,11 @@ seconds, and the extension's socket also carries every agent's commands.
 
 Operations: ``overview`` (this machine, sharing state, every node; ``discover``
 scans the LAN), ``add``/``remove`` a node, ``share`` (start or stop this
-machine's node server), ``rotate_key``, and ``send_tab`` (open a URL in another
-computer's Chrome and leave the tab there).
+machine's node server), ``rotate_key``, ``send_tab`` (open a URL in another
+computer's Chrome and leave the tab there), the button pairing of
+:mod:`web_search_neo.nodes.pairing` - ``pair``/``pair_poll``/``pair_cancel`` on
+the computer asking, ``pair_decide`` on the one being asked - and ``firewall``,
+which admits the node through Windows Firewall behind its own UAC prompt.
 """
 
 from __future__ import annotations
@@ -26,7 +29,7 @@ import threading
 import time
 from typing import Any, Callable
 
-from web_search_neo.nodes import client, config, overview
+from web_search_neo.nodes import client, config, firewall, overview, pairing
 from web_search_neo.process_probe import popen_detached
 
 LOGGER = logging.getLogger("web_search_neo.bridge.nodes")
@@ -63,12 +66,23 @@ def _op_overview(message: dict[str, Any], version: str) -> dict[str, Any]:
     result = overview.overview(
         version=version, local_extra={"browser": {"companion_connected": True}},
         discover=bool(message.get("discover")), refresh_public=bool(message.get("refresh")),
-        include_key=False, timeout=2.5,
+        include_key=False, timeout=2.5, firewall_wait=False,
     )
     sharing = result["sharing"]
     if sharing.get("enabled") or sharing.get("running"):  # the popup is how a person pairs
         sharing["pair_key"] = config.display_key(config.load_or_create_key())
+    result["pair_requests"] = _waiting_requests() if sharing.get("running") else []
+    result["pairings"] = _recent_pairings()
     return result
+
+
+def _waiting_requests() -> list[dict[str, Any]]:
+    try:
+        waiting = client.local_call("GET", "/wsn/pair/waiting", None, timeout=2.0)
+    except client.NodeError as exc:  # an older node, or one restarting
+        LOGGER.debug("No pairing requests from the local node: %s", exc)
+        return []
+    return waiting if isinstance(waiting, list) else []
 
 
 def _op_add(message: dict[str, Any], _version: str) -> dict[str, Any]:
@@ -126,6 +140,93 @@ def _op_send_tab(message: dict[str, Any], _version: str) -> dict[str, Any]:
             **({} if ok else {"error": str((result or {}).get("error") or result)[:400]})}
 
 
+# Pairing attempts this daemon follows to the end, so closing the popup while the
+# person walks to the other computer loses nothing: attempt id -> latest answer.
+_PAIRINGS: dict[str, dict[str, Any]] = {}
+_PAIRINGS_LOCK = threading.Lock()
+_PAIRINGS_KEPT_SECONDS = 600.0
+_PAIR_POLL_SECONDS = 1.5
+
+
+def _note_pairing(attempt: str, answer: dict[str, Any]) -> None:
+    with _PAIRINGS_LOCK:
+        now = time.monotonic()
+        for key in [key for key, item in _PAIRINGS.items() if now - item["at"] > _PAIRINGS_KEPT_SECONDS]:
+            _PAIRINGS.pop(key, None)
+        _PAIRINGS[attempt] = {**answer, "attempt": attempt, "at": now}
+
+
+def _follow_pairing(attempt: str, started: dict[str, Any]) -> None:
+    deadline = time.monotonic() + pairing.ATTEMPT_TTL_SECONDS
+    answer: dict[str, Any] = {**started, "state": "expired"}
+    while time.monotonic() < deadline:
+        try:
+            answer = pairing.check(attempt)
+        except Exception as exc:  # unreachable, refused, or a seal that does not verify
+            answer = {**started, "state": "failed", "error": str(exc) or type(exc).__name__}
+            break
+        if answer.get("state") != "waiting":
+            break
+        time.sleep(_PAIR_POLL_SECONDS)
+    with _PAIRINGS_LOCK:
+        if _PAIRINGS.get(attempt, {}).get("state") == "cancelled":
+            return
+    _note_pairing(attempt, answer)
+    if answer.get("state") == "paired":
+        try:
+            answer["status"] = overview.probe(config.resolve(answer["saved"]["name"]))
+        except Exception as exc:
+            LOGGER.info("Paired, but the first probe failed: %s", exc)
+        _note_pairing(attempt, answer)
+
+
+def _recent_pairings() -> list[dict[str, Any]]:
+    with _PAIRINGS_LOCK:
+        return [{key: value for key, value in item.items() if key != "at"}
+                for item in _PAIRINGS.values()]
+
+
+def _op_pair(message: dict[str, Any], _version: str) -> dict[str, Any]:
+    target = str(message.get("address") or message.get("node") or "").strip()
+    if not target:
+        raise ValueError("Pick the computer to pair with (its address, e.g. 192.168.1.115).")
+    started = pairing.begin(config.resolve(target).address)
+    _note_pairing(started["attempt"], started)
+    threading.Thread(target=_follow_pairing, args=(started["attempt"], started),
+                     name="wsn-bridge-pairing", daemon=True).start()
+    return started
+
+
+def _op_pair_poll(message: dict[str, Any], _version: str) -> dict[str, Any]:
+    attempt = str(message.get("attempt") or "")
+    with _PAIRINGS_LOCK:
+        answer = _PAIRINGS.get(attempt)
+    if answer is None:
+        return {"attempt": attempt, "state": "expired"}
+    return {key: value for key, value in answer.items() if key != "at"}
+
+
+def _op_pair_cancel(message: dict[str, Any], _version: str) -> dict[str, Any]:
+    attempt = str(message.get("attempt") or "")
+    cancelled = pairing.cancel(attempt)
+    if cancelled:
+        _note_pairing(attempt, {"state": "cancelled"})
+    return {"cancelled": cancelled}
+
+
+def _op_pair_decide(message: dict[str, Any], _version: str) -> dict[str, Any]:
+    return client.local_call("POST", "/wsn/pair/decide", {
+        "request": str(message.get("request") or ""), "allow": message.get("allow") is True,
+    })
+
+
+def _op_firewall(_message: dict[str, Any], _version: str) -> dict[str, Any]:
+    from web_search_neo.nodes import identity
+
+    addresses = identity.lan_addresses()
+    return firewall.open_ports(addresses[0] if addresses else "")
+
+
 OPERATIONS: dict[str, Callable[[dict[str, Any], str], dict[str, Any]]] = {
     "overview": _op_overview,
     "add": _op_add,
@@ -133,6 +234,11 @@ OPERATIONS: dict[str, Callable[[dict[str, Any], str], dict[str, Any]]] = {
     "share": _op_share,
     "rotate_key": _op_rotate_key,
     "send_tab": _op_send_tab,
+    "pair": _op_pair,
+    "pair_poll": _op_pair_poll,
+    "pair_cancel": _op_pair_cancel,
+    "pair_decide": _op_pair_decide,
+    "firewall": _op_firewall,
 }
 
 

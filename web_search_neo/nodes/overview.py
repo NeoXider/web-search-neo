@@ -6,14 +6,15 @@ from concurrent.futures import ThreadPoolExecutor
 import time
 from typing import Any
 
-from web_search_neo.nodes import client, config, identity
+from web_search_neo.nodes import client, config, firewall, identity
 from web_search_neo.nodes.config import NodeEntry
 
 HOW = (
     "web_action(node='<name>', actions=[...]) and web_info(node='<name>', topic=...) run on "
-    "that computer, in its Chrome. Save one with web_action nodes op='add' (name, address, "
-    "key); params.discover=true scans the LAN. Share a computer: `wsn --node` there, or the "
-    "companion popup's Share switch; its pairing key is shown there."
+    "that computer, in its Chrome. Pair one with web_action nodes op='pair' (address; no key: "
+    "the user allows it on that computer, then call again), or op='add' with its key; "
+    "params.discover=true scans the LAN. sharing.firewall says whether Windows Firewall lets "
+    "the LAN reach this computer."
 )
 
 
@@ -64,8 +65,13 @@ def probe(entry: NodeEntry, timeout: float = client.PROBE_TIMEOUT) -> dict[str, 
 
 def overview(*, version: str = "", local_extra: dict[str, Any] | None = None,
              discover: bool = False, refresh_public: bool = False,
-             include_key: bool = False, timeout: float = client.PROBE_TIMEOUT) -> dict[str, Any]:
-    """This machine, its sharing state, and every known (and optionally discovered) node."""
+             include_key: bool = False, timeout: float = client.PROBE_TIMEOUT,
+             firewall_wait: bool = True) -> dict[str, Any]:
+    """This machine, its sharing state, and every known (and optionally discovered) node.
+
+    While this computer is shared, ``sharing.firewall`` says whether Windows Firewall
+    lets the LAN in; ``firewall_wait=False`` answers from the cache and reads it later.
+    """
     me = identity.local_identity(version, include_public=True, refresh=refresh_public)
     if local_extra:
         me.update(local_extra)
@@ -91,9 +97,12 @@ def overview(*, version: str = "", local_extra: dict[str, Any] | None = None,
     if entries:
         with ThreadPoolExecutor(max_workers=min(8, len(entries))) as pool:
             rows = list(pool.map(lambda entry: probe(entry, timeout), entries))
+    sharing = sharing_state(me["lan_ips"], include_key=include_key)
+    if sharing.get("enabled") or sharing.get("running"):
+        sharing["firewall"] = firewall.state(me.get("primary_ip") or "", wait=firewall_wait)
     return {
         "self": me,
-        "sharing": sharing_state(me["lan_ips"], include_key=include_key),
+        "sharing": sharing,
         "nodes": rows,
         "discovered": len(found) if discover else None,
         "how": HOW,

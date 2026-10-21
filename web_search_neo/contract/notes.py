@@ -447,8 +447,8 @@ _ACTION_NOTES = {
     },
     "nodes": {
         "routing": "node='<name>' (or an IP) on web_action/web_info sends the whole call to that computer: its Chrome, sessions, files and network. Dict results come back with via_node. session_id and agent_label rules apply there as they do here.",
-        "pairing": "Each computer has a pairing key: `wsn --node --key` there, or the companion popup's Computers tab. op='add' saves name, address and key; a node without its own key is called with this machine's key (WEB_SEARCH_NEO_NODE_KEY or its node-key file), so one key copied to every computer pairs them all.",
-        "sharing": "A computer answers only while `wsn --node` runs there or its popup Share switch is on (HTTP 8766, LAN discovery UDP 8767; allow both in its firewall). Requests are HMAC-signed and replay-proof but not encrypted: use a trusted LAN or VPN. update_companion is refused remotely (WEB_SEARCH_NEO_NODE_DENY).",
+        "pairing": "op='pair' (address or name) needs no key: the first call returns a six-digit code and that computer shows it with Allow/Deny; tell the user the code, and once they allow it call op='pair' again to save it. op='add' saves a key copied by hand; a node without its own key is called with this machine's key.",
+        "sharing": "Shared by default while Chrome and the companion run (HTTP 8766, discovery UDP 8767). sharing.firewall says whether Windows Firewall admits the LAN; the popup's Allow in firewall button fixes it. Requests are HMAC-signed and replay-proof but not encrypted: use a trusted LAN or VPN. update_companion is refused remotely.",
         "states": "online: paired and answering; unpaired: answering but the key is missing or differs; offline: nothing answers at that address.",
     },
 }

@@ -12,12 +12,15 @@ bookkeeping: who the nodes are (:mod:`.config`), what this machine looks like
 from the network - LAN addresses, public IP, coarse geolocation
 (:mod:`.identity`), how a request proves it knows the key (:mod:`.protocol`),
 the HTTP server and its LAN discovery responder (:mod:`.server`), the client
-side (:mod:`.client`), and the combined picture the ``nodes`` topic and the
-popup show (:mod:`.overview`). The glue that hands a call to the facade lives
-in ``web_search_neo/node_actions.py``.
+side (:mod:`.client`), pairing by button instead of a copied key
+(:mod:`.pairing`), whether Windows Firewall lets the LAN in (:mod:`.firewall`),
+and the combined picture the ``nodes`` topic and the popup show
+(:mod:`.overview`). The glue that hands a call to the facade lives in
+``web_search_neo/node_actions.py``.
 
-The pairing key never crosses the wire: every request and every answer carries
-an HMAC-SHA256 over its method, path, time, nonce and body digest, and a nonce
-is accepted once. The traffic itself is plain HTTP, so page text and cookies a
+Calls never carry the pairing key: every request and every answer carries an
+HMAC-SHA256 over its method, path, time, nonce and body digest, and a nonce is
+accepted once. Button pairing hands the key over once, sealed with a
+Diffie-Hellman secret, after a person at that computer allowed it. The traffic itself is plain HTTP, so page text and cookies a
 call returns are readable on the LAN - use a trusted network or a VPN overlay.
 """

@@ -608,6 +608,73 @@ kbd {
   background: color-mix(in srgb, var(--accent) 10%, transparent);
 }
 
+/* Pairing: a request to answer here, the code to compare, the firewall verdict. */
+.pair-requests[hidden], .pairing-box[hidden], .firewall-row[hidden] { display: none; }
+.pair-requests { display: grid; gap: 6px; margin: 0 0 10px; }
+.pair-request {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 4px 8px;
+  align-items: center;
+  padding: 9px 11px;
+  border: 1px solid color-mix(in srgb, var(--warn) 55%, var(--line));
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--warn) 10%, var(--panel));
+  animation: row-in .22s ease-out both, ask 1.6s ease-in-out .3s infinite;
+}
+.pair-request strong { grid-column: 1 / -1; overflow-wrap: anywhere; }
+.pair-request small {
+  grid-area: 2 / 1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 6px;
+  color: var(--muted);
+}
+.pair-request .answers { grid-area: 2 / 2; display: flex; gap: 5px; }
+.pair-code, .pairing-code {
+  font: 700 15px ui-monospace, Consolas, monospace;
+  letter-spacing: .12em;
+  white-space: nowrap;
+  color: var(--text);
+}
+@keyframes ask {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--warn) 0%, transparent); }
+  50% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 30%, transparent); }
+}
+.pairing-box {
+  display: grid;
+  justify-items: center;
+  gap: 4px;
+  margin: 2px 0 8px;
+  padding: 10px;
+  border: 1px dashed color-mix(in srgb, var(--accent) 60%, var(--line));
+  border-radius: 10px;
+  text-align: center;
+}
+.pairing-head { display: flex; align-items: center; gap: 7px; font-weight: 650; }
+.pairing-code { font-size: 22px; }
+.pairing-box[data-state="paired"] { border-color: var(--ok); }
+.pairing-box[data-state="paired"] .spinner,
+.pairing-box[data-state="denied"] .spinner,
+.pairing-box[data-state="expired"] .spinner { display: none; }
+.pairing-box[data-state="denied"], .pairing-box[data-state="expired"] { border-color: var(--bad); }
+.spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin .8s linear infinite;
+}
+.firewall-row { display: flex; align-items: center; gap: 7px; font-size: 12px; }
+.fw-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.firewall-row[data-state="open"] .fw-dot { background: var(--ok); }
+.firewall-row[data-state="blocked"] .fw-dot { background: var(--warn); animation: pulse-ring 1.4s ease-out infinite; color: var(--warn); }
+.fw-text { flex: 1; min-width: 0; color: var(--muted); }
+.firewall-row[data-state="blocked"] .fw-text { color: var(--text); }
+.firewall-row .btn { flex: none; }
+
 @media (prefers-reduced-motion: reduce) {
   * {
     animation-duration: .01ms !important;

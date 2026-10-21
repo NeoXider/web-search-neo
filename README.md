@@ -597,11 +597,15 @@ call.
 `web_info(topic="nodes")` shows this computer — LAN addresses, public IP, and the city,
 region, country and network operator registries attach to that IP — and every other
 computer: online, unpaired or offline, with its IPs, location, latency and whether its
-Chrome is linked. `params.discover=true` scans the LAN. Pair a computer once with
-`web_action nodes op='add'` (name, address, the pairing key that computer shows) or in
-the popup's **Computers** tab, which also sends the tab you are looking at to another
-computer. Requests are HMAC-signed and replay-proof; the key never crosses the network,
-but the traffic is not encrypted, so share on a trusted LAN or a VPN.
+Chrome is linked. `params.discover=true` scans the LAN. Pairing needs no key copied
+between computers: press **Pair** on a computer the popup's **Computers** tab found
+(or call `web_action nodes op='pair'`), and the other computer shows a Chrome
+notification with a six-digit code and **Allow** / **Deny** — allow it when the codes
+match. If Windows Firewall keeps the LAN out, that computer's popup says so and its
+**Allow in firewall** button fixes it behind Windows' own permission prompt. The
+**Computers** tab also sends the tab you are looking at to another computer. Requests
+are HMAC-signed and replay-proof; the key never crosses the network in the clear, but
+the traffic is not encrypted, so share on a trusted LAN or a VPN.
 [docs/remote-nodes.md](docs/remote-nodes.md) has pairing, the security model and every
 setting.
 

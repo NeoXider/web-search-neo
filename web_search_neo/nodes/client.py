@@ -99,6 +99,19 @@ def hello(entry: NodeEntry, timeout: float = PROBE_TIMEOUT) -> dict[str, Any]:
     return result
 
 
+def open_post(entry: NodeEntry, path: str, payload: dict[str, Any],
+              timeout: float = PROBE_TIMEOUT) -> Any:
+    """An unsigned POST (the pairing steps, made before any key is shared); raw JSON back."""
+    return _exchange(entry, "POST", path, payload, timeout, signed=False)
+
+
+def local_call(method: str, path: str, payload: dict[str, Any] | None = None,
+               timeout: float = PROBE_TIMEOUT) -> Any:
+    """A signed call to the node on this machine, with this machine's own key."""
+    entry = NodeEntry("local", f"127.0.0.1:{config.listen_port()}", None, "address")
+    return _exchange(entry, method, path, payload, timeout)
+
+
 def stop_local(port: int | None = None, timeout: float = PROBE_TIMEOUT) -> bool:
     """Ask the node on this machine to exit; False when none answered."""
     entry = NodeEntry("local", f"127.0.0.1:{port or config.listen_port()}", None, "address")

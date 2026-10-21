@@ -17,7 +17,7 @@ import pytest
 from mcp.server.fastmcp import Image
 
 from web_search_neo import main, node_actions, node_link
-from web_search_neo.nodes import client, config, identity, overview, protocol
+from web_search_neo.nodes import client, config, firewall, identity, overview, pairing, protocol
 from web_search_neo.nodes.server import NodeServer
 
 
@@ -28,6 +28,12 @@ def node_home(tmp_path, monkeypatch):
     for name in (config.KEY_ENV, config.NODES_ENV, config.NAME_ENV, node_actions.DENY_ENV,
                  config.SHARE_ENV):
         monkeypatch.delenv(name, raising=False)
+    # Reading the real Windows Firewall takes seconds; the tests that need it fake it.
+    monkeypatch.setattr(firewall, "supported", lambda: False)
+    # A real node may be running on this machine's 8766: point "this machine's node" elsewhere.
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        monkeypatch.setenv(config.PORT_ENV, str(probe.getsockname()[1]))
     return tmp_path
 
 
@@ -383,3 +389,191 @@ def test_popup_errors_come_back_as_text():
     answer = _popup({"op": "send_tab", "node": "x", "url": "file:///etc/passwd"})
     assert "http(s)" in answer["error"]
     assert "Unknown nodes operation" in _popup({"op": "explode"})["error"]
+
+
+# --- button pairing --------------------------------------------------------------------
+
+
+def _paired_server(notices=None) -> NodeServer:
+    server = _server(key="cd" * 16)
+    server.pairing.notify = (notices.append if notices is not None else None)
+    return server
+
+
+def test_button_pairing_hands_the_key_over_once_after_allow():
+    notices = []
+    server = _paired_server(notices)
+    try:
+        started = pairing.begin(f"127.0.0.1:{server.port}")
+        assert started["name"] == "fake" and len(started["code"]) == 7
+        # The person at B sees the code A shows - in the notification and in the popup.
+        assert [notice["code"] for notice in notices] == [started["code"]]
+        waiting = server.pairing.waiting()
+        assert [(item["code"], item["address"]) for item in waiting] == [(started["code"], "127.0.0.1")]
+        assert pairing.check(started["attempt"])["state"] == "waiting"
+        assert config.saved_nodes() == [], "nothing is saved before Allow"
+        server.pairing.decide(waiting[0]["request"], True)
+        done = pairing.check(started["attempt"])
+        assert done["state"] == "paired" and done["saved"]["has_own_key"] is True
+        saved = config.resolve(done["saved"]["name"])
+        assert saved.key == "cd" * 16 and overview.probe(saved)["state"] == "online"
+        assert pairing.check(started["attempt"])["state"] == "expired", "handed over once"
+        assert server.pairing.waiting() == []
+    finally:
+        server.shutdown()
+
+
+def test_a_denied_pairing_shares_nothing():
+    server = _paired_server()
+    try:
+        started = pairing.begin(f"127.0.0.1:{server.port}")
+        server.pairing.decide(server.pairing.waiting()[0]["request"], False)
+        assert pairing.check(started["attempt"])["state"] == "denied"
+        assert config.saved_nodes() == []
+    finally:
+        server.shutdown()
+
+
+def test_pairing_steps_refuse_strangers_and_floods():
+    desk = pairing.PairingDesk("b", lambda: "ab" * 16)
+    _private, public = pairing.new_secret()
+    commit = pairing.commitment(public)
+    started = desk.start({"name": "a", "commit": commit}, "10.0.0.1")
+    with pytest.raises(pairing.PairingError, match="every few seconds"):
+        desk.start({"name": "a", "commit": commit}, "10.0.0.1")
+    with pytest.raises(pairing.PairingError, match="no such pairing request"):
+        desk.reveal({"request": started["request"], "pub": format(public, "x")}, "10.0.0.2")
+    _other_private, other_public = pairing.new_secret()
+    with pytest.raises(pairing.PairingError, match="commitment"):
+        desk.reveal({"request": started["request"], "pub": format(other_public, "x")}, "10.0.0.1")
+    assert desk.poll({"request": started["request"], "proof": "x"}, "10.0.0.1") == {"state": "expired"}
+    with pytest.raises(pairing.PairingError, match="out of range"):
+        pairing.peer_value("1")
+    for index in range(pairing.MAX_WAITING):
+        desk.start({"name": "a", "commit": commit}, f"10.0.1.{index}")
+    with pytest.raises(pairing.PairingError, match="too many"):
+        desk.start({"name": "a", "commit": commit}, "10.0.2.1")
+
+
+def test_the_answer_needs_the_shared_secret_and_the_seal_resists_tampering():
+    desk = pairing.PairingDesk("b", lambda: "ef" * 16)
+    private, public = pairing.new_secret()
+    started = desk.start({"name": "a", "commit": pairing.commitment(public)}, "10.0.0.1")
+    desk.reveal({"request": started["request"], "pub": format(public, "x")}, "10.0.0.1")
+    desk.decide(desk.waiting()[0]["request"], True)
+    with pytest.raises(pairing.PairingError, match="bad proof"):
+        desk.poll({"request": started["request"], "proof": "00" * 32}, "10.0.0.1")
+    b_public = pairing.peer_value(started["pub"])
+    session = pairing.derive(private, b_public, request=started["request"], a_name="a",
+                             b_name="b", a_public=public, b_public=b_public)
+    answer = desk.poll({"request": started["request"], "proof": session.proof(started["request"])},
+                       "10.0.0.1")
+    assert answer["state"] == "allowed" and "ef" * 16 not in json.dumps(answer)
+    assert session.unseal(answer) == "ef" * 16
+    tampered = {**answer, "sealed": ("00" if answer["sealed"][:2] != "00" else "11") + answer["sealed"][2:]}
+    with pytest.raises(pairing.PairingError, match="does not belong"):
+        session.unseal(tampered)
+
+
+def test_the_popup_lists_and_answers_requests_only_with_this_machines_key(monkeypatch):
+    server = _server()  # this machine's own key, as the shared node runs with
+    monkeypatch.setenv(config.PORT_ENV, str(server.port))
+    try:
+        pairing.begin(f"127.0.0.1:{server.port}")
+        listed = client.local_call("GET", "/wsn/pair/waiting")
+        assert len(listed) == 1 and listed[0]["name"] == config.node_name()
+        stranger = config.NodeEntry("x", f"127.0.0.1:{server.port}", "0f" * 16, "saved")
+        with pytest.raises(client.NodeError, match="pairing key differs"):
+            client._exchange(stranger, "POST", "/wsn/pair/decide",
+                             {"request": listed[0]["request"], "allow": True}, 3.0)
+        decided = _popup({"op": "pair_decide", "request": listed[0]["request"], "allow": True})
+        assert decided["result"]["decided"] == "allowed"
+    finally:
+        server.shutdown()
+
+
+def test_an_older_node_says_how_to_pair_instead(monkeypatch):
+    monkeypatch.setattr(client, "open_post", lambda *args, **kwargs: {"ok": False, "error": "not found"})
+    with pytest.raises(pairing.PairingError, match="older Web Search Neo"):
+        pairing.begin("192.0.2.10")
+
+
+def test_the_daemon_follows_a_pairing_the_popup_may_close_on():
+    server = _paired_server()
+    try:
+        started = _popup({"op": "pair", "address": f"127.0.0.1:{server.port}"})["result"]
+        assert started["state"] == "waiting" and started["code"]
+        server.pairing.decide(server.pairing.waiting()[0]["request"], True)
+        deadline = time.monotonic() + 10
+        answer = {}
+        while time.monotonic() < deadline:
+            answer = _popup({"op": "pair_poll", "attempt": started["attempt"]})["result"]
+            if answer.get("state") != "waiting":
+                break
+            time.sleep(0.3)
+        assert answer["state"] == "paired" and answer["saved"]["name"] == "fake"
+        assert config.resolve("fake").key == "cd" * 16
+    finally:
+        server.shutdown()
+
+
+def test_an_agent_pairs_in_two_calls(monkeypatch):
+    monkeypatch.setattr(node_actions, "PAIR_WAIT_SECONDS", 5.0)
+    server = _paired_server()
+    try:
+        address = f"127.0.0.1:{server.port}"
+        first = asyncio.run(node_actions.browser_node_manage(op="pair", address=address))
+        assert first["success"] and first["code"] in first["next"]
+        server.pairing.decide(server.pairing.waiting()[0]["request"], True)
+        second = asyncio.run(node_actions.browser_node_manage(op="pair", address=address))
+        assert second["success"] and second["state"] == "paired"
+        assert second["status"]["state"] == "online"
+    finally:
+        server.shutdown()
+
+
+# --- Windows Firewall ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("facts, state", [
+    ({"category": "Public", "enabled": ["Domain", "Private", "Public"], "allow": ["Private"]}, "blocked"),
+    ({"category": "Public", "enabled": ["Public"], "allow": ["Private, Public"]}, "open"),
+    ({"category": "Public", "enabled": ["Public"], "named": ["Any"]}, "open"),
+    ({"category": "Public", "enabled": ["Public"], "named": ["Any"], "block": ["Public"]}, "blocked"),
+    ({"category": "Private", "enabled": ["Public"]}, "open"),
+    ({"category": "DomainAuthenticated", "enabled": ["Domain"], "allow": ["Domain"]}, "open"),
+])
+def test_the_firewall_verdict_follows_the_lan_profile(facts, state):
+    assert firewall.judge(facts)["state"] == state
+
+
+def test_opening_the_firewall_goes_through_windows_own_prompt(monkeypatch):
+    scripts = []
+
+    class Done:
+        returncode, stdout, stderr = 0, "", ""
+
+    def fake_powershell(script, timeout):
+        scripts.append(script)
+        return Done()
+
+    monkeypatch.setenv(config.PORT_ENV, "8766")
+    monkeypatch.setattr(firewall, "supported", lambda: True)
+    monkeypatch.setattr(firewall, "_powershell", fake_powershell)
+    monkeypatch.setattr(firewall, "_read", lambda lan_ip: {"supported": True, "state": "open",
+                                                           "program": r"C:\Py\python.exe"})
+    assert firewall.open_ports("192.168.1.115")["state"] == "open"
+    launcher = scripts[0]
+    assert "-Verb RunAs" in launcher, "only Windows' own elevation prompt can grant the change"
+    inner = base64.b64decode(launcher.split("'-EncodedCommand','")[1].split("'")[0]).decode("utf-16-le")
+    assert "-Protocol TCP -LocalPort 8766 -RemoteAddress LocalSubnet" in inner
+    assert "-Protocol UDP -LocalPort 8767 -RemoteAddress LocalSubnet" in inner
+    assert "-Program 'C:\\Py\\python.exe'" in inner and "Disable-NetFirewallRule" in inner
+
+    class Declined:
+        returncode, stdout = 1, ""
+        stderr = "Start-Process : The operation was canceled by the user."
+
+    monkeypatch.setattr(firewall, "_powershell", lambda script, timeout: Declined())
+    with pytest.raises(RuntimeError, match="declined; nothing changed"):
+        firewall.open_ports("192.168.1.115")

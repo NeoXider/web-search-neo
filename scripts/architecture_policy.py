@@ -50,7 +50,9 @@ LEGACY_MAX_LINES = {
     # Raised 1738 -> 1741 (2026-10-21) for the popup's Computers tab and Take over: one
     # pause check in handleCommand, the nodes relay hand-off in onmessage, one status
     # field and one import line; the logic lives in nodes.js and control.js.
-    "chrome-extension/service-worker.js": 1741,
+    # Raised 1741 -> 1742 (2026-10-21) for button pairing: the one spread that registers
+    # nodes.js's companion.pairRequest command; the notification lives in nodes.js.
+    "chrome-extension/service-worker.js": 1742,
     # Lowered 1163 -> 1162 (2026-10-21): the popup's nodes frames are answered by
     # node_link.py; the one-line hello_ack freed the room for that branch and for
     # the one call that starts this computer's node when the companion connects.

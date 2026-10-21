@@ -665,6 +665,7 @@ const captureBackground = createBackgroundCapture(chrome.debugger);
 const tabFollower = createTabFollower(chrome.tabs, chrome.storage?.session);
 const nodeRelay = createNodeRelay(() => (isLiveConnection(socket) ? socket : null));
 const commands = {
+  ...nodeRelay.commands, // companion.pairRequest: another computer asks to pair (nodes.js)
   async "tabs.resolve"({tabId}) {
     return tabFollower.resolve(tabId);
   },

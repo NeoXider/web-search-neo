@@ -10,6 +10,10 @@ Endpoints (all JSON):
   "result": ...}`` or ``{"ok": false, "error": "..."}``.
 * ``POST /wsn/stop`` - signed and loopback-only; how the companion's "Share this
   computer" switch turns a node it started back off.
+* ``POST /wsn/pair/start|reveal|poll`` - open: the button pairing of
+  :mod:`.pairing`, which hands the key over only after a person here allows it.
+* ``GET /wsn/pair/waiting`` and ``POST /wsn/pair/decide`` - signed and
+  loopback-only; how this computer's popup lists and answers those requests.
 
 Discovery is one UDP datagram: a probe of :data:`protocol.DISCOVERY_PROBE` on
 the discovery port is answered with the same facts ``/wsn/hello`` gives.
@@ -27,11 +31,15 @@ import time
 from typing import Any, Callable
 
 from web_search_neo.nodes import protocol
+from web_search_neo.nodes.pairing import PairingDesk, PairingError
 
 LOGGER = logging.getLogger("web_search_neo.nodes.server")
 MAX_BODY_BYTES = 16 * 1024 * 1024
+MAX_PAIR_BODY_BYTES = 8 * 1024
 ALLOWED_TOOLS = frozenset({"web_action", "web_info"})
 _AUTH_FAILURE_DELAY = 0.25
+_PAIR_STEPS = {"/wsn/pair/start": "start", "/wsn/pair/reveal": "reveal", "/wsn/pair/poll": "poll"}
+_LOCAL_POSTS = ("/wsn/stop", "/wsn/pair/decide")
 
 
 def _json_bytes(payload: Any) -> bytes:
@@ -52,6 +60,7 @@ class NodeServer:
         host: str = "0.0.0.0",
         port: int = 8766,
         discovery_port: int | None = 8767,
+        on_pair_request: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.call = call
         self.info = info
@@ -67,6 +76,7 @@ class NodeServer:
         self._udp: socket.socket | None = None
         self._stopped = threading.Event()
         self.discovery_error: str | None = None
+        self.pairing = PairingDesk(name, lambda: self.key, notify=on_pair_request)
 
     # -- lifecycle -------------------------------------------------------------
 
@@ -167,15 +177,27 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _read_body(self) -> bytes | None:
+    def _read_body(self, limit: int = MAX_BODY_BYTES) -> bytes | None:
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             length = -1
-        if length < 0 or length > MAX_BODY_BYTES:
-            self._send(413, {"ok": False, "error": f"body must be 0-{MAX_BODY_BYTES} bytes"})
+        if length < 0 or length > limit:
+            self._send(413, {"ok": False, "error": f"body must be 0-{limit} bytes"})
             return None
         return self.rfile.read(length) if length else b""
+
+    def _loopback(self) -> bool:
+        try:
+            return ipaddress.ip_address(self.client_address[0]).is_loopback
+        except ValueError:
+            return False
+
+    def _local_only(self, nonce: str, what: str) -> bool:
+        if self._loopback():
+            return True
+        self._send(403, {"ok": False, "error": f"{what} only from this node's own machine"}, nonce)
+        return False
 
     def _authenticate(self, body: bytes) -> str | None:
         """The request nonce when authentic; otherwise answers 401 and returns None."""
@@ -194,6 +216,10 @@ class _Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path == "/wsn/hello":
             self._send(200, self.node.hello())
+        elif path == "/wsn/pair/waiting":
+            nonce = self._authenticate(b"")
+            if nonce and self._local_only(nonce, "pairing requests are listed"):
+                self._send(200, {"ok": True, "result": self.node.pairing.waiting()}, nonce)
         elif path == "/wsn/info":
             nonce = self._authenticate(b"")
             if nonce:
@@ -206,7 +232,10 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0]
-        if path not in ("/wsn/call", "/wsn/stop"):
+        if path in _PAIR_STEPS:
+            self._pair_step(_PAIR_STEPS[path])
+            return
+        if path not in ("/wsn/call", *_LOCAL_POSTS):
             self._send(404, {"ok": False, "error": "not found"})
             return
         body = self._read_body()
@@ -217,6 +246,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path == "/wsn/stop":
             self._stop(nonce)
+            return
+        if path == "/wsn/pair/decide":
+            self._decide(nonce, body)
             return
         try:
             request = json.loads(body.decode("utf-8") or "{}")
@@ -238,13 +270,38 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(200, {"ok": True, "result": result}, nonce)
 
     def _stop(self, nonce: str) -> None:
-        try:
-            loopback = ipaddress.ip_address(self.client_address[0]).is_loopback
-        except ValueError:
-            loopback = False
-        if not loopback:
-            self._send(403, {"ok": False, "error": "a node can only be stopped from its own machine"},
-                       nonce)
+        if not self._local_only(nonce, "a node can be stopped"):
             return
         self._send(200, {"ok": True, "result": {"stopping": True}}, nonce)
         threading.Thread(target=self.node.shutdown, name="wsn-node-stop", daemon=True).start()
+
+    def _pair_step(self, step: str) -> None:
+        """One open pairing step; nothing secret leaves before a person here allows it."""
+        body = self._read_body(MAX_PAIR_BODY_BYTES)
+        if body is None:
+            return
+        try:
+            payload = json.loads(body.decode("utf-8") or "{}")
+            if not isinstance(payload, dict):
+                raise ValueError
+        except ValueError:
+            self._send(400, {"ok": False, "error": "body is not a JSON object"})
+            return
+        try:
+            result = getattr(self.node.pairing, step)(payload, self.client_address[0])
+        except PairingError as exc:
+            LOGGER.info("Pairing %s from %s refused: %s", step, self.client_address[0], exc)
+            self._send(400, {"ok": False, "error": str(exc)})
+            return
+        self._send(200, {"ok": True, "result": result})
+
+    def _decide(self, nonce: str, body: bytes) -> None:
+        if not self._local_only(nonce, "pairing requests are answered"):
+            return
+        try:
+            payload = json.loads(body.decode("utf-8") or "{}")
+            result = self.node.pairing.decide(payload.get("request"), payload.get("allow") is True)
+        except (ValueError, AttributeError, PairingError) as exc:
+            self._send(200, {"ok": False, "error": str(exc) or "bad request"}, nonce)
+            return
+        self._send(200, {"ok": True, "result": result}, nonce)

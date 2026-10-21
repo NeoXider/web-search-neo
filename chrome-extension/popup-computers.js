@@ -28,15 +28,28 @@ const nodeNameInput = document.querySelector("#node-name");
 const nodeAddressInput = document.querySelector("#node-address");
 const nodeKeyInput = document.querySelector("#node-key");
 const addNodeButton = document.querySelector("#add-node");
+const pairRequestsNode = document.querySelector("#pair-requests");
+const firewallRow = document.querySelector("#firewall-row");
+const firewallText = document.querySelector("#firewall-text");
+const openFirewallButton = document.querySelector("#open-firewall");
+const pairingBox = document.querySelector("#pairing-box");
+const pairingTitle = document.querySelector("#pairing-title");
+const pairingCode = document.querySelector("#pairing-code");
+const pairingHint = document.querySelector("#pairing-hint");
+const pairingCancelButton = document.querySelector("#pairing-cancel");
 
 const NODES_REFRESH_MS = 15000;
+const REQUESTS_REFRESH_MS = 3000;
+const PAIR_POLL_MS = 1500;
 const CONFIRM_WINDOW_MS = 4000;
 let pairKey = "";
 let pairKeyRevealed = false;
 let loadingNodes = null;
 let armed = {action: "", until: 0};
+let pairing = null; // {attempt, name}: the pairing this popup is showing
+let requestsTimer = 0;
 
-const STATE_WORDS = {online: "online", unpaired: "needs its pairing key", offline: "offline"};
+const STATE_WORDS = {online: "online", unpaired: "not paired yet", offline: "offline"};
 
 function countryChip(code) {
   const chip = document.createElement("span");
@@ -111,6 +124,71 @@ function renderSharing(sharing) {
   shareAddressNode.title = reach.length > 1 ? `Also: ${reach.slice(1).join(", ")}` : "";
   if (sharing?.pair_key) pairKey = String(sharing.pair_key);
   renderPairKey();
+  renderFirewall(running ? sharing?.firewall : null);
+}
+
+function renderFirewall(verdict) {
+  const shown = Boolean(verdict && verdict.supported !== false);
+  firewallRow.hidden = !shown;
+  if (!shown) return;
+  const state = ["open", "blocked", "checking"].includes(verdict.state) ? verdict.state : "unknown";
+  firewallRow.dataset.state = state;
+  firewallText.textContent = {
+    open: "Other computers on this network can reach this one.",
+    blocked: `Other computers can't connect: ${verdict.why || "Windows Firewall keeps them out"}.`,
+    checking: "Checking Windows Firewall...",
+  }[state] || `Firewall state unknown${verdict.why ? `: ${verdict.why}` : ""}.`;
+  firewallText.title = verdict.network ? `Network profile: ${verdict.network}` : "";
+  openFirewallButton.hidden = state === "open" || state === "checking";
+}
+
+// Another computer asked to pair: the same question its Chrome notification asks.
+function pairRequestRow(request) {
+  const item = document.createElement("div");
+  item.className = "pair-request";
+  const title = document.createElement("strong");
+  title.textContent = `${request.name || "A computer"} wants to drive this Chrome`;
+  const answers = document.createElement("span");
+  answers.className = "answers";
+  const allow = document.createElement("button");
+  allow.type = "button";
+  allow.className = "btn small";
+  allow.textContent = "Allow";
+  const deny = document.createElement("button");
+  deny.type = "button";
+  deny.className = "btn ghost small";
+  deny.textContent = "Deny";
+  allow.addEventListener("click", () => answerRequest(request, true, [allow, deny]));
+  deny.addEventListener("click", () => answerRequest(request, false, [allow, deny]));
+  answers.append(allow, deny);
+  const detail = document.createElement("small");
+  const code = document.createElement("span");
+  code.className = "pair-code";
+  code.textContent = String(request.code || "");
+  detail.append(document.createTextNode(`${request.address || ""} · same code there? `), code);
+  item.append(title, answers, detail);
+  return item;
+}
+
+function renderPairRequests(requests) {
+  const list = Array.isArray(requests) ? requests : [];
+  pairRequestsNode.hidden = list.length === 0;
+  pairRequestsNode.replaceChildren(...list.map(pairRequestRow));
+  clearTimeout(requestsTimer);
+  if (list.length) requestsTimer = setTimeout(() => loadNodes(), REQUESTS_REFRESH_MS);
+}
+
+async function answerRequest(request, allow, buttons) {
+  for (const button of buttons) button.disabled = true;
+  try {
+    await send("companion.nodePairDecide", {request: request.request, allow});
+    messageNode.textContent = allow
+      ? `Allowed: ${request.name} is paired and can drive this Chrome.`
+      : `Denied: ${request.name} got nothing.`;
+  } catch (error) {
+    messageNode.textContent = error.message;
+  }
+  await loadNodes();
 }
 
 function nodeButton(label, title, path, handler) {
@@ -175,8 +253,8 @@ function nodeRow(row) {
       () => sendTab(row.name)));
   }
   if (state === "unpaired") {
-    actions.append(nodeButton(`Pair with ${row.name}: enter its key`, "Pair", ICON_PAIR,
-      () => startPairing(row)));
+    actions.append(nodeButton(`Pair with ${row.name}: no key needed, you allow it there`, "Pair",
+      ICON_PAIR, () => pairWith(row.address, row.reported_name || row.name)));
   }
   if (row.source === "saved") {
     const remove = nodeButton(`Forget ${row.name}`, "Forget (click twice)", ICON_REMOVE,
@@ -204,6 +282,10 @@ function renderOverview(result) {
   renderSelf(result?.self);
   renderSharing(result?.sharing);
   renderNodes(result?.nodes);
+  renderPairRequests(result?.pair_requests);
+  // Reopened while a pairing is still waiting: pick it up where it is.
+  const waiting = (result?.pairings || []).find(item => item?.state === "waiting");
+  if (!pairing && waiting?.attempt) followPairing(waiting);
 }
 
 async function loadNodes(options = {}) {
@@ -261,13 +343,66 @@ async function sendTab(name) {
   }
 }
 
-function startPairing(row) {
-  addNodePanel.open = true;
-  nodeNameInput.value = row.reported_name || row.name || "";
-  nodeAddressInput.value = row.address || "";
-  nodeKeyInput.value = "";
-  nodeKeyInput.focus?.();
-  messageNode.textContent = `Enter the pairing key shown on ${row.name} (its Computers tab, or wsn --node --key).`;
+function showPairing(state, title, hint) {
+  pairingBox.hidden = false;
+  pairingBox.dataset.state = state;
+  pairingTitle.textContent = title;
+  pairingHint.textContent = hint;
+  pairingCancelButton.textContent = state === "waiting" || state === "starting" ? "Cancel" : "Close";
+}
+
+// No key to copy: the other computer shows a code and Allow; the daemon waits for it.
+async function pairWith(address, label) {
+  if (pairing) return;
+  const name = label || address;
+  pairing = {attempt: "", name};
+  pairingCode.textContent = "--- ---";
+  showPairing("starting", `Asking ${name}...`, "Contacting that computer.");
+  try {
+    followPairing(await send("companion.nodePair", {address}));
+  } catch (error) {
+    pairing = null;
+    showPairing("denied", `Could not pair with ${name}`, error.message);
+  }
+}
+
+function followPairing(started) {
+  const name = started.name || started.address || "the other computer";
+  pairing = {attempt: started.attempt, name};
+  pairingCode.textContent = String(started.code || "--- ---");
+  showPairing("waiting", `Waiting for ${name}`,
+    `On ${name}, press Allow in the Chrome notification (or its Web Search Neo panel) ` +
+    "if it shows this same code.");
+  pollPairing(started.attempt);
+}
+
+async function pollPairing(attempt) {
+  while (pairing?.attempt === attempt) {
+    await new Promise(done => setTimeout(done, PAIR_POLL_MS));
+    if (pairing?.attempt !== attempt) return;
+    let answer;
+    try {
+      answer = await send("companion.nodePairPoll", {attempt});
+    } catch (error) {
+      answer = {state: "failed", error: error.message};
+    }
+    if (answer?.state === "waiting") continue;
+    const name = answer?.saved?.name || answer?.name || pairing.name;
+    pairing = null;
+    if (answer?.state === "paired") {
+      const state = answer.status?.state;
+      showPairing("paired", `Paired with ${name}`, state === "online"
+        ? `Online. Agents reach it with node="${name}".`
+        : `Saved; it is ${STATE_WORDS[state] || "not answering"} right now.`);
+      await loadNodes();
+    } else if (answer?.state === "denied") {
+      showPairing("denied", `${name} said no`, "Nothing was shared.");
+    } else if (answer?.state === "failed") {
+      showPairing("denied", `Pairing with ${name} failed`, answer.error || "unknown error");
+    } else if (answer?.state !== "cancelled") {
+      showPairing("expired", "The request expired", `Nobody answered on ${name} in time; try again.`);
+    }
+  }
 }
 
 async function removeNode(name, button) {
@@ -339,11 +474,31 @@ function bindComputers() {
         : "Scan done: no other computer answered. Is wsn --node running there, UDP 8767 open?";
     }
   });
+  pairingCancelButton.addEventListener("click", async () => {
+    const attempt = pairing?.attempt;
+    pairing = null;
+    pairingBox.hidden = true;
+    if (attempt) await send("companion.nodePairCancel", {attempt}).catch(() => null);
+  });
+  openFirewallButton.addEventListener("click", async () => {
+    messageNode.textContent = "Windows asks for permission: answer its prompt (it may be behind this window).";
+    try {
+      renderFirewall(await busy(openFirewallButton, () => send("companion.nodeFirewall")));
+      messageNode.textContent = "Firewall rules added: other computers on this network can reach this one.";
+    } catch (error) {
+      messageNode.textContent = error.message;
+    }
+  });
   addNodeButton.addEventListener("click", async () => {
     const address = nodeAddressInput.value.trim();
     if (!address) {
       messageNode.textContent = "Enter the other computer's address, e.g. 192.168.1.115.";
       nodeAddressInput.focus?.();
+      return;
+    }
+    if (!nodeKeyInput.value.trim()) { // no key: pair by button instead
+      addNodePanel.open = false;
+      pairWith(address, nodeNameInput.value.trim());
       return;
     }
     messageNode.textContent = `Adding ${address}...`;
@@ -387,10 +542,20 @@ function previewComputers(type, extra) {
     {name: "home-server", address: "10.8.0.5:8766", source: "saved", state: "offline"},
   ];
   const sharing = {enabled: true, running: true, port: 8766, pair_key: "1f2e-3d4c-5b6a-7980-a1b2-c3d4-e5f6-0718",
-    reach_at: ["192.168.1.154:8766", "10.0.236.10:8766"]};
+    reach_at: ["192.168.1.154:8766", "10.0.236.10:8766"],
+    firewall: {supported: true, state: "blocked", network: "Public",
+      why: "Windows Firewall has no rule for Public networks"}};
+  const requests = [{request: "0a1b2c3d4e5f6071", name: "studio-pc", address: "192.168.1.154", code: "482 913"}];
   if (type === "companion.nodes") {
-    return Promise.resolve({self: me, sharing, nodes, discovered: extra.discover ? 2 : null});
+    return Promise.resolve({self: me, sharing, nodes, discovered: extra.discover ? 2 : null,
+      pair_requests: requests, pairings: []});
   }
+  if (type === "companion.nodePair") {
+    return Promise.resolve({attempt: "preview", code: "482 913", name: "laptop", address: extra.address});
+  }
+  if (type === "companion.nodePairPoll") return Promise.resolve({state: "waiting", attempt: extra.attempt});
+  if (type === "companion.nodeFirewall") return Promise.resolve({...sharing.firewall, state: "open"});
+  if (type === "companion.nodePairDecide") return Promise.resolve({decided: "allowed"});
   if (type === "companion.nodeShare") return Promise.resolve({...sharing, running: Boolean(extra.enabled)});
   if (type === "companion.nodeRotateKey") return Promise.resolve(sharing);
   if (type === "companion.nodeSendTab") return Promise.resolve({sent: true, node: extra.node});
