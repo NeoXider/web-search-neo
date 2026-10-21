@@ -577,3 +577,22 @@ def test_opening_the_firewall_goes_through_windows_own_prompt(monkeypatch):
     monkeypatch.setattr(firewall, "_powershell", lambda script, timeout: Declined())
     with pytest.raises(RuntimeError, match="declined; nothing changed"):
         firewall.open_ports("192.168.1.115")
+
+
+def test_switching_sharing_on_also_lets_the_network_in(monkeypatch):
+    opened = []
+    monkeypatch.setattr(node_link, "_sharing", lambda include_key=True: {"enabled": True, "running": True})
+    monkeypatch.setattr(firewall, "state", lambda ip, wait=True, refresh=False: {
+        "supported": True, "state": "blocked", "why": "Windows Firewall has no rule for Public networks"})
+    monkeypatch.setattr(firewall, "open_ports", lambda ip: opened.append(ip) or {"supported": True, "state": "open"})
+    result = _popup({"op": "share", "enabled": True})["result"]
+    assert result["firewall"]["state"] == "open" and len(opened) == 1
+
+    def declined(ip):
+        raise RuntimeError("The Windows permission prompt was declined; nothing changed.")
+
+    monkeypatch.setattr(firewall, "open_ports", declined)
+    result = _popup({"op": "share", "enabled": True})["result"]
+    assert result["running"] is True, "a declined prompt leaves sharing on"
+    assert result["firewall"]["state"] == "blocked" and "declined" in result["firewall"]["error"]
+    assert config.share_enabled() is True

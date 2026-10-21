@@ -96,6 +96,26 @@ def _op_remove(message: dict[str, Any], _version: str) -> dict[str, Any]:
     return {"removed": config.remove_node(message.get("name"))}
 
 
+def _settle_firewall() -> dict[str, Any]:
+    """After the person switched sharing on: let the LAN in if Windows Firewall keeps it out.
+
+    The switch is the person's consent, and Windows still asks its own question (UAC),
+    so nothing changes unless they accept it there. A declined or failed prompt leaves
+    sharing on and says why; the popup offers the same step again.
+    """
+    from web_search_neo.nodes import identity
+
+    addresses = identity.lan_addresses()
+    lan_ip = addresses[0] if addresses else ""
+    verdict = firewall.state(lan_ip, refresh=True)
+    if verdict.get("state") != "blocked":
+        return verdict
+    try:
+        return firewall.open_ports(lan_ip)
+    except Exception as exc:  # declined, timed out, or not allowed to change rules
+        return {**verdict, "error": str(exc) or type(exc).__name__}
+
+
 def _op_share(message: dict[str, Any], _version: str) -> dict[str, Any]:
     enabled = bool(message.get("enabled"))
     config.set_share(enabled)
@@ -111,7 +131,10 @@ def _op_share(message: dict[str, Any], _version: str) -> dict[str, Any]:
     elif not enabled and running:
         client.stop_local()
         _wait_running(False)
-    return _sharing(include_key=enabled)
+    state = _sharing(include_key=enabled)
+    if enabled:
+        state["firewall"] = _settle_firewall()
+    return state
 
 
 def _op_rotate_key(_message: dict[str, Any], _version: str) -> dict[str, Any]:

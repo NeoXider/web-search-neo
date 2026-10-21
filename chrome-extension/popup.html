@@ -82,6 +82,7 @@
                   fill="currentColor"/>
           </svg>
           <span id="self-summary-text">Locating this computer...</span>
+          <span id="share-chip" class="share-chip" data-state="off" hidden>-</span>
         </button>
 
         <section id="agent-tabs" class="card agent-tabs" aria-labelledby="agent-tabs-title">
@@ -179,23 +180,23 @@
         <label class="switch-row">
           <span class="switch-text">
             <strong>Share this computer</strong>
-            <small>On by default: computers you paired with can drive this Chrome.
-              Switch off to refuse them all.</small>
+            <small id="share-state" data-state="checking">Checking...</small>
           </span>
           <input id="share" type="checkbox" role="switch"
                  aria-label="Share this computer with paired computers on the network"
-                 title="Share this computer" disabled>
+                 title="On by default. Switching it on also lets this network in (Windows asks once)"
+                 disabled>
         </label>
+        <div id="firewall-row" class="firewall-row" data-state="checking" hidden>
+          <span class="fw-dot" aria-hidden="true"></span>
+          <span id="firewall-text" class="fw-text">Checking Windows Firewall...</span>
+          <button id="open-firewall" type="button" class="btn small"
+                  aria-label="Let other computers on this network reach this one (Windows asks first)"
+                  title="Windows asks for permission first" hidden>Allow in firewall</button>
+        </div>
         <section id="share-details" class="card share-card" hidden>
           <p class="hint">On the other computer: Computers &rarr; Scan &rarr; Pair, then press
             Allow here. No key to copy.</p>
-          <div id="firewall-row" class="firewall-row" data-state="checking" hidden>
-            <span class="fw-dot" aria-hidden="true"></span>
-            <span id="firewall-text" class="fw-text">Checking Windows Firewall...</span>
-            <button id="open-firewall" type="button" class="btn small"
-                    aria-label="Let other computers on this network reach this one (Windows asks first)"
-                    title="Windows asks for permission first" hidden>Allow in firewall</button>
-          </div>
           <div class="kv">
             <span class="key">Address</span>
             <span id="share-address" class="mono">-</span>

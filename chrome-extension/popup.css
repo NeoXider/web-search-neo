@@ -667,7 +667,28 @@ kbd {
   border-radius: 50%;
   animation: spin .8s linear infinite;
 }
-.firewall-row { display: flex; align-items: center; gap: 7px; font-size: 12px; }
+.firewall-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: -4px 0 10px;
+  padding: 7px 10px;
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--line));
+  border-radius: 10px;
+  font-size: 12px;
+}
+#share-state[data-state="ready"] { color: var(--ok); }
+#share-state[data-state="blocked"], #share-state[data-state="error"] { color: var(--warn); }
+.share-chip {
+  flex: none;
+  margin-left: auto;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  font-size: 11px;
+}
+.share-chip[data-state="ready"] { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 50%, var(--line)); }
+.share-chip[data-state="blocked"] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 50%, var(--line)); }
 .fw-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
 .firewall-row[data-state="open"] .fw-dot { background: var(--ok); }
 .firewall-row[data-state="blocked"] .fw-dot { background: var(--warn); animation: pulse-ring 1.4s ease-out infinite; color: var(--warn); }

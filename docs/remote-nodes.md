@@ -122,6 +122,12 @@ prompt is dismissed, and they would beat any allow rule). It runs through Window
 UAC prompt: nothing changes unless the person accepts it. `web_info(topic="nodes")`
 reports the same verdict as `sharing.firewall` (`open`, `blocked`, `checking`).
 
+The **Share this computer** switch is on by default and says what that means right
+now: off, starting, on and reachable, or on but kept out by the firewall (the
+Overview strip carries the same as a chip). Switching it on does the whole setup -
+it starts the node and, when the firewall keeps the LAN out, asks Windows once. A
+declined prompt leaves sharing on, says so, and **Allow in firewall** asks again.
+
 ## From the popup
 
 - **Overview** shows this computer's LAN address, public IP and place in one strip.

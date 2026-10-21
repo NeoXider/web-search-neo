@@ -15,8 +15,9 @@ const REQUEST_TIMEOUT_MS = 20000;
 // Starting a node server waits for it to come up, and a LAN scan probes every answer.
 const SLOW_OPS = new Set(["share", "rotate_key", "send_tab", "pair"]);
 const SLOW_TIMEOUT_MS = 45000;
-// Windows' UAC prompt waits for the person; the daemon gives up after 150 s.
-const OP_TIMEOUT_MS = {firewall: 160000};
+// Windows' UAC prompt waits for the person; the daemon gives up after 150 s. Switching
+// sharing on may ask the same question.
+const OP_TIMEOUT_MS = {firewall: 160000, share: 175000};
 const PAIR_NOTICE = "wsn-pair-";
 const SOCKET_WAIT_MS = 6000;
 

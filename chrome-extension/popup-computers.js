@@ -14,6 +14,8 @@ const selfPublicNode = document.querySelector("#self-public");
 const selfPlaceNode = document.querySelector("#self-place");
 const selfIspNode = document.querySelector("#self-isp");
 const shareInput = document.querySelector("#share");
+const shareStateNode = document.querySelector("#share-state");
+const shareChipNode = document.querySelector("#share-chip");
 const shareDetailsNode = document.querySelector("#share-details");
 const shareAddressNode = document.querySelector("#share-address");
 const pairKeyNode = document.querySelector("#pair-key");
@@ -114,10 +116,36 @@ function renderSelf(me) {
     : "This computer's address is not known yet";
 }
 
+// off | starting | checking | ready | blocked: what "shared" means right now.
+function sharingState(sharing) {
+  const running = Boolean(sharing?.running);
+  if (!sharing?.enabled && !running) return "off";
+  if (!running) return "starting";
+  const verdict = sharing?.firewall;
+  if (!verdict || verdict.supported === false || verdict.state === "open") return "ready";
+  return verdict.state === "blocked" ? "blocked" : "checking";
+}
+
+const SHARE_WORDS = {
+  off: ["Off: no other computer can drive this Chrome.", "not shared"],
+  starting: ["On: starting...", "sharing..."],
+  checking: ["On: checking whether this network can reach it...", "sharing..."],
+  ready: ["On: computers you pair with can drive this Chrome.", "shared"],
+  blocked: ["On, but other computers cannot reach it yet: Windows Firewall needs one confirmation.",
+    "not reachable"],
+};
+
 function renderSharing(sharing) {
   const running = Boolean(sharing?.running);
+  const state = sharingState(sharing);
   shareInput.checked = Boolean(sharing?.enabled || running);
   shareInput.disabled = false;
+  shareInput.dataset.state = state;
+  shareStateNode.dataset.state = state;
+  shareStateNode.textContent = SHARE_WORDS[state][0];
+  shareChipNode.hidden = false;
+  shareChipNode.dataset.state = state;
+  shareChipNode.textContent = SHARE_WORDS[state][1];
   shareDetailsNode.hidden = !running;
   const reach = Array.isArray(sharing?.reach_at) ? sharing.reach_at : [];
   shareAddressNode.textContent = String(reach[0] || "-");
@@ -127,19 +155,18 @@ function renderSharing(sharing) {
   renderFirewall(running ? sharing?.firewall : null);
 }
 
+// Shown only when something is left to do; the state itself is under the switch.
 function renderFirewall(verdict) {
-  const shown = Boolean(verdict && verdict.supported !== false);
-  firewallRow.hidden = !shown;
-  if (!shown) return;
-  const state = ["open", "blocked", "checking"].includes(verdict.state) ? verdict.state : "unknown";
+  const state = ["open", "blocked", "checking"].includes(verdict?.state) ? verdict.state : "unknown";
+  firewallRow.hidden = !verdict || verdict.supported === false || state === "open" || state === "checking";
+  if (firewallRow.hidden) return;
   firewallRow.dataset.state = state;
-  firewallText.textContent = {
-    open: "Other computers on this network can reach this one.",
-    blocked: `Other computers can't connect: ${verdict.why || "Windows Firewall keeps them out"}.`,
-    checking: "Checking Windows Firewall...",
-  }[state] || `Firewall state unknown${verdict.why ? `: ${verdict.why}` : ""}.`;
+  firewallText.textContent = state === "blocked"
+    ? `Other computers can't connect: ${verdict.why || "Windows Firewall keeps them out"}.`
+    : `Firewall state unknown${verdict.why ? `: ${verdict.why}` : ""}.`;
+  if (verdict.error) firewallText.textContent += ` ${verdict.error}`;
   firewallText.title = verdict.network ? `Network profile: ${verdict.network}` : "";
-  openFirewallButton.hidden = state === "open" || state === "checking";
+  openFirewallButton.hidden = false;
 }
 
 // Another computer asked to pair: the same question its Chrome notification asks.
@@ -452,12 +479,17 @@ function bindComputers() {
   shareInput.addEventListener("change", async () => {
     const enabled = shareInput.checked;
     shareInput.disabled = true;
-    messageNode.textContent = enabled ? "Starting the node on this computer..." : "Stopping the node...";
+    messageNode.textContent = enabled
+      ? "Turning sharing on. If Windows Firewall keeps this network out, Windows asks once - answer its prompt."
+      : "Stopping the node...";
     try {
-      renderSharing(await send("companion.nodeShare", {enabled}));
-      messageNode.textContent = enabled
-        ? "Shared. Other computers add this one with the address and pairing key below."
-        : "This computer is no longer shared.";
+      const sharing = await send("companion.nodeShare", {enabled});
+      renderSharing(sharing);
+      const state = sharingState(sharing);
+      messageNode.textContent = !enabled ? "This computer is no longer shared."
+        : state === "ready" ? "Shared. On the other computer: Computers, Scan, Pair - then Allow here."
+          : state === "blocked" ? (sharing.firewall?.error || "Windows Firewall still keeps other computers out.")
+            : "Shared; still checking whether this network can reach it.";
     } catch (error) {
       shareInput.checked = !enabled;
       shareInput.disabled = false;
