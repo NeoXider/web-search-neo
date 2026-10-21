@@ -1,6 +1,6 @@
 ---
 name: web-search-neo
-description: Use the Web Search Neo MCP server for free web search without API keys, resilient multi-engine fallback, HTTP page fetching, the user's current signed-in Chrome with AI-group tabs, isolated browser profiles, accessibility-level page inspection, form filling and upload, page console and network diagnostics, screenshots, deterministic canvas/WebGL game testing, and reusable macros kept as JSON files in the calling project. Trigger when a task needs current web results, visible work in existing Chrome tabs, authorized browser state, reading or driving a rendered page, diagnosing a broken page, writing or replaying a repeated browser flow, or frame-exact keyboard, mouse, and touch input through the two-tool web_info/web_action contract.
+description: Use the Web Search Neo MCP server for free web search without API keys, resilient multi-engine fallback, HTTP page fetching, the user's current signed-in Chrome with AI-group tabs, isolated browser profiles, accessibility-level page inspection, form filling and upload, page console and network diagnostics, screenshots, deterministic canvas/WebGL game testing, and reusable macros kept as JSON files in the calling project. Trigger when a task needs current web results, visible work in existing Chrome tabs, authorized browser state, reading or driving a rendered page, diagnosing a broken page, writing or replaying a repeated browser flow, or frame-exact keyboard, mouse, and touch input through the two-tool web_info/web_action contract. Also drives the Chrome of other computers on the LAN with node="<name>" after a one-click pairing.
 ---
 
 # Web Search Neo
@@ -12,7 +12,7 @@ they are meant to be used in this order.
 | --- | --- |
 | `web_info(topic="actions")` | What can I call? Every action with its summary and required parameters. `params={"group": "macro"}` narrows it to one group (`search`, `fetch`, `session`, `page`, `game`, `macro`). |
 | `web_info(topic="skill")` | How do I work? The compact inspect → act → verify playbook, plus the names of its detailed sections. |
-| `web_info(topic="skill", params={"section": "<name>"})` | The full section: when it applies, the calls in order, the rules that cannot be guessed, and what to avoid. Sections are `start`, `loop`, `locators`, `forms`, `macros`, `guarded`, `parallel`, `search`, `diagnostics`, `games`, `troubleshooting`. |
+| `web_info(topic="skill", params={"section": "<name>"})` | The full section: when it applies, the calls in order, the rules that cannot be guessed, and what to avoid. Sections are `start`, `loop`, `locators`, `forms`, `macros`, `guarded`, `parallel`, `search`, `diagnostics`, `games`, `audit`, `testing`, `computers`, `troubleshooting`. |
 | `web_info(topic="action_schema", params={"action": "<name>"})` | Exactly what one action or one observation topic accepts: optional names, types, defaults. |
 
 `web_info()` with no arguments returns the whole contract at once — action index, topics,
@@ -71,10 +71,9 @@ outcome happened. After navigation or rerender, discard old selectors, refs, and
   `attach_tab` is recorded only from the claim onwards. `dropped` counts what the 500-entry
   buffer evicted, so an empty list plus a high `dropped` is not a quiet page.
 - `screenshot`, `game_probe`, `browser_status`, `browser_tabs`, `search_status`.
-- `nodes`: this computer's LAN/public IP and location, and the other computers running
-  `wsn --node` (online / unpaired / offline; `discover=true` scans the LAN). Add
-  `node="<name or IP>"` to any `web_action` or `web_info` call to run it in that
-  computer's Chrome; pair one with the `nodes` action (`op="add"`, address, key).
+- `nodes`: this computer's LAN/public IP and location, whether its firewall lets the LAN
+  in, and every other computer running Web Search Neo (online / unpaired / offline;
+  `discover=true` scans the LAN). See [Other computers](#other-computers).
 - `execute_js`: run a JavaScript snippet in a session's page and read its JSON-serialisable
   return value. The escape hatch for state the DOM reads do not expose — `localStorage`,
   virtualised rows, framework stores — and for mutations without an input-shaped
@@ -168,10 +167,12 @@ stay reachable, so local services work unchanged.
   driving, a server installed from a wheel - and `refused` names which. It moves the user's
   checkout, so ask first; after it runs, read `server_restart_note` before assuming this
   process picked the new code up (it does not).
-- A tab an agent is driving wears a small slime on its favicon (green while acting, amber
-  for 5 quiet minutes after), a ghost cursor glides between the agent's pointer points
-  with its name tag and lands a fading ring on every press (red when refused), and the
-  companion's toolbar badge reads `AI`. Such a tab is
+- A tab an agent is driving wears an animated slime on its favicon (a pulsing ring while
+  acting, a green breath for a minute after, a dozing amber one for 5 quiet minutes), a
+  ghost cursor glides between the agent's pointer points with its name tag and a caption
+  of what it does ("Click · Sign in", "Typing…"), and lands a fading ring on every press
+  (red when refused); its tab group turns green, then yellow, and the toolbar icon spins
+  while commands arrive. Such a tab is
   agent-held: observe it read-only
   (`page_text`/`page_outline`/`screenshot`) or open your own session — acting on it
   collides mid-run, and claiming it is refused with the holder named. Pointer input is
@@ -179,6 +180,13 @@ stay reachable, so local services work unchanged.
   cursor is hidden from every screenshot the agent reads back. The signals are on by
   default; the user can turn them off for their Chrome in the popup (**Agent presence**),
   or everywhere with `WEB_SEARCH_NEO_AGENT_PRESENCE=0` in the server environment.
+- The user can press **Take over** (or Alt+Shift+P): every page- or tab-changing command is
+  then refused with a sentence saying the user took over, reads keep working, and the tab
+  groups turn orange. Stop and wait for **Resume**; do not retry in a loop, and do not open
+  a different browser to get around it.
+- One server holds 30 browser sessions at once by default (`WEB_SEARCH_NEO_MAX_SESSIONS`,
+  or the popup's setting; `0` means no cap). The refusal at the cap names every holder;
+  close your own sessions when done instead of waiting for the idle reaper.
 - Chrome's "started debugging this browser" banner on driven tabs is mandatory platform
   UI and cannot be dismissed while the tab is driven; its Cancel only detaches until the
   next action. Silence it by relaunching Chrome once with `--silent-debugger-extension-api`,
@@ -194,6 +202,30 @@ stay reachable, so local services work unchanged.
   `attach` uses a Chrome you started with a DevTools port and preserves its window mode.
 - No normal action should steal focus. `show` is the sole foreground opt-in; call it only
   when the user explicitly asks to see the controlled tab. It never changes window state.
+
+## Other computers
+
+`node="<name or IP>"` on `web_action` or `web_info` runs the whole call on another
+computer: its Chrome, its sessions, its files, its network. The answer carries `via_node`.
+
+1. `web_info(topic="nodes", params={"discover": true})` lists them: `online` (paired and
+   answering), `unpaired` (answering, key missing or different), `offline`.
+2. Pair an unpaired one with no key: `web_action nodes op="pair"` with `address` (or a
+   name). The first call returns `code`; tell the user that code. The other computer shows
+   it in a Chrome notification with Allow / Deny. When they have pressed Allow, call
+   `op="pair"` again with the same address: it waits up to 90 s and returns
+   `state: "paired"`. `denied` means they said no - do not ask again unprompted.
+3. Use `node="<saved name>"` from then on. `session_id`, `agent_label` and
+   `profile_mode` rules apply there exactly as here; `current` is that user's own Chrome.
+
+- `offline`: the computer is off, its bridge is not running, or its firewall keeps the LAN
+  out. Its popup (Share this computer) says which and has the fix; say so to the user
+  rather than retrying.
+- A node does not relay to a third computer, and refuses `update_companion`.
+- Traffic between computers is signed but not encrypted: say so before moving anything
+  sensitive across an untrusted network.
+- `op="add"` with `key` saves a computer whose key the user copied by hand; `op="ping"`,
+  `op="list"` and `op="remove"` do what they say.
 
 ## Forms
 

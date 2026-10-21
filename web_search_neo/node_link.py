@@ -12,8 +12,9 @@ scans the LAN), ``add``/``remove`` a node, ``share`` (start or stop this
 machine's node server), ``rotate_key``, ``send_tab`` (open a URL in another
 computer's Chrome and leave the tab there), the button pairing of
 :mod:`web_search_neo.nodes.pairing` - ``pair``/``pair_poll``/``pair_cancel`` on
-the computer asking, ``pair_decide`` on the one being asked - and ``firewall``,
-which admits the node through Windows Firewall behind its own UAC prompt.
+the computer asking, ``pair_decide`` on the one being asked - ``firewall``,
+which admits the node through Windows Firewall behind its own UAC prompt, and
+``logon_start``, the "Start with Windows" switch (:mod:`web_search_neo.logon_start`).
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ import threading
 import time
 from typing import Any, Callable
 
+from web_search_neo import logon_start
 from web_search_neo.nodes import client, config, firewall, overview, pairing
 from web_search_neo.process_probe import popen_detached
 
@@ -73,6 +75,7 @@ def _op_overview(message: dict[str, Any], version: str) -> dict[str, Any]:
         sharing["pair_key"] = config.display_key(config.load_or_create_key())
     result["pair_requests"] = _waiting_requests() if sharing.get("running") else []
     result["pairings"] = _recent_pairings()
+    result["logon_start"] = logon_start.apply() if _autostart_allowed() else logon_start.state()
     return result
 
 
@@ -243,6 +246,10 @@ def _op_pair_decide(message: dict[str, Any], _version: str) -> dict[str, Any]:
     })
 
 
+def _op_logon_start(message: dict[str, Any], _version: str) -> dict[str, Any]:
+    return logon_start.set_wanted(message.get("enabled") is True)
+
+
 def _op_firewall(_message: dict[str, Any], _version: str) -> dict[str, Any]:
     from web_search_neo.nodes import identity
 
@@ -262,6 +269,7 @@ OPERATIONS: dict[str, Callable[[dict[str, Any], str], dict[str, Any]]] = {
     "pair_cancel": _op_pair_cancel,
     "pair_decide": _op_pair_decide,
     "firewall": _op_firewall,
+    "logon_start": _op_logon_start,
 }
 
 
@@ -304,7 +312,7 @@ def ensure_shared_node() -> None:
     ``WEB_SEARCH_NEO_NODE_AUTOSTART=0`` leaves starting it to a person.
     """
     global _last_autostart
-    if os.getenv(AUTOSTART_ENV, "1").strip().lower() in {"0", "false", "no", "off"}:
+    if not _autostart_allowed():
         return
     try:
         if not config.share_enabled() or _sharing(include_key=False).get("running"):
@@ -319,6 +327,27 @@ def ensure_shared_node() -> None:
         LOGGER.info("Could not start the shared node: %s: %s", type(exc).__name__, exc)
 
 
+def _autostart_allowed() -> bool:
+    return os.getenv(AUTOSTART_ENV, "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _on_companion_connected() -> None:
+    ensure_shared_node()
+    if not _autostart_allowed():
+        return
+    # On by default: the extension's first connection after an install or an update
+    # writes the logon entry (or moves it to where this checkout lives now).
+    verdict = logon_start.apply()
+    if verdict.get("error"):
+        LOGGER.info("Could not write the logon entry: %s", verdict["error"])
+
+
 def ensure_shared_node_soon() -> None:
-    """:func:`ensure_shared_node` off the caller's thread (it probes and may spawn)."""
-    threading.Thread(target=ensure_shared_node, name="wsn-node-autostart", daemon=True).start()
+    """What the daemon does when the companion connects, off the caller's thread.
+
+    It starts this computer's node (sharing on) and keeps the "Start with Windows"
+    entry as the popup's switch says; both probe or write, so neither may hold up
+    the companion's handshake. ``WEB_SEARCH_NEO_NODE_AUTOSTART=0`` skips both.
+    """
+    threading.Thread(target=_on_companion_connected, name="wsn-node-autostart",
+                     daemon=True).start()

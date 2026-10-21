@@ -194,6 +194,16 @@
                   aria-label="Let other computers on this network reach this one (Windows asks first)"
                   title="Windows asks for permission first" hidden>Allow in firewall</button>
         </div>
+        <label id="logon-row" class="switch-row" hidden>
+          <span class="switch-text">
+            <strong>Start with Windows</strong>
+            <small id="logon-state" data-state="on">-</small>
+          </span>
+          <input id="logon-start" type="checkbox" role="switch"
+                 aria-label="Start the bridge and this computer's sharing when you log in to Windows"
+                 title="On by default: after a restart this computer is reachable without starting an agent"
+                 disabled>
+        </label>
         <section id="share-details" class="card share-card" hidden>
           <p class="hint">On the other computer: Computers &rarr; Scan &rarr; Pair, then press
             Allow here. No key to copy.</p>

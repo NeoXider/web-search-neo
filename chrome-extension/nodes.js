@@ -94,6 +94,8 @@ export function createNodeRelay(liveSocket) {
         return decide(String(msg.request || ""), msg.allow === true);
       case "companion.nodeFirewall":
         return request("firewall");
+      case "companion.nodeLogonStart":
+        return request("logon_start", {enabled: msg.enabled === true});
       default:
         return null;
     }

@@ -160,6 +160,20 @@ declined prompt leaves sharing on, says so, and **Allow in firewall** asks again
 - A node does not relay: a call that names another node from inside a node is refused.
 - `POST /wsn/stop` is accepted only from the node's own machine.
 
+## After a restart
+
+Pairing is kept on disk on both computers, and the firewall rules stay. What has to come
+back is the bridge daemon, which starts the node: the popup's **Start with Windows**
+switch (on by default) registers it to start at logon - one value under
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, no admin rights - so a rebooted
+computer is reachable again as soon as you log in, before anyone starts an agent there.
+The daemon writes the entry each time the companion connects (so installing or updating
+the extension switches it on) unless the switch was turned off, which removes it.
+
+A pairing ends only when the other computer makes a **New key**. If its IP address
+changed, **Scan** finds it at the new one; press **Pair** again (or reserve its address
+in the router).
+
 ## Updating a computer
 
 In the folder Web Search Neo was cloned to:
@@ -179,7 +193,8 @@ an MCP server already running keeps its code until its client restarts it.
 | Variable | Effect |
 | --- | --- |
 | `WEB_SEARCH_NEO_NODE_SHARE` | `0` makes "not shared" the default; the popup switch still overrides it. |
-| `WEB_SEARCH_NEO_NODE_AUTOSTART` | `0` stops the bridge from starting the node when the companion connects. |
+| `WEB_SEARCH_NEO_NODE_AUTOSTART` | `0` stops the bridge from starting the node, and from writing the logon entry, when the companion connects. |
+| `WEB_SEARCH_NEO_LOGON_START` | `0` makes **Start with Windows** off by default; the popup's switch still wins. |
 | `WEB_SEARCH_NEO_NODE_PORT` | HTTP port a node listens on, default `8766`. |
 | `WEB_SEARCH_NEO_NODE_HOST` | Interface a node binds, default `0.0.0.0` (all). |
 | `WEB_SEARCH_NEO_NODE_DISCOVERY_PORT` | UDP port of the LAN discovery answer, default `8767`. |

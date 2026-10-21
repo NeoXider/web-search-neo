@@ -23,7 +23,10 @@ and explicit callbacks instead of importing either facade or accessing its globa
   HTTP transport and its UDP discovery answer, this machine's LAN/public IP and location,
   and the combined overview. It touches no browser; `node_actions.py` connects it to the
   facade (`node=` forwarding, the `nodes` topic and action, `wsn --node`) and
-  `node_link.py` answers the companion popup inside the bridge daemon.
+  `node_link.py` answers the companion popup inside the bridge daemon. Pairing by button
+  (`nodes/pairing.py`) and the Windows Firewall verdict (`nodes/firewall.py`) live in the
+  package; `logon_start.py` is the "Start with Windows" entry and `run_modes.py` the
+  `--bridge`, `--node` and `--update` command lines.
 
 Top-level helpers extracted from the facades: `dispatch.py` is the ordered-action loop behind
 `web_action`, macro replays and test_run (main keeps a thin `_execute_actions` that passes

@@ -677,7 +677,8 @@ kbd {
   border-radius: 10px;
   font-size: 12px;
 }
-#share-state[data-state="ready"] { color: var(--ok); }
+#share-state[data-state="ready"], #logon-state[data-state="on"] { color: var(--ok); }
+#logon-state[data-state="error"] { color: var(--warn); }
 #share-state[data-state="blocked"], #share-state[data-state="error"] { color: var(--warn); }
 .share-chip {
   flex: none;

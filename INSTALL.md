@@ -285,8 +285,10 @@ That listener is not part of the MCP server process. It is a standalone daemon �
 `web_search_neo/bridge_daemon.py` — which owns the port, holds the one connection to the companion, and
 relays commands for any number of local MCP clients. You do not install or configure it: an
 MCP server starts it detached as it comes up, if nothing is listening yet, and it then
-outlives that server. Nothing is registered for autostart: no service, no scheduled task, no
-login item.
+outlives that server. On Windows the companion popup's **Start with Windows** switch (on by
+default) also registers it to start at logon: one `HKCU\...\CurrentVersion\Run` value, no
+service, no scheduled task, no admin rights. Switch it off to leave starting it to the MCP
+servers.
 
 Two consequences are worth knowing before you troubleshoot anything:
 
@@ -500,6 +502,15 @@ A provider may report a regional challenge while the overall service remains hea
 ## Updating
 
 ```text
+python main.py --update
+```
+
+pulls the checkout (fast-forward only), stops this computer's LAN node and the bridge daemon,
+starts a fresh daemon and reloads the Chrome companion onto the new files; the daemon brings
+the node back by itself. It does not cut off agents that are driving tabs unless given
+`--force`. By hand the same is:
+
+```text
 git pull --ff-only
 python -m pip install -r requirements.txt
 ```
@@ -597,6 +608,8 @@ Set these for the MCP server process before it starts.
 | `WEB_SEARCH_NEO_BRIDGE_AUTOSPAWN` | `0`, `false`, or `no` stops a server from starting a daemon; it then works only if one is already running. |
 | `WEB_SEARCH_NEO_BRIDGE_CONNECT_TIMEOUT` | How long a server keeps trying to reach a daemon, including one it just started, default `12` seconds. |
 | `WEB_SEARCH_NEO_BRIDGE_START_TIMEOUT` | How long startup waits for that first attempt before it continues in the background, default `2` seconds. |
+| `WEB_SEARCH_NEO_LOGON_START` | `0` makes the popup's **Start with Windows** off by default; a choice made in the popup still wins. |
+| `WEB_SEARCH_NEO_NODE_SHARE` | `0` makes **Share this computer** off by default. The other `WEB_SEARCH_NEO_NODE_*` settings are in [docs/remote-nodes.md](docs/remote-nodes.md). |
 | `WEB_SEARCH_NEO_ALLOW_PLAIN_HTTP` | Accept unencrypted `http://` to public hosts. |
 | `WEB_SEARCH_NEO_DOWNLOAD_DIR` | The only directory fetch `save_to` may write into, default `downloads/` under the server's working directory. |
 | `WEB_SEARCH_NEO_LOG_FILE` | Path of the server's `msp_server.log`, instead of the per-user state directory. |
@@ -723,9 +736,9 @@ Clicking the toolbar icon resets that schedule and retries immediately.
 
 ### Starting fresh after a reboot
 
-Nothing needs clicking. If the logon launcher (`scripts/install_bridge_autostart.bat`,
-run once) is in place, the bridge is already listening; otherwise the first MCP run
-starts a daemon on demand. Opening Chrome then reconnects the companion by itself and
+Nothing needs clicking. With **Start with Windows** on (the default) the bridge is
+already listening when you log in, and this computer's LAN node with it; otherwise the
+first MCP run starts a daemon on demand. Opening Chrome then reconnects the companion by itself and
 its badge turns `ON` within seconds. If it reads `OFF`, press **Reconnect** in the popup —
 and **Reload** the card first when the folder Chrome loads is not the one
 `setup_current_chrome` reports in `extension_directory`.

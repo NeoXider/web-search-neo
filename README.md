@@ -25,6 +25,8 @@ look, `web_action` to act — and behind them four capabilities:
 | **Perception** | An accessibility outline, readable text, semantic element lookup, the page console, and its HTTP traffic. |
 | **Isolation** | Separate Selenium profiles — isolated (the default for a new session), temporary, persistent, or attached. |
 | **Site checks** | For your own site: a passive security report graded A–F, load metrics, HAR export, and step-by-step regression tests. |
+| **Other computers** | The Chrome of another PC on your network, with `node="<name>"` on any call. Pair once with a button and a six-digit code; no key to copy. |
+| **You stay in charge** | Driven tabs are marked (animated favicon, ghost cursor, captions, coloured tab groups), and **Take over** in the popup pauses every agent at once. |
 
 Brave is the default search route. DuckDuckGo, Yahoo, Bing, Mojeek, and
 Startpage are available as fallbacks; an engine that keeps answering "nothing"
@@ -33,7 +35,7 @@ where another finds hits is tried last and named in `unreliable_engines`.
 ## Contents
 
 - [Quick start](#quick-start) · [Connect to LM Studio](#connect-to-lm-studio)
-- [**Examples**](#examples) — copy-paste calls for the seven things people do most
+- [**Examples**](#examples) — copy-paste calls for the eight things people do most
 - [**Check your own site**](#check-your-own-site) — `security_report`, `perf_report`, `har_export`, `test_run` · [the long version](docs/site-checks.md)
 - [Deep dives: playing games](docs/playing-games.md) · [complex forms](docs/complex-forms.md)
 - [Extending Web Search Neo](docs/extending.md) — plugin actions, observation topics, and search providers
@@ -70,6 +72,19 @@ python main.py
 The server uses MCP over stdio. Keep stdout reserved for MCP messages; rotating diagnostic logs are written to `%LOCALAPPDATA%\web-search-neo\logs\msp_server.log` on Windows, or `$XDG_STATE_HOME/web-search-neo/logs/msp_server.log` — by default under `~/.local/state` — elsewhere; `WEB_SEARCH_NEO_LOG_FILE` overrides the path. The companion bridge runs as [its own process](#the-bridge-daemon) and keeps a separate rotating log at `%LOCALAPPDATA%\WebSearchNeo\bridge-daemon.log`, or `$XDG_DATA_HOME/WebSearchNeo/bridge-daemon.log` — by default `~/.local/share/WebSearchNeo/bridge-daemon.log` — because two processes rotating one file collide on Windows.
 
 For Linux/macOS activation and detailed setup/troubleshooting, see [INSTALL.md](INSTALL.md).
+
+Then, in this order:
+
+1. **Point your MCP client at it** — [LM Studio](#connect-to-lm-studio) below, or any
+   client that runs `python main.py` over stdio.
+2. **Optional: your own Chrome.** Load `chrome-extension/` once as an unpacked extension
+   ([three steps](#connect-your-already-open-chrome)) so agents can work in your
+   signed-in browser, visibly, in the `🟢 AI` tab group.
+3. **Optional: other computers.** Do the same on another PC and press **Pair** in the
+   popup's **Computers** tab ([how](#other-computers-on-your-network)).
+
+Later, `python main.py --update` pulls the checkout and moves the bridge, the LAN node and
+the Chrome companion onto the new code in one step.
 
 ## Connect to LM Studio
 
@@ -226,6 +241,23 @@ arithmetic behind the score, the cookies' flags and the third parties the page
 loads. `scope: "site"` crawls the site, `scope: "hosts"` checks several origins (a front end and
 an API on `localhost`, graded in development mode). → [Check your own site](#check-your-own-site)
 
+### 8. Drive the Chrome of another computer
+
+```json
+{"actions":[{"action":"nodes","op":"pair","address":"192.168.1.115"}]}
+```
+
+Returns a six-digit code; the other computer shows the same code in a Chrome
+notification with **Allow**. Once it is allowed, call `op="pair"` again to save it, and
+from then on add `node` to any call:
+
+```json
+{"node":"office-pc","actions":[{"action":"open","url":"https://example.com","session_id":"office-1","profile_mode":"current"}]}
+```
+
+The whole call runs on that computer, in its Chrome, and the answer comes back with
+`via_node`. → [Other computers on your network](#other-computers-on-your-network)
+
 ### Where to go next
 
 ```json
@@ -252,7 +284,7 @@ limits, and worked examples. `web_info(topic="action_schema", params={"action":
 | Semantic page reading | `page_outline`, `page_text`, `element_text`, and `find` return roles, accessible names, states, boxes, and `ref:<epoch>:N` handles across open Shadow DOM and same-origin iframes — and `element_text` hands over the whole content of one element, overflow-clipped tails included. |
 | Visible failures | The `console` and `network` topics surface console output, uncaught exceptions with stack frames, and every HTTP request with status, type, duration, and size — recorded from the session's first navigation, not from the first time someone asks. |
 | Deterministic frames | Gated render modes freeze `performance.now()`/`Date.now()` and queue page timers, so a released frame is a fixed delta instead of the agent's thinking time. |
-| Concurrent work | Search, HTTP fetches, and independent browser sessions run outside the MCP event loop; eight browser sessions work in parallel by default (the companion popup and `WEB_SEARCH_NEO_MAX_SESSIONS` both move it). Agents running side by side must each take their own `session_id`, because that is the only thing separating them inside one server, and may pass `agent_label` on `open` so `browser_status` can say who is where. |
+| Concurrent work | Search, HTTP fetches, and independent browser sessions run outside the MCP event loop; 30 browser sessions work in parallel by default (the companion popup and `WEB_SEARCH_NEO_MAX_SESSIONS` both move it, `0` removes the cap). Agents running side by side must each take their own `session_id`, because that is the only thing separating them inside one server, and may pass `agent_label` on `open` so `browser_status` can say who is where. |
 
 ## Connect your already-open Chrome
 
@@ -356,9 +388,11 @@ tab are refused with a message telling the agent to wait, the toolbar badge read
 `II`, and **Resume** hands control back. Below it three tabs: **Overview** — three
 figures (controlled tabs, tabs held against the parallel-session limit - or ∞ - with a
 small capacity meter, the bridge endpoint), this computer's IP and place in one
-strip, and the agent tabs; **Computers** — [other computers on your
-network](#other-computers-on-your-network), sharing this one, pairing and sending a
-tab; **Settings**. While agents work, the toolbar icon animates, the logo in the panel
+strip (with a chip saying whether this computer is shared and reachable), and the agent
+tabs; **Computers** — [other computers on your network](#other-computers-on-your-network):
+the **Share this computer** and **Start with Windows** switches with what each means right
+now, a pairing request from another computer with its code and **Allow** / **Deny**,
+**Scan** and **Pair**, and **Send this tab**; **Settings**. While agents work, the toolbar icon animates, the logo in the panel
 turns, each agent tab row shows a bar draining over its five-minute afterglow, and every
 tab group holding a driven tab is coloured by state: green while an agent acted in the
 last minute, yellow for the afterglow, orange while you have taken over — then it gets
@@ -368,8 +402,9 @@ apply/reset session limit. A version chip and a GitHub release check round off
 the top; **Settings** holds the port and session limit. Everything renders from the
 status the service worker reports each second — connected, connecting,
 waiting, disabled, or error — and nothing else: no fabricated connection state,
-no secrets in the UI. Opening the panel is read-only by construction: it never
-navigates, submits, closes, or releases anything on its own.
+no secrets in the UI. Opening the panel never touches a page or a tab: it never
+navigates, submits, closes, or releases anything on its own. (It does keep this
+computer's sharing node and logon start as their switches say.)
 
 ![Companion widget connected](docs/assets/companion-widget-connected.png)
 
@@ -379,8 +414,8 @@ deliberate backoff:
 
 ![Companion widget waiting for the bridge](docs/assets/companion-widget-waiting.png)
 
-Opening the panel — by click or by shortcut — performs no navigation and
-controls nothing; it only reads status.
+Opening the panel — by click or by shortcut — performs no navigation and drives
+no tab; it reads status.
 
 Under **Settings**:
 
@@ -421,9 +456,12 @@ An MCP server starts the daemon as it comes up, if nothing is listening yet, so
 the companion is connected before the first action rather than during it. It is
 started detached — with no console window on Windows, in its own session
 elsewhere, and never inheriting the stdio that carries MCP — and it outlives the
-server that started it. Nothing is registered for autostart: no service, no
-scheduled task, no login item. It exists once an MCP server has run, or once you
-have run one yourself, and it goes away again on its own.
+server that started it. On Windows the popup's **Start with Windows** switch (on
+by default) also has it start at logon — one value under
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, no service, no scheduled
+task, no admin rights — so after a reboot the companion and this computer's sharing
+are up before any agent runs. With the switch off it exists once an MCP server has
+run, or once you have run one yourself, and it goes away again on its own.
 
 On Windows the launcher deliberately bypasses a uv virtual-environment
 `python.exe`/`pythonw.exe` redirector and starts the base `pythonw.exe` with
@@ -447,12 +485,16 @@ daemon's environment before starting it (or in the MCP server's `env` block):
 $env:WEB_SEARCH_NEO_BRIDGE_PORT = "18765"; .\.venv\Scripts\python.exe -m web_search_neo.main --bridge
 ```
 
-For a hands-off setup, `scripts/bridge_autostart.bat [port]` launches the daemon
-through pythonw (no console window), and running
-`scripts/install_bridge_autostart.bat [port]` once drops that launcher into the
-Windows Startup folder so the bridge is up on every logon. Delete the generated
-startup file to undo. The launcher sets `WEB_SEARCH_NEO_BRIDGE_IDLE_SECONDS=0`,
-so a logon-started bridge does not idle-exit before the next browser session.
+**Start with Windows** is the hands-off setup: the entry runs this checkout's
+`main.py --bridge --at-logon` with `pythonw` (no console window), the daemon then
+never idle-exits, and a few seconds in it starts this computer's LAN node while
+sharing is on. The daemon writes the entry whenever the companion connects — so
+installing or updating the extension switches it on — and rewrites it when the
+checkout moved; switching it off removes it and is remembered
+(`WEB_SEARCH_NEO_LOGON_START=0` makes off the default). The older
+`scripts/install_bridge_autostart.bat [port]`, which drops a launcher into the
+Startup folder for a checkout with a `.venv`, still works; running both is harmless,
+because the second daemon finds the port taken and exits.
 
 Quiet on Windows: nothing the agent runs may pop a console onto your screen. The
 generated MCP configuration points at `pythonw` (no console, same stdio pipes) -
@@ -583,10 +625,20 @@ neither a companion nor a client attached exits after fifteen minutes
 
 ## Other computers on your network
 
-Every computer with Chrome and the companion is shared by default — its bridge starts a
-LAN node when the companion connects, and the popup's **Share this computer** switch
-turns that off. This MCP can then drive that computer's Chrome too: add `node` to any
-call.
+One MCP server can drive the Chrome of every computer on your network that runs Web
+Search Neo with the companion. Three steps, once:
+
+1. **On each computer:** install Web Search Neo and load the companion, as above. Its
+   popup's **Share this computer** and **Start with Windows** switches are on by default:
+   the computer answers on the LAN, and still does after a reboot. If Windows Firewall
+   keeps the network out, the switch says so in amber and **Allow in firewall** fixes it
+   behind Windows' own permission prompt.
+2. **Pair:** on the computer that drives, open **Computers**, press **Scan**, then
+   **Pair** on the computer found. It shows a Chrome notification with a six-digit code
+   and **Allow** / **Deny**; press **Allow** if the codes match. No key is copied - the
+   two computers agree on a secret and the key is handed over once, sealed. An agent can
+   start the same with `web_action nodes op='pair'`.
+3. **Use it:** add `node` to any call.
 
 ```json
 {"tool": "web_action", "arguments": {"node": "office-pc", "actions": [
@@ -595,19 +647,15 @@ call.
 ```
 
 `web_info(topic="nodes")` shows this computer — LAN addresses, public IP, and the city,
-region, country and network operator registries attach to that IP — and every other
-computer: online, unpaired or offline, with its IPs, location, latency and whether its
-Chrome is linked. `params.discover=true` scans the LAN. Pairing needs no key copied
-between computers: press **Pair** on a computer the popup's **Computers** tab found
-(or call `web_action nodes op='pair'`), and the other computer shows a Chrome
-notification with a six-digit code and **Allow** / **Deny** — allow it when the codes
-match. If Windows Firewall keeps the LAN out, that computer's popup says so and its
-**Allow in firewall** button fixes it behind Windows' own permission prompt. The
-**Computers** tab also sends the tab you are looking at to another computer. Requests
-are HMAC-signed and replay-proof; the key never crosses the network in the clear, but
-the traffic is not encrypted, so share on a trusted LAN or a VPN.
-[docs/remote-nodes.md](docs/remote-nodes.md) has pairing, the security model and every
-setting.
+region, country and network operator registries attach to that IP, plus whether the
+firewall lets the LAN in — and every other computer: online, unpaired or offline, with
+its IPs, location, latency and whether its Chrome is linked. `params.discover=true` scans
+the LAN. Pairing is kept on disk on both sides; it ends only when the other computer
+makes a **New key**, and a computer whose IP changed is paired again with **Pair**.
+The **Computers** tab also sends the tab you are looking at to another computer.
+Requests are HMAC-signed and replay-proof, but the traffic is not encrypted, so share on
+a trusted LAN or a VPN. [docs/remote-nodes.md](docs/remote-nodes.md) has the protocol,
+the security model and every setting.
 
 ## Search behavior
 
@@ -976,7 +1024,7 @@ the server does the one useful thing instead of pretending otherwise and says so
 `shared_session` with a warning appears on `browser_status` and on `open` when
 this session is one of them. Give each agent its own `session_id` and they get a
 tab each. The session cap is per process, so parallel agents share it too; it
-defaults to eight, the companion popup carries a user's own number to the server,
+defaults to 30 (`0` or `unlimited` removes it), the companion popup carries a user's own number to the server,
 and `WEB_SEARCH_NEO_MAX_SESSIONS` in the server's environment overrides both. The
 refusal at the cap names the setting and lists every holder - session, agent, tab,
 age, idle time, busy flag and last URL. Sessions idle past
@@ -1721,7 +1769,7 @@ web_info(topic='action_schema', params={'action': '<name>'}) for the full schema
 
 Existing direct Python imports remain available. For temporary MCP-client migration only, set `WEB_SEARCH_NEO_LEGACY_TOOLS=1` before starting the server to advertise the former narrow tool list instead of the compact default.
 
-Browser state is keyed by `session_id`, and that key is also the boundary between agents working at the same time: one `session_id` is one tab, so parallel agents must not share one. The `open_many` action can create as many independent sessions concurrently as the session cap allows (eight by default), and the companion popup or `WEB_SEARCH_NEO_MAX_SESSIONS` moves that ceiling. A viewport screenshot with no dimensions preserves the current viewport in every mode. An explicit viewport `width`/`height` pair is exact in isolated Selenium modes and is refused in `current` mode, where the MCP never resizes the user's Chrome; use `mode="region"` there for an exact-size image. Full-page captures above `3840x10000` fail explicitly instead of returning an unlabelled partial image.
+Browser state is keyed by `session_id`, and that key is also the boundary between agents working at the same time: one `session_id` is one tab, so parallel agents must not share one. The `open_many` action can create as many independent sessions concurrently as the session cap allows (30 by default, `0` for no cap), and the companion popup or `WEB_SEARCH_NEO_MAX_SESSIONS` moves that ceiling. A viewport screenshot with no dimensions preserves the current viewport in every mode. An explicit viewport `width`/`height` pair is exact in isolated Selenium modes and is refused in `current` mode, where the MCP never resizes the user's Chrome; use `mode="region"` there for an exact-size image. Full-page captures above `3840x10000` fail explicitly instead of returning an unlabelled partial image.
 
 Image-guided clicking is available through `pointer` with
 `pointer_action="click"` and viewport CSS `x`/`y`. Take a fresh viewport screenshot;
@@ -1757,6 +1805,9 @@ that are not guessable, and the mistakes to avoid.
 | `search` | Search and fetch without a browser. |
 | `diagnostics` | Console, network, response bodies, page scripts. |
 | `games` | The render gate, per-frame input, probes. |
+| `audit` | Checking your own site: security, performance, HAR. |
+| `testing` | Step-by-step regression tests with `test_run`. |
+| `computers` | Another computer's Chrome: `nodes`, pairing by button, `node=`. |
 | `troubleshooting` | Symptom, cause, and the call that fixes it. |
 
 The `troubleshooting` section maps the server's own error text — an unknown
@@ -1826,6 +1877,7 @@ server process: a daemon inherits the environment of whichever server spawns it.
 | `WEB_SEARCH_NEO_BRIDGE_AUTOSPAWN` | `0`, `false`, or `no` stops a server from starting a daemon; it then uses one only if something else already runs it. |
 | `WEB_SEARCH_NEO_BRIDGE_CONNECT_TIMEOUT` | How long a server keeps trying to reach a daemon, including one it started itself, default `12` seconds. |
 | `WEB_SEARCH_NEO_BRIDGE_START_TIMEOUT` | How long server startup waits for that first attempt before continuing in the background, default `2` seconds. |
+| `WEB_SEARCH_NEO_LOGON_START` | `0` makes **Start with Windows** off by default; the popup's switch still wins. |
 
 One more is about the server rather than the bridge:
 

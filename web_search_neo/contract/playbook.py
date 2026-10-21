@@ -271,6 +271,7 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
             "browser_status reports shared_session when more than one caller is on an id.",
             "attach_tab on a tab another agent holds is refused with who holds it. Pick a different tab; do not retry.",
             "close removes a tab the agent opened and leaves a claimed user tab open. close_all ends every agent's sessions in this server, not only yours.",
+            "When the user presses Take over, page and tab changes are refused with a sentence saying so: wait for Resume, do not retry in a loop.",
         ],
         "avoid": [
             "close_all as cleanup while other agents are working.",
@@ -423,6 +424,25 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
                  "expect": {"text": "Thanks", "no_console_errors": True}},
             ]}]
         },
+    },
+    "computers": {
+        "summary": "Driving the Chrome of another computer on the LAN with node=.",
+        "when": "The user asks for work on another PC, or web_info(topic='nodes') lists one.",
+        "steps": [
+            "web_info(topic='nodes', params={'discover': true}): this computer, then each other one as online, unpaired or offline.",
+            "Unpaired: web_action nodes op='pair' with address. Tell the user the returned code; they press Allow on that computer when it matches. Then call op='pair' again to save it.",
+            "Add node='<saved name>' to web_action/web_info: the whole call runs there and the answer carries via_node.",
+        ],
+        "rules": [
+            "session_id, agent_label and profile_mode work there as here; profile_mode='current' is that user's own Chrome.",
+            "offline means off, no bridge running there, or its firewall keeps the LAN out; its popup says which. Tell the user instead of retrying.",
+            "A node does not relay to a third computer and refuses update_companion.",
+        ],
+        "avoid": [
+            "Asking the user to copy a pairing key when op='pair' works.",
+            "Pairing without showing the user the code: comparing it is their protection.",
+        ],
+        "example": {"actions": [{"action": "nodes", "op": "pair", "address": "192.168.1.115"}]},
     },
     "troubleshooting": {
         "summary": "Symptom, cause, and the call that fixes it.",

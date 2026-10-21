@@ -15,6 +15,9 @@ const selfPlaceNode = document.querySelector("#self-place");
 const selfIspNode = document.querySelector("#self-isp");
 const shareInput = document.querySelector("#share");
 const shareStateNode = document.querySelector("#share-state");
+const logonRow = document.querySelector("#logon-row");
+const logonInput = document.querySelector("#logon-start");
+const logonStateNode = document.querySelector("#logon-state");
 const shareChipNode = document.querySelector("#share-chip");
 const shareDetailsNode = document.querySelector("#share-details");
 const shareAddressNode = document.querySelector("#share-address");
@@ -305,9 +308,26 @@ function renderNodes(rows) {
   nodeListNode.replaceChildren(...list.map(nodeRow));
 }
 
+// "Start with Windows": on by default; the daemon writes the logon entry itself.
+function renderLogonStart(logon) {
+  logonRow.hidden = !logon?.supported;
+  if (logonRow.hidden) return;
+  const enabled = Boolean(logon.enabled);
+  const broken = enabled && (logon.error || !logon.current);
+  logonInput.checked = enabled;
+  logonInput.disabled = false;
+  logonStateNode.dataset.state = broken ? "error" : enabled ? "on" : "off";
+  logonStateNode.textContent = broken
+    ? `On, but Windows will not start it yet${logon.error ? `: ${logon.error}` : " - it is written on the next connect"}.`
+    : enabled
+      ? "On: after a restart the bridge and sharing come up at logon, no agent needed."
+      : "Off: after a restart this computer is reachable once an agent starts here.";
+}
+
 function renderOverview(result) {
   renderSelf(result?.self);
   renderSharing(result?.sharing);
+  renderLogonStart(result?.logon_start);
   renderNodes(result?.nodes);
   renderPairRequests(result?.pair_requests);
   // Reopened while a pairing is still waiting: pick it up where it is.
@@ -496,6 +516,20 @@ function bindComputers() {
       messageNode.textContent = error.message;
     }
   });
+  logonInput.addEventListener("change", async () => {
+    const enabled = logonInput.checked;
+    logonInput.disabled = true;
+    try {
+      const logon = await send("companion.nodeLogonStart", {enabled});
+      renderLogonStart(logon);
+      messageNode.textContent = logon?.error ? `Not saved: ${logon.error}`
+        : enabled ? "Starts with Windows from the next logon." : "No longer starts with Windows.";
+    } catch (error) {
+      logonInput.checked = !enabled;
+      logonInput.disabled = false;
+      messageNode.textContent = error.message;
+    }
+  });
   scanNodesButton.addEventListener("click", async () => {
     messageNode.textContent = "Scanning this network...";
     const result = await busy(scanNodesButton, () => loadNodes({discover: true, loud: true}));
@@ -578,10 +612,12 @@ function previewComputers(type, extra) {
     firewall: {supported: true, state: "blocked", network: "Public",
       why: "Windows Firewall has no rule for Public networks"}};
   const requests = [{request: "0a1b2c3d4e5f6071", name: "studio-pc", address: "192.168.1.154", code: "482 913"}];
+  const logon = {supported: true, enabled: true, installed: true, current: true};
   if (type === "companion.nodes") {
     return Promise.resolve({self: me, sharing, nodes, discovered: extra.discover ? 2 : null,
-      pair_requests: requests, pairings: []});
+      pair_requests: requests, pairings: [], logon_start: logon});
   }
+  if (type === "companion.nodeLogonStart") return Promise.resolve({...logon, enabled: Boolean(extra.enabled)});
   if (type === "companion.nodePair") {
     return Promise.resolve({attempt: "preview", code: "482 913", name: "laptop", address: extra.address});
   }

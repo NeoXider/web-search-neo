@@ -330,16 +330,25 @@ def share_enabled() -> bool:
     that should never be reachable; otherwise other paired computers can drive
     it, which is what the feature is for. Nobody without the pairing key can.
     """
-    stored = _read_store().get("share")
-    if isinstance(stored, bool):
-        return stored
-    return os.getenv(SHARE_ENV, "1").strip().lower() not in _OFF_WORDS
+    return choice("share", SHARE_ENV)
 
 
 def set_share(enabled: bool) -> None:
+    set_choice("share", enabled)
+
+
+def choice(name: str, default_env: str) -> bool:
+    """A switch the popup stores here: the stored choice, else on unless ``default_env`` says off."""
+    stored = _read_store().get(name)
+    if isinstance(stored, bool):
+        return stored
+    return os.getenv(default_env, "1").strip().lower() not in _OFF_WORDS
+
+
+def set_choice(name: str, enabled: bool) -> None:
     with _LOCK:
         data = _read_store()
-        data["share"] = bool(enabled)
+        data[name] = bool(enabled)
         _write_store(data)
 
 

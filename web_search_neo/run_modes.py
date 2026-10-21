@@ -6,7 +6,8 @@ agent's browser calls reach it over the loopback bridge instead. ``--bridge
 --stop`` asks a running daemon to exit. ``--node`` publishes this machine's
 ``web_action``/``web_info`` to the LAN for other computers (``--node --stop``
 ends it, ``--node --key`` prints the pairing key). ``--update`` pulls this
-checkout and puts the daemon, the node and the Chrome companion on the new code.
+checkout and puts the daemon, the node and the Chrome companion on the new code;
+``--bridge --at-logon`` is what "Start with Windows" runs.
 """
 
 from __future__ import annotations
@@ -89,6 +90,24 @@ def update_here(arguments: list[str]) -> int:
     return 0
 
 
+def _prepare_logon_start() -> None:
+    """``--bridge --at-logon``: what Windows runs at logon ("Start with Windows").
+
+    Chrome may open long after logon, so the daemon must not exit idle meanwhile; and
+    the computer should be reachable before anyone opens Chrome, so the LAN node is
+    started a few seconds in, once the daemon listens (when sharing is on).
+    """
+    import os
+    import threading
+
+    from web_search_neo import node_link
+
+    os.environ["WEB_SEARCH_NEO_BRIDGE_IDLE_SECONDS"] = "0"
+    timer = threading.Timer(5.0, node_link.ensure_shared_node)
+    timer.daemon = True
+    timer.start()
+
+
 def run(arguments: list[str], version: str) -> int | None:
     """The exit code of a non-MCP mode, or None when the arguments start the MCP server.
 
@@ -98,6 +117,8 @@ def run(arguments: list[str], version: str) -> int | None:
     if "--bridge" in arguments:
         if "--stop" in arguments:
             return stop_bridge_daemon()
+        if "--at-logon" in arguments:
+            _prepare_logon_start()
         return bridge_daemon.run_forever(version)
     if "--update" in arguments:
         return update_here(arguments)
