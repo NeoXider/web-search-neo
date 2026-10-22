@@ -38,7 +38,7 @@ import uuid
 
 from web_search_neo import bridge_auth, node_link
 from web_search_neo.bridge_claims import claim_is_own, js_number_tab_id
-from web_search_neo.bridge_handshake import TOKEN_MISMATCH_REASON, authenticate_peer  # noqa: F401
+from web_search_neo.bridge_handshake import TOKEN_MISMATCH_REASON, answer_plain_http, authenticate_peer  # noqa: F401
 from web_search_neo.process_probe import process_alive
 
 
@@ -356,8 +356,8 @@ class BridgeDaemon:
                 # A local client sends no Origin at all; None is how websockets
                 # spells that, and it is not a header a browser can omit.
                 origins=[extension_origin, None],
-                ping_interval=20,
-                ping_timeout=20,
+                process_request=answer_plain_http,
+                ping_interval=20, ping_timeout=20,
                 max_size=MAX_FRAME_BYTES,
             ) as server:
                 self._server = server

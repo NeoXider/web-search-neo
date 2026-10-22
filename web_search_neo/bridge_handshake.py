@@ -24,6 +24,7 @@ that number from the reason (see :func:`client_handshake`).
 
 from __future__ import annotations
 
+import http
 import json
 import logging
 import re
@@ -52,6 +53,21 @@ class HandshakeFailure(Exception):
     def __init__(self, message: str, refused_protocol: str | None = None) -> None:
         super().__init__(message)
         self.refused_protocol = refused_protocol
+
+
+def answer_plain_http(connection: Any, request: Any) -> Any:
+    """``process_request`` for the bridge port: plain HTTP gets a quiet 426.
+
+    Browser tabs and port probes GET the port now and then. Left to websockets,
+    each one failed the opening handshake and logged a full traceback at ERROR;
+    answered here it is one INFO line. Anything asking for an upgrade goes on to
+    the normal handshake, the Origin check included.
+    """
+    if "websocket" in request.headers.get("Upgrade", "").lower():
+        return None
+    response = connection.respond(http.HTTPStatus.UPGRADE_REQUIRED, "This port speaks WebSocket only.\n")
+    response.headers["Upgrade"] = "websocket"
+    return response
 
 
 def _close(connection: Any, code: int, reason: str) -> None:

@@ -5,7 +5,9 @@ token file's atomic, owner-only storage."""
 from __future__ import annotations
 
 import json
+import logging
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -445,3 +447,19 @@ def test_an_acl_failure_is_logged_not_fatal(tmp_path, monkeypatch, caplog) -> No
         bridge_auth.write_extension_token(TEST_TOKEN)
     assert (tmp_path / "bridge-token.js").is_file()
     assert any("restrict" in message for message in caplog.messages)
+
+
+def test_plain_http_on_the_bridge_port_is_answered_without_a_traceback(caplog) -> None:
+    # Browser tabs and port probes GET the port; each used to log a handshake traceback at ERROR.
+    with caplog.at_level(logging.INFO), _running_daemon() as daemon:
+        with socket.create_connection(("127.0.0.1", daemon.port), timeout=5.0) as sock:
+            sock.sendall(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n")
+            answer = b""
+            while chunk := sock.recv(4096):
+                answer += chunk
+        assert answer.startswith(b"HTTP/1.1 426 ")
+        assert b"Upgrade: websocket" in answer
+        # A real peer still gets through the same port.
+        client = _raw_client(daemon.port, "c3" * 16, pid=333)
+        client.close()
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
