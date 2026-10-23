@@ -168,9 +168,10 @@ SOURCE = r"""
     const cx = CONFIG.slimeOrigin[0] + 8 * CONFIG.slimeScale;
     const cy = CONFIG.slimeOrigin[1] + 9.5 * CONFIG.slimeScale;
     context.save();
+    clipToCorner(context, 2);
     context.globalAlpha = frame < 0 ? 1 : 1 - 0.7 * t;
     context.beginPath();
-    context.arc(cx, cy, (9 + 4.5 * t) * CONFIG.slimeScale, 0, Math.PI * 2);
+    context.arc(cx, cy, (8.5 + 3 * t) * CONFIG.slimeScale, 0, Math.PI * 2);
     context.lineWidth = 3.4;
     context.strokeStyle = "rgba(10,30,18,0.75)";
     context.stroke();
@@ -180,17 +181,34 @@ SOURCE = r"""
     context.restore();
   }
 
+  // The glow and the ring stay in the slime's own corner: a clip to the square
+  // the slime occupies (plus a margin for the glow), so they can never spill over
+  // the page's icon. Painted unclipped, a filled circle of radius 10-13 on this
+  // 32 px canvas covered more than half of the favicon and turned it all green.
+  function clipToCorner(context, margin) {
+    context.beginPath();
+    context.rect(CONFIG.slimeOrigin[0] - margin, CONFIG.slimeOrigin[1] - margin,
+      32 - CONFIG.slimeOrigin[0] + margin, 32 - CONFIG.slimeOrigin[1] + margin);
+    context.clip();
+  }
+
   // A soft halo behind the slime; `t` (0..1) is how far it has swollen. At
   // strip size (16 px) a glow that grows and fades is what still reads as
-  // motion, where finer detail is lost.
+  // motion, where finer detail is lost. A radial gradient, strongest under the
+  // slime and fully clear at the rim, rather than a flat disc.
   function drawHalo(context, color, t, base, swell) {
     const cx = CONFIG.slimeOrigin[0] + 8 * CONFIG.slimeScale;
     const cy = CONFIG.slimeOrigin[1] + 9.5 * CONFIG.slimeScale;
+    const radius = (8 + 0.5 * swell * t) * CONFIG.slimeScale;
     context.save();
-    context.globalAlpha = base + 0.5 * t;
+    clipToCorner(context, 2);
+    const glow = context.createRadialGradient(cx, cy, 0, cx, cy, radius);
+    glow.addColorStop(0, color);
+    glow.addColorStop(1, "rgba(0,0,0,0)");
+    context.globalAlpha = Math.min(1, base + 0.5 * t);
     context.beginPath();
-    context.arc(cx, cy, (10 + swell * t) * CONFIG.slimeScale, 0, Math.PI * 2);
-    context.fillStyle = color;
+    context.arc(cx, cy, radius, 0, Math.PI * 2);
+    context.fillStyle = glow;
     context.fill();
     context.restore();
   }

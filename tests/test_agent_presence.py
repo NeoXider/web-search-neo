@@ -449,6 +449,17 @@ def test_favicon_mark_is_an_opaque_full_size_slime_over_the_page_icon():
     assert "window.__wsnPresence" in browser_tools._TAB_ACTIVITY_SOURCE
 
 
+def test_the_glow_and_ring_stay_in_the_slimes_corner():
+    source = agent_presence.install_source()
+    # Regression: the halo was a flat disc of radius 10-13 on the 32 px canvas
+    # and turned the whole favicon green instead of leaving the slime in the
+    # corner. Glow and ring are clipped to the slime's square and fade out.
+    assert "function clipToCorner(context, margin)" in source
+    assert source.count("clipToCorner(context, 2);") == 2
+    assert "createRadialGradient(cx, cy, 0, cx, cy, radius)" in source
+    assert "(10 + swell * t)" not in source
+
+
 # --- the ghost cursor ----------------------------------------------------------
 
 

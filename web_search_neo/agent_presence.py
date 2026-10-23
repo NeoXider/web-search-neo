@@ -31,7 +31,7 @@ from web_search_neo.presence_overlay import CAPTION_MS, MAX_RIPPLES, RIPPLE_MS  
 # reinstall itself. Without it a long-lived tab would keep running whatever
 # version was current when it first loaded, and a fix here would only reach
 # pages opened afterwards.
-PRESENCE_VERSION = 9
+PRESENCE_VERSION = 10
 
 PRESENCE_ENV = "WEB_SEARCH_NEO_AGENT_PRESENCE"
 
