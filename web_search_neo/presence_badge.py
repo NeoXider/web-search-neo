@@ -21,6 +21,10 @@ stays cheap: a handful of 32x32 frames painted once per document and swapped on
 one timer, which stops with the badge; Chrome's own throttling slows it further
 in a background tab.
 
+Every action also makes the slime hop once, whatever the state: a quick arc up
+and a squash on landing (about a third of a second), on its own fast timer that
+hands back to the state's rhythm when it ends. Reduced motion skips the hop.
+
 A slow step announced before it runs (``presence_live.lead_action``) carries
 ``inFlightMs``, its own time limit, so the ring keeps pulsing through a long
 wait; the step's own note afterwards ends it a few seconds later.
@@ -42,6 +46,11 @@ BREATHE_FRAMES = 6
 BREATHE_FRAME_MS = 340
 DOZE_FRAMES = 4
 DOZE_FRAME_MS = 1000
+# The hop on each action: lift in canvas pixels per frame, and the squash of the
+# landing frame. Short enough that quick successive actions read as a bounce.
+HOP_LIFTS = (3.0, 7.0, 9.0, 7.0, 3.0, 0.0)
+HOP_SQUASH = 0.8
+HOP_FRAME_MS = 55
 BUSY_COLOR = "#5dff8f"
 
 
@@ -56,6 +65,9 @@ def config() -> dict[str, Any]:
         "breatheFrameMs": BREATHE_FRAME_MS,
         "dozeFrames": DOZE_FRAMES,
         "dozeFrameMs": DOZE_FRAME_MS,
+        "hopLifts": list(HOP_LIFTS),
+        "hopSquash": HOP_SQUASH,
+        "hopFrameMs": HOP_FRAME_MS,
         "busyColor": BUSY_COLOR,
     }
 
@@ -100,7 +112,7 @@ SOURCE = r"""
     context.closePath();
   }
 
-  function drawSlime(context, phase, lift) {
+  function drawSlime(context, phase, lift, squash) {
     const awake = phase !== "recent";
     context.save();
     // 16 units drawn at full size in the bottom-right corner: half the tab
@@ -109,6 +121,12 @@ SOURCE = r"""
     // it a little for the breathing frames.
     context.translate(CONFIG.slimeOrigin[0], CONFIG.slimeOrigin[1] - (lift || 0));
     context.scale(CONFIG.slimeScale, CONFIG.slimeScale);
+    if (squash && squash !== 1) {
+      // Squashed against the floor of the slime (y = 15), so it lands flat.
+      context.translate(0, 15);
+      context.scale(1 / squash, squash);
+      context.translate(0, -15);
+    }
     context.globalAlpha = CONFIG.slimeAlpha;
     // A light halo keeps the slime readable on dark favicons, the dark edge on
     // light ones; which one the page has is unknowable here.
@@ -257,13 +275,22 @@ SOURCE = r"""
       // shows, so an iconless tab gains a mark instead of a replacement.
       if (baseImage) context.drawImage(baseImage, 0, 0, 32, 32);
       const parts = String(key).split(":");
-      const frame = parts.length > 1 ? Number(parts[1]) : null;
+      // "<state>:hop<i>" is hop frame i over the state's still decoration.
+      const hop = parts.length > 1 ? /^hop(\d+)$/.exec(parts[1]) : null;
+      const frame = parts.length > 1 && !hop ? Number(parts[1]) : null;
       let lift = 0;
-      if (parts[0] === "busy") drawRing(context, frame);
-      if (parts[0] === "active" && frame !== null) lift = drawBreath(context, frame);
-      if (parts[0] === "recent" && frame !== null) drawDozeGlow(context, frame);
-      drawSlime(context, parts[0], lift);
-      if (parts[0] === "recent" && frame !== null) drawDoze(context, frame);
+      let squash = 1;
+      if (hop) {
+        const index = Math.min(Number(hop[1]), CONFIG.hopLifts.length - 1);
+        lift = CONFIG.hopLifts[index];
+        if (index === CONFIG.hopLifts.length - 1) squash = CONFIG.hopSquash;
+      }
+      const still = hop ? 2 : frame;
+      if (parts[0] === "busy") drawRing(context, hop ? 1 : frame);
+      if (parts[0] === "active" && still !== null) lift += drawBreath(context, still);
+      if (parts[0] === "recent" && still !== null) drawDozeGlow(context, still % CONFIG.dozeFrames);
+      drawSlime(context, parts[0], lift, squash);
+      if (parts[0] === "recent" && still !== null) drawDoze(context, still % CONFIG.dozeFrames);
       return canvas.toDataURL("image/png");
     } catch (error) {
       // A cross-origin favicon without CORS taints the canvas and toDataURL
@@ -416,6 +443,33 @@ SOURCE = r"""
     state.pulse = setTimeout(pulse, motion[1]);
   }
 
+  // One hop: the frames play on a fast timer in place of the state's own, then
+  // the state's rhythm resumes. A note that lands mid-hop lets it finish, unless
+  // it is already on its way down, so a steady stream of actions bounces on.
+  function hopStep() {
+    state.pulse = null;
+    const phase = badgePhase(Date.now());
+    if (!phase || phase !== state.phase) { state.hop = -1; return; }
+    state.hop += 1;
+    if (state.hop >= CONFIG.hopLifts.length) {
+      state.hop = -1;
+      const motion = motionOf(phase);
+      show(phase + ":" + Math.max(0, state.frame));
+      state.pulse = setTimeout(pulse, motion[1]);
+      return;
+    }
+    show(phase + ":hop" + state.hop);
+    state.pulse = setTimeout(hopStep, CONFIG.hopFrameMs);
+  }
+
+  function startHop() {
+    if (stillBadge() || !state.phase) return;
+    if (typeof state.hop === "number" && state.hop >= 0 && state.hop < CONFIG.hopLifts.length - 3) return;
+    stopPulse();
+    state.hop = -1;
+    hopStep();
+  }
+
   function enter(phase) {
     const changed = phase !== state.phase;
     if (changed || !phase) stopPulse();
@@ -459,5 +513,6 @@ SOURCE = r"""
     state.activeUntil = Math.max(now + CONFIG.activeMs, state.busyUntil);
     state.recentUntil = Math.max(now + CONFIG.recentMs, state.activeUntil);
     schedule();
+    startHop();
   }
 """

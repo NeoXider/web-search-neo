@@ -460,6 +460,19 @@ def test_the_glow_and_ring_stay_in_the_slimes_corner():
     assert "(10 + swell * t)" not in source
 
 
+def test_every_action_makes_the_slime_hop():
+    source = agent_presence.install_source()
+    # Each note starts a hop on its own fast timer; the state's rhythm resumes
+    # afterwards, and reduced motion gets no hop at all.
+    assert "function startHop()" in source and "function hopStep()" in source
+    assert "schedule();" in source and "startHop();" in source
+    assert "if (stillBadge() || !state.phase) return;" in source
+    assert '"hopLifts"' in source and '"hopFrameMs"' in source
+    lifts = presence_badge.HOP_LIFTS
+    assert lifts[0] > 0 and lifts[-1] == 0 and max(lifts) <= 10
+    assert 0 < presence_badge.HOP_SQUASH < 1
+
+
 # --- the ghost cursor ----------------------------------------------------------
 
 
