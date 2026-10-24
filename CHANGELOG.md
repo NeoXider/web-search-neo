@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.28.1
+
+- **The popup's Computers tab works again, and so does Update.** In 1.28.0 the bridge daemon called its claimed-tab count as a function, so the first frame from the Computers tab or the Update button ended the companion's connection: the switches stayed at "Checking..." and could not be turned on. The daemon now reads the count, and a test sends real popup frames through the daemon's companion loop.
+- **The package names its real version.** The 1.28.0 bump missed `web_search_neo.__version__` and the popup preview's fallback, so MCP servers and their clients still introduced themselves as 1.27.0.
+
 ## 1.28.0
 
 - **The popup's Update button updates.** It used to reload the companion onto the files already on disk and close the popup, so on an up-to-date checkout it looked like a button that did nothing, and pulling was left to an agent or the command line. Now it asks the bridge daemon (over the socket the Computers tab already uses, op `update`) to run `python main.py --update` as a process of its own: pull this checkout, start a fresh daemon, reload the companion - the popup closes on that reload, and what happened is written to `~/.web-search-neo/update.log`. The daemon puts its own count of agent-driven tabs on the request and the update is refused while there are any, the popup saying why; a server that is not a git checkout is refused too. With no daemon (or an older one) the button does what it did before. `companion_update.start_detached_update`.

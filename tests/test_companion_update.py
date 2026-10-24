@@ -283,9 +283,41 @@ def test_the_daemon_puts_its_own_claims_on_the_update_frame(monkeypatch):
                         lambda claimed_tabs=0: seen.append(claimed_tabs) or {"started": True})
     assert node_link.OPERATIONS["update"]({"op": "update", "claimed_tabs": 3}, "9.9.9") == {"started": True}
     assert seen == [3]
-    source = (PROJECT_ROOT / "web_search_neo" / "bridge_daemon.py").read_text(encoding="utf-8")
-    # The companion's frame is spread first, so a claimed_tabs it sends is overwritten.
-    assert '{**message, "claimed_tabs": len(self.claimed_tabs())}' in source
+
+
+class FrameSocket:
+    """A companion socket that sends the given frames, then closes."""
+
+    def __init__(self, frames: list[dict]) -> None:
+        self.frames = [json.dumps(frame) for frame in frames]
+        self.sent: list[str] = []
+
+    def __iter__(self):
+        return iter(self.frames)
+
+    def send(self, text: str) -> None:
+        self.sent.append(text)
+
+    def close(self, *args) -> None:
+        pass
+
+
+def test_the_daemon_passes_popup_frames_on_with_its_own_claim_count(monkeypatch):
+    from web_search_neo.bridge_daemon import BridgeDaemon
+
+    handed: list[dict] = []
+    monkeypatch.setattr(node_link, "ensure_shared_node_soon", lambda: None)
+    monkeypatch.setattr(node_link, "handle", lambda send, message, version: handed.append(message))
+    daemon = BridgeDaemon(port=19999, token="", version="")
+    socket = FrameSocket([{"type": "nodes", "id": 1, "op": "overview"},
+                          {"type": "nodes", "id": 2, "op": "update", "claimed_tabs": 5},
+                          {"type": "ping"}])
+    daemon._serve_extension(socket, {"role": "extension"}, "")
+    # Every frame reached its handler: one failing frame used to end the companion's connection.
+    assert [frame["op"] for frame in handed] == ["overview", "update"]
+    assert any(json.loads(text)["type"] == "pong" for text in socket.sent)
+    # The count is the daemon's own; whatever the companion put there is overwritten.
+    assert [frame["claimed_tabs"] for frame in handed] == [0, 0]
 
 
 POPUP_IDS = [

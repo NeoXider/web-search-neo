@@ -355,7 +355,7 @@ companion popup's Reconnect (Restart companion when its service worker has
 stopped) is the one action; Reload on its card at chrome://extensions is the
 fallback.
 
-The bundled companion is version 1.28.0. Chrome does not refresh an unpacked
+The bundled companion is version 1.28.1. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. That only works for

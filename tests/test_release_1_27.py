@@ -22,11 +22,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_version_is_consistent_across_the_package_and_the_companion():
-    assert main.__version__ == "1.27.0"
+    # 1.27.0 or later; test_popup_widget checks that every declaration names the same one.
+    assert tuple(int(part) for part in main.__version__.split(".")) >= (1, 27, 0)
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     manifest = json.loads((ROOT / "chrome-extension" / "manifest.json").read_text(encoding="utf-8"))
-    assert 'version = "1.27.0"' in pyproject
-    assert manifest["version"] == "1.27.0"
+    assert f'version = "{main.__version__}"' in pyproject
+    assert manifest["version"] == main.__version__
 
 
 def test_capabilities_publish_the_two_new_habits_under_the_written_budget():

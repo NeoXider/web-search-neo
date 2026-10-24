@@ -851,7 +851,7 @@ class BridgeDaemon:
                 elif message_type == "ping":
                     websocket.send(json.dumps({"type": "pong", "at": time.time()}))
                 elif message_type == "nodes":  # popup Computers tab and Update (refused while agents drive)
-                    node_link.handle(websocket.send, {**message, "claimed_tabs": len(self.claimed_tabs())}, self.version)
+                    node_link.handle(websocket.send, {**message, "claimed_tabs": len(self.claimed_tabs)}, self.version)
                 else:
                     LOGGER.warning("Ignored unknown bridge frame type %r", message_type)
         except Exception as exc:
