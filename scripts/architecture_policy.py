@@ -38,7 +38,10 @@ LEGACY_MAX_LINES = {
     # Lowered 2701 -> 2689: action discriminator diagnostics moved to action_calls.py.
     # Lowered 2689 -> 2678 (2026-10-21): the --bridge/--stop modes moved to run_modes.py,
     # which also carries --node; the freed lines hold the node= forwarding and nodes topic.
-    "web_search_neo/main.py": 2678,
+    # Lowered 2678 -> 2506 (2026-10-24, macro scripts): the macro validator moved to macro_check.py,
+    # which also holds the script-layer checks; the runner is macro_flow.py, expressions
+    # macro_expr.py, background jobs macro_jobs.py. What stayed here is the op routing.
+    "web_search_neo/main.py": 2506,
     # Raised 2681 -> 2686 for the aria-hidden majority hint in page_text exclusions.
     "web_search_neo/page_perception.py": 2686,
     # Raised 2070 -> 2075 (2026-10-13, from upstream 96427c0): a tab create on a busy

@@ -47,11 +47,43 @@ _FRAME_CSS = "Frame to work inside: plain CSS only - a ref or a '>>>' path is re
 _ACTION_NOTES = {
     "macro": {
         "ops": (
-            "list/show read the store; validate checks a file without running it; "
-            "preview resolves its placeholders and dispatches nothing; run replays it; "
+            "list/show read the store; validate checks a file (or inline steps) without running it; "
+            "preview resolves its placeholders and dispatches nothing; run replays it; run_steps runs "
+            "inline steps you pass in this call, saving nothing; background=true on run/run_steps "
+            "returns a job_id at once, then job (wait_seconds), jobs and cancel; "
             "guarded_stage/guarded_commit are the two-phase path for an action that must "
             "happen at most once. A macro is a JSON file: create, edit, rename and delete "
             "it with ordinary file operations."
+        ),
+        "scripts": (
+            "Any step may carry when (run only if the expression is true), save_as (keep the result "
+            "as a variable: a run_script's returned value, JSON text decoded; otherwise the action's "
+            "data), assert (expression over result/value that must hold), expect (test_run's page "
+            "checks: selector, absent, text, no_text, url_contains, title_contains, script, "
+            "timeout_seconds), retry + retry_delay, on_error='continue', label. Control steps: "
+            "if {test, then, else}; repeat {times | while | until, as, max_iterations, delay_seconds}; "
+            "for_each {items, as, index_as}; wait_until {test, steps, timeout_seconds, interval_seconds, "
+            "on_timeout}; try {steps, catch, finally} (catch sees error.message/step); set {values}; "
+            "sleep {seconds}; log {message}; fail {message}; return {value}; break; continue; "
+            "call {name, variables} runs another macro (depth 5, no cycles) and save_as keeps its "
+            "return value; read {topic, params} runs a web_info topic (network, page_text, find, "
+            "console, screen_state...) with output=json by default."
+        ),
+        "expressions": (
+            "Python-like and safe: and/or/not (&&, ||, ! too), == != < > in, a if c else b, "
+            "a.b and a[0] (a missing key is null), and functions len, str, int, float, number, "
+            "lower, upper, strip, contains, icontains, startswith, endswith, matches(text, regex), "
+            "search(text, regex), replace, split, join, json, to_json, find(items, key=value or "
+            "key='~regex'), filter, count, pluck, get, keys, values, first, last, sorted, unique, "
+            "empty, default, range, now, today. In parameters write {{expression}}: a whole-string "
+            "template keeps its type. last = {ok, value, error, action, step} of the previous step. "
+            "A variable the file declares (even as null) exists; an undeclared one never given is "
+            "reported before the run starts."
+        ),
+        "results": (
+            "A script run answers success, error and failed_step (path like 2.then.0), returned "
+            "(from return), outputs (every save_as/set), log, results[] with step paths, and trace: "
+            "one line per step that survives summary='min'."
         ),
         "storage": (
             "project_root='auto' resolves WEB_SEARCH_NEO_PROJECT_ROOT, then an existing "
@@ -88,8 +120,11 @@ _ACTION_NOTES = {
             "consequential run."
         ),
         "limits": (
-            "A macro cannot run another macro; run them in order. A replay reports like a "
-            "batch, so check failure_count and every results[i].success."
+            "A step of action 'macro' inside a macro is refused; use the call control step. Loops "
+            "stop at max_iterations/max_items (default 1000), a run at 20000 steps, and a guarded "
+            "macro must stay a plain step list. A plain replay reports like a batch, so check "
+            "failure_count and every results[i].success. Background jobs live as long as the "
+            "server process; give them their own session_id."
         ),
     },
     "fill": {

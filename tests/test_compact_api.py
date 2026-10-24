@@ -493,7 +493,10 @@ def test_the_macro_section_says_where_a_project_keeps_its_files():
     assert ".web-search-neo/macros" in section
     assert "project_root='auto'" in section
     assert "op='preview'" in section
-    assert "cannot run another macro" in section
+    # Reuse goes through the script step `call`; a step of action 'macro' stays refused.
+    assert "{action: call, name, variables}" in section and "is refused" in section
+    scripts = json.dumps(asyncio.run(main.web_info("skill", {"section": "macro_scripts"})))
+    assert "wait_until" in scripts and "background=true" in scripts and "find(items" in scripts
 
     troubleshooting = asyncio.run(main.web_info("skill", {"section": "troubleshooting"}))
     # The failure this release exists to make legible: saved in one store,
@@ -506,8 +509,11 @@ def test_the_macro_action_schema_documents_storage_files_and_checking():
     properties = schema["input_schema"]["properties"]
     assert {"op", "name", "variables", "project_root", "session_id"} <= set(properties)
     # The write half of the action is gone: a macro is a file, so there is no
-    # parameter that carries steps, a pack, or a path to write one to.
-    assert not {"steps", "path", "pack", "overwrite", "description"} & set(properties)
+    # parameter that carries a pack, or a path to write one to. `steps` exists
+    # only for op='run_steps' (and op='validate'): an inline script that runs
+    # and is never saved anywhere.
+    assert not {"path", "pack", "overwrite", "description"} & set(properties)
+    assert {"steps", "background", "job_id", "wait_seconds"} <= set(properties)
     notes = schema["notes"]
     assert "auto" in notes["storage"] and "per-user store" in notes["storage"]
     assert ".web-search-neo/macros/" in notes["files"]

@@ -382,6 +382,11 @@ def serve(port: int, out_dir: Path, idle_minutes: float) -> int:
         print(f"READY {port} (token in {_token_path(port)})", flush=True)
         while not stopping.is_set():
             if idle_minutes > 0 and time.monotonic() - last_used[0] > idle_minutes * 60:
+                # A background macro job lives in the server child: idling out would kill it mid-run.
+                if _jobs_running(client, lock):
+                    last_used[0] = time.monotonic()
+                    print("idle, but background macro jobs are running; staying up", flush=True)
+                    continue
                 print("idle timeout, stopping", flush=True)
                 break
             stopping.wait(1.0)
@@ -394,6 +399,20 @@ def serve(port: int, out_dir: Path, idle_minutes: float) -> int:
         if token:
             _remove_token(port, token)
     return 0
+
+
+def _jobs_running(client: "StdioClient | None", lock: threading.Lock) -> bool:
+    """True while the server child still runs a background macro job (op='jobs')."""
+    if client is None:
+        return False
+    try:
+        with lock:
+            result = client.call("web_action", {"actions": [{"action": "macro", "op": "jobs"}]})
+        text = next((part.get("text", "") for part in result.get("content", []) if part.get("type") == "text"), "{}")
+        jobs = (json.loads(text).get("results") or [{}])[0].get("data", {}).get("jobs", [])
+        return any(job.get("state") in ("starting", "running") for job in jobs)
+    except Exception:
+        return False
 
 
 def send(port: int, request: dict, timeout: float = 600.0) -> dict:
@@ -420,6 +439,51 @@ def _arguments(text: str) -> dict:
 def _print_answer(answer: dict) -> int:
     print(json.dumps(answer, ensure_ascii=False, indent=1))
     return 1 if answer.get("error") or answer.get("isError") else 0
+
+
+def _value(text: str) -> object:
+    """A --var value: JSON when it parses (numbers, lists, null), else the text itself; @file reads a file."""
+    if text.startswith("@"):
+        return Path(text[1:]).read_text(encoding="utf-8")
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text
+
+
+def macro_request(ns: argparse.Namespace) -> dict:
+    """The web_action call behind `mcp_cli.py macro ...`, so nobody hand-escapes JSON for a run."""
+    action: dict = {"action": "macro", "op": "run_steps" if ns.op == "steps" else ns.op}
+    variables: dict = {}
+    if ns.vars:
+        variables.update(_arguments("@" + ns.vars))
+    for item in ns.var or []:
+        key, sep, raw = item.partition("=")
+        if not sep:
+            raise SystemExit(f"--var needs name=value, got {item!r}")
+        variables[key] = _value(raw)
+    if ns.op == "steps":
+        action["steps"] = _arguments("@" + ns.target)
+    elif ns.op in ("job", "cancel"):
+        action["job_id"] = ns.target
+    elif ns.target:
+        action["name"] = ns.target
+    for key, value in (("variables", variables), ("background", ns.background), ("session_id", ns.session),
+                       ("project_root", ns.project_root), ("wait_seconds", ns.wait), ("timeout_seconds", ns.timeout_run)):
+        if value:
+            action[key] = value
+    return {"tool": "web_action", "args": {"actions": [action], "summary": ns.summary}}
+
+
+def _print_macro(answer: dict) -> int:
+    """Print the macro's own answer (not the transport envelope) when there is one."""
+    try:
+        data = answer["content"][0]["value"]["results"][0]
+        shown = data.get("data", data)
+        print(json.dumps(shown, ensure_ascii=False, indent=1))
+        return 0 if data.get("success") and shown.get("success", True) is not False else 1
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return _print_answer(answer)
 
 
 def repl(port: int) -> int:
@@ -459,6 +523,22 @@ def main() -> int:
     loop.add_argument("--port", type=int, default=DEFAULT_PORT)
     halt = sub.add_parser("stop", help="stop a running daemon")
     halt.add_argument("--port", type=int, default=DEFAULT_PORT)
+    mac = sub.add_parser("macro", help="run or check a macro through a running daemon (no JSON to escape)",
+                         description="mcp_cli.py macro run NAME --var key=value --background | "
+                                     "macro steps FILE.json | macro job JOB_ID --wait 60 | macro jobs | "
+                                     "macro cancel JOB_ID | macro validate|preview|show NAME | macro list")
+    mac.add_argument("op", choices=["run", "steps", "job", "jobs", "cancel", "validate", "preview", "show", "list"])
+    mac.add_argument("target", nargs="?", default=None, help="macro name, steps file, or job id")
+    mac.add_argument("--var", action="append", help="name=value (JSON if it parses; @file reads a file)")
+    mac.add_argument("--vars", help="JSON file with variables")
+    mac.add_argument("--background", action="store_true", help="start as a background job")
+    mac.add_argument("--session", help="point every step at this session_id")
+    mac.add_argument("--project-root", help="project store ('auto' or a path)")
+    mac.add_argument("--wait", type=float, default=0.0, help="op job: seconds to wait for the end")
+    mac.add_argument("--timeout-run", type=float, default=None, help="bound the whole run, seconds")
+    mac.add_argument("--summary", choices=["full", "min"], default="full")
+    mac.add_argument("--port", type=int, default=DEFAULT_PORT)
+    mac.add_argument("--timeout", type=float, default=3600.0, help="socket timeout, seconds")
     ns = parser.parse_args()
 
     if hasattr(sys.stdout, "reconfigure"):
@@ -472,6 +552,8 @@ def main() -> int:
         return repl(ns.port)
     if ns.command == "stop":
         return _print_answer(send(ns.port, {"op": "stop"}))
+    if ns.command == "macro":
+        return _print_macro(send(ns.port, macro_request(ns), ns.timeout))
 
     if ns.command == "call":
         return run_steps([{"tool": ns.tool, "args": json.loads(ns.args)}], ns.out_dir)

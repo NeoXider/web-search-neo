@@ -198,14 +198,16 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
             "Write <name>.json in that storage directory: a JSON array of web_action step objects, or {name, description, steps, variables}. Put {{placeholders}} where values change and declare each one under variables.",
             "macro op='validate' name='<name>' project_root='auto' reads the file and dispatches nothing. Fix every error it reports; read the warnings.",
             "macro op='preview' name='<name>' variables={...} resolves every placeholder and returns the exact steps, still dispatching nothing. This is the review point.",
-            "macro op='run' name='<name>' variables={...} replays it.",
+            "macro op='run' name='<name>' variables={...} replays it. Add background=true for a long run: the answer is a job_id at once, and macro op='job' job_id=<id> wait_seconds=60 reads progress or waits for the end.",
+            "Need logic now, without a file? macro op='run_steps' steps=[...] runs the same script language inline and saves nothing.",
         ],
         "rules": [
             "project_root='auto' finds the project from WEB_SEARCH_NEO_PROJECT_ROOT, then from an existing .web-search-neo directory, then from the repository root. Passing an absolute path is always exact.",
             "With no project_root at all, macros use the per-user store - a different set. Every macro answer reports scope, project_root, and storage, so check those before concluding a macro is missing.",
             "A macro file is one JSON file per macro, in <project_root>/.web-search-neo/macros/. The bare step list is a valid file; so is {name, description, steps, variables}. A README beside them states the format.",
             "A placeholder filling a whole string keeps its type, so a recorded number replays as a number. A run missing values names all of them at once.",
-            "A macro cannot run another macro. Run them one after another.",
+            "A macro reuses another with the control step {action: call, name, variables} (save_as keeps what it returns); a step of action 'macro' inside a macro is refused.",
+            "Scripts: when / save_as / assert / expect / retry / on_error on any step; if, repeat, for_each, wait_until, try, set, sleep, log, fail, return, break, continue, call, read as control steps; {{expressions}} in parameters (a whole-string template keeps its type). skill section='macro_scripts' has the full language.",
             "There is no write API. Creating, editing, renaming, copying and deleting a macro are file operations; op='validate' is how you check the result before a live run.",
             "Never put a {{placeholder}} inside a run_script script. It is pasted in as raw text, so any value with a newline or a quote breaks the JavaScript and the step fails with an opaque page error. Pass it through args and read arguments[0].",
             "A replay is a batch: check failure_count and every results[i].success. A saved click path is exactly as fragile as the page it was recorded from.",
@@ -223,6 +225,50 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
                     "name": "daily-report",
                     "project_root": "auto",
                     "variables": {"day": "2026-08-21"},
+                }
+            ]
+        },
+    },
+    "macro_scripts": {
+        "summary": "A macro is a script: variables, conditions, loops, waits on the page or the network, sub-macros, background jobs.",
+        "when": "A flow with a decision in it (optional field, a branch on what the page or a server said), a list to work through, a condition to wait for, or a run too long to hold one call open.",
+        "steps": [
+            "Write the steps as usual, then add logic: when on a step runs it only if an expression holds; save_as keeps its result; {{expression}} uses it in later parameters.",
+            "Branch with {action: if, test, then, else}; loop with repeat {times | while | until} or for_each {items, as}; stop a loop with break, skip with continue.",
+            "Wait for anything with wait_until {test, steps, timeout_seconds, interval_seconds}: the steps re-read (read network, run_script, page_text) and test decides.",
+            "Check results where they happen: assert 'result.data.status == 200' on an http_request, expect {text: 'Saved'} on a click, retry: 2 on a flaky wait.",
+            "Contain failures with try {steps, catch, finally}, or on_error: 'continue' plus a later if on last.ok.",
+            "Reuse with call {name, variables}; finish with return {value}. The answer carries returned, outputs, log and a trace line per step.",
+            "Long or watching runs: run with background=true, read op='job' (wait_seconds), op='jobs', op='cancel'. Use a session_id of the job's own.",
+        ],
+        "rules": [
+            "Expressions are Python-like (and/or/not, also &&, ||, !): a.b and a[0] give null when missing; functions: len, contains, matches(text, regex), search, number, json, find(items, key=value | key='~regex'), filter, count, pluck, get, default, empty, first, last, sorted, join, split, lower, upper, now, today.",
+            "find/filter/count accept a read's whole answer (they pick its requests/items/results list) or a list.",
+            "read {topic, params} runs any web_info topic; output defaults to json so fields are readable.",
+            "save_as keeps a run_script's returned value (JSON text is decoded), else the action's data; last always has ok, value, error of the previous step.",
+            "op='validate' checks scripts too: bad expressions, loops with no way to stop, break outside a loop, unknown control keys, inputs nobody declared. Read inputs and produced in its answer.",
+            "Every loop is capped (max_iterations / max_items, default 1000), a run at 20000 steps, call nesting at 5; a guarded macro must stay a plain list.",
+            "Still never put {{...}} inside a run_script script: pass values in args.",
+        ],
+        "avoid": [
+            "A background job and the foreground driving the same session_id.",
+            "wait_until without timeout_seconds when the condition may never come (the default is 30 s).",
+            "Branching on text the page shows when a network read or a run_script value says it exactly.",
+        ],
+        "example": {
+            "actions": [
+                {
+                    "action": "macro",
+                    "op": "run_steps",
+                    "background": True,
+                    "steps": [
+                        {"action": "open", "url": "https://example.com/upload", "session_id": "watch"},
+                        {"action": "wait_until", "timeout_seconds": 600, "interval_seconds": 5, "steps": [
+                            {"action": "read", "topic": "network", "params": {"session_id": "watch"}, "save_as": "net"},
+                        ], "test": "count(net, method='POST', status=200) > 0"},
+                        {"action": "screenshot", "session_id": "watch", "path": "done.png"},
+                        {"action": "return", "value": "{{find(net, method='POST', status=200).url}}"},
+                    ],
                 }
             ]
         },

@@ -1,6 +1,6 @@
 ---
 name: web-search-neo
-description: Use the Web Search Neo MCP server for free web search without API keys, resilient multi-engine fallback, HTTP page fetching, the user's current signed-in Chrome with AI-group tabs, isolated browser profiles, accessibility-level page inspection, form filling and upload, page console and network diagnostics, screenshots, deterministic canvas/WebGL game testing, and reusable macros kept as JSON files in the calling project. Trigger when a task needs current web results, visible work in existing Chrome tabs, authorized browser state, reading or driving a rendered page, diagnosing a broken page, writing or replaying a repeated browser flow, or frame-exact keyboard, mouse, and touch input through the two-tool web_info/web_action contract. Also drives the Chrome of other computers on the LAN with node="<name>" after a one-click pairing.
+description: Use the Web Search Neo MCP server for free web search without API keys, resilient multi-engine fallback, HTTP page fetching, the user's current signed-in Chrome with AI-group tabs, isolated browser profiles, accessibility-level page inspection, form filling and upload, page console and network diagnostics, screenshots, deterministic canvas/WebGL game testing, and reusable macro scripts kept as JSON files in the calling project (variables, conditions, loops, waits on the page or network, background jobs). Trigger when a task needs current web results, visible work in existing Chrome tabs, authorized browser state, reading or driving a rendered page, diagnosing a broken page, writing or replaying a repeated browser flow, or frame-exact keyboard, mouse, and touch input through the two-tool web_info/web_action contract. Also drives the Chrome of other computers on the LAN with node="<name>" after a one-click pairing.
 ---
 
 # Web Search Neo
@@ -455,9 +455,52 @@ tab, because that would change what it does; give those steps a `{{placeholder}}
 instead.
 
 Macros are files and outlive the server; `op=list` summarises them and `op=show` prints one. A
-macro cannot run another macro — run them in order instead. A replay reports like any batch, so
-check `failure_count` and each `results[i].success`: a saved click path is exactly as fragile
-as the page it was written against, and a site redesign invalidates it silently.
+macro reuses another with the script step `call` (a step of action `macro` is refused). A plain
+replay reports like any batch, so check `failure_count` and each `results[i].success`: a saved
+click path is exactly as fragile as the page it was written against, and a site redesign
+invalidates it silently.
+
+### Scripts: logic, loops, waits, background jobs
+
+When a flow has a decision in it, write the decision into the macro instead of making it
+between calls. On any step: `when` (run only if an expression holds), `save_as` (keep the
+result: a `run_script` value, JSON text decoded, else the action's data), `assert` (an
+expression over `result`/`value`), `expect` (test_run's page checks: `text`, `selector`,
+`url_contains`...), `retry`/`retry_delay`, `on_error: "continue"`, `label`. Control steps:
+`if {test, then, else}`, `repeat {times | while | until, as, max_iterations}`,
+`for_each {items, as}`, `wait_until {test, steps, timeout_seconds, interval_seconds}`,
+`try {steps, catch, finally}`, `set {values}`, `sleep`, `log`, `fail`, `return {value}`,
+`break`, `continue`, `call {name, variables}`, `read {topic, params}` (any web_info topic;
+`network` gives the page's HTTP traffic with `output: json`).
+
+Expressions are a safe Python-like language: `and/or/not` (also `&&`, `||`, `!`),
+comparisons, `a.b`/`a[0]` (missing gives null), and functions such as `len`, `contains`,
+`matches(text, regex)`, `search`, `number`, `json`, `find(items, method="POST",
+url="~/api/x")`, `filter`, `count`, `pluck`, `default`, `empty`. In parameters write
+`{{expression}}`; a whole-string template keeps its type. `last` is always the previous step's
+`{ok, value, error}`.
+
+```json
+{"action":"macro","op":"run_steps","steps":[
+  {"action":"click","selector":"#save","session_id":"s","expect":{"text":"Saved"},"retry":2},
+  {"action":"wait_until","timeout_seconds":60,"steps":[
+    {"action":"read","topic":"network","params":{"session_id":"s"},"save_as":"net"}],
+   "test":"find(net, method='POST', url='~/api/save').status == 200"},
+  {"action":"return","value":"{{find(net, method='POST').status}}"}]}
+```
+
+- `op=run_steps` runs inline steps and saves nothing; `op=validate` with `steps` checks them.
+- `background: true` on `run`/`run_steps` answers at once with a `job_id`; read it with
+  `op=job job_id=<id> wait_seconds=60`, list with `op=jobs`, stop with `op=cancel`. A job
+  needs its own `session_id`. Use it for anything that waits minutes (a generation, an upload,
+  a watcher) — other calls keep working meanwhile.
+- The answer of a script run: `success`, `error` + `failed_step` (a path like `2.then.0`),
+  `returned`, `outputs`, `log`, `results[]`, and `trace` (one line per step, kept by
+  `summary: "min"`).
+- `op=validate` also finds bad expressions, loops that cannot stop, `break` outside a loop and
+  undeclared inputs; its `inputs` field says what a caller must pass.
+- Loops are capped (1000 by default), a run at 20000 steps, `call` 5 deep; a guarded macro
+  must stay a plain list. Full reference: docs/macro-scripts.md.
 
 ### Keeping domain rules out of the engine
 

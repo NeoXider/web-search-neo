@@ -78,7 +78,7 @@ The full form:
 - Every step is exactly one `web_action` action object. Ask the server what each
   action accepts with
   `web_info(topic="action_schema", params={"action": "<name>"})`.
-- A macro cannot run another macro. Run them one after another instead.
+- Logic (when, save_as, if, for_each, wait_until, call, read...): docs/macro-scripts.md.
 - These files are the whole API for writing a macro. Create, edit, rename, copy
   and delete them like any other file; there is no MCP action that writes one.
   `macro op=list` reports a file it cannot read as `broken` rather than hiding
@@ -636,10 +636,10 @@ def consume_checkpoint(
 def validate_steps(steps: Any) -> list[dict[str, Any]]:
     """Check the shape of a step list before it reaches the dispatcher.
 
-    A macro that names a nested ``macro`` step is refused outright rather than
-    depth-limited: the useful cases (a login prologue shared by two macros) are
-    better served by running two macros in order, and the useless case is an
-    accidental self-reference that would recurse until something else broke.
+    A macro that names a nested ``macro`` step is refused outright: reuse goes through
+    the script step ``call`` (macro_flow.py), which is depth-limited and refuses a
+    cycle, instead of an accidental self-reference recursing until something else
+    broke.
     """
     if not isinstance(steps, list) or not steps:
         raise ValueError("macro steps must be a non-empty list of action objects")

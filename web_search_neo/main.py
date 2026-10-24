@@ -15,7 +15,7 @@ from web_search_neo.contract.param_docs import annotate as annotate_params
 from web_search_neo import bridge_daemon, node_actions, run_modes
 from web_search_neo import browser_tools
 from web_search_neo import chrome_bridge, companion_update, extra_actions, persist_actions, screen_state, tab_actions
-from web_search_neo import macro_files, macros
+from web_search_neo import macro_check, macro_flow, macro_jobs, macros
 from web_search_neo import msp_date_time
 from web_search_neo import msp_search
 from web_search_neo import plugins
@@ -1476,238 +1476,9 @@ def _step_problems(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return problems
 
 
-# A placeholder inside a script is the expensive mistake, and the reason this
-# checker exists at all. A `{{body}}` is substituted as raw text into JavaScript,
-# so a value with a newline, a quote or a backslash - which is most real values -
-# produces a syntactically broken program, and the step fails with an opaque
-# "WebDriverException: Uncaught" from inside the page. Variables belong in the
-# script's `args`, where they cross as data.
-_SCRIPT_FIELDS = ("script", "source")
-
-# The steps that read something back. A macro whose last act is to send, click or
-# submit reports whatever the dispatcher happened to return and calls it done;
-# one that ends by waiting for a success marker or reading state can be believed.
-_VERIFYING_ACTIONS = frozenset(
-    {"wait", "wait_challenge", "run_script", "fetch_text", "fetch_links", "search", "screenshot"}
-)
-# Steps that end a macro without being its point, so the "does it check itself"
-# question is asked of what came before them.
-_EPILOGUE_ACTIONS = frozenset({"close", "close_all", "release_inputs", "render"})
-
-
-def _declared_variables(payload: Any) -> dict[str, Any] | None:
-    """What the file itself declares, or None when it declares nothing at all."""
-    if isinstance(payload, dict) and isinstance(payload.get("variables"), dict):
-        return dict(payload["variables"])
-    return None
-
-
 def _validate_macro_file(name: str, project_root: str | None = None) -> dict[str, Any]:
-    """Check a macro file without running a single step of it.
-
-    A macro is a JSON file a person or a generator writes, so the mistakes in one
-    are writing mistakes: a misspelled action, a required parameter left out, a
-    placeholder nobody declared, a session id that drifted halfway through. Every
-    one of those used to surface mid-replay, on a live page, after the steps
-    before it had already clicked something.
-
-    Errors are things that cannot work. Warnings are things that usually mean a
-    typo but might be deliberate, so they never make a macro invalid.
-    """
-    validated_name = macros.validate_name(name)
-    path = macros.macro_file(validated_name, project_root)
-    errors: list[dict[str, Any]] = []
-    warnings: list[dict[str, Any]] = []
-
-    if not path.exists():
-        return macro_files.unreadable(
-            validated_name,
-            path,
-            f"No macro file at {path}.",
-            "Check op='list' for the store in use, and the file name.",
-        )
-    try:
-        payload = macros.raw_payload(validated_name, project_root)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        return macro_files.unreadable(
-            validated_name,
-            path,
-            f"{path} is not readable JSON: {exc}",
-            "Fix the JSON syntax: a macro file is a JSON object or a JSON array of steps.",
-        )
-    except OSError as exc:
-        return macro_files.unreadable(
-            validated_name,
-            path,
-            f"{path} could not be read: {exc}",
-            "Check that the file exists and can be read.",
-        )
-
-    declared = _declared_variables(payload)
-    try:
-        record = macros.record_from_payload(payload, validated_name, path)
-    except ValueError as exc:
-        return macro_files.unreadable(
-            validated_name,
-            path,
-            str(exc),
-            'A macro file is {"name": ..., "steps": [...]} or the bare list of steps.',
-        )
-
-    steps = record["steps"]
-    sessions: list[str] = []
-    for index, step in enumerate(steps):
-        arguments = dict(step)
-        action_name = str(arguments.pop("action", "")).strip().lower()
-        spec = _ACTIONS.get(action_name)
-        if spec is None:
-            errors.append(
-                {
-                    "index": index,
-                    "action": action_name or None,
-                    "error": _unsupported_action_error(action_name, arguments),
-                    "fix": "Use a published action name; web_info(topic='actions') lists them.",
-                }
-            )
-            continue
-        required, optional = _parameter_names(spec.tool_name)
-        known = set(required) | set(optional)
-        missing = [item for item in required if item not in arguments]
-        schema_hint = (
-            "web_info(topic='action_schema', params={'action': '" + action_name + "'})"
-        )
-        if missing:
-            errors.append(
-                {
-                    "index": index,
-                    "action": action_name,
-                    "error": f"required parameter(s) {missing} are missing",
-                    "fix": f"Add them to step {index}; {schema_hint} has the types.",
-                }
-            )
-        unknown = sorted(key for key in arguments if key not in known)
-        if unknown:
-            errors.append(
-                {
-                    "index": index,
-                    "action": action_name,
-                    "error": (
-                        f"parameter(s) {unknown} are not part of this action and would "
-                        "be refused at dispatch"
-                    ),
-                    "fix": f"Remove them, or read {schema_hint} for the right names.",
-                }
-            )
-        for field in _SCRIPT_FIELDS:
-            value = arguments.get(field)
-            inside = macros.placeholders_in(value) if isinstance(value, str) else set()
-            if inside:
-                errors.append(
-                    {
-                        "index": index,
-                        "action": action_name,
-                        "error": (
-                            f"{sorted(inside)} are substituted as raw text into "
-                            f"'{field}'. A value containing a newline, a quote or a "
-                            "backslash breaks the JavaScript, and the step fails with "
-                            "an opaque error from inside the page."
-                        ),
-                        "fix": (
-                            "Pass the value through args instead, and read it inside "
-                            "the script from arguments[0]."
-                        ),
-                    }
-                )
-        session = arguments.get("session_id")
-        if isinstance(session, str) and session.strip():
-            sessions.append(session.strip())
-
-    used = macros.placeholders_in(steps)
-    if declared is None:
-        if used:
-            warnings.append(
-                {
-                    "error": f"the file declares no 'variables', but its steps use {sorted(used)}",
-                    "fix": (
-                        'Add "variables": {"<name>": null} for each, so op=show says '
-                        "what the macro wants before anyone runs it."
-                    ),
-                }
-            )
-    else:
-        undeclared = sorted(used - set(declared))
-        unused = sorted(set(declared) - used)
-        if undeclared:
-            errors.append(
-                {
-                    "error": f"placeholder(s) {undeclared} are used but not declared in 'variables'",
-                    "fix": "Declare each one, with a default value or null.",
-                }
-            )
-        if unused:
-            warnings.append(
-                {
-                    "error": f"variable(s) {unused} are declared but no step uses them",
-                    "fix": "Remove them, or check how the placeholder is spelled in the steps.",
-                }
-            )
-
-    distinct = sorted(set(sessions))
-    if len(distinct) > 1:
-        warnings.append(
-            {
-                "error": f"the steps drive {len(distinct)} different sessions: {distinct}",
-                "fix": (
-                    "Almost always a typo. Use one session_id throughout, or pass "
-                    "session_id to op='run' to point the whole macro at one tab."
-                ),
-            }
-        )
-
-    # Paired with the step it is about, not with the end of the file: a macro
-    # that ends `submit, close_all` is judged on the submit, and pointing the
-    # finding at the close would send the reader to the wrong line.
-    meaningful = [
-        (index, step)
-        for index, step in enumerate(steps)
-        if str(step.get("action") or "").strip().lower() not in _EPILOGUE_ACTIONS
-    ]
-    if meaningful:
-        last_index, last_step = meaningful[-1]
-        last = str(last_step.get("action") or "").strip().lower()
-        if last not in _VERIFYING_ACTIONS:
-            warnings.append(
-                {
-                    "index": last_index,
-                    "error": f"the macro ends on '{last}' and never reads the result back",
-                    "fix": (
-                        "End with a wait on a success marker, or a run_script that reads "
-                        "the page state. A macro that sends something without checking "
-                        "reports success for a submit that failed."
-                    ),
-                }
-            )
-
-    return {
-        "success": True,
-        "macro": validated_name,
-        "valid": not errors,
-        "path": str(path),
-        "step_count": len(steps),
-        "declared_variables": sorted(declared) if declared is not None else [],
-        "used_placeholders": sorted(used),
-        "errors": errors,
-        "warnings": warnings,
-        "executed": False,
-        "note": (
-            "Nothing was dispatched. "
-            + (
-                "No errors; run op='preview' with the variables to see the final steps."
-                if not errors
-                else f"{len(errors)} error(s) would fail this macro as written."
-            )
-        ),
-    }
+    """Check a macro file without running a step; the checker lives in macro_check.py."""
+    return macro_check.validate_file(sys.modules[__name__], name, project_root)
 
 
 def _retarget_session(steps: list[dict[str, Any]], session_id: str) -> list[dict[str, Any]]:
@@ -1765,22 +1536,66 @@ async def browser_macro(
     checkpoint: str | None = None,
     project_root: str | None = None,
     session_id: str | None = None,
+    steps: list[dict[str, Any]] | None = None,
+    background: bool = False,
+    job_id: str | None = None,
+    wait_seconds: float = 0.0,
+    timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
-    """Check and replay named macro files from this project's or the user's store."""
+    """Check and run macro scripts: saved files (op=run name) or inline steps (op=run_steps steps).
+
+    A step is a web_action object, optionally with when / save_as / assert / expect / retry /
+    on_error / label, or a control step: if, repeat, for_each, wait_until, try, set, sleep, log,
+    fail, return, break, continue, call (another macro), read (a web_info topic such as network).
+    {{expressions}} fill parameters; last holds the previous step's ok/value/error.
+    background=true returns a job_id at once: op=job (wait_seconds), op=jobs, op=cancel.
+    Ops: list, show, validate, preview, run, run_steps, job, jobs, cancel, guarded_stage, guarded_commit.
+    """
     op = str(op or "").strip().lower()
+    facade = sys.modules[__name__]
 
     if op == "validate":
+        if not name and steps is not None:  # inline steps can be checked before they run, too
+            report = macro_check.check_steps(facade, macros.validate_steps(steps), None)
+            return {"success": True, "valid": not report["errors"], **report, "executed": False}
         if not name:
-            raise ValueError("macro op 'validate' requires name")
+            raise ValueError("macro op 'validate' requires name (or steps)")
         return {
             **await asyncio.to_thread(_validate_macro_file, name, project_root),
             **await _macro_store(project_root),
         }
 
+    if op in ("jobs", "job", "cancel"):
+        if op == "jobs":
+            return {"success": True, "jobs": macro_jobs.listing()}
+        if not job_id:
+            raise ValueError(f"macro op '{op}' requires job_id (op='jobs' lists them)")
+        if op == "cancel":
+            return {"success": True, **macro_jobs.cancel(job_id)}
+        return {"success": True, **await macro_jobs.wait(job_id, wait_seconds)}
+
+    if op == "run_steps":
+        if not steps:
+            raise ValueError("macro op 'run_steps' requires steps: a list of step objects")
+        record = {"name": None, "steps": macros.validate_steps(steps), "variables": dict(variables or {})}
+        return await macro_flow.run_record(facade, record, variables, continue_on_error=continue_on_error,
+                                           session_id=session_id, project_root=project_root,
+                                           background=background, timeout_seconds=timeout_seconds)
+
     if op == "run":
         if not name:
             raise ValueError("macro op 'run' requires name")
         record = await asyncio.to_thread(macros.load, name, project_root)
+        if background or timeout_seconds or macro_check.uses_flow(record["steps"]):
+            record = await asyncio.to_thread(macro_flow.load_script, name, project_root)
+            if session_id:
+                _retarget_session([step for _, step in macro_check.walk(record["steps"])
+                                   if macro_check.action_of(step) not in macro_check.CONTROL_ACTIONS], session_id)
+            outcome = await macro_flow.run_record(
+                facade, record, variables, continue_on_error=continue_on_error, session_id=session_id,
+                project_root=project_root, background=background, timeout_seconds=timeout_seconds)
+            return {**outcome, **({"session_override": _named_session(session_id)} if session_id else {}),
+                    **await _macro_store(project_root)}
         resolved = macros.resolve(record["steps"], record.get("variables"), variables)
         if session_id:
             resolved = _retarget_session(resolved, session_id)
@@ -1799,6 +1614,10 @@ async def browser_macro(
         if not name:
             raise ValueError("macro op 'guarded_stage' requires name")
         record = await asyncio.to_thread(macros.load, name, project_root)
+        if macro_check.uses_flow(record["steps"]):
+            # One reviewed path to one terminal action: branches or loops could reach it twice.
+            raise ValueError("a guarded macro must be a plain step list; script steps (when, if, loops, "
+                             "save_as, templates) are refused here. Run the logic as a separate macro first.")
         resolved = macros.resolve(record["steps"], record.get("variables"), variables)
         checked_guard = await asyncio.to_thread(macros.validate_guard, guard, resolved)
         staged_steps, terminal_step = macros.split_terminal_action(resolved)
@@ -1863,6 +1682,15 @@ async def browser_macro(
         if not name:
             raise ValueError("macro op 'preview' requires name")
         record = await asyncio.to_thread(macros.load, name, project_root)
+        if macro_check.uses_flow(record["steps"]):
+            record = await asyncio.to_thread(macro_flow.load_script, name, project_root)
+            shown = macro_flow.preview(record, variables)
+            problems = macro_check.check_steps(facade, record["steps"], record.get("variables"))["errors"]
+            return {"success": True, "macro": record["name"], "description": record.get("description") or "",
+                    "step_count": len(record["steps"]), **shown, "executed": False, "steps_valid": not problems,
+                    **({"problems": problems} if problems else {}),
+                    "note": "Preview only: nothing was dispatched. Templates that need values made during the run "
+                            "(save_as, loop variables, last) stay as written.", **await _macro_store(project_root)}
         resolved = macros.resolve(record["steps"], record.get("variables"), variables)
         if session_id:
             resolved = _retarget_session(resolved, session_id)
@@ -1900,8 +1728,8 @@ async def browser_macro(
         return {"success": True, **record, **await _macro_store(project_root)}
 
     raise ValueError(
-        "macro op must be list, show, validate, preview, run, guarded_stage or "
-        f"guarded_commit, not '{op}'. Macros are JSON files: create, edit, rename "
+        "macro op must be list, show, validate, preview, run, run_steps, job, jobs, cancel, "
+        f"guarded_stage or guarded_commit, not '{op}'. Macros are JSON files: create, edit, rename "
         "and delete them with ordinary file operations, then check the result with "
         "op='validate'."
     )
@@ -2223,7 +2051,7 @@ _ACTIONS: dict[str, ActionSpec] = {
             "macro",
             browser_macro,
             "macro",
-            "Check and replay named macro files from this project's macro store.",
+            "Run macro scripts, saved or inline: logic, loops, waits, sub-macros, background jobs.",
         ),
         _action("captcha", browser_captcha, "page", "Detect a captcha and wait it out or solve it."),
         _action(

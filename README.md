@@ -25,6 +25,7 @@ look, `web_action` to act — and behind them four capabilities:
 | **Perception** | An accessibility outline, readable text, semantic element lookup, the page console, and its HTTP traffic. |
 | **Isolation** | Separate Selenium profiles — isolated (the default for a new session), temporary, persistent, or attached. |
 | **Site checks** | For your own site: a passive security report graded A–F, load metrics, HAR export, and step-by-step regression tests. |
+| **Macro scripts** | Saved or inline flows with variables, conditions, loops, waits on the page or the network, sub-macros and background jobs — validated before they run. |
 | **Other computers** | The Chrome of another PC on your network, with `node="<name>"` on any call. Pair once with a button and a six-digit code; no key to copy. |
 | **You stay in charge** | Driven tabs are marked (animated favicon, ghost cursor, captions, coloured tab groups), and **Take over** in the popup pauses every agent at once. |
 
@@ -46,7 +47,7 @@ where another finds hits is tried last and named in `unreliable_engines`.
 - [Current Chrome automation](#current-chrome-automation) · [Chrome profile modes](#chrome-profile-modes)
 - [Reading a page](#reading-a-page) · [Locators](#locators)
 - [Console and network diagnostics](#console-and-network-diagnostics)
-- [Forms and multi-step flows](#forms-and-multi-step-flows) · [Reviewable macros](#reviewable-macros)
+- [Forms and multi-step flows](#forms-and-multi-step-flows) · [Reviewable macros](#reviewable-macros) · [Macro scripts](#macro-scripts-logic-loops-background-jobs)
 - [Where macros live](#where-macros-live) · [Macro files](#macro-files) · [There is no write API](#there-is-no-write-api)
 - [Architecture invariants](ARCHITECTURE.md) · [Project-local and guarded macros](#project-local-and-guarded-macros)
 - [Dialogs, downloads, navigation](#dialogs-downloads-navigation)
@@ -1369,6 +1370,32 @@ check the batch result and freshly inspect the page. For applications, payments,
 messages, or other consequential actions, use the guarded two-phase path below so the exact
 terminal Submit or safe Click is attempted only once after live-state validation.
 
+### Macro scripts: logic, loops, background jobs
+
+A macro can decide and wait, not only replay. Any step takes `when` (run only if),
+`save_as` (keep its result), `assert` / `expect` (check it), `retry` and
+`on_error: "continue"`; control steps add `if`, `repeat`, `for_each`, `wait_until`, `try`,
+`set`, `sleep`, `log`, `fail`, `return`, `break`, `continue`, `call` (another macro) and
+`read` (any `web_info` topic — the network log, page text, the console). Parameters take
+`{{expression}}` templates in a small, safe Python-like language with `find`, `count`,
+`matches`, `json` and friends:
+
+```json
+{"actions":[{"action":"macro","op":"run_steps","steps":[
+  {"action":"open","url":"https://example.com/upload","session_id":"job"},
+  {"action":"wait_until","timeout_seconds":120,"steps":[
+    {"action":"read","topic":"network","params":{"session_id":"job"},"save_as":"net"}],
+   "test":"find(net, method='POST', url='~/api/upload').status == 200"},
+  {"action":"return","value":"{{find(net, method='POST').url}}"}]}]}
+```
+
+`op=run_steps` runs inline steps without a file; `background: true` on `run` or
+`run_steps` answers at once with a `job_id` (`op=job` with `wait_seconds`, `op=jobs`,
+`op=cancel`), so a long wait no longer holds the call — or a single-call daemon — open.
+`op=validate` checks scripts too. The full language, the answer's fields and recipes are in
+[docs/macro-scripts.md](docs/macro-scripts.md). A macro with none of this still replays as
+one batch, exactly as before.
+
 ### Checking a macro before it runs
 
 `op=validate` reads a macro file and dispatches nothing at all. It is the check that
@@ -1840,6 +1867,20 @@ python scripts/mcp_cli.py send web_info '{"topic":"screenshot","params":{"sessio
 python scripts/mcp_cli.py repl                         # one "tool json" per line
 python scripts/mcp_cli.py stop
 ```
+
+Macros have their own command, so nobody escapes JSON in a shell: `--var name=value` takes
+JSON when it parses (numbers, lists, null) and the text otherwise, `@file` reads a value
+from a file (a long description, say), and the answer printed is the macro's own.
+
+```
+python scripts/mcp_cli.py macro run youtube-upload --var title="My video" --var description=@desc.txt
+python scripts/mcp_cli.py macro run gpt-image --vars image-job.json --background --session gpt
+python scripts/mcp_cli.py macro job job-153012-a1b2c3 --wait 600
+python scripts/mcp_cli.py macro steps flow.json --var url=https://example.com
+python scripts/mcp_cli.py macro validate youtube-upload
+```
+
+While a background macro job runs, the daemon does not stop on its idle timeout.
 
 The daemon listens on 127.0.0.1 only (a busy port is an error, and on Windows the port is
 bound exclusively) and answers only callers holding the random token it writes to

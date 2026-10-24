@@ -15,6 +15,7 @@ _RECIPES = {
         "macro validate, then preview {variables}",
         "macro run {name, variables}",
     ],
+    "macro_script": ["macro {op: run_steps, steps}: if/loops/waits; skill section=macro_scripts"],
     "existing_tab": ["browser_tabs", "attach_tab {tab_id}", "page_elements", "act"],
     # 1.27.0: name the obstacle before acting on it - captcha_challenge says what kind it is,
     # auto_fix dry_run says what the page itself asked for. Both read, neither touches.
@@ -35,8 +36,8 @@ _RECIPES = {
 }
 
 _PITFALLS = [
-    "web_action(actions=[...]) takes a JSON array of objects; EACH needs action from web_info(topic='actions'); other keys are its parameters. type/name/tool/command/op/operation/method are accepted aliases; prefer action. Genuine parameters such as method/op/name remain parameters of the selected action.",
-    "Every action object needs an \"action\" key can mean client schema-pruning removed it. Check web_action actions.items.properties.action; refresh/reconnect cached tools. Read web_info(topic='action_schema', params={'action':'fetch_text'}) for that action's parameters.",
+    "web_action(actions=[...]) is a JSON array of objects, EACH with action (aliases type/name/tool/command/op/operation/method; a genuine method/op/name stays the action's own parameter).",
+    "Every action object needs an \"action\" key can mean client schema-pruning removed it: check web_action actions.items.properties.action, reconnect cached tools; action_schema lists an action's parameters.",
     "Noisy page: page_elements category='interactive', visible_only, role/text_pattern (filter before paging).",
     "web_action success=true is not task success: check every results[i].success.",
     "Never repeat a click or submit on verified=false/null or after a timeout: read the page first - it may have gone through. Only an observation repeats on its own, while the page asks to wait.",
@@ -120,6 +121,24 @@ _EXAMPLES = {
                 "name": "open-report",
                 "project_root": "auto",
                 "variables": {"url": "https://example.com/reports/2026-08-21"},
+            },
+            {
+                "action": "macro",
+                "op": "run_steps",
+                "variables": {"items": ["a", "b"], "thumbnail": None},
+                "steps": [
+                    {"action": "open", "url": "https://example.com/form", "session_id": "job"},
+                    {"action": "upload", "selector": "#thumb", "file_paths": ["{{thumbnail}}"],
+                     "session_id": "job", "when": "thumbnail"},
+                    {"action": "for_each", "items": "items", "as": "item", "steps": [
+                        {"action": "fill", "fields": {"#tag": "{{item}}"}, "session_id": "job"},
+                    ]},
+                    {"action": "click", "selector": "#save", "session_id": "job", "expect": {"text": "Saved"}},
+                    {"action": "wait_until", "timeout_seconds": 30, "steps": [
+                        {"action": "read", "topic": "network", "params": {"session_id": "job"}, "save_as": "net"},
+                    ], "test": "find(net, method='POST', url='~/api/save').status == 200"},
+                    {"action": "return", "value": "{{find(net, method='POST').status}}"},
+                ],
             },
         ]
     },

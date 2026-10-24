@@ -19,7 +19,7 @@ STRING_LIMIT = 240
 SMALL_OBJECT_CHARS = 400
 # Lists that carry the verdict itself: kept, but only their head.
 HEAD_LISTS = {"priority": 5, "failed_steps": 10, "problems": 5, "recommendations": 5, "warnings": 5,
-              "refused": 5, "not_deleted": 5}
+              "refused": 5, "not_deleted": 5, "trace": 40, "log": 10, "recent": 10, "jobs": 20}
 
 
 def _clip(value: str, clipped: list[str], key: str) -> str:

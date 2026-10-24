@@ -19,7 +19,7 @@ import time
 from typing import Any, Literal
 from urllib.parse import urljoin, urlsplit
 
-from web_search_neo import __version__, browser_tools, macros, network_log, obstacle_recovery, obstacle_scripts
+from web_search_neo import __version__, browser_tools, macro_check, macros, network_log, obstacle_recovery, obstacle_scripts
 from web_search_neo.audit import active, api, api_contract, api_parts, diff, har, multipage, page as page_checks
 from web_search_neo.audit import perf, report, sarif, scenario, secrets as secret_checks, site
 from web_search_neo.audit import scope as scope_mod
@@ -647,7 +647,7 @@ def _refuse_nested_macros(plan: list[dict[str, Any]]) -> None:
             record = macros.load(str(action["name"]), action.get("project_root"))
         except (ValueError, OSError):
             continue
-        for inner in record.get("steps") or []:
+        for _, inner in macro_check.walk(record.get("steps") or []):
             if str(inner.get("action") or "").strip().lower() in scenario.FORBIDDEN_IN_STEPS:
                 raise ValueError(f"step {step['index']}: macro '{record['name']}' runs a test_run, and a test_run "
                                  "cannot run inside another one")
