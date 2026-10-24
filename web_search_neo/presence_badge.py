@@ -141,148 +141,42 @@ SOURCE = r"""
     return macro && state.macroAt >= state.agentAt ? "macro" : "agent";
   }
 
-  // A background macro's mark: a wrench, its open jaw up and right. `scale` and the
-  // offsets let it sit small beside the robot when both are on the tab.
-  function drawWrench(context, phase, scale, dx, dy) {
-    context.save();
-    context.translate(CONFIG.slimeOrigin[0] + (dx || 0), CONFIG.slimeOrigin[1] + (dy || 0));
-    context.scale(CONFIG.slimeScale * (scale || 1), CONFIG.slimeScale * (scale || 1));
-    const tilt = -Math.PI / 4;
-    const shape = function () {
-      context.beginPath();
-      context.moveTo(3, 14);
-      context.lineTo(9.4, 7.6);
-      context.moveTo(11.2 + 2.9 * Math.cos(tilt + 0.55), 4.8 + 2.9 * Math.sin(tilt + 0.55));
-      context.arc(11.2, 4.8, 2.9, tilt + 0.55, tilt - 0.55 + Math.PI * 2);
-    };
-    context.lineCap = "round";
-    for (const [width, colour] of [[5, "rgba(255,255,255,0.9)"], [3.8, "rgba(10,30,18,0.85)"], [2.4, phaseColor(phase)]]) {
-      shape();
-      context.lineWidth = width;
-      context.strokeStyle = colour;
-      context.stroke();
-    }
-    context.restore();
+  // The marks sit in the left corners and leave the rest of the page's icon alone
+  // (the owner, 2026-10-24): the state in the top-left - a dot coloured by how long
+  // ago the tab was driven, ringed while it works - and a padlock in the bottom-left
+  // while a background macro job drives the tab.
+  const DOT = {x: 7, y: 7, r: 5.2};
+
+  function disc(context, x, y, radius, fill) {
+    context.beginPath();
+    context.arc(x, y, radius + 1.6, 0, Math.PI * 2);
+    context.fillStyle = "rgba(255,255,255,0.95)";
+    context.fill();
+    context.beginPath();
+    context.arc(x, y, radius + 0.7, 0, Math.PI * 2);
+    context.fillStyle = "rgba(10,20,14,0.85)";
+    context.fill();
+    context.beginPath();
+    context.arc(x, y, radius, 0, Math.PI * 2);
+    context.fillStyle = fill;
+    context.fill();
   }
 
-  // The agent's mark: a robot head with an antenna, same corner, coloured by the time.
-  function drawRobot(context, phase, lift, squash) {
-    const awake = phase !== "recent" && phase !== "stale";
-    const color = phaseColor(phase);
-    context.save();
-    context.translate(CONFIG.slimeOrigin[0], CONFIG.slimeOrigin[1] - (lift || 0));
-    context.scale(CONFIG.slimeScale, CONFIG.slimeScale);
-    if (squash && squash !== 1) {
-      context.translate(0, 15);
-      context.scale(1 / squash, squash);
-      context.translate(0, -15);
-    }
-    context.globalAlpha = CONFIG.slimeAlpha;
-    const head = function () {
-      context.beginPath();
-      if (context.roundRect) context.roundRect(1.5, 5, 13, 10, 3);
-      else context.rect(1.5, 5, 13, 10);
-    };
-    context.lineCap = "round";
-    context.beginPath();
-    context.moveTo(8, 5);
-    context.lineTo(8, 2.4);
-    context.lineWidth = 2.6;
-    context.strokeStyle = "rgba(255,255,255,0.9)";
-    context.stroke();
-    context.lineWidth = 1.1;
-    context.strokeStyle = "#10261a";
-    context.stroke();
-    context.beginPath();
-    context.arc(8, 1.9, 1.4, 0, Math.PI * 2);
-    context.fillStyle = color;
-    context.fill();
-    head();
-    context.lineWidth = 2;
-    context.strokeStyle = "rgba(255,255,255,0.9)";
-    context.stroke();
-    head();
-    context.lineWidth = 0.8;
-    context.strokeStyle = "rgba(10,30,18,0.8)";
-    context.stroke();
-    context.fillStyle = color;
-    context.fill();
-    context.fillStyle = "#10261a";
-    context.strokeStyle = "#10261a";
-    context.lineWidth = 1;
-    for (const x of [5.4, 10.6]) {
-      if (awake) {
-        context.beginPath();
-        context.arc(x, 9.6, 1.6, 0, Math.PI * 2);
-        context.fillStyle = "#ffffff";
-        context.fill();
-        context.beginPath();
-        context.arc(x, 9.7, 0.8, 0, Math.PI * 2);
-        context.fillStyle = "#10261a";
-        context.fill();
-      } else {
-        context.beginPath();
-        context.moveTo(x - 1.4, 9.8);
-        context.lineTo(x + 1.4, 9.8);
-        context.stroke();
-      }
-    }
-    context.beginPath();
-    context.moveTo(6.2, 12.8);
-    context.lineTo(9.8, 12.8);
-    context.stroke();
-    context.restore();
-  }
-
-  // "Working right now": a ring behind the slime that swells and fades over
-  // the pulse frames. Frame -1 is the still ring reduced motion gets.
+  // "Working right now": a ring around the dot that swells and fades over the
+  // pulse frames, kept inside the top-left quarter. Frame -1 is the still ring
+  // reduced motion gets.
   function drawRing(context, frame) {
     const t = frame < 0 ? 0.3 : frame / CONFIG.pulseFrames;
-    const cx = CONFIG.slimeOrigin[0] + 8 * CONFIG.slimeScale;
-    const cy = CONFIG.slimeOrigin[1] + 9.5 * CONFIG.slimeScale;
     context.save();
-    clipToCorner(context, 2);
+    context.beginPath();
+    context.rect(0, 0, 16, 16);
+    context.clip();
     context.globalAlpha = frame < 0 ? 1 : 1 - 0.7 * t;
     context.beginPath();
-    context.arc(cx, cy, (8.5 + 3 * t) * CONFIG.slimeScale, 0, Math.PI * 2);
-    context.lineWidth = 3.4;
-    context.strokeStyle = "rgba(10,30,18,0.75)";
-    context.stroke();
+    context.arc(DOT.x, DOT.y, DOT.r + 2.4 + 2.6 * t, 0, Math.PI * 2);
     context.lineWidth = 2;
     context.strokeStyle = CONFIG.busyColor;
     context.stroke();
-    context.restore();
-  }
-
-  // The glow and the ring stay in the slime's own corner: a clip to the square
-  // the slime occupies (plus a margin for the glow), so they can never spill over
-  // the page's icon. Painted unclipped, a filled circle of radius 10-13 on this
-  // 32 px canvas covered more than half of the favicon and turned it all green.
-  function clipToCorner(context, margin) {
-    context.beginPath();
-    context.rect(CONFIG.slimeOrigin[0] - margin, CONFIG.slimeOrigin[1] - margin,
-      32 - CONFIG.slimeOrigin[0] + margin, 32 - CONFIG.slimeOrigin[1] + margin);
-    context.clip();
-  }
-
-  // A soft halo behind the slime; `t` (0..1) is how far it has swollen. At
-  // strip size (16 px) a glow that grows and fades is what still reads as
-  // motion, where finer detail is lost. A radial gradient, strongest under the
-  // slime and fully clear at the rim, rather than a flat disc.
-  function drawHalo(context, color, t, base, swell) {
-    const cx = CONFIG.slimeOrigin[0] + 8 * CONFIG.slimeScale;
-    const cy = CONFIG.slimeOrigin[1] + 9.5 * CONFIG.slimeScale;
-    const radius = (8 + 0.5 * swell * t) * CONFIG.slimeScale;
-    context.save();
-    clipToCorner(context, 2);
-    const glow = context.createRadialGradient(cx, cy, 0, cx, cy, radius);
-    glow.addColorStop(0, color);
-    glow.addColorStop(1, "rgba(0,0,0,0)");
-    context.globalAlpha = Math.min(1, base + 0.5 * t);
-    context.beginPath();
-    context.arc(cx, cy, radius, 0, Math.PI * 2);
-    context.fillStyle = glow;
-    context.fill();
     context.restore();
   }
 
@@ -290,31 +184,49 @@ SOURCE = r"""
     return 0.5 - 0.5 * Math.cos((frame / frames) * Math.PI * 2);
   }
 
-  // "Active": the green halo swells and fades, and the slime rises with it.
-  function drawBreath(context, frame) {
-    const t = breath(frame, CONFIG.breatheFrames);
-    drawHalo(context, CONFIG.activeColor, t, 0.3, 3);
-    return 1.4 * t;
+  // The state dot: green while working and for a minute after (breathing), yellow
+  // for the next minutes, red until the hour is up. `grow` is the hop of an action.
+  function drawStateDot(context, phase, still, grow) {
+    let radius = DOT.r * (grow || 1);
+    if (phase === "active" && still !== null) radius += 0.9 * breath(still, CONFIG.breatheFrames);
+    if (phase === "recent" && still !== null) radius -= 0.6 * breath(still, CONFIG.dozeFrames);
+    disc(context, DOT.x, DOT.y, radius, phaseColor(phase));
   }
 
-  // "Recent": a slower amber glow behind the sleeping slime...
-  function drawDozeGlow(context, frame) {
-    drawHalo(context, CONFIG.recentColor, breath(frame, CONFIG.dozeFrames), 0.15, 2);
-  }
-
-  // ...and a z drifting up and fading beside it.
-  function drawDoze(context, frame) {
-    const t = frame / CONFIG.dozeFrames;
+  // A background macro's mark: a padlock, bottom-left, its body in the state colour.
+  function drawLock(context, phase) {
     context.save();
-    context.globalAlpha = 1 - 0.5 * t;
-    context.font = "900 " + (9 + 3 * t).toFixed(1) + "px sans-serif";
-    context.lineWidth = 2.5;
-    context.strokeStyle = "rgba(10,30,18,0.9)";
-    context.fillStyle = "#ffd27a";
-    const x = CONFIG.slimeOrigin[0] - 5 + 3 * t;
-    const y = CONFIG.slimeOrigin[1] + 5 - 6 * t;
-    context.strokeText("z", x, y);
-    context.fillText("z", x, y);
+    context.translate(1, 17);
+    context.lineCap = "round";
+    for (const [width, colour] of [[4.6, "rgba(255,255,255,0.95)"], [2.6, "rgba(10,20,14,0.9)"]]) {
+      context.beginPath();
+      context.arc(6.5, 6, 3.6, Math.PI, 0);
+      context.lineTo(10.1, 7.5);
+      context.moveTo(2.9, 7.5);
+      context.lineTo(2.9, 6);
+      context.lineWidth = width;
+      context.strokeStyle = colour;
+      context.stroke();
+    }
+    const body = function () {
+      context.beginPath();
+      if (context.roundRect) context.roundRect(0.6, 6.6, 11.8, 8.2, 2);
+      else context.rect(0.6, 6.6, 11.8, 8.2);
+    };
+    body();
+    context.lineWidth = 2.2;
+    context.strokeStyle = "rgba(255,255,255,0.95)";
+    context.stroke();
+    body();
+    context.fillStyle = phaseColor(phase);
+    context.fill();
+    context.lineWidth = 0.9;
+    context.strokeStyle = "rgba(10,20,14,0.9)";
+    context.stroke();
+    context.beginPath();
+    context.arc(6.5, 10.4, 1.3, 0, Math.PI * 2);
+    context.fillStyle = "rgba(10,20,14,0.9)";
+    context.fill();
     context.restore();
   }
 
@@ -333,22 +245,15 @@ SOURCE = r"""
       // "<state>:hop<i>" is hop frame i over the state's still decoration.
       const hop = parts.length > 1 ? /^hop(\d+)$/.exec(parts[1]) : null;
       const frame = parts.length > 1 && !hop ? Number(parts[1]) : null;
-      let lift = 0;
-      let squash = 1;
+      let grow = 1;
       if (hop) {
         const index = Math.min(Number(hop[1]), CONFIG.hopLifts.length - 1);
-        lift = CONFIG.hopLifts[index];
-        if (index === CONFIG.hopLifts.length - 1) squash = CONFIG.hopSquash;
+        grow = 1 + CONFIG.hopLifts[index] / 20;
       }
       const still = hop ? 2 : frame;
       if (parts[0] === "busy") drawRing(context, hop ? 1 : frame);
-      if (parts[0] === "active" && still !== null) lift += drawBreath(context, still);
-      if (parts[0] === "recent" && still !== null) drawDozeGlow(context, still % CONFIG.dozeFrames);
-      const mode = markMode(Date.now());
-      if (mode === "macro") drawWrench(context, parts[0], 1, 0, -(lift || 0));
-      else drawRobot(context, parts[0], lift, squash);
-      if (mode === "both") drawWrench(context, parts[0], 0.55, -6, 7);
-      if (parts[0] === "recent" && still !== null) drawDoze(context, still % CONFIG.dozeFrames);
+      drawStateDot(context, parts[0], still, grow);
+      if (markMode(Date.now()) !== "agent") drawLock(context, parts[0]);
       return canvas.toDataURL("image/png");
     } catch (error) {
       // A cross-origin favicon without CORS taints the canvas and toDataURL
@@ -411,7 +316,7 @@ SOURCE = r"""
 
   // The page's own icon, loaded once per document and shared by every state
   // and frame. undefined: not asked yet; null: the page has none, so the mark
-  // goes on its own; false: unreadable, and the page's icon is left alone.
+  // goes on its own; false: unreadable until the server sends it (setBase).
   function withBase(done) {
     if (state.base !== undefined) { done(state.base); return; }
     state.waiting.push(done);
@@ -432,6 +337,7 @@ SOURCE = r"""
         // Nothing readable. A page that declares an icon still has one on
         // screen (Chrome fetches it without CORS), so it stays; only a page
         // with no icon at all gets the corner mark on its own.
+        state.baseHref = declared || fallback;
         settle(iconLinks().length || state.hidden.length ? false : null);
         return;
       }
@@ -457,6 +363,8 @@ SOURCE = r"""
       return;
     }
     withBase(function (image) {
+      // Unreadable (most sites: a cross-origin icon without CORS): the page's icon
+      // stays until the server hands it over as a data URL (needBase / setBase).
       if (image === false) return;
       const dataUrl = paint(key, image);
       if (!dataUrl) {
@@ -612,6 +520,30 @@ SOURCE = r"""
     schedule();
     startHop();
   }
+
+  // A page whose icon this script cannot read (cross-origin without CORS) asks the
+  // server for it once per document; the server fetches it and calls setBase with a
+  // data URL - same-origin to the canvas - or null when it could not, and the mark
+  // then goes on a transparent canvas, in its corner as always.
+  state.needBase = function () {
+    if (state.base !== false || !state.baseHref || state.baseAsked) return null;
+    state.baseAsked = true;
+    return {needBase: state.baseHref};
+  };
+
+  state.setBase = function (dataUrl) {
+    const done = function (image) {
+      state.base = image;
+      state.painted = {};
+      if (state.shown) show(state.shown.slice(state.shown.indexOf("/") + 1));
+    };
+    if (!dataUrl) { done(null); return true; }
+    const image = new Image();
+    image.onload = function () { done(image); };
+    image.onerror = function () { done(null); };
+    image.src = dataUrl;
+    return true;
+  };
 
   // The time of the agent's last action, from the companion after a navigation or
   // from this tab's sessionStorage after a reload: the badge picks up where it was.

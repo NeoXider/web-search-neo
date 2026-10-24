@@ -19,7 +19,7 @@ import logging
 import time
 from typing import Any, Callable
 
-from web_search_neo import agent_presence
+from web_search_neo import agent_presence, presence_icon
 
 logger = logging.getLogger(__name__)
 
@@ -134,13 +134,15 @@ def hide_overlays(driver: Any, hide: bool = True) -> None:
 def _ping(session: Any, payload: dict[str, Any], *, install: bool) -> bool:
     driver = session.driver
     marked = driver.execute_script(agent_presence.ping_script(), payload)
-    if marked or not install:
-        return bool(marked)
-    # Nothing installed in this document - a navigation the registration did
-    # not cover, or a backend without CDP. Install it here and mark the page in
-    # the same call rather than skipping the signal.
-    driver.execute_script(agent_presence.install_source())
-    return bool(driver.execute_script(agent_presence.ping_script(), payload))
+    if not marked and install:
+        # Nothing installed in this document - a navigation the registration did
+        # not cover, or a backend without CDP. Install it here and mark the page in
+        # the same call rather than skipping the signal.
+        driver.execute_script(agent_presence.install_source())
+        marked = driver.execute_script(agent_presence.ping_script(), payload)
+    if isinstance(marked, dict) and marked.get("needBase"):
+        presence_icon.deliver(session, str(marked["needBase"]))
+    return bool(marked)
 
 
 def note(

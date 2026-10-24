@@ -430,41 +430,35 @@ def test_a_broken_signal_never_fails_the_action(monkeypatch):
     assert result["success"] is True
 
 
-def test_favicon_mark_is_an_opaque_full_size_robot_or_wrench_over_the_page_icon():
+def test_favicon_mark_keeps_the_page_icon_and_marks_only_the_left_corners():
     source = agent_presence.install_source()
-    # The page's own icon is drawn first and the mark goes on top of it in the
-    # bottom-right corner, at full size and fully opaque: the tab keeps its
-    # identity, and the mark survives being looked at in a crowded tab strip.
-    # The shape says who (the owner, 2026-10-24): a robot head for an agent, a
-    # wrench for a background macro job, the robot with a small wrench for both.
-    assert "function drawRobot(" in source and "function drawWrench(" in source
-    assert 'if (mode === "both") drawWrench(context, parts[0], 0.55, -6, 7);' in source
-    assert "function markMode(now)" in source
+    # The page's own icon is drawn whole and stays recognisable; the state is a dot
+    # in the top-left corner, coloured by phase and ringed while working, and a
+    # padlock goes in the bottom-left while a background macro job drives the tab
+    # (the owner, 2026-10-24: "not the whole icon, only the top-left corner").
     assert "context.drawImage(baseImage, 0, 0, 32, 32)" in source
-    assert "CONFIG.slimeOrigin[0], CONFIG.slimeOrigin[1]" in source
-    assert "context.scale(CONFIG.slimeScale, CONFIG.slimeScale)" in source
-    assert "context.globalAlpha = CONFIG.slimeAlpha;" in source
-    assert agent_presence.SLIME_ALPHA == 1.0 and agent_presence.SLIME_SCALE >= 1.0
-    # The geometry has to stay inside the canvas, halo stroke included: a mark
-    # clipped at the tab edge reads as a chip of the site's own icon.
-    origin_x, origin_y = agent_presence.SLIME_ORIGIN
-    assert origin_x + 16 * agent_presence.SLIME_SCALE <= 31
-    assert origin_y + 15 * agent_presence.SLIME_SCALE <= 31
-    # An unreadable (tainted) favicon is left alone instead of being replaced by
-    # an opaque tile, and the older activity dot defers to this script.
+    assert "function drawStateDot(" in source and "function drawLock(" in source
+    assert "const DOT = {x: 7, y: 7, r: 5.2};" in source
+    assert 'if (markMode(Date.now()) !== "agent") drawLock(context, parts[0]);' in source
+    assert "context.translate(1, 17);" in source  # the lock's corner
+    assert "function drawRobot(" not in source and "roundRect(0, 0, 32, 32" not in source
+    # An icon the page cannot read (cross-origin without CORS - most sites) used to
+    # mean no mark at all. The page keeps its icon, asks the server for it once
+    # (needBase), and setBase repaints the marks over the real icon; the older
+    # activity dot defers to this script.
+    assert "state.needBase = function ()" in source and "state.setBase = function (dataUrl)" in source
+    assert "return (state.needBase && state.needBase()) || true;" in source
+    assert "return presence.note(arguments[0]);" in agent_presence.ping_script()
     assert "#20272e" not in source
     assert "window.__wsnPresence" in browser_tools._TAB_ACTIVITY_SOURCE
 
 
-def test_the_glow_and_ring_stay_in_the_slimes_corner():
+def test_the_working_ring_stays_in_the_top_left_quarter():
     source = agent_presence.install_source()
-    # Regression: the halo was a flat disc of radius 10-13 on the 32 px canvas
-    # and turned the whole favicon green instead of leaving the slime in the
-    # corner. Glow and ring are clipped to the slime's square and fade out.
-    assert "function clipToCorner(context, margin)" in source
-    assert source.count("clipToCorner(context, 2);") == 2
-    assert "createRadialGradient(cx, cy, 0, cx, cy, radius)" in source
-    assert "(10 + swell * t)" not in source
+    # Regression: an unclipped glow once turned the whole favicon green. The ring
+    # around the state dot is clipped to the top-left 16 x 16 quarter.
+    assert "context.rect(0, 0, 16, 16);" in source
+    assert "createRadialGradient" not in source
 
 
 def test_every_action_makes_the_slime_hop():
@@ -745,24 +739,69 @@ def test_a_dom_click_sets_the_cursor_off_before_the_click_lands(monkeypatch):
 def test_the_badge_has_three_states_told_apart_by_more_than_colour():
     source = agent_presence.install_source()
     # Every state moves in its own rhythm, painted as frames and swapped on one
-    # timer: a fast ring pulse while working, a slow breath (halo + bob) while
-    # active, a slower doze (a drifting z) while recent. Reduced motion gets the
-    # still version of each state, a still ring for working.
+    # timer: a fast ring pulse while working, a slow breath of the dot while
+    # active, a slower one while recent. Reduced motion gets the still version
+    # of each state, a still ring for working.
     assert 'show(phase + ":" + state.frame)' in source
     assert 'show(phase === "busy" ? "busy:-1" : phase)' in source
     assert "prefers-reduced-motion: reduce" in source
-    assert "function drawBreath(" in source and "function drawDoze(" in source
+    assert 'if (phase === "active" && still !== null) radius += 0.9 * breath(still, CONFIG.breatheFrames);' in source
+    assert 'if (phase === "recent" && still !== null) radius -= 0.6 * breath(still, CONFIG.dozeFrames);' in source
     assert f'"busyMs": {presence_badge.BUSY_MS}' in source
     assert f'"pulseFrameMs": {presence_badge.PULSE_FRAME_MS}' in source
     assert f'"breatheFrameMs": {presence_badge.BREATHE_FRAME_MS}' in source
     assert f'"dozeFrameMs": {presence_badge.DOZE_FRAME_MS}' in source
     assert (presence_badge.PULSE_FRAME_MS < presence_badge.BREATHE_FRAME_MS
             < presence_badge.DOZE_FRAME_MS), "working must look busier than the quiet states"
-    # Active, recent, stale: awake green, asleep yellow, still red - then the page's own icon.
-    assert 'const awake = phase !== "recent" && phase !== "stale";' in source
+    # Active, recent, stale: green, yellow, red - then the page's own icon.
+    assert "disc(context, DOT.x, DOT.y, radius, phaseColor(phase));" in source
     assert 'if (phase === "stale") { show("stale"); return; }' in source
     assert "restoreIcon();" in source
     assert presence_badge.BUSY_MS < agent_presence.ACTIVE_MS < agent_presence.RECENT_MS
     # The animation timer is the only repeating one, and it stops itself the
     # moment its state is over (or the badge is gone).
     assert "if (!phase || phase !== state.phase) return;" in source
+
+
+def test_an_unreadable_site_icon_is_fetched_by_the_server_and_handed_back(monkeypatch):
+    from web_search_neo import presence_icon, presence_live
+
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 20
+    assert presence_icon._sniff(png, "") == "image/png"
+    assert presence_icon._sniff(b"\x00\x00\x01\x00rest", "application/octet-stream") == "image/x-icon"
+    assert presence_icon._sniff(b"  <svg xmlns='http://www.w3.org/2000/svg'/>", "text/plain") == "image/svg+xml"
+    assert presence_icon._sniff(b"<html>", "text/html") is None
+    for href in ("file:///C:/secret.png", "data:,", "javascript:alert(1)", "chrome://favicon"):
+        assert presence_icon.fetch_data_url(href) is None
+
+    calls = []
+
+    class Driver:
+        def execute_script(self, script, *args):
+            calls.append((script, args))
+            if "presence.note" in script:
+                return {"needBase": "https://cdn.example/favicon.ico"}
+            return True
+
+    class Session:
+        driver = Driver()
+        lock = __import__("threading").Lock()
+
+    delivered = []
+    monkeypatch.setattr(presence_icon, "deliver", lambda session, href: delivered.append(href))
+    assert presence_live._ping(Session(), {"action": "click"}, install=True) is True
+    assert delivered == ["https://cdn.example/favicon.ico"]
+
+
+def test_the_status_panel_opens_on_a_click_and_never_takes_an_agents_click():
+    source = agent_presence.install_source()
+    # The owner (2026-10-24): stats on the page, and a click to open or close them.
+    assert "function panelPaint()" in source and "state.panelStats = function (stats)" in source
+    assert 'const PANEL_KEY = "__wsnPanelOpen";' in source  # the choice is kept for the tab
+    assert 'host.addEventListener("click", function (event) {' in source
+    # The one clickable presence layer lets clicks through while the agent acts,
+    # hides with the rest before screenshots, and goes with the overlay.
+    assert 'entry.host.style.pointerEvents = state.phase === "busy" ? "none" : "auto";' in source
+    assert "panelHide();" in source and "panelShow();" in source and "panelRestore();" in source
+    assert 'overlayHost("panel", 2147483645)' in source  # tagged data-wsn-presence like every layer
+    assert "try { panelNote(data); } catch (error) {}" in source

@@ -533,7 +533,7 @@ def test_a_background_job_marks_its_tabs_as_the_macro_s(monkeypatch):
         await main.browser_macro(op="run", name="watch", timeout_seconds=30)
 
     asyncio.run(scenario())
-    # The background job's actions carry the wrench; the run the caller waited for is the agent's own.
+    # The background job's actions carry the padlock; the run the caller waited for is the agent's own.
     assert seen == ["watch", None]
 
 

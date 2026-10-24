@@ -239,7 +239,7 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
             "Check results where they happen: assert 'result.data.status == 200' on an http_request, expect {text: 'Saved'} on a click, retry: 2 on a flaky wait.",
             "Contain failures with try {steps, catch, finally}, or on_error: 'continue' plus a later if on last.ok.",
             "Reuse with call {name, variables}; finish with return {value}. The answer carries returned, outputs, log and a trace line per step.",
-            "Long or watching runs: run with background=true, read op='job' (wait_seconds), op='jobs', op='cancel'. Use a session_id of the job's own. The person sees the jobs in the companion popup (Stop there too), and a background job's tabs carry a wrench badge.",
+            "Long or watching runs: run with background=true, read op='job' (wait_seconds), op='jobs', op='cancel'. Use a session_id of the job's own. The person sees the jobs in the companion popup (Stop there too), and a background job's tabs carry a padlock in the favicon's bottom-left corner.",
             "Before an irreversible step, {action: ask, message, options, default, timeout_seconds, save_as} pauses for the person (popup buttons or a notification) or an agent's op='answer'.",
             "Two tabs at once: {action: parallel, branches: [[...], [...]]}, a session_id per branch; fail_fast (default true) stops the rest at the first failure.",
             "Repeat it on a clock: op='schedule' with name or steps and every_seconds (>= 10) or times ['09:00'], max_runs; op='schedules', op='unschedule'. Each run is a background job; an overlapping run is skipped.",

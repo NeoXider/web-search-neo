@@ -1,5 +1,5 @@
 """The companion's idle-tab auto-close and its macro jobs (jobs.js): Stop and ask answers ride
-back on the server's own jobsReport, background jobs' tabs wear the wrench."""
+back on the server's own jobsReport, background jobs' tabs wear the padlock."""
 
 from __future__ import annotations
 
@@ -93,5 +93,5 @@ def test_a_jobs_report_lists_jobs_and_carries_stop_and_answers_back() -> None:
     assert "wsn-ask-j2" in ids and "wsn-job-j1" in ids
     ask = next(note for note in outcome["notes"] if note["id"] == "wsn-ask-j2")
     assert [button["title"] for button in ask["buttons"]] == ["yes", "no"]
-    # The tab a background job drove wears the wrench on the toolbar badge.
-    assert outcome["wrench"]["text"] == "\U0001f527"
+    # The tab a background job drove wears the padlock on the toolbar badge.
+    assert outcome["wrench"]["text"] == "\U0001f512"

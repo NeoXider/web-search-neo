@@ -4,7 +4,7 @@
 // own answer carries those presses back to the server, so nothing here needs a channel of its
 // own. A notification says when a background job ends, and asks the question with buttons.
 //
-// The tabs a background job drove are kept in macroTabIds: the toolbar badge shows the wrench
+// The tabs a background job drove are kept in macroTabIds: the toolbar badge shows the padlock
 // there instead of the agent's robot.
 
 const STORE = "macro_jobs";

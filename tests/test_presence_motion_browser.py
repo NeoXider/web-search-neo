@@ -114,23 +114,30 @@ def test_a_new_target_mid_glide_bends_instead_of_jumping(visible_page):
     assert abs(settled["x"] - 100) < 0.6 and abs(settled["y"] - 650) < 0.6
 
 
-def test_a_scroll_is_captioned_in_a_corner_and_kept_out_of_screenshots(visible_page):
+def test_a_scroll_is_told_by_the_status_panel_and_kept_out_of_screenshots(visible_page):
     session_id, session = visible_page
     driver = session.driver
     _act({"action": "scroll", "delta_y": 300, "session_id": session_id, "wait_seconds": 0})
-    hud = driver.execute_script("""
-      const h = document.querySelector('[data-wsn-presence="caption"]');
+    read = """
+      const h = document.querySelector('[data-wsn-presence="panel"]');
       return h ? {text: h.shadowRoot.textContent, display: getComputedStyle(h).display,
                   hidden: h.getAttribute('aria-hidden'), events: getComputedStyle(h).pointerEvents} : null;
-    """)
-    assert hud and "Scrolling ↓" in hud["text"] and "presence-motion" in hud["text"]
-    assert hud == {**hud, "display": "block", "hidden": "true", "events": "none"}
+    """
+    panel = driver.execute_script(read)
+    # A caption with nothing to stand beside goes to the panel, not to a second
+    # pill in a corner (the owner, 2026-10-24: "why two states?").
+    assert panel and "Scrolling ↓" in panel["text"] and "presence-motion" in panel["text"]
+    # While the agent is acting the panel lets clicks through.
+    assert panel == {**panel, "display": "block", "hidden": "true", "events": "none"}
+    assert driver.execute_script(
+        "const h = document.querySelector('[data-wsn-presence=caption]');"
+        " return h ? getComputedStyle(h).display : 'none';") == "none"
     seen = {}
     real = driver.get_screenshot_as_png
 
     def capture():
         seen["display"] = driver.execute_script(
-            "return getComputedStyle(document.querySelector('[data-wsn-presence=caption]')).display")
+            "return getComputedStyle(document.querySelector('[data-wsn-presence=panel]')).display")
         return real()
 
     driver.get_screenshot_as_png = capture
@@ -140,8 +147,8 @@ def test_a_scroll_is_captioned_in_a_corner_and_kept_out_of_screenshots(visible_p
         del driver.get_screenshot_as_png
     assert seen["display"] == "none"
     assert driver.execute_script(
-        "return getComputedStyle(document.querySelector('[data-wsn-presence=caption]')).display") == "block"
-    # The page readers never see the caption.
+        "return getComputedStyle(document.querySelector('[data-wsn-presence=panel]')).display") == "block"
+    # The page readers never see it.
     assert "Scrolling" not in browser_tools.get_page_text(session_id).get("text", "")
 
 

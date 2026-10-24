@@ -278,6 +278,12 @@ env.step(key_probs=[0.05, 0.9, 0.4])              # per-key mode; gym_env(keys=.
 env.step(pressed=["RIGHT", "SPACE"], frames=8)
 ```
 
+In a tab with a window (your own Chrome, `profile_mode: "current"`, brought forward with `show`)
+the page's status panel shows each step, its reward, the running total and the keys held, so a
+person can watch the model play. A free vision LLM (`dots-3-note-preview:free` on OpenRouter),
+shown the frame every step and answering `key_probs` with a step length, cleared the platformer
+fixture in 8 moves without a death.
+
 Measured on the bundled platformer fixture: a probability policy played through 5.8 steps a
 second with a 64 x 36 pixel observation, and `done` fired on the death it caused. Each step
 is one round trip, so this suits a policy that thinks per step, not a 60 Hz training run.

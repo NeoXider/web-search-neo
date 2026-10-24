@@ -170,9 +170,12 @@ stay reachable, so local services work unchanged.
   driving, a server installed from a wheel - and `refused` names which. It moves the user's
   checkout, so ask first; after it runs, read `server_restart_note` before assuming this
   process picked the new code up (it does not).
-- A tab an agent is driving wears a robot on its favicon (a background macro job's tab a
-  wrench, both when both act): green while acting and for a minute after, yellow for the
-  next five minutes, red for up to an hour; the mark survives reloads and navigation. The
+- A tab an agent is driving keeps its own favicon with a state dot in the top-left corner
+  (a background macro job's tab also a padlock bottom-left): green while acting and for a
+  minute after, yellow for the next five minutes, red for up to an hour; it survives
+  reloads and navigation. A small panel in the page's bottom-left corner names the agent
+  and its state, and a click opens its stats (last action, counts, an env's step and
+  reward); it lets clicks through while the agent acts and is never in your screenshots. The
   companion closes tabs the agent opened and left idle for an hour (popup Settings, Idle AI
   tabs; never a pinned, audible or watched tab). A
   ghost cursor glides between the agent's pointer points with its name tag and a caption

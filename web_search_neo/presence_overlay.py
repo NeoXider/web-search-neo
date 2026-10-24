@@ -36,6 +36,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from web_search_neo import presence_panel
 from web_search_neo.actions import pointer_path
 
 # The arrow's own glide when nothing dictates its timing: Fitts-shaped like the
@@ -81,6 +82,7 @@ def config() -> dict[str, Any]:
         "trailMs": TRAIL_MS,
         "trailDots": TRAIL_DOTS,
         "leadEchoMs": LEAD_ECHO_MS,
+        "panelRefreshMs": presence_panel.PANEL_REFRESH_MS,
     }
 
 
@@ -480,6 +482,10 @@ SOURCE = r"""
   }
 
   function showHud(line, rect) {
+    // A caption with nothing to stand beside would sit in a corner and repeat
+    // what the status panel already says: the panel shows it instead.
+    const beside = rect && rect.width > 0 && rect.top < window.innerHeight && rect.top + rect.height > 0;
+    if (!beside && panel.entry && state.phase) return;
     let entry = attached(state.hud);
     if (!entry) {
       const host = overlayHost("caption", 2147483646);
@@ -598,6 +604,7 @@ SOURCE = r"""
   // beside the arrow when there is one, else beside the element, else in a
   // corner. Returns nothing the caller has to use.
   function overlayNote(data) {
+    try { panelNote(data); } catch (error) {}
     const now = clock();
     if (data.label) motion.label = String(data.label);
     motion.gap = motion.lastNote ? now - motion.lastNote : 0;
@@ -619,6 +626,7 @@ SOURCE = r"""
 
   function overlayHide() {
     state.hidden = true;
+    panelHide();
     for (const host of state.ripples.splice(0)) dropFlash(host);
     for (const key of ["cursor", "hud", "trail"]) {
       if (state[key]) state[key].host.style.display = "none";
@@ -627,6 +635,7 @@ SOURCE = r"""
 
   function overlayShow() {
     state.hidden = false;
+    panelShow();
     if (state.cursor && state.cursor.visible) state.cursor.host.style.display = "block";
     if (state.hud && state.hud.until > Date.now()) state.hud.host.style.display = "block";
   }
@@ -650,5 +659,9 @@ SOURCE = r"""
       dropFlash(entry.host);
     }
     state.cursor = undefined; state.hud = null; state.trail = null;
+    panelRestore();
   }
+
+__WSN_PRESENCE_PANEL__
 """
+SOURCE = SOURCE.replace("__WSN_PRESENCE_PANEL__", presence_panel.SOURCE)

@@ -89,7 +89,7 @@ def test_activity_phases_badges_and_expiry() -> None:
         "text": "\U0001f916", "color": "#16a34a",
         "title": "Web Search Neo — Agent claude — active now",
     }
-    assert out["macroText"] == "\U0001f527"
+    assert out["macroText"] == "\U0001f512"
     assert out["recent"]["phase"] == "recent"
     assert out["recent"]["badge"]["color"] == "#ca8a04"
     assert out["recent"]["badge"]["title"].endswith("Agent claude — last action 2 min ago")

@@ -399,7 +399,7 @@ agent opened and left alone for an hour (by default) are closed, never a pinned,
 watched one. The **Macros** card lists running and recent macro jobs with their progress, a
 **Stop** button, and the buttons of a job that asks you something; a background job that ends
 or asks shows a notification. While agents work, the toolbar icon animates (its badge shows
-a robot, or a wrench while a background macro job drives tabs), the logo in the panel
+a robot, or a padlock while a background macro job drives tabs), the logo in the panel
 turns, each agent tab row shows a bar draining over its afterglow, and every
 tab group holding a driven tab is coloured by state: green while an agent acted in the
 last minute, yellow for the next five minutes, red until an hour has passed, orange while
@@ -1060,17 +1060,22 @@ set `WEB_SEARCH_NEO_LABEL_TABS=0` in the server's environment, to turn it off.
 
 The label says whose tab it is; three further signals say whether anything is
 happening in it. Every action marks the page it ran in: the tab's favicon gets
-a small mark in its corner — a robot for an agent, a wrench for a background
-macro job, both when both act — green while it works and for a minute after,
-yellow for the next five minutes, red until an hour has passed — on
-top of the site's own icon (it survives reloads and navigation, and a page that
-rewrites its favicon does not wipe it), which comes back clean afterwards (a favicon the
-page cannot read cross-origin is left untouched) — so a glance at the
+a state dot in its top-left corner — green while an agent or a macro works and
+for a minute after, yellow for the next five minutes, red until an hour has
+passed — and a padlock in the bottom-left corner while a background macro job
+drives it, on top of the site's own icon, which stays whole and comes back clean
+afterwards (an icon the page cannot read, on another origin without CORS, is
+fetched by the server and handed back; the mark survives reloads and navigation,
+and a page that rewrites its favicon does not wipe it) — so a glance at the
 tab strip separates the tab being driven right now from the one abandoned an
 hour ago. In the page itself, the element the action touched flashes for a
 quarter of a second, in red when the action was refused, which turns a burst of
 thirty clicks into thirty visible taps instead of a page that mutates on its
-own. And a ghost cursor follows the agent's virtual pointer from action to
+own. A small panel in the page's bottom-left corner names the agent and its
+state; a click opens it - the last action and how long ago, how many actions, a
+background job, and for an `env` game the step, reward and keys - and another
+closes it (kept per tab). It lets clicks through while the agent is acting. And
+a ghost cursor follows the agent's virtual pointer from action to
 action, gliding between points with the agent's name riding next to it, landing
 a fading ring on every press — red when the press was refused. All pointer
 input here is synthetic CDP events, so the operating system's mouse never moves

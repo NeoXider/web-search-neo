@@ -166,6 +166,15 @@ def _apply(session_id: str, env: dict[str, Any], entry: dict[str, Any]) -> None:
         browser_tools.pointer_action("click", entry["click"]["x"], entry["click"]["y"], session_id=session_id)
 
 
+def _panel(session_id: str, stats: dict[str, Any]) -> None:
+    """The step's numbers on the page's status panel (presence_panel), for the person watching. Decoration only."""
+    try:
+        browser_tools.execute_js("const p = window.__wsnPresence; if (p && p.panelStats) p.panelStats(arguments[0]);"
+                                 " return true;", args=[stats], session_id=session_id)
+    except Exception:
+        pass
+
+
 def _step_sync(session_id: str, env: dict[str, Any], entry: dict[str, Any], frames: int) -> dict[str, Any]:
     _apply(session_id, env, entry)
     stepped = browser_tools.render_step(frames, session_id, include_summary=False)
@@ -174,6 +183,9 @@ def _step_sync(session_id: str, env: dict[str, Any], entry: dict[str, Any], fram
     done = bool(_script(session_id, env.get("done"))) if env.get("done") else False
     reward = float(reward) if isinstance(reward, (int, float)) and not isinstance(reward, bool) else 0.0
     env["total_reward"] += reward
+    _panel(session_id, {"step": env["steps"], "reward": round(reward, 3), "total": round(env["total_reward"], 3),
+                        "keys": "+".join(entry["hold"] + entry["tap"]) or entry["name"],
+                        "probability": entry.get("probability")})
     return {"observation": _observe(session_id, env), "reward": reward, "done": done,
             "frame": stepped.get("frame") or stepped.get("frames_released"), "step_count": env["steps"],
             "total_reward": round(env["total_reward"], 6)}
@@ -252,7 +264,8 @@ async def browser_env(
             return {"success": True, "held": held, "chosen_by": "pressed" if weights is None else choose,
                     "key_probs": weights, "frames": length, **result}
         index, how, probability = _choose(env, act, probs, choose, temperature)
-        result = await asyncio.to_thread(_step_sync, session_id, env, env["actions"][index], length)
+        entry = {**env["actions"][index], "probability": round(probability, 3) if probability is not None else None}
+        result = await asyncio.to_thread(_step_sync, session_id, env, entry, length)
         return {"success": True, "action": env["actions"][index]["name"], "action_index": index,
                 "chosen_by": how, "probability": probability, "frames": length, **result}
     if op == "close":

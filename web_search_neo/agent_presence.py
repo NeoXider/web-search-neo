@@ -31,7 +31,7 @@ from web_search_neo.presence_overlay import CAPTION_MS, MAX_RIPPLES, RIPPLE_MS  
 # reinstall itself. Without it a long-lived tab would keep running whatever
 # version was current when it first loaded, and a fix here would only reach
 # pages opened afterwards.
-PRESENCE_VERSION = 12
+PRESENCE_VERSION = 15
 
 PRESENCE_ENV = "WEB_SEARCH_NEO_AGENT_PRESENCE"
 
@@ -226,7 +226,7 @@ def ping_script() -> str:
         "const presence = window.__wsnPresence;"
         " if (!presence || presence.version !== "
         f"{PRESENCE_VERSION}) return false;"
-        " presence.note(arguments[0]); return true;"
+        " return presence.note(arguments[0]);"
     )
 
 
@@ -440,7 +440,7 @@ __WSN_PRESENCE_OVERLAY__
     if (data.flash !== false) {
       try { flash(data); } catch (error) {}
     }
-    return true;
+    return (state.needBase && state.needBase()) || true;
   };
 
   state.hideFlashes = function () {

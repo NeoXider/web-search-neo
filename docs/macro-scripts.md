@@ -170,8 +170,9 @@ already have acted). The newest 50 finished jobs are kept.
 
 **In the browser.** The companion popup's **Macros** card lists the running and recent jobs
 with their step and progress, a **Stop** button, and the buttons of an open `ask`. A background
-job's tabs carry a wrench in their favicon badge (a robot is an agent; both show when both act
-on the tab) and the toolbar badge shows the wrench while a background job drives tabs. When a
+job's tabs carry a padlock in the bottom-left corner of their favicon (the state dot in the
+top-left shows how recently the tab was driven) and the toolbar badge shows the padlock while a
+background job drives tabs. When a
 background job ends, or asks something, Chrome shows a notification.
 
 Give a job its own `session_id`: a job and the foreground driving one tab collide.
