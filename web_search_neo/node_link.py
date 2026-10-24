@@ -13,8 +13,10 @@ machine's node server), ``rotate_key``, ``send_tab`` (open a URL in another
 computer's Chrome and leave the tab there), the button pairing of
 :mod:`web_search_neo.nodes.pairing` - ``pair``/``pair_poll``/``pair_cancel`` on
 the computer asking, ``pair_decide`` on the one being asked - ``firewall``,
-which admits the node through Windows Firewall behind its own UAC prompt, and
-``logon_start``, the "Start with Windows" switch (:mod:`web_search_neo.logon_start`).
+which admits the node through Windows Firewall behind its own UAC prompt,
+``logon_start``, the "Start with Windows" switch (:mod:`web_search_neo.logon_start`), and
+``update``, the popup's Update button (``--update`` run detached, see
+:func:`web_search_neo.companion_update.start_detached_update`).
 """
 
 from __future__ import annotations
@@ -250,6 +252,13 @@ def _op_logon_start(message: dict[str, Any], _version: str) -> dict[str, Any]:
     return logon_start.set_wanted(message.get("enabled") is True)
 
 
+def _op_update(message: dict[str, Any], _version: str) -> dict[str, Any]:
+    from web_search_neo import companion_update
+
+    # claimed_tabs is put on the frame by the daemon, never taken from the companion's own.
+    return companion_update.start_detached_update(claimed_tabs=int(message.get("claimed_tabs") or 0))
+
+
 def _op_firewall(_message: dict[str, Any], _version: str) -> dict[str, Any]:
     from web_search_neo.nodes import identity
 
@@ -270,6 +279,7 @@ OPERATIONS: dict[str, Callable[[dict[str, Any], str], dict[str, Any]]] = {
     "pair_decide": _op_pair_decide,
     "firewall": _op_firewall,
     "logon_start": _op_logon_start,
+    "update": _op_update,
 }
 
 

@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -289,3 +290,46 @@ def update_companion(
         ) if result.get("python_code_changed") else "",
     })
     return result
+
+
+def update_log_path() -> Path:
+    return Path.home() / ".web-search-neo" / "update.log"
+
+
+def start_detached_update(
+    *,
+    claimed_tabs: int = 0,
+    package_file: str | Path | None = None,
+    spawn: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """The popup's Update button: run ``main.py --update`` as a process of its own.
+
+    The bridge daemon is what answers the popup, and ``--update`` stops that very daemon
+    before starting a fresh one, so the update cannot run inside it: it runs detached,
+    outlives the daemon, and writes what it did to ``update.log``. Its last step reloads
+    the companion, which closes the popup. Refused while agents drive tabs here, the same
+    refusal ``--update`` itself makes.
+    """
+    root = package_checkout(str(package_file or Path(__file__).resolve().with_name("__init__.py")))
+    if root is None:
+        return {"started": False, "refused": "not_a_checkout", "reason": (
+            "This Web Search Neo is not a git checkout, so there is nothing to pull. "
+            "Update the package the way it was installed.")}
+    if claimed_tabs:
+        return {"started": False, "refused": "agent_driving_tab", "claimed_tabs": claimed_tabs, "reason": (
+            f"An agent is driving {claimed_tabs} tab(s) here; updating would cut it off. "
+            "Press Update again when it is done.")}
+    from web_search_neo.process_probe import popen_detached  # noqa: PLC0415 - only the popup path spawns
+
+    log = update_log_path()
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write(f"\n--- update from the popup, {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        handle.flush()
+        (spawn or popen_detached)(
+            [sys.executable, "-m", "web_search_neo.main", "--update"],
+            windows=sys.platform == "win32", windows_flags=0x08000000,  # CREATE_NO_WINDOW
+            cwd=str(root), stdin=subprocess.DEVNULL, stdout=handle, stderr=subprocess.STDOUT,
+            close_fds=True,
+        )
+    return {"started": True, "checkout": str(root), "log": str(log)}

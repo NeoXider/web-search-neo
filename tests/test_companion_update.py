@@ -8,14 +8,20 @@ only when the pull changed what a reinstall is for.
 
 from __future__ import annotations
 
+import json
 import pathlib
+import shutil
+import subprocess
 
 import pytest
 
-from web_search_neo import chrome_bootstrap, companion_update, main
+from web_search_neo import chrome_bootstrap, companion_update, main, node_link
 
 
 ROOT = pathlib.Path("C:/checkout")
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
+NODE = shutil.which("node")
+requires_node = pytest.mark.skipif(NODE is None, reason="Node.js runs the popup script")
 
 
 class FakeRunner:
@@ -234,3 +240,145 @@ def test_the_action_is_offered_and_says_what_it_refuses():
     actions = main._capabilities()["actions"]
     assert "update_companion" in actions
     assert "refused" in actions["update_companion"]["summary"]
+
+
+# --- the popup's Update button: the bridge daemon runs `--update` detached -------------------
+
+
+def test_the_popup_update_runs_dash_dash_update_detached_in_the_checkout(monkeypatch, tmp_path):
+    monkeypatch.setattr(companion_update, "package_checkout", lambda path: ROOT)
+    monkeypatch.setattr(companion_update, "update_log_path", lambda: tmp_path / "update.log")
+    spawned: list[dict] = []
+
+    def fake_spawn(command, **kwargs):
+        spawned.append({"command": command, **kwargs})
+
+    result = companion_update.start_detached_update(spawn=fake_spawn)
+    assert result == {"started": True, "checkout": str(ROOT), "log": str(tmp_path / "update.log")}
+    assert len(spawned) == 1
+    assert spawned[0]["command"][-3:] == ["-m", "web_search_neo.main", "--update"]
+    assert spawned[0]["cwd"] == str(ROOT)
+    # Its output goes to the log, never to the daemon's own (absent) console.
+    assert spawned[0]["stdout"] is not None and spawned[0]["stderr"] == subprocess.STDOUT
+    assert "update from the popup" in (tmp_path / "update.log").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("checkout, claimed, refused", [
+    (ROOT, 2, "agent_driving_tab"),
+    (None, 0, "not_a_checkout"),
+])
+def test_the_popup_update_is_refused_before_anything_starts(monkeypatch, checkout, claimed, refused):
+    monkeypatch.setattr(companion_update, "package_checkout", lambda path: checkout)
+    spawned: list = []
+    result = companion_update.start_detached_update(claimed_tabs=claimed, spawn=lambda *a, **k: spawned.append(a))
+    assert result["started"] is False
+    assert result["refused"] == refused
+    assert result["reason"]
+    assert spawned == []
+
+
+def test_the_daemon_puts_its_own_claims_on_the_update_frame(monkeypatch):
+    seen: list[int] = []
+    monkeypatch.setattr(companion_update, "start_detached_update",
+                        lambda claimed_tabs=0: seen.append(claimed_tabs) or {"started": True})
+    assert node_link.OPERATIONS["update"]({"op": "update", "claimed_tabs": 3}, "9.9.9") == {"started": True}
+    assert seen == [3]
+    source = (PROJECT_ROOT / "web_search_neo" / "bridge_daemon.py").read_text(encoding="utf-8")
+    # The companion's frame is spread first, so a claimed_tabs it sends is overwritten.
+    assert '{**message, "claimed_tabs": len(self.claimed_tabs())}' in source
+
+
+POPUP_IDS = [
+    "enabled", "presence", "reconnect", "release-tabs", "status", "tabs", "bridge", "version",
+    "release-status", "message", "check-release", "open-github", "update-companion", "update-hint",
+    "port", "save-port", "reset-port", "port-default", "next-attempt",
+    "max-sessions", "save-max-sessions", "reset-max-sessions", "max-sessions-default",
+    "panel", "state-card", "max-sessions-value", "max-sessions-ceiling", "sessions-used",
+    "meter-fill", "release-chip",
+]
+
+
+def _press_update(update_answer: dict) -> dict:
+    popup_script = (PROJECT_ROOT / "chrome-extension" / "popup.js").as_uri()
+    module = f"""
+const callbacks = {{}};
+const nodes = new Map({json.dumps(POPUP_IDS)}.map(id => [id, {{
+  textContent: "", title: "", value: "", dataset: {{}}, checked: false, disabled: false, hidden: false,
+  style: {{width: ""}},
+  addEventListener(type, callback) {{ callbacks[`${{id}}:${{type}}`] = callback; }},
+}}]));
+globalThis.document = {{querySelector: selector => nodes.get(selector.slice(1)), activeElement: null}};
+const sent = [];
+globalThis.chrome = {{
+  runtime: {{sendMessage: async message => {{
+    sent.push(message.type);
+    if (message.type === "companion.updateServer") return {json.dumps(update_answer)};
+    return {{enabled: true, connected: true, controlled_tabs: 0, bridge_port: 8765, default_bridge_port: 8765,
+             max_sessions: 8, default_max_sessions: 8, max_sessions_ceiling: 64, presence: true,
+             version: "1.3.4"}};
+  }}}},
+  tabs: {{create: () => {{}}}},
+}};
+globalThis.fetch = async () => ({{ok: true, json: async () => [{{tag_name: "v1.3.4", html_url: "https://x"}}]}});
+globalThis.setInterval = () => 0;
+await import({json.dumps(popup_script)});
+await new Promise(resolve => setTimeout(resolve, 20));
+await callbacks["update-companion:click"]();
+await new Promise(resolve => setTimeout(resolve, 40));
+process.stdout.write(JSON.stringify({{
+  sent, message: nodes.get("message").textContent, hint: nodes.get("update-hint").textContent,
+  disabled: nodes.get("update-companion").disabled,
+}}));
+"""
+    completed = subprocess.run([NODE, "--input-type=module", "-e", module], capture_output=True, text=True,
+                               encoding="utf-8", timeout=60)
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout)
+
+
+@requires_node
+def test_the_update_button_hands_the_update_to_the_daemon():
+    outcome = _press_update({"started": True, "log": "C:/Users/me/.web-search-neo/update.log"})
+    assert "companion.updateServer" in outcome["sent"]
+    # The daemon's --update reloads the companion itself; the popup does not race it.
+    assert "companion.reloadExtension" not in outcome["sent"]
+    assert "restarting the bridge" in outcome["message"]
+    assert "update.log" in outcome["hint"]
+    assert outcome["disabled"] is True
+
+
+@requires_node
+def test_a_refused_update_says_why_and_can_be_pressed_again():
+    outcome = _press_update({"started": False, "refused": "agent_driving_tab",
+                             "reason": "An agent is driving 1 tab(s) here; updating would cut it off."})
+    assert "companion.reloadExtension" not in outcome["sent"]
+    assert outcome["message"].startswith("An agent is driving 1 tab(s)")
+    assert outcome["disabled"] is False
+
+
+@requires_node
+def test_the_release_chip_compares_with_the_newest_tag_not_only_the_last_release():
+    popup_script = (PROJECT_ROOT / "chrome-extension" / "popup.js").as_uri()
+    module = f"""
+const nodes = new Map({json.dumps(POPUP_IDS)}.map(id => [id, {{
+  textContent: "", title: "", value: "", dataset: {{}}, checked: false, disabled: false, hidden: false,
+  style: {{width: ""}}, addEventListener() {{}},
+}}]));
+globalThis.document = {{querySelector: selector => nodes.get(selector.slice(1)), activeElement: null}};
+globalThis.chrome = {{runtime: {{sendMessage: async () => ({{enabled: true, connected: true, controlled_tabs: 0,
+  bridge_port: 8765, default_bridge_port: 8765, max_sessions: 8, default_max_sessions: 8,
+  max_sessions_ceiling: 64, presence: true, version: "1.28.0"}})}}, tabs: {{create() {{}}}}}};
+// The last published release is old; the tags carry every version since.
+globalThis.fetch = async url => ({{ok: true, json: async () => String(url).includes("/tags")
+  ? [{{name: "v1.27.0"}}, {{name: "v1.28.0"}}, {{name: "v1.9.0"}}]
+  : [{{tag_name: "v1.18.2", html_url: "https://github.com/NeoXider/web-search-neo/releases/tag/v1.18.2"}}]}});
+globalThis.setInterval = () => 0;
+await import({json.dumps(popup_script)});
+await new Promise(resolve => setTimeout(resolve, 40));
+process.stdout.write(JSON.stringify({{label: nodes.get("release-status").textContent,
+  state: nodes.get("release-status").dataset.state}}));
+"""
+    completed = subprocess.run([NODE, "--input-type=module", "-e", module], capture_output=True, text=True,
+                               encoding="utf-8", timeout=60)
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {"label": "latest", "state": "current"}

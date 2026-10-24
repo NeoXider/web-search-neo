@@ -44,6 +44,7 @@ const AFTERGLOW_MS = 60 * 60 * 1000; // agent-activity.js STALE_MS: the bar drai
 
 const GITHUB_URL = "https://github.com/NeoXider/web-search-neo";
 const RELEASES_API = "https://api.github.com/repos/NeoXider/web-search-neo/releases?per_page=1";
+const TAGS_API = "https://api.github.com/repos/NeoXider/web-search-neo/tags?per_page=30";
 // Where the newest published release lives, once the check has read it: the
 // Update button opens that page rather than a guess at it.
 let latestReleaseUrl = GITHUB_URL;
@@ -235,28 +236,31 @@ async function checkRelease() {
     if (PREVIEW) {
       releases = previewReleases();
     } else {
-      const response = await fetch(RELEASES_API, {
-        headers: {Accept: "application/vnd.github+json"},
-        cache: "no-store",
-      });
-      if (!response.ok) throw new Error(`GitHub HTTP ${response.status}`);
-      releases = await response.json();
+      // Every version bump is tagged, but a GitHub release is published only now and then:
+      // compared with releases alone, a current checkout read "ahead of" a months-old one.
+      const lists = await Promise.all([RELEASES_API, TAGS_API].map(async url => {
+        const response = await fetch(url, {headers: {Accept: "application/vnd.github+json"}, cache: "no-store"});
+        if (!response.ok) throw new Error(`GitHub HTTP ${response.status}`);
+        return response.json();
+      }));
+      releases = lists.flat().filter(Boolean);
     }
     if (!Array.isArray(releases) || !releases.length) {
       markRelease("none published", "error", `${GITHUB_URL}/releases`);
       return;
     }
-    const latest = releases[0];
-    latestReleaseUrl = String(latest.html_url || GITHUB_URL);
-    const remote = String(latest.tag_name || latest.name || "").replace(/^v/i, "");
+    const versionOf = item => String(item.tag_name || item.name || "").replace(/^v/i, "");
+    const latest = releases.reduce((best, item) => (compareVersions(versionOf(item), versionOf(best)) > 0 ? item : best));
+    const remote = versionOf(latest);
+    latestReleaseUrl = String(latest.html_url || `${GITHUB_URL}/releases/tag/v${remote}`);
     const local = versionNode.textContent;
     const comparison = compareVersions(local, remote);
     if (comparison < 0) {
-      markRelease(`update v${remote}`, "update", latest.html_url);
+      markRelease(`update v${remote}`, "update", latestReleaseUrl);
     } else if (comparison === 0) {
-      markRelease("latest", "current", latest.html_url);
+      markRelease("latest", "current", latestReleaseUrl);
     } else {
-      markRelease(`ahead of v${remote}`, "current", latest.html_url);
+      markRelease(`ahead of v${remote}`, "current", latestReleaseUrl);
     }
   } catch (error) {
     markRelease("check failed", "error", error.message);
@@ -534,16 +538,19 @@ openGitHubButton.addEventListener("click", () => {
   chrome.tabs.create({url: GITHUB_URL});
 });
 
-// Update: pulling and reinstalling is a shell step this page cannot run, but the
-// half people actually forget is pressing Reload on the extension card - that is
-// what loads the pulled files into the running companion. So the button names the
-// command it cannot run, opens the release that explains it, and does the half it
-// can: reload the companion onto whatever is on disk now.
+// Update: this page cannot run git, but the bridge daemon can. So the button asks it
+// to run `--update` on its own (pull this checkout, start a fresh daemon, reload the
+// companion - which closes this popup). Only when no daemon answers does it fall back
+// to the half it can do itself: name the pull it cannot run, open the release that
+// explains it, and reload the companion onto whatever is on disk now.
 updateButton.addEventListener("click", async () => {
   updateButton.disabled = true;
+  updateHintNode.hidden = true;
   messageNode.textContent = "Updating...";
+  const released = checkRelease();
   try {
-    await checkRelease();
+    if (await updateThroughBridge()) return;
+    await released;
     const remote = releaseNode.textContent.replace(/^update v/, "");
     const behind = releaseNode.dataset.state === "update";
     if (behind) {
@@ -564,6 +571,25 @@ updateButton.addEventListener("click", async () => {
     updateButton.disabled = false;
   }
 });
+
+// True once the daemon started the update; a refusal (agents driving tabs, not a git
+// checkout) is thrown so the button says why; false when no daemon, or an older one
+// without this operation, answers.
+async function updateThroughBridge() {
+  let answer;
+  try {
+    answer = await send("companion.updateServer");
+  } catch (error) {
+    return false;
+  }
+  if (answer?.refused) throw new Error(answer.reason || answer.refused);
+  if (!answer?.started) return false;
+  messageNode.textContent =
+    "Pulling the checkout and restarting the bridge; the companion reloads in a few seconds.";
+  updateHintNode.hidden = false;
+  updateHintNode.textContent = `What it did is written to ${answer.log}.`;
+  return true;
+}
 
 // Test and preview hook: the same render pipeline the popup uses, reachable
 // without Chrome. Production popups never read this property.

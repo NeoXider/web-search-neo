@@ -2,7 +2,7 @@
 
 This guide installs the MCP server from source and connects it to LM Studio or another stdio-compatible MCP client.
 
-It describes version 1.27.0. The Python package, the server, and the bundled Chrome
+It describes version 1.28.0. The Python package, the server, and the bundled Chrome
 companion carry that same version, and the bridge only accepts a companion that speaks the
 current handshake (bridge protocol 2, since 1.15.0) — see [Updating](#updating) if an older one is already
 installed.
@@ -222,10 +222,13 @@ Leave **Web Search Neo Companion** enabled. Its toolbar popup (also on
 connecting, waiting with the retry countdown, disabled, or error — the
 controlled-tab count against the parallel-session limit, the bridge endpoint,
 a GitHub release/version check and repository link, a persistent on/off switch,
-**Reconnect**, **Update**, and **Release tabs**. **Update** re-checks GitHub, opens the newer
-release, prints the pull-and-reinstall step, and reloads the companion onto the files on disk —
-the Reload nobody can press from outside Chrome after a `git pull` of an unpacked extension.
-The pull itself is an agent's job: the `update_companion` action fast-forwards this checkout,
+**Reconnect**, **Update**, and **Release tabs**. **Update** asks the bridge daemon to run
+`python main.py --update` detached: it pulls this checkout, starts a fresh daemon and reloads the
+companion onto the new files (the popup closes on that reload; the output goes to
+`~/.web-search-neo/update.log`). It is refused while an agent drives a tab here. With no daemon
+to ask, the button falls back to re-checking GitHub, printing the pull-and-reinstall step and
+reloading the companion onto the files on disk.
+An agent can do the same: the `update_companion` action fast-forwards this checkout,
 reinstalls when the pull changed an install spec, replaces the bridge daemon and reloads the
 companion onto the new files — and refuses rather than forcing, so a tree with uncommitted work,
 a diverged branch or a tab an agent is driving is left exactly as it was.
@@ -239,7 +242,7 @@ Earlier revisions tried to perform those clicks for you through Windows UI Autom
 code is gone. It depended on the interface language, on which window happened to have focus,
 and on a folder picker that the automation backend does not even enumerate.
 
-The bundled companion is version 1.27.0 and declares five permissions: `alarms`, `debugger`,
+The bundled companion is version 1.28.0 and declares five permissions: `alarms`, `debugger`,
 `storage`, `tabs`, and `tabGroups`. There are no content scripts and no `host_permissions`;
 page access comes from `debugger`, which attaches the Chrome DevTools Protocol to the tabs
 the agent drives. `alarms` exists because Chrome suspends an idle MV3 service worker after
@@ -722,7 +725,7 @@ or when `setup_current_chrome` answered `self_update: "unsupported"` or `"timeou
    very directory **Load unpacked** points at, then reload the extension. Restarting the
    daemon does not help and never did after the daemon learned to re-read the token file:
    it already fetches the current secret from disk before calling anything a mismatch.
-3. Check the card's version. It must read 1.27.0; anything older speaks bridge protocol 1
+3. Check the card's version. It must read 1.28.0; anything older speaks bridge protocol 1
    and is refused with `Expected Web Search Neo bridge protocol 2; update and reload the
    companion`, and Chrome only picks up the new manifest on reload.
 4. `%LOCALAPPDATA%\WebSearchNeo\bridge-daemon.log` records the bridge's side: `Rejected a

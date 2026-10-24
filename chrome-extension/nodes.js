@@ -96,6 +96,8 @@ export function createNodeRelay(liveSocket) {
         return request("firewall");
       case "companion.nodeLogonStart":
         return request("logon_start", {enabled: msg.enabled === true});
+      case "companion.updateServer":  // the Update button: the daemon runs `--update` detached
+        return request("update");
       default:
         return null;
     }

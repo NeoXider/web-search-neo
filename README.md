@@ -322,9 +322,11 @@ DevTools port cannot be given one later. So three steps stay with the user:
 Keep **Web Search Neo Companion** enabled. Click its toolbar icon to open the
 companion panel: it shows the bridge state and controlled-tab count, and offers
 **Reconnect**, **Update**, **Release tabs**, a GitHub release/version check, a repository link,
-and a persistent on/off switch. **Update** reloads the companion onto the files in this checkout;
-pulling those files is the `update_companion` action's job, because an extension has no git and
-no filesystem of its own. Turning the switch
+and a persistent on/off switch. **Update** asks the bridge daemon to run `--update` on its own:
+pull this checkout, start a fresh daemon and reload the companion onto the new files (the popup
+closes on that reload; what it did is in `~/.web-search-neo/update.log`). An extension has no git
+of its own, so the daemon does the pull; it refuses while an agent drives a tab here, and with no
+daemon the button only reloads the companion onto the files on disk. Turning the switch
 off closes the bridge and detaches every controlled tab. Its toolbar badge reads
 `ON` while the companion is connected and authenticated to the [bridge daemon](#the-bridge-daemon),
 which is between agent calls too, not only while one is running. Nobody has to
@@ -353,7 +355,7 @@ companion popup's Reconnect (Restart companion when its service worker has
 stopped) is the one action; Reload on its card at chrome://extensions is the
 fallback.
 
-The bundled companion is version 1.27.0. Chrome does not refresh an unpacked
+The bundled companion is version 1.28.0. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. That only works for
