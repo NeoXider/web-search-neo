@@ -1,6 +1,6 @@
 ---
 name: web-search-neo
-description: Use the Web Search Neo MCP server for free web search without API keys, resilient multi-engine fallback, HTTP page fetching, the user's current signed-in Chrome with AI-group tabs, isolated browser profiles, accessibility-level page inspection, form filling and upload, page console and network diagnostics, screenshots, deterministic canvas/WebGL game testing, and reusable macro scripts kept as JSON files in the calling project (variables, conditions, loops, waits on the page or network, background jobs). Trigger when a task needs current web results, visible work in existing Chrome tabs, authorized browser state, reading or driving a rendered page, diagnosing a broken page, writing or replaying a repeated browser flow, or frame-exact keyboard, mouse, and touch input through the two-tool web_info/web_action contract. Also drives the Chrome of other computers on the LAN with node="<name>" after a one-click pairing.
+description: Use the Web Search Neo MCP server for free web search without API keys, resilient multi-engine fallback, HTTP page fetching, the user's current signed-in Chrome with AI-group tabs, isolated browser profiles, accessibility-level page inspection, form filling and upload, page console and network diagnostics, screenshots, deterministic canvas/WebGL game testing (also as an RL environment for models that output action probabilities), and reusable macro scripts kept as JSON files in the calling project (variables, conditions, loops, waits on the page or network, background jobs, schedules, questions to the user). Trigger when a task needs current web results, visible work in existing Chrome tabs, authorized browser state, reading or driving a rendered page, diagnosing a broken page, writing or replaying a repeated browser flow, or frame-exact keyboard, mouse, and touch input through the two-tool web_info/web_action contract. Also drives the Chrome of other computers on the LAN with node="<name>" after a one-click pairing.
 ---
 
 # Web Search Neo
@@ -53,7 +53,10 @@ outcome happened. After navigation or rerender, discard old selectors, refs, and
 - `find`: `params.query="submit request"` returns ranked refs instead of a whole page.
   `low_confidence: true` means nothing on the page answers the query - the matches are
   guesses, so read the page instead of clicking one. `ambiguous: true` means two matched
-  equally and order alone chose; say which you mean. `role` filters.
+  equally and order alone chose; say which you mean. `role` filters. Ask the way you would
+  say it: filler words drop out, a role word ("link to Unreal Engine", "search field") becomes
+  a role hint, and `terms` shows how the query was read. Facts are findable: a table row
+  header or definition term that matches ("release date") carries `answer`, the value beside it.
 - `page_elements`: flat selectors — CSS, a piercing path inside a shadow root or frame, or
   `""` when none is unique — plus `<select>` options, form metadata, and
   `visible`/`hidden_reason` per entry. It has no selector filter and takes no
@@ -167,11 +170,14 @@ stay reachable, so local services work unchanged.
   driving, a server installed from a wheel - and `refused` names which. It moves the user's
   checkout, so ask first; after it runs, read `server_restart_note` before assuming this
   process picked the new code up (it does not).
-- A tab an agent is driving wears an animated slime on its favicon (a pulsing ring while
-  acting, a green breath for a minute after, a dozing amber one for 5 quiet minutes), a
+- A tab an agent is driving wears a robot on its favicon (a background macro job's tab a
+  wrench, both when both act): green while acting and for a minute after, yellow for the
+  next five minutes, red for up to an hour; the mark survives reloads and navigation. The
+  companion closes tabs the agent opened and left idle for an hour (popup Settings, Idle AI
+  tabs; never a pinned, audible or watched tab). A
   ghost cursor glides between the agent's pointer points with its name tag and a caption
   of what it does ("Click · Sign in", "Typing…"), and lands a fading ring on every press
-  (red when refused); its tab group turns green, then yellow, and the toolbar icon spins
+  (red when refused); its tab group turns green, then yellow, then red, and the toolbar icon spins
   while commands arrive. Such a tab is
   agent-held: observe it read-only
   (`page_text`/`page_outline`/`screenshot`) or open your own session — acting on it
@@ -490,10 +496,19 @@ url="~/api/x")`, `filter`, `count`, `pluck`, `default`, `empty`. In parameters w
 ```
 
 - `op=run_steps` runs inline steps and saves nothing; `op=validate` with `steps` checks them.
-- `background: true` on `run`/`run_steps` answers at once with a `job_id`; read it with
-  `op=job job_id=<id> wait_seconds=60`, list with `op=jobs`, stop with `op=cancel`. A job
-  needs its own `session_id`. Use it for anything that waits minutes (a generation, an upload,
-  a watcher) — other calls keep working meanwhile.
+- Every script run is a job. `background: true` on `run`/`run_steps` answers at once with a
+  `job_id`; read it with `op=job job_id=<id> wait_seconds=60`, list with `op=jobs` (other
+  servers' jobs too: state is saved to disk), stop with `op=cancel`. A job needs its own
+  `session_id`. Use it for anything that waits minutes (a generation, an upload, a watcher) —
+  other calls keep working meanwhile. The user sees jobs in the companion popup (Macros card,
+  with Stop) and gets a notification when a background job ends.
+- `ask {message, options, default, timeout_seconds, save_as}` pauses the job for the user
+  (popup or notification buttons) or `op=answer job_id=<id> answer=<value>` — put one before an
+  irreversible step. `parallel {branches: [[...], [...]], fail_fast}` runs branches at once,
+  one `session_id` each.
+- `op=schedule` with `name` or `steps` and `every_seconds` (>= 10) or `times: ["09:00"]`,
+  `max_runs`, runs it as background jobs on a clock; `op=schedules` lists, `op=unschedule
+  schedule_id=<id>` removes. Schedules survive restarts; an overlapping run is skipped.
 - The answer of a script run: `success`, `error` + `failed_step` (a path like `2.then.0`),
   `returned`, `outputs`, `log`, `results[]`, and `trace` (one line per step, kept by
   `summary: "min"`).
@@ -634,6 +649,14 @@ document's window metrics, so an inner container can move while they stay unchan
 ## Input and games
 
 Read `game_probe` first and reuse its `frame_selector` for input and render actions.
+
+A model that outputs probabilities over actions (an RL policy, a JEPA-style world model, a
+classifier) plays through the `env` action: `op=define` (named actions that hold/tap keys or
+click, `frames_per_step`, `observe` pixels and/or a state script, `reward`/`done` expressions),
+`op=reset {url}`, then `op=step` with `act` (a name or index) or `probs` (sampled or argmax
+here); or define `keys` and step with `key_probs` (one per key) or `pressed`, plus `frames` for
+how long; the page waits between steps. `scripts/wsn_env.py` wraps it as a Gymnasium-style env.
+See docs/playing-games.md.
 
 Use one `input` action for everything that must land in the same frame. Key entries take
 `tap`, `hold`, or `release`; pointer entries take `click`, `double_click`, `hover`, `move`,

@@ -14,6 +14,7 @@ because a signal must never cost a caller an action.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import time
 from typing import Any, Callable
@@ -34,6 +35,11 @@ LEAD_ACTIONS = frozenset({"wait", "wait_challenge", "wait_frames", "captcha", "n
 # How long a led step is assumed to run when it names no limit of its own; the
 # page caps it (presence_badge.IN_FLIGHT_MAX_MS) and the step's own note ends it.
 DEFAULT_IN_FLIGHT_SECONDS = 30.0
+
+# Set while a macro script drives the tabs (macro_flow.run_record): its actions mark the
+# tab with the macro badge - a robot - instead of the agent's slime, so a person can tell
+# a replayed script from a model thinking live.
+MACRO_RUN: contextvars.ContextVar[str | None] = contextvars.ContextVar("wsn_macro_run", default=None)
 
 # The gestures whose lead ends in a press.
 _TAP_GESTURES = frozenset({"click", "double_click"})
@@ -160,6 +166,8 @@ def note(
         payload["cursor"] = {"x": x, "y": y, "tap": True}
     if action == "click":
         session.presence_click_point = None
+    if MACRO_RUN.get():
+        payload["macro"] = MACRO_RUN.get()
     now = time.monotonic()
     led = _LED.pop(id(session), None) is not None
     if not payload["flash"] and not led and now - session.last_presence_ping < QUIET_SECONDS:

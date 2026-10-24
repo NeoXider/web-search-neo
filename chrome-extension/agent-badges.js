@@ -4,12 +4,15 @@
 // refuse ours - which the in-page favicon badge cannot.
 //
 // The toolbar badge is per tab: green "AI" while an agent acted on the tab in
-// the last minute, amber until five minutes have passed, then the tab goes back
-// to the global ON/OFF badge. The map is mirrored into chrome.storage.session
-// and a one-minute alarm sweeps it, so expiry survives MV3 worker eviction.
+// the last minute, yellow until six minutes have passed, then red until the
+// auto-close time (an hour by default): a tab the agent opened is closed then,
+// unless the popup switched auto-close off, and any other tab goes back to the
+// global ON/OFF badge. The map is mirrored into chrome.storage.session and a
+// one-minute alarm sweeps it, so expiry survives MV3 worker eviction.
 import {
   activityPhase,
   badgeFor,
+  dueForClose,
   expireActivity,
   forgetActivity,
   listRecent,
@@ -18,9 +21,19 @@ import {
   recordActivity,
 } from "./agent-activity.js";
 import {pulseToolbar, syncGroups} from "./tab-status.js";
+import {jobCommands, jobsMessage, macroTabIds} from "./jobs.js";
+
+// The service worker registers the jobs report command through this module.
+export {jobCommands};
 
 const STORAGE_KEY = "agent_activity";
 export const AGENT_ALARM = "agent-activity-sweep";
+// The popup's "Close idle AI tabs" setting: on by default, after an hour.
+const AUTO_CLOSE_KEY = "auto_close_tabs";
+const AUTO_CLOSE_DEFAULT = {enabled: true, minutes: 60};
+let autoClose = {...AUTO_CLOSE_DEFAULT};
+const staleMs = () => Math.max(6, Number(autoClose.minutes) || 60) * 60 * 1000;
+const phaseOf = (entry, now) => activityPhase(entry, now, staleMs());
 
 let activity = {};
 // Tabs whose per-tab badge was handed back: they mirror the global badge, so a
@@ -54,7 +67,9 @@ function load() {
         // Anything recorded by this worker before the read finished wins.
         activity = {...(saved.activity || {}), ...activity};
         for (const tabId of saved.retired || []) retired.add(Number(tabId));
+        return chrome.storage?.local?.get(AUTO_CLOSE_KEY);
       })
+      .then(stored => { autoClose = {...AUTO_CLOSE_DEFAULT, ...(stored?.[AUTO_CLOSE_KEY] || {})}; })
       .catch(error => console.warn("bridge: agent activity restore failed", error));
   }
   return loadPromise;
@@ -75,7 +90,7 @@ function showGlobal(tabId) {
 
 function paint(tabId, now) {
   const entry = activity[String(tabId)];
-  const badge = entry && badgeFor(entry, now);
+  const badge = entry && badgeFor(entry, now, staleMs(), macroTabIds.has(tabId));
   if (!badge) {
     retired.add(tabId);
     showGlobal(tabId);
@@ -89,7 +104,7 @@ function paint(tabId, now) {
 
 function schedule(now) {
   clearTimeout(sweepTimer);
-  const wait = nextChangeIn(activity, now);
+  const wait = nextChangeIn(activity, now, staleMs());
   const hasEntries = wait !== null;
   if (hasEntries && !alarmArmed && chrome.alarms?.create) {
     alarmArmed = true;
@@ -105,13 +120,57 @@ function schedule(now) {
 
 export async function sweep(now = Date.now()) {
   await load();
-  const {map, expired} = expireActivity(activity, now);
+  await closeIdleTabs(now);
+  const {map, expired} = expireActivity(activity, now, staleMs());
   activity = map;
   for (const tabId of expired) paint(tabId, now);
   for (const key of Object.keys(activity)) paint(Number(key), now);
   persist();
   schedule(now);
-  syncGroups(activity, now, activityPhase);
+  syncGroups(activity, now, phaseOf);
+}
+
+// Auto-close: a tab an agent opened and has not used for the set time is closed -
+// unless the person is looking at it right now, pinned it, or it is playing sound.
+async function closeIdleTabs(now) {
+  if (!autoClose.enabled || !chrome.tabs?.remove) return;
+  for (const tabId of dueForClose(activity, now, staleMs())) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      const watched = tab.active && (await chrome.windows.get(tab.windowId)).focused;
+      if (watched || tab.pinned || tab.audible) continue;
+      await chrome.tabs.remove(tabId);
+    } catch (error) {
+      // Already gone: the entry is dropped below either way.
+    }
+    activity = forgetActivity(activity, tabId);
+    retired.delete(tabId);
+  }
+}
+
+export async function autoCloseSettings(next) {
+  await load();
+  if (next && typeof next === "object") {
+    const minutes = Math.round(Number(next.minutes ?? autoClose.minutes));
+    autoClose = {enabled: next.enabled === undefined ? autoClose.enabled : Boolean(next.enabled),
+                 minutes: Number.isFinite(minutes) ? Math.min(Math.max(minutes, 6), 24 * 60) : autoClose.minutes};
+    await chrome.storage?.local?.set({[AUTO_CLOSE_KEY]: autoClose});
+    sweep();
+  }
+  return {...autoClose};
+}
+
+// The in-page badge lives in the document; after a navigation the new page has the
+// machinery (registered for every new document) but not the time of the last action.
+// Hand it over, through the debugger the agent already holds on its tabs; a tab not
+// attached right now simply keeps the toolbar badge.
+function resumePageBadge(tabId, at, mode) {
+  try {
+    const expression = `window.__wsnPresence && window.__wsnPresence.resume && window.__wsnPresence.resume(${Number(at)}, ${JSON.stringify(mode)})`;
+    Promise.resolve(chrome.debugger?.sendCommand?.({tabId}, "Runtime.evaluate", {expression})).catch(() => {});
+  } catch (error) {
+    // No debugger on this tab: nothing to resume.
+  }
 }
 
 // Called for every verified command the bridge relays. Never throws: a badge
@@ -120,7 +179,7 @@ export function noteAgentCommand(message, params, payload) {
   try {
     const now = Date.now();
     const agent = message?.agent && typeof message.agent === "object" ? message.agent : null;
-    const extra = {method: message?.method};
+    const extra = {method: message?.method, created: message?.method === "tabs.create"};
     let tabId = normalizeTabId(params?.tabId);
     if (tabId === null && message?.method === "tabs.create") tabId = normalizeTabId(payload?.result?.id);
     if (tabId === null || (message?.method === "tabs.remove" && !payload?.error)) return;
@@ -128,7 +187,7 @@ export function noteAgentCommand(message, params, payload) {
     retired.delete(tabId);
     paint(tabId, now);
     pulseToolbar();
-    syncGroups(activity, now, activityPhase);
+    syncGroups(activity, now, phaseOf);
     load().then(() => {
       persist();
       schedule(Date.now());
@@ -162,7 +221,7 @@ function forget(tabId) {
     retired.delete(id);
     persist();
     schedule(Date.now());
-    syncGroups(activity, Date.now(), activityPhase);
+    syncGroups(activity, Date.now(), phaseOf);
   });
 }
 
@@ -185,7 +244,7 @@ async function tabDetails(tabIds) {
 export async function agentTabs() {
   await load();
   const now = Date.now();
-  const {map, expired} = expireActivity(activity, now);
+  const {map, expired} = expireActivity(activity, now, staleMs());
   if (expired.length) {
     activity = map;
     for (const tabId of expired) paint(tabId, now);
@@ -196,7 +255,7 @@ export async function agentTabs() {
   const details = await tabDetails(ids);
   for (const tabId of ids) if (details[tabId] === null) forget(tabId);
   const live = Object.fromEntries(Object.entries(activity).filter(([, e]) => details[e.tabId]));
-  return {tabs: listRecent(live, now, details), now};
+  return {tabs: listRecent(live, now, details, staleMs()), now, auto_close: {...autoClose}};
 }
 
 export async function focusAgentTab(value) {
@@ -212,7 +271,8 @@ export async function focusAgentTab(value) {
 export function agentMessage(message) {
   if (message?.type === "companion.agentTabs") return agentTabs();
   if (message?.type === "companion.focusAgentTab") return focusAgentTab(message.tab_id);
-  return null;
+  if (message?.type === "companion.autoClose") return autoCloseSettings(message.settings);
+  return jobsMessage(message);
 }
 
 chrome.tabs?.onRemoved?.addListener(tabId => forget(tabId));
@@ -221,7 +281,10 @@ chrome.tabs?.onRemoved?.addListener(tabId => forget(tabId));
 chrome.tabs?.onUpdated?.addListener((tabId, changeInfo) => {
   if (!changeInfo?.status && !changeInfo?.url) return;
   load().then(() => {
-    if (activity[String(tabId)]) paint(tabId, Date.now());
+    const entry = activity[String(tabId)];
+    if (!entry) return;
+    paint(tabId, Date.now());
+    if (changeInfo.status === "complete") resumePageBadge(tabId, entry.at, macroTabIds.has(tabId) ? "macro" : "agent");
   });
 });
 chrome.alarms?.onAlarm?.addListener(alarm => {

@@ -56,7 +56,7 @@ def expected_extension_version() -> str:
 CODE_FILES = (
     "service-worker.js", "events.js", "agent-badges.js", "agent-activity.js",
     "background-capture.js", "tab-follow.js", "bridge-auth.js", "control.js", "nodes.js",
-    "tab-status.js", "code-hash.js",
+    "tab-status.js", "jobs.js", "code-hash.js",
 )
 
 

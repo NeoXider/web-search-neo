@@ -9,8 +9,9 @@ publishes exactly as a hand-written batch would be. What this adds, in the JSON 
   ``assert`` (an expression the result must satisfy), ``expect`` (test_run's page checks),
   ``retry``/``retry_delay``, ``on_error: continue``, ``label``;
 * control steps: ``if``, ``repeat``, ``for_each``, ``wait_until``, ``try``, ``set``, ``sleep``,
-  ``log``, ``fail``, ``return``, ``break``, ``continue``, ``call`` (another macro) and ``read``
-  (any web_info topic: network, page_text, find, console, ...);
+  ``log``, ``fail``, ``return``, ``break``, ``continue``, ``call`` (another macro), ``read``
+  (any web_info topic: network, page_text, find, console, ...), ``parallel`` (branches at
+  once) and ``ask`` (pause until a person or an agent answers);
 * ``{{expression}}`` templates in any parameter (macro_expr), with ``last`` always holding the
   previous step's ``ok``/``value``/``error``.
 
@@ -25,7 +26,7 @@ import json
 import time
 from typing import Any
 
-from web_search_neo import macro_check, macro_expr, macro_jobs, macros
+from web_search_neo import macro_check, macro_expr, macro_jobs, macros, presence_live
 from web_search_neo.audit import scenario
 
 MAX_EXECUTED = 20_000
@@ -217,6 +218,7 @@ class Runner:
             self.outputs[step["save_as"]] = value
         if shared.job is not None:
             shared.job["progress"].update(executed=shared.executed, step=path, action=action, last_ok=ok)
+            macro_jobs.persist(shared.job)
 
     def _settle(self, step: dict[str, Any], path: str, action: str, result: dict[str, Any]) -> None:
         """After recording: stop the run on a failure unless the step (or the run) says continue."""
@@ -239,6 +241,10 @@ class Runner:
         if self.session_override and spec is not None and "session_id" in self.facade._argument_model(
                 spec.tool_name).model_fields:
             rendered["session_id"] = self.session_override
+        job = self.shared.job
+        session = rendered.get("session_id")
+        if job is not None and isinstance(session, str) and session not in job["sessions"]:
+            job["sessions"].append(session)  # the tabs a job drove get the macro badge
         attempts, retries = 0, int(step.get("retry") or 0)
         while True:
             attempts += 1
@@ -435,6 +441,63 @@ class Runner:
     async def _c_continue(self, step: dict[str, Any], path: str) -> None:
         raise _Continue()
 
+    async def _c_parallel(self, step: dict[str, Any], path: str) -> None:
+        """Branches at once; each sees a copy of the variables and its saves come back after.
+
+        Give every branch its own session_id: one tab cannot be driven two ways at once.
+        fail_fast (default true) stops the other branches at the first failure.
+        """
+        branches = step.get("branches") or []
+        runners = []
+        for index, _ in enumerate(branches):
+            runners.append(Runner(self.facade, dict(self.scope), summary=self.summary,
+                                  continue_on_error=self.continue_on_error, session_override=self.session_override,
+                                  project_root=self.project_root, call_stack=self.call_stack, shared=self.shared,
+                                  prefix=f"{path}.branches.{index}."))
+        tasks = [asyncio.ensure_future(runner.block(steps, runner.prefix)) for runner, steps in zip(runners, branches)]
+        self.shared.trace.append(f"{path} parallel: {len(tasks)} branches")
+        failure: BaseException | None = None
+        if step.get("fail_fast", True):
+            try:
+                await asyncio.gather(*tasks)
+            except (_Failed, _Return) as exc:
+                failure = exc
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+        else:
+            outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+            failure = next((item for item in outcomes if isinstance(item, (_Failed, _Return))), None)
+        for runner in runners:
+            for name, value in runner.outputs.items():
+                self.scope[name] = value
+                self.outputs[name] = value
+        if isinstance(failure, _Return):
+            raise failure
+        if failure is not None:
+            raise failure
+
+    async def _c_ask(self, step: dict[str, Any], path: str) -> None:
+        """Pause until someone answers: the companion popup (buttons, a notification) or op='answer'."""
+        text = str(self._render(step.get("message", "Continue?"), path, "ask"))
+        options = [str(item) for item in (self._render(step.get("options"), path, "ask") or ["yes", "no"])]
+        timeout = max(1.0, min(float(step.get("timeout_seconds", 600)), SLEEP_MAX))
+        job = self.shared.job
+        if job is None:
+            raise _Failed("ask needs a job (run through op='run' or op='run_steps')", path, "ask")
+        self.shared.trace.append(f"{path} ask: {_preview(text, 120)} {options}")
+        try:
+            value = await macro_jobs.ask(job, text, options, timeout)
+        except asyncio.TimeoutError:
+            if "default" not in step:
+                raise _Failed(f"nobody answered within {timeout:g}s: {text}", path, "ask") from None
+            value = step["default"]
+        self.shared.trace.append(f"{path} answer: {_preview(value, 80)}")
+        self.scope["last"] = {"ok": True, "value": value, "error": None, "action": "ask", "step": path}
+        if isinstance(step.get("save_as"), str):
+            self.scope[step["save_as"]] = value
+            self.outputs[step["save_as"]] = value
+
     async def _c_call(self, step: dict[str, Any], path: str) -> None:
         name = str(self._render(step.get("name"), path, "call"))
         if name in self.call_stack or len(self.call_stack) >= CALL_DEPTH:
@@ -507,18 +570,26 @@ async def run_record(facade: Any, record: dict[str, Any], values: dict[str, Any]
     deadline = time.monotonic() + float(timeout_seconds) if timeout_seconds else None
     name = record.get("name")
 
-    def runner(job: dict[str, Any] | None) -> Runner:
-        return Runner(facade, scope, summary=summary, continue_on_error=continue_on_error,
-                      session_override=session_id, project_root=project_root, call_stack=(name,) if name else (),
-                      shared=_Shared(job, deadline))
+    job = macro_jobs.new(name, session=session_id, background=background)
 
+    async def go() -> dict[str, Any]:
+        # A background job's tabs wear the wrench; a run the caller waits for is the agent's own work.
+        token = presence_live.MACRO_RUN.set((name or "script") if background else None)
+        try:
+            return await Runner(facade, scope, summary=summary, continue_on_error=continue_on_error,
+                                session_override=session_id, project_root=project_root,
+                                call_stack=(name,) if name else (), shared=_Shared(job, deadline)).run(record["steps"])
+        finally:
+            presence_live.MACRO_RUN.reset(token)
+
+    # Every run is a job: a background one answers now, a foreground one is awaited - and
+    # either can be seen (op='jobs', the popup) and stopped (op='cancel', Stop) while it runs.
+    task = macro_jobs.launch(job, go)
     if background:
-        job = macro_jobs.new(name, session=session_id)
-        view = macro_jobs.launch(job, lambda: runner(job).run(record["steps"]))
-        return {"success": True, "background": True, "macro": name, **view,
+        return {"success": True, "background": True, "macro": name, **macro_jobs.view(job),
                 "note": "Started in the background. op='job' job_id=<id> reads progress; wait_seconds waits for it."}
-    outcome = await runner(None).run(record["steps"])
-    return {**outcome, "macro": name}
+    outcome = await asyncio.shield(task)
+    return {**outcome, "macro": name, "job_id": job["job_id"]}
 
 
 def preview(record: dict[str, Any], values: dict[str, Any] | None) -> dict[str, Any]:

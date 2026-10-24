@@ -51,10 +51,10 @@ _PITFALLS = [
     "captcha_challenge says which kind it is and if it can be measured; verify only when sure.",
     "find low_confidence=true is guessing: re-query, do not click matches[0].",
     "New sessions open isolated; profile_mode='current' is the user's Chrome and logins (close closes only the agent's tabs).",
-    "Parallel agents: own session_id each, agent_label on open; close_all scope='mine' ends only yours.",
-    "Every cut is flagged: truncated/budget_truncated/has_more=true means more exists; continue at next_offset/next_seq.",
+    "Parallel agents: own session_id each, agent_label on open; close_all scope='mine'.",
+    "Cuts are flagged (truncated/budget_truncated/has_more): continue at next_offset/next_seq.",
     "Stay in the background; show only when the user asks.",
-    "render=step freezes the page until input/step runs; then release_inputs and set render normal.",
+    "render=step freezes the page until input/step; then release_inputs, render normal.",
     "Pointer x/y are viewport CSS pixels (iframe: frame_selector + frame-local x/y).",
 ]
 

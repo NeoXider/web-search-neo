@@ -270,6 +270,26 @@ p { margin: 0; }
 }
 .agent-meta { color: var(--muted); font-size: 11.5px; }
 .agent-row[data-phase="active"] .agent-meta { color: var(--ok); }
+.agent-row[data-phase="stale"] .agent-dot,
+.agent-row[data-phase="stale"] .agent-life { background: var(--bad); color: var(--bad); }
+.agent-row[data-phase="stale"] .agent-meta { color: var(--bad); }
+
+/* Macro jobs: one row each, a state chip, Stop, and the ask buttons when one waits. */
+.job-row { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; align-items: center;
+  padding: 6px 8px; border: 1px solid var(--line); border-radius: 10px; }
+.job-row + .job-row { margin-top: 6px; }
+.job-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.job-meta { grid-column: 1 / -1; color: var(--muted); font-size: 11.5px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.job-state { font-size: 11px; padding: 1px 7px; border-radius: 999px; border: 1px solid currentColor; }
+.job-state[data-state="running"], .job-state[data-state="starting"] { color: var(--ok); }
+.job-state[data-state="waiting"] { color: var(--warn); }
+.job-state[data-state="failed"], .job-state[data-state="interrupted"], .job-state[data-state="unknown"] { color: var(--bad); }
+.job-state[data-state="done"], .job-state[data-state="cancelled"] { color: var(--muted); }
+.job-question { grid-column: 1 / -1; font-size: 12px; margin: 4px 0 2px; }
+.job-actions { grid-column: 1 / -1; display: flex; gap: 6px; flex-wrap: wrap; }
+.job-actions .btn { padding: 3px 10px; font-size: 12px; }
+#auto-close { margin-right: 6px; }
 
 .release-row {
   display: flex;

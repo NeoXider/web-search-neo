@@ -145,14 +145,16 @@ def test_the_installer_never_creates_a_stylesheet():
 
 def test_the_installer_carries_this_build_s_timings():
     source = agent_presence.install_source()
-    assert f'"recentMs": {5 * 60 * 1000}' in source
+    assert f'"recentMs": {6 * 60 * 1000}' in source
     assert f'"flashMs": {agent_presence.FLASH_MS}' in source
     assert agent_presence.FLASH_MS <= 300
-    # The badge the person in the tab strip reads: green for a minute after the
-    # last action, amber until five minutes, then the favicon is handed back.
+    # The badge the person in the tab strip reads (the owner, 2026-10-24): green for a
+    # minute after the last action, yellow until six minutes, red until an hour, then
+    # the favicon is handed back (and the companion closes a tab the agent opened).
     assert agent_presence.ACTIVE_MS == 60_000
     assert f'"activeMs": {agent_presence.ACTIVE_MS}' in source
-    assert agent_presence.RECENT_MS == 5 * 60 * 1000
+    assert agent_presence.RECENT_MS == 6 * 60 * 1000
+    assert f'"staleMs": {presence_badge.STALE_MS}' in source and presence_badge.STALE_MS == 60 * 60 * 1000
 
 
 def test_the_corner_mark_geometry_reaches_the_page_script():
@@ -428,11 +430,16 @@ def test_a_broken_signal_never_fails_the_action(monkeypatch):
     assert result["success"] is True
 
 
-def test_favicon_mark_is_an_opaque_full_size_slime_over_the_page_icon():
+def test_favicon_mark_is_an_opaque_full_size_robot_or_wrench_over_the_page_icon():
     source = agent_presence.install_source()
-    # The page's own icon is drawn first and the slime goes on top of it in the
+    # The page's own icon is drawn first and the mark goes on top of it in the
     # bottom-right corner, at full size and fully opaque: the tab keeps its
     # identity, and the mark survives being looked at in a crowded tab strip.
+    # The shape says who (the owner, 2026-10-24): a robot head for an agent, a
+    # wrench for a background macro job, the robot with a small wrench for both.
+    assert "function drawRobot(" in source and "function drawWrench(" in source
+    assert 'if (mode === "both") drawWrench(context, parts[0], 0.55, -6, 7);' in source
+    assert "function markMode(now)" in source
     assert "context.drawImage(baseImage, 0, 0, 32, 32)" in source
     assert "CONFIG.slimeOrigin[0], CONFIG.slimeOrigin[1]" in source
     assert "context.scale(CONFIG.slimeScale, CONFIG.slimeScale)" in source
@@ -751,8 +758,9 @@ def test_the_badge_has_three_states_told_apart_by_more_than_colour():
     assert f'"dozeFrameMs": {presence_badge.DOZE_FRAME_MS}' in source
     assert (presence_badge.PULSE_FRAME_MS < presence_badge.BREATHE_FRAME_MS
             < presence_badge.DOZE_FRAME_MS), "working must look busier than the quiet states"
-    # Active and recent: awake green, asleep amber - then the page's own icon.
-    assert 'const awake = phase !== "recent";' in source
+    # Active, recent, stale: awake green, asleep yellow, still red - then the page's own icon.
+    assert 'const awake = phase !== "recent" && phase !== "stale";' in source
+    assert 'if (phase === "stale") { show("stale"); return; }' in source
     assert "restoreIcon();" in source
     assert presence_badge.BUSY_MS < agent_presence.ACTIVE_MS < agent_presence.RECENT_MS
     # The animation timer is the only repeating one, and it stops itself the

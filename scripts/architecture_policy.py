@@ -41,9 +41,13 @@ LEGACY_MAX_LINES = {
     # Lowered 2678 -> 2506 (2026-10-24, macro scripts): the macro validator moved to macro_check.py,
     # which also holds the script-layer checks; the runner is macro_flow.py, expressions
     # macro_expr.py, background jobs macro_jobs.py. What stayed here is the op routing.
-    "web_search_neo/main.py": 2506,
+    # Lowered 2506 -> 2503 (2026-10-24, jobs/schedules/ask): the script ops route to macro_ops.py.
+    "web_search_neo/main.py": 2503,
     # Raised 2681 -> 2686 for the aria-hidden majority hint in page_text exclusions.
-    "web_search_neo/page_perception.py": 2686,
+    # Raised 2686 -> 2703 (2026-10-24, find for agents): the query reading and the fact
+    # answer live in perception/find_terms.py; this file carries the hooks, the two
+    # result keys and the docstring paragraph that says what they mean.
+    "web_search_neo/page_perception.py": 2703,
     # Raised 2070 -> 2075 (2026-10-13, from upstream 96427c0): a tab create on a busy
     # machine answered late and left an orphan about:blank behind, so the wait is now
     # configurable. Came in with the rebase; the ratchet follows the file.
@@ -55,7 +59,9 @@ LEGACY_MAX_LINES = {
     # field and one import line; the logic lives in nodes.js and control.js.
     # Raised 1741 -> 1742 (2026-10-21) for button pairing: the one spread that registers
     # nodes.js's companion.pairRequest command; the notification lives in nodes.js.
-    "chrome-extension/service-worker.js": 1742,
+    # Raised 1742 -> 1743 (2026-10-24, macro jobs in the popup): the one spread that registers
+    # jobs.js's companion.jobsReport command; the jobs, Stop and ask answers live in jobs.js.
+    "chrome-extension/service-worker.js": 1743,
     # Lowered 1163 -> 1162 (2026-10-21): the popup's nodes frames are answered by
     # node_link.py; the one-line hello_ack freed the room for that branch and for
     # the one call that starts this computer's node when the companion connects.

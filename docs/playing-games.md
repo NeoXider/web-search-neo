@@ -15,6 +15,7 @@ README](../README.md#canvas-and-webgl-games). Everything here is expressed as
 - [Why frame gating exists](#why-frame-gating-exists)
 - [Render modes](#render-modes)
 - [A full playthrough](#a-full-playthrough)
+- [A model that outputs probabilities: env](#a-model-that-outputs-probabilities-env)
 - [Why a tapped key stays down for a whole frame](#why-a-tapped-key-stays-down-for-a-whole-frame)
 - [Auto-repeat for held keys](#auto-repeat-for-held-keys)
 - [Games inside an iframe](#games-inside-an-iframe)
@@ -230,6 +231,56 @@ next few moves are already known:
 `include_summary=false` skips the post-action page read, which is the only cost
 worth trimming on a hot loop: `step` drops from about 11 ms to 8 ms, `input`
 from 34 ms to 29 ms.
+
+## A model that outputs probabilities: env
+
+A reinforcement-learning policy, a JEPA-style world model with a policy head or a small
+classifier does not write `web_action` JSON: it sees an observation and answers a
+probability per action. The `env` action gives it that loop on top of the frame gate - the
+page waits while the model thinks, however long that takes.
+
+```json
+{"actions": [{"action": "env", "op": "define", "session_id": "rl",
+  "actions": [{"name": "idle"}, {"name": "right", "hold": ["RIGHT"]},
+              {"name": "jump", "hold": ["RIGHT"], "tap": ["SPACE"]}],
+  "frames_per_step": 4,
+  "observe": {"pixels": {"selector": "#game", "width": 64, "height": 48, "gray": true},
+              "script": "return {x: window.__game.x, onGround: window.__game.onGround}"},
+  "reward": "window.__game.x / 100",
+  "done": "window.__game.won || window.__game.deaths > 0"}]}
+{"actions": [{"action": "env", "op": "reset", "session_id": "rl", "url": "http://127.0.0.1:8797/platformer.html", "seed": 1}]}
+{"actions": [{"action": "env", "op": "step", "session_id": "rl", "probs": [0.1, 0.6, 0.3]}]}
+```
+
+| op | |
+|---|---|
+| `define` | the action set (each a `name` with keys to `hold`, keys to `tap` and/or a viewport `click: {x, y}`; a plain string is a held key), `frames_per_step` (1-120), `observe` (`pixels` of the largest element matching `selector`, box-averaged to `width` x `height`, gray or RGB; a `script` for game state), `reward` and `done` (JavaScript expressions read after each step) |
+| `reset` | opens or reloads `url`, freezes the page clock (render step mode), answers the first observation; `seed` seeds the sampler |
+| `step` | one action: `act` (a name or an index), or `probs` (one non-negative weight per action, normalised; `choose: "sample"` with `temperature`, or `"argmax"`); holds and releases keys as the action changes, releases `frames_per_step` frames, answers `observation`, `reward`, `done`, the action taken, `chosen_by` and its `probability` |
+| `step` in per-key mode | `define` with `keys: ["LEFT", "RIGHT", "SPACE"]` instead of `actions`; each step says which keys are down - `key_probs` (one probability per key, each held with its own probability, or when >= 0.5 with `choose: "argmax"`) or `pressed` (key names) - which is what an LLM does with `input` + `step`, as numbers instead of JSON |
+| `frames` on a step | how long this step keeps its keys down, overriding `frames_per_step` (1-120): the "when" |
+| `spec` | mode (`actions` or `keys`), action names or keys, observation shape, reward/done expressions, steps so far |
+| `close` | releases held keys and returns the page to normal rendering |
+
+`observation.pixels` is `{width, height, channels, data}` with `data` base64 bytes (uint8, row
+by row). From Python, [`scripts/wsn_env.py`](../scripts/wsn_env.py) wraps a running daemon
+(`mcp_cli.py serve`) as a Gymnasium-style environment:
+
+```python
+from wsn_env import WsnEnv, gym_env
+env = WsnEnv(url="http://127.0.0.1:8797/platformer.html", actions=[...], observe={...}, reward="...", done="...")
+obs, info = env.reset(seed=1)                     # obs["pixels"] is a numpy array when numpy is installed
+obs, reward, terminated, truncated, info = env.step(probs=policy(obs))
+env.close()
+gym = gym_env(url=..., actions=[...])              # a gymnasium.Env: Discrete actions, Box uint8 pixels
+env = WsnEnv(url=..., keys=["LEFT", "RIGHT", "SPACE"], observe={...})
+env.step(key_probs=[0.05, 0.9, 0.4])              # per-key mode; gym_env(keys=...) gives MultiBinary actions
+env.step(pressed=["RIGHT", "SPACE"], frames=8)
+```
+
+Measured on the bundled platformer fixture: a probability policy played through 5.8 steps a
+second with a 64 x 36 pixel observation, and `done` fired on the death it caused. Each step
+is one round trip, so this suits a policy that thinks per step, not a 60 Hz training run.
 
 ## Why a tapped key stays down for a whole frame
 

@@ -15,7 +15,7 @@ from web_search_neo.contract.param_docs import annotate as annotate_params
 from web_search_neo import bridge_daemon, node_actions, run_modes
 from web_search_neo import browser_tools
 from web_search_neo import chrome_bridge, companion_update, extra_actions, persist_actions, screen_state, tab_actions
-from web_search_neo import macro_check, macro_flow, macro_jobs, macros
+from web_search_neo import macro_check, macro_flow, macro_ops, macros
 from web_search_neo import msp_date_time
 from web_search_neo import msp_search
 from web_search_neo import plugins
@@ -1541,18 +1541,25 @@ async def browser_macro(
     job_id: str | None = None,
     wait_seconds: float = 0.0,
     timeout_seconds: float | None = None,
+    answer: Any = None,
+    every_seconds: float | None = None,
+    times: list[str] | None = None,
+    max_runs: int | None = None,
+    schedule_id: str | None = None,
 ) -> dict[str, Any]:
     """Check and run macro scripts: saved files (op=run name) or inline steps (op=run_steps steps).
 
     A step is a web_action object, optionally with when / save_as / assert / expect / retry /
     on_error / label, or a control step: if, repeat, for_each, wait_until, try, set, sleep, log,
-    fail, return, break, continue, call (another macro), read (a web_info topic such as network).
-    {{expressions}} fill parameters; last holds the previous step's ok/value/error.
-    background=true returns a job_id at once: op=job (wait_seconds), op=jobs, op=cancel.
-    Ops: list, show, validate, preview, run, run_steps, job, jobs, cancel, guarded_stage, guarded_commit.
+    fail, return, break, continue, call (another macro), read (a web_info topic such as network),
+    parallel (branches at once), ask (pause for an answer). {{expressions}} fill parameters.
+    Every script run is a job: background=true returns its job_id at once; op=job (wait_seconds),
+    jobs, cancel, answer. op=schedule (every_seconds or times ["09:00"]) repeats one; schedules,
+    unschedule. Ops: list, show, validate, preview, run, run_steps, guarded_stage, guarded_commit.
     """
     op = str(op or "").strip().lower()
     facade = sys.modules[__name__]
+    macro_ops.start_scheduler(facade)
 
     if op == "validate":
         if not name and steps is not None:  # inline steps can be checked before they run, too
@@ -1565,22 +1572,12 @@ async def browser_macro(
             **await _macro_store(project_root),
         }
 
-    if op in ("jobs", "job", "cancel"):
-        if op == "jobs":
-            return {"success": True, "jobs": macro_jobs.listing()}
-        if not job_id:
-            raise ValueError(f"macro op '{op}' requires job_id (op='jobs' lists them)")
-        if op == "cancel":
-            return {"success": True, **macro_jobs.cancel(job_id)}
-        return {"success": True, **await macro_jobs.wait(job_id, wait_seconds)}
-
-    if op == "run_steps":
-        if not steps:
-            raise ValueError("macro op 'run_steps' requires steps: a list of step objects")
-        record = {"name": None, "steps": macros.validate_steps(steps), "variables": dict(variables or {})}
-        return await macro_flow.run_record(facade, record, variables, continue_on_error=continue_on_error,
-                                           session_id=session_id, project_root=project_root,
-                                           background=background, timeout_seconds=timeout_seconds)
+    if op in macro_ops.OPS:
+        return await macro_ops.handle(
+            facade, op, name=name, steps=steps, variables=variables, continue_on_error=continue_on_error,
+            session_id=session_id, project_root=project_root, background=background, job_id=job_id,
+            wait_seconds=wait_seconds, timeout_seconds=timeout_seconds, answer=answer,
+            every_seconds=every_seconds, times=times, max_runs=max_runs, schedule_id=schedule_id)
 
     if op == "run":
         if not name:
@@ -1728,8 +1725,8 @@ async def browser_macro(
         return {"success": True, **record, **await _macro_store(project_root)}
 
     raise ValueError(
-        "macro op must be list, show, validate, preview, run, run_steps, job, jobs, cancel, "
-        f"guarded_stage or guarded_commit, not '{op}'. Macros are JSON files: create, edit, rename "
+        "macro op must be list, show, validate, preview, run, run_steps, job, jobs, cancel, answer, schedule, "
+        f"schedules, unschedule, guarded_stage or guarded_commit, not '{op}'. Macros are JSON files: create, edit, rename "
         "and delete them with ordinary file operations, then check the result with "
         "op='validate'."
     )
@@ -2051,7 +2048,7 @@ _ACTIONS: dict[str, ActionSpec] = {
             "macro",
             browser_macro,
             "macro",
-            "Run macro scripts, saved or inline: logic, loops, waits, sub-macros, background jobs.",
+            "Macro scripts: logic, loops, waits, background jobs.",
         ),
         _action("captcha", browser_captcha, "page", "Detect a captcha and wait it out or solve it."),
         _action(

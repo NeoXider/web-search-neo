@@ -155,15 +155,15 @@ def test_the_badge_animates_each_state_in_its_own_rhythm(visible_page):
         "phase": "busy", "pulse": True}
     time.sleep(0.5)
     frames = driver.execute_script("return Object.keys(window.__wsnPresence.painted)")
-    assert len([key for key in frames if key.startswith("busy:")]) >= 2
+    assert len([key for key in frames if key.startswith("agent/busy:")]) >= 2
     # Past the working seconds: still green, now breathing - a slower loop of its
     # own frames on the same single timer.
     time.sleep(presence_badge.BUSY_MS / 1000 + 2.5 * presence_badge.BREATHE_FRAME_MS / 1000)
     state = driver.execute_script(read)
     assert state["phase"] == "active" and state["pulse"] is True
-    assert state["shown"].startswith("active:")
+    assert state["shown"].startswith("agent/active:")
     frames = driver.execute_script("return Object.keys(window.__wsnPresence.painted)")
-    assert len([key for key in frames if key.startswith("active:")]) >= 2
+    assert len([key for key in frames if key.startswith("agent/active:")]) >= 2
 
 
 def test_reduced_motion_gets_a_still_ring_and_no_glide(visible_page):
@@ -180,4 +180,4 @@ def test_reduced_motion_gets_a_still_ring_and_no_glide(visible_page):
     assert abs(cursor["x"] - 800) < 0.6 and abs(cursor["y"] - 500) < 0.6  # moved, not animated
     state = driver.execute_script("const s = window.__wsnPresence; return {phase: s.phase, pulse: !!s.pulse,"
                                   " shown: s.shown};")
-    assert state["phase"] == "busy" and state["pulse"] is False and state["shown"] == "busy:-1"
+    assert state["phase"] == "busy" and state["pulse"] is False and state["shown"] == "agent/busy:-1"

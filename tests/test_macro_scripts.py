@@ -17,6 +17,8 @@ from web_search_neo import main
 @pytest.fixture(autouse=True)
 def macro_root(tmp_path, monkeypatch):
     monkeypatch.setenv("WEB_SEARCH_NEO_MACRO_ROOT", str(tmp_path / "macros"))
+    monkeypatch.setenv("WEB_SEARCH_NEO_JOBS_DIR", str(tmp_path / "jobs"))
+    monkeypatch.setattr(macro_jobs, "REPORTER", lambda payload: None)
     monkeypatch.delenv("WEB_SEARCH_NEO_PROJECT_ROOT", raising=False)
     yield tmp_path
 
@@ -324,7 +326,7 @@ def test_background_job_can_be_cancelled(monkeypatch):
 def test_an_unknown_job_names_the_known_ones():
     with pytest.raises(ValueError) as excinfo:
         asyncio.run(macro_jobs.wait("job-nope", 0))
-    assert "no background job" in str(excinfo.value)
+    assert "no job 'job-nope'" in str(excinfo.value) and "op='jobs'" in str(excinfo.value)
 
 
 # --- validation, preview, guarded ------------------------------------------------------------
@@ -428,3 +430,176 @@ def test_the_cli_builds_a_macro_call_without_hand_written_json(tmp_path):
     action = request["args"]["actions"][0]
     assert action == {"action": "macro", "op": "run", "name": "youtube-upload", "background": True, "session_id": "yt",
                       "variables": {"count": 3, "title": "Hello world", "description": "line 1\nline 2", "tags": ["a", "b"]}}
+
+
+# --- jobs everywhere, ask, parallel, schedules ------------------------------------------------
+
+def test_a_foreground_run_is_a_job_too_and_says_so(monkeypatch):
+    _fake(monkeypatch)
+    outcome = _call(op="run_steps", steps=[{"action": "open", "url": "https://f"}, {"action": "return", "value": 1}])
+    assert outcome["success"] is True and outcome["job_id"].startswith("job-")
+    listed = _call(op="jobs")["jobs"]
+    assert any(job["job_id"] == outcome["job_id"] and job["state"] == "done" for job in listed)
+    assert (macro_jobs.jobs_dir() / f"{outcome['job_id']}.json").exists()
+
+
+def test_another_process_s_jobs_are_listed_stopped_and_interrupted():
+    import os
+    root = macro_jobs.jobs_dir()
+    alive = {"job_id": "job-000001-aaaaaa", "macro": "watcher", "state": "running", "pid": os.getpid(),
+             "started_at": 1.0, "background": True}
+    dead = {"job_id": "job-000002-bbbbbb", "macro": "old", "state": "running", "pid": 999_999_999,
+            "started_at": 2.0, "background": True}
+    for record in (alive, dead):
+        (root / f"{record['job_id']}.json").write_text(json.dumps(record), encoding="utf-8")
+    listed = {job["job_id"]: job for job in _call(op="jobs")["jobs"]}
+    assert listed["job-000001-aaaaaa"]["state"] == "running"
+    # Its process is gone: the job reads interrupted, never resumed.
+    assert listed["job-000002-bbbbbb"]["state"] == "interrupted"
+    stopped = _call(op="cancel", job_id="job-000001-aaaaaa")
+    assert stopped["cancel_requested"] is True and (root / "job-000001-aaaaaa.cancel").exists()
+
+
+def test_ask_pauses_a_job_until_op_answer(monkeypatch):
+    calls = _fake(monkeypatch)
+
+    async def scenario():
+        started = await main.browser_macro(op="run_steps", background=True, steps=[
+            {"action": "ask", "message": "Publish {{what}}?", "options": ["yes", "no"], "save_as": "reply"},
+            {"action": "if", "test": "reply == 'yes'", "then": [{"action": "open", "url": "https://publish"}]},
+            {"action": "return", "value": "{{reply}}"}], variables={"what": "the Short"})
+        seen = {}
+        for _ in range(50):
+            seen = await main.browser_macro(op="job", job_id=started["job_id"])
+            if seen["state"] == "waiting":
+                break
+            await asyncio.sleep(0.05)
+        assert seen["question"]["text"] == "Publish the Short?" and seen["question"]["options"] == ["yes", "no"]
+        await main.browser_macro(op="answer", job_id=started["job_id"], answer="yes")
+        return await main.browser_macro(op="job", job_id=started["job_id"], wait_seconds=5)
+
+    finished = asyncio.run(scenario())
+    assert finished["state"] == "done" and finished["returned"] == "yes"
+    assert [call["url"] for call in calls] == ["https://publish"]
+
+
+def test_ask_falls_back_to_its_default_on_timeout(monkeypatch):
+    _fake(monkeypatch)
+    outcome = _call(op="run_steps", steps=[{"action": "ask", "message": "Continue?", "timeout_seconds": 1,
+                                            "default": "no", "save_as": "reply"},
+                                           {"action": "return", "value": "{{reply}}"}])
+    assert outcome["success"] is True and outcome["returned"] == "no"
+
+
+def test_parallel_runs_branches_at_once_and_merges_their_saves(monkeypatch):
+    calls = _fake(monkeypatch, lambda action, n: _script_value(action["session_id"])
+                  if action["action"] == "run_script" else {"success": True, "data": {}})
+    outcome = _call(op="run_steps", steps=[
+        {"action": "parallel", "branches": [
+            [{"action": "sleep", "seconds": 0.2},
+             {"action": "run_script", "script": "return 1", "session_id": "a", "save_as": "left"}],
+            [{"action": "run_script", "script": "return 2", "session_id": "b", "save_as": "right"}],
+        ]},
+        {"action": "return", "value": "{{left}}+{{right}}"}])
+    assert outcome["success"] is True and outcome["returned"] == "a+b"
+    assert [call["session_id"] for call in calls] == ["b", "a"]  # the second branch did not wait for the first
+    assert any(result["step"].startswith("0.branches.1.") for result in outcome["results"])
+
+
+def test_parallel_fail_fast_stops_the_other_branch(monkeypatch):
+    calls = _fake(monkeypatch, lambda action, n: {"success": False, "error": "nope"}
+                  if action.get("url") == "https://bad" else {"success": True, "data": {}})
+    outcome = _call(op="run_steps", steps=[{"action": "parallel", "branches": [
+        [{"action": "open", "url": "https://bad"}],
+        [{"action": "sleep", "seconds": 2}, {"action": "open", "url": "https://never"}]]}])
+    assert outcome["success"] is False and "nope" in outcome["error"]
+    assert "https://never" not in [call.get("url") for call in calls]
+
+
+def test_a_background_job_marks_its_tabs_as_the_macro_s(monkeypatch):
+    from web_search_neo import presence_live
+    seen = []
+
+    async def fake(actions, continue_on_error=False, summary="full"):
+        seen.append(presence_live.MACRO_RUN.get())
+        return {"success": True, "results": [{"index": 0, "action": actions[0]["action"], "success": True, "data": {}}]}
+
+    monkeypatch.setattr(main, "_execute_actions", fake)
+    _save("watch", [{"action": "open", "url": "https://w", "session_id": "bg"}, {"action": "log", "message": "x"}])
+
+    async def scenario():
+        started = await main.browser_macro(op="run", name="watch", background=True)
+        await main.browser_macro(op="job", job_id=started["job_id"], wait_seconds=5)
+        await main.browser_macro(op="run", name="watch", timeout_seconds=30)
+
+    asyncio.run(scenario())
+    # The background job's actions carry the wrench; the run the caller waited for is the agent's own.
+    assert seen == ["watch", None]
+
+
+def test_the_report_answer_stops_a_job_from_the_popup(monkeypatch):
+    _fake(monkeypatch)
+    replies = []
+
+    def reporter(payload):
+        running = [job["job_id"] for job in payload["jobs"] if job["state"] == "running"]
+        replies.append(running)
+        return {"cancel": running, "answers": {}}
+
+    monkeypatch.setattr(macro_jobs, "REPORTER", reporter)
+    monkeypatch.setattr(macro_jobs, "REPORT_SECONDS", 0.1)
+    monkeypatch.setattr(macro_jobs, "WATCH_SECONDS", 0.1)
+
+    async def scenario():
+        started = await main.browser_macro(op="run_steps", background=True, steps=[
+            {"action": "sleep", "seconds": 30}, {"action": "open", "url": "https://x"}])
+        return await main.browser_macro(op="job", job_id=started["job_id"], wait_seconds=5)
+
+    finished = asyncio.run(scenario())
+    assert finished["state"] == "cancelled" and any(replies)
+
+
+def test_schedules_are_stored_listed_run_and_removed(monkeypatch, tmp_path):
+    from web_search_neo import macro_schedules
+    monkeypatch.setenv("WEB_SEARCH_NEO_SCHEDULES_FILE", str(tmp_path / "schedules.json"))
+    _save("tick", [{"action": "log", "message": "tick"}])
+    created = _call(op="schedule", name="tick", every_seconds=30, max_runs=2)["schedule"]
+    assert created["name"] == "tick" and created["every_seconds"] == 30.0 and created["next_run"]
+    with pytest.raises(ValueError):
+        _call(op="schedule", name="tick", every_seconds=1)
+    with pytest.raises(ValueError):
+        _call(op="schedule", name="tick", times=["25:00"])
+    daily = _call(op="schedule", steps=[{"action": "log", "message": "d"}], times=["09:00", "18:30"])["schedule"]
+    assert daily["inline_steps"] == 1
+    listed = _call(op="schedules")
+    assert {item["schedule_id"] for item in listed["schedules"]} == {created["schedule_id"], daily["schedule_id"]}
+
+    launched = []
+
+    async def launch(item):
+        launched.append(item["schedule_id"])
+        return {"job_id": f"job-{item['schedule_id']}", "state": "running"}
+
+    items = json.loads((tmp_path / "schedules.json").read_text(encoding="utf-8"))["schedules"]
+    for item in items:
+        item["next_run_at"] = 0  # due now
+    (tmp_path / "schedules.json").write_text(json.dumps({"schedules": items}), encoding="utf-8")
+    monkeypatch.setitem(macro_schedules._STATE, "launch", launch)
+    asyncio.run(macro_schedules._tick())
+    assert sorted(launched) == sorted([created["schedule_id"], daily["schedule_id"]])
+    stored = {item["schedule_id"]: item for item in macro_schedules._load()}
+    assert stored[created["schedule_id"]]["runs"] == 1
+    assert stored[created["schedule_id"]]["last_job_id"] == f"job-{created['schedule_id']}"
+    assert stored[created["schedule_id"]]["next_run_at"] > 0
+    _call(op="unschedule", schedule_id=daily["schedule_id"])
+    assert [item["schedule_id"] for item in _call(op="schedules")["schedules"]] == [created["schedule_id"]]
+
+
+def test_validate_knows_parallel_and_ask():
+    checked = _call(op="validate", steps=[
+        {"action": "parallel", "branches": [[{"action": "open", "url": "https://a"}], []]},
+        {"action": "ask"},
+        {"action": "parallel", "branches": [[{"action": "nope"}]]}])
+    errors = " | ".join(item["error"] for item in checked["errors"])
+    assert "'parallel' needs branches" in errors and "'ask' needs a message" in errors
+    assert any(item["index"] == "2.branches.0.0" for item in checked["errors"])

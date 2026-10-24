@@ -32,6 +32,8 @@ CONTROL_FIELDS: dict[str, frozenset[str]] = {
     "continue": frozenset(),
     "call": frozenset({"name", "variables", "project_root"}),
     "read": frozenset({"topic", "params"}),
+    "parallel": frozenset({"branches", "fail_fast"}),
+    "ask": frozenset({"message", "options", "timeout_seconds", "default"}),
 }
 CONTROL_ACTIONS = frozenset(CONTROL_FIELDS)
 BODIES = {"if": ("then", "else"), "repeat": ("steps",), "for_each": ("steps",), "wait_until": ("steps",),
@@ -69,6 +71,9 @@ def walk(steps: Any, prefix: str = "") -> Iterator[tuple[str, dict[str, Any]]]:
         yield path, step
         for body in BODIES.get(action_of(step), ()):
             yield from walk(step.get(body), f"{path}.{body}.")
+        if action_of(step) == "parallel" and isinstance(step.get("branches"), list):
+            for index, branch in enumerate(step["branches"]):
+                yield from walk(branch, f"{path}.branches.{index}.")
 
 
 def uses_flow(steps: Any) -> bool:
@@ -116,7 +121,7 @@ def read_names(steps: Any) -> set[str]:
             for key in ("times", "items"):
                 value = step.get(key)
                 names |= macro_expr.names_in(value) if isinstance(value, str) and "{{" not in value else set()
-        bodies = set(BODIES.get(action, ()))
+        bodies = set(BODIES.get(action, ())) | ({"branches"} if action == "parallel" else set())
         params = {key: value for key, value in step.items()
                   if key not in STEP_KEYS and key not in bodies and key not in EXPRESSION_KEYS.get(action, ())}
         names |= macro_expr.template_names(params)
@@ -204,6 +209,12 @@ def flow_problems(steps: Any) -> list[dict[str, Any]]:
                                           "Use letters, digits and _."))
         if action == "call" and not isinstance(step.get("name"), str):
             found.append(_problem(path, action, "'call' needs the macro name", '"name": "youtube-publish"'))
+        if action == "parallel" and (not isinstance(step.get("branches"), list) or not step["branches"]
+                                     or not all(isinstance(item, list) and item for item in step["branches"])):
+            found.append(_problem(path, action, "'parallel' needs branches: a list of non-empty step lists",
+                                  '"branches": [[...steps in session a...], [...steps in session b...]]'))
+        if action == "ask" and not isinstance(step.get("message"), str):
+            found.append(_problem(path, action, "'ask' needs a message", '"message": "Publish now?"'))
         if action == "read" and not isinstance(step.get("topic"), str):
             found.append(_problem(path, action, "'read' needs a web_info topic", '"topic": "network"'))
         if action in ("break", "continue") and not inside_loop:
@@ -346,7 +357,8 @@ def outline(steps: Any) -> list[str]:
         depth = path.count(".") // 2
         action = action_of(step)
         detail = {key: value for key, value in step.items()
-                  if key != "action" and key not in BODIES.get(action, ()) and key not in SCRIPT_FIELDS}
+                  if key != "action" and key not in BODIES.get(action, ()) and key not in SCRIPT_FIELDS
+                  and not (action == "parallel" and key == "branches")}
         text = json.dumps(detail, ensure_ascii=False, default=str)
         lines.append(f"{'  ' * depth}{path} {action} {text[:160] + ('...' if len(text) > 160 else '')}")
     return lines

@@ -40,7 +40,7 @@ const tabPanels = {
   "tab-settings": document.querySelector("#panel-settings"),
 };
 const TAB_STORAGE = "wsn-popup-tab";
-const AFTERGLOW_MS = 5 * 60 * 1000; // agent-activity.js RECENT_MS
+const AFTERGLOW_MS = 60 * 60 * 1000; // agent-activity.js STALE_MS: the bar drains until the tab is closed or let go
 
 const GITHUB_URL = "https://github.com/NeoXider/web-search-neo";
 const RELEASES_API = "https://api.github.com/repos/NeoXider/web-search-neo/releases?per_page=1";
@@ -332,7 +332,7 @@ function agentRow(row) {
   const button = document.createElement("button");
   button.type = "button";
   button.className = "agent-row";
-  button.dataset.phase = row.phase === "active" ? "active" : "recent";
+  button.dataset.phase = ["active", "stale"].includes(row.phase) ? row.phase : "recent";
   button.title = row.url || row.title || "";
   const claim = row.claim ? ` · claimed by ${row.claim}` : "";
   const meta = `${row.agent} · ${row.status_text}${claim}`;
@@ -346,7 +346,7 @@ function agentRow(row) {
   const details = document.createElement("span");
   details.className = "agent-meta";
   details.textContent = meta;
-  // How much of the five-minute afterglow is left: full while working, draining after.
+  // How much of the hour is left before the tab is closed or let go: full while working, draining after.
   const life = document.createElement("span");
   life.className = "agent-life";
   life.setAttribute("aria-hidden", "true");
@@ -657,6 +657,9 @@ function previewSend(type, extra = {}) {
   // The Computers tab's fake network lives beside its renderer (popup-computers.js).
   if (String(type).startsWith("companion.node") && typeof window.__wsnPreviewNodes === "function") {
     return window.__wsnPreviewNodes(type, extra);
+  }
+  if (/^companion\.(jobs|cancelJob|answerJob|autoClose)$/.test(type) && typeof window.__wsnPreviewJobs === "function") {
+    return window.__wsnPreviewJobs(type, extra);
   }
   if (type === "companion.agentTabs") return Promise.resolve(previewAgentTabs());
   if (type === "companion.focusAgentTab") return Promise.resolve({focused: extra.tab_id});

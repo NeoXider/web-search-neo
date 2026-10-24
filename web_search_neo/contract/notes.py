@@ -49,8 +49,11 @@ _ACTION_NOTES = {
         "ops": (
             "list/show read the store; validate checks a file (or inline steps) without running it; "
             "preview resolves its placeholders and dispatches nothing; run replays it; run_steps runs "
-            "inline steps you pass in this call, saving nothing; background=true on run/run_steps "
-            "returns a job_id at once, then job (wait_seconds), jobs and cancel; "
+            "inline steps you pass in this call, saving nothing; every script run is a job, and "
+            "background=true on run/run_steps returns its job_id at once; then job (wait_seconds), "
+            "jobs, cancel, and answer (job_id, answer) for an ask step; schedule (name or steps, "
+            "every_seconds >= 10 or times=['09:00'], max_runs) runs it as background jobs, "
+            "schedules lists them, unschedule (schedule_id) removes one; "
             "guarded_stage/guarded_commit are the two-phase path for an action that must "
             "happen at most once. A macro is a JSON file: create, edit, rename and delete "
             "it with ordinary file operations."
@@ -67,7 +70,10 @@ _ACTION_NOTES = {
             "sleep {seconds}; log {message}; fail {message}; return {value}; break; continue; "
             "call {name, variables} runs another macro (depth 5, no cycles) and save_as keeps its "
             "return value; read {topic, params} runs a web_info topic (network, page_text, find, "
-            "console, screen_state...) with output=json by default."
+            "console, screen_state...) with output=json by default; parallel {branches: [[steps], "
+            "[steps]], fail_fast} runs branches at once (one session_id each; their save_as values "
+            "come back after); ask {message, options, timeout_seconds, default, save_as} waits for "
+            "the person (companion popup or notification) or op='answer'."
         ),
         "expressions": (
             "Python-like and safe: and/or/not (&&, ||, ! too), == != < > in, a if c else b, "
@@ -123,8 +129,9 @@ _ACTION_NOTES = {
             "A step of action 'macro' inside a macro is refused; use the call control step. Loops "
             "stop at max_iterations/max_items (default 1000), a run at 20000 steps, and a guarded "
             "macro must stay a plain step list. A plain replay reports like a batch, so check "
-            "failure_count and every results[i].success. Background jobs live as long as the "
-            "server process; give them their own session_id."
+            "failure_count and every results[i].success. A job's state is saved to disk, so "
+            "op='jobs' also lists other servers' jobs and op='cancel' stops them; a job whose "
+            "server died reads interrupted and is never resumed. Give a job its own session_id."
         ),
     },
     "fill": {
@@ -210,6 +217,7 @@ _ACTION_NOTES = {
         "role": "A filter, not a nudge: another role is dropped. Under low_confidence the guesses come from the unfiltered set, so a wrong role can reappear there.",
         "ambiguous": "The top two matched and ranked equally, so document order alone chose; say which you mean instead of taking matches[0].",
         "limits": "visible_only=true by default; limit is clamped to 25.",
+        "queries": "Write it as you would say it: filler words (the, to, click) are dropped, a role word (link, button, field) becomes a role hint, and terms says how the query was read. Table row headers and definition terms are searched too: such a match carries answer, the value beside the label ('release date' -> the date cell). match.text is the visible text when a title or aria-label took the name.",
     },
     "page_elements": {
         "filters": "category='interactive' returns one deduplicated interactive list (links, buttons, inputs, editable controls and ARIA widgets). Other categories: all (legacy default), links, forms, fields, buttons, iframes. Combine visible_only=true, enabled_only=true, role='button', text_pattern='Save', href_pattern='/settings'. Filters run before offset/limit and the character budget; found and next_offset describe matching rows.",

@@ -31,7 +31,7 @@ from web_search_neo.presence_overlay import CAPTION_MS, MAX_RIPPLES, RIPPLE_MS  
 # reinstall itself. Without it a long-lived tab would keep running whatever
 # version was current when it first loaded, and a fix here would only reach
 # pages opened afterwards.
-PRESENCE_VERSION = 11
+PRESENCE_VERSION = 12
 
 PRESENCE_ENV = "WEB_SEARCH_NEO_AGENT_PRESENCE"
 
@@ -42,9 +42,9 @@ PRESENCE_ENV = "WEB_SEARCH_NEO_AGENT_PRESENCE"
 # made a busy tab flip to amber between two actions, which read as "nobody is
 # driving this". Matches the companion's toolbar badge (agent-activity.js).
 ACTIVE_MS = 60_000
-# The afterglow the user asked for: the tab stays marked for five minutes after
-# the agent's last action, then gives the favicon back.
-RECENT_MS = 5 * 60 * 1000
+# Yellow from one to six minutes after the last action, then red until an hour
+# (presence_badge.STALE_MS) - the owner's states, 2026-10-24.
+RECENT_MS = 6 * 60 * 1000
 # The flash is deliberately at the short end of what the eye still registers:
 # with dozens of actions a second, anything longer turns into a smear of
 # overlapping boxes instead of a readable sequence.
@@ -54,7 +54,7 @@ FLASH_MS = 250
 MAX_FLASHES = 6
 
 _ACTIVE_COLOR = "#2fbf5c"
-_RECENT_COLOR = "#e2a03f"
+_RECENT_COLOR = "#f2c230"
 
 # The corner mark's geometry on the 32x32 canvas: 16-unit slime drawn at full
 # size (half the tab icon) in the bottom-right corner, with no transparency.

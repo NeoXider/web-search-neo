@@ -926,8 +926,8 @@ def test_an_unknown_op_lists_the_ones_that_exist():
         _call(op="teleport")
     message = str(excinfo.value)
     assert (
-        "macro op must be list, show, validate, preview, run, run_steps, job, jobs, cancel, "
-        "guarded_stage or guarded_commit, not 'teleport'." in message
+        "macro op must be list, show, validate, preview, run, run_steps, job, jobs, cancel, answer, schedule, "
+        "schedules, unschedule, guarded_stage or guarded_commit, not 'teleport'." in message
     )
     # The ops that went away were how a caller wrote a macro, so the refusal has
     # to say what replaced them rather than only listing what is left.

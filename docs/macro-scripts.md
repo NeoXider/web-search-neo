@@ -12,7 +12,9 @@ dispatcher - every action is still validated against its published schema before
 - [Control steps](#control-steps)
 - [Expressions and templates](#expressions-and-templates)
 - [Variables, results and the answer](#variables-results-and-the-answer)
-- [Background jobs](#background-jobs)
+- [Jobs: background, visible, stoppable](#jobs-background-visible-stoppable)
+- [Asking the person: ask](#asking-the-person-ask)
+- [Schedules](#schedules)
 - [Inline scripts: run_steps](#inline-scripts-run_steps)
 - [Checking before running](#checking-before-running)
 - [Recipes](#recipes)
@@ -80,6 +82,8 @@ Any action step may carry these keys; they belong to the script, not to the acti
 | `break`, `continue` | - | leave or skip a pass of the nearest loop |
 | `call` | `name`, `variables`, `project_root` | runs another macro (5 deep at most, no cycles); `save_as` keeps its `return` value, or its outputs |
 | `read` | `topic`, `params` | runs a `web_info` topic (`network`, `page_text`, `find`, `console`, `screen_state`, `page_elements`...); `output` defaults to `json` |
+| `parallel` | `branches` (a list of step lists), `fail_fast` (default true) | runs the branches at once; each sees a copy of the variables and its `save_as`/`set` values come back after; give each branch its own `session_id` |
+| `ask` | `message`, `options` (default yes/no), `timeout_seconds` (600), `default`, `save_as` | pauses until the person answers in the companion popup or a notification, or an agent calls `op=answer`; without `default` an unanswered ask fails |
 
 `when` works on control steps too: a skipped `if` runs neither branch.
 
@@ -138,24 +142,66 @@ A script run answers:
 | `results[]` | each executed action with `step`, `success`, `data` or `error`, `attempts` |
 | `executed_count`, `failure_count`, `duration_ms` | |
 
-## Background jobs
+## Jobs: background, visible, stoppable
+
+Every script run is a job, whether it runs in the foreground or with `background: true`:
 
 ```json
 {"actions":[{"action":"macro","op":"run","name":"gpt-image","background":true,"variables":{"prompt":"..."}}]}
 ```
 
-The answer comes back at once with a `job_id`. Then:
+A background run answers at once with a `job_id`; a foreground run answers when it ends, with
+its `job_id` too. Then:
 
 | Call | |
 |---|---|
-| `macro op=job job_id=<id>` | state (`running`, `done`, `failed`, `cancelled`), progress (step, action, executed), the last log lines, the result once finished |
+| `macro op=job job_id=<id>` | state (`starting`, `running`, `waiting`, `done`, `failed`, `cancelled`, `interrupted`), progress (step, action, executed), the last log lines, the result once finished |
 | `macro op=job job_id=<id> wait_seconds=120` | waits up to that long for the end (max 3600) |
-| `macro op=jobs` | every job of this server process |
+| `macro op=jobs` | every job: this server's and the ones other servers on this computer wrote |
 | `macro op=cancel job_id=<id>` | stops it before the next step; a waiting step is interrupted |
+| `macro op=answer job_id=<id> answer=<value>` | answers the job's open `ask` |
 
-A job runs inside the server process, so other calls keep working while it waits - the
-single-call CLI daemon included. Jobs live as long as that process. Give a job its own
-`session_id`: a job and the foreground driving one tab collide.
+A job runs inside its server process, so other calls keep working while it waits - the
+single-call CLI daemon included (it does not idle-exit while a job runs). Each job writes its
+state to `~/.web-search-neo/macro-jobs/<job_id>.json` (`WEB_SEARCH_NEO_JOBS_DIR` moves it), so
+another agent's server lists it and can stop it, and a restarted server still shows what ran
+before; a job whose process is gone reads `interrupted` and is never resumed (its steps may
+already have acted). The newest 50 finished jobs are kept.
+
+**In the browser.** The companion popup's **Macros** card lists the running and recent jobs
+with their step and progress, a **Stop** button, and the buttons of an open `ask`. A background
+job's tabs carry a wrench in their favicon badge (a robot is an agent; both show when both act
+on the tab) and the toolbar badge shows the wrench while a background job drives tabs. When a
+background job ends, or asks something, Chrome shows a notification.
+
+Give a job its own `session_id`: a job and the foreground driving one tab collide.
+
+## Asking the person: ask
+
+```json
+{"action": "ask", "message": "Publish '{{title}}' now?", "options": ["publish", "keep draft"],
+ "timeout_seconds": 1800, "default": "keep draft", "save_as": "choice"},
+{"action": "if", "test": "choice == 'publish'", "then": [{"action": "click", "selector": "#publish", "session_id": "pub"}]}
+```
+
+The job waits in state `waiting` with the question in `op=job`'s answer. The person answers
+from the popup or the notification's buttons; an agent answers with `op=answer`. With no
+answer by `timeout_seconds`, `default` is used, or the step fails.
+
+## Schedules
+
+```json
+{"actions":[{"action":"macro","op":"schedule","name":"price-watch","every_seconds":900,"variables":{"url":"..."}}]}
+{"actions":[{"action":"macro","op":"schedule","steps":[...],"times":["09:00","18:30"],"max_runs":20}]}
+```
+
+A schedule runs a saved macro (`name`) or inline `steps` every `every_seconds` (10 at least)
+or at `times` of day (local, `HH:MM`), until `max_runs`. Every run is an ordinary background
+job. `op=schedules` lists them with the next run, the last job and its state;
+`op=unschedule schedule_id=<id>` removes one. Schedules are kept in
+`~/.web-search-neo/macro-schedules.json` (`WEB_SEARCH_NEO_SCHEDULES_FILE`), so they survive a
+restart; one server process on the computer runs them (a heartbeat file), another takes over
+when it stops, and a run still going when the next is due is skipped, never stacked.
 
 ## Inline scripts: run_steps
 
@@ -224,7 +270,20 @@ and `{"action": "if", "test": "not last.ok", ...}` after it.
 `{"action": "call", "name": "login", "variables": {"user": "{{user}}"}}`.
 
 **Watcher**: a `repeat` with `delay_seconds` and a `wait_until` inside, started with
-`background: true`, then read it with `op=job`.
+`background: true`, then read it with `op=job`; or `op=schedule` it every few minutes.
+
+**Two sites at once**
+
+```json
+{"action": "parallel", "branches": [
+  [{"action": "open", "url": "https://a.example/price", "session_id": "a"},
+   {"action": "run_script", "session_id": "a", "script": "return document.querySelector('.price').innerText", "save_as": "price_a"}],
+  [{"action": "open", "url": "https://b.example/price", "session_id": "b"},
+   {"action": "run_script", "session_id": "b", "script": "return document.querySelector('.price').innerText", "save_as": "price_b"}]
+]}
+```
+
+**Confirm before the irreversible step**: an `ask` before the publish or submit click (above).
 
 ## Limits and rules
 

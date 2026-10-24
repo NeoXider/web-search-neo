@@ -41,10 +41,12 @@ def test_activity_phases_badges_and_expiry() -> None:
     out = _node_module_eval(
         ACTIVITY_MODULE,
         """
-        const t0 = 1_000_000;
+        const t0 = 10_000_000;
         const agent = {label: "main.py#7", name: "claude", pid: 7, claim_holder: "main.py#7"};
         let map = m.recordActivity({}, 42, agent, t0, {method: "cdp.send"});
         map = m.recordActivity(map, "43", {label: "x#8", pid: 8}, t0 - 200_000);
+        map = m.recordActivity(map, 44, agent, t0 - 4_000_000, {method: "tabs.create", created: true});
+        const opened = m.recordActivity(m.recordActivity({}, 50, agent, t0, {created: true}), 50, agent, t0 + 5);
         const ignored = m.recordActivity(map, "nope", agent, t0);
         const at = offset => ({
           phase: m.activityPhase(map["42"], t0 + offset),
@@ -55,12 +57,19 @@ def test_activity_phases_badges_and_expiry() -> None:
         return {
           entry: map["42"],
           ignoredSame: Object.keys(ignored).length,
-          fresh: at(1_000), recent: at(150_000), gone: at(300_000), young: at(35_000),
+          stickyCreated: opened["50"].created,
+          fresh: at(1_000), recent: at(150_000), red: at(400_000), gone: at(3_600_000), young: at(35_000),
           green_edge: at(59_000)["phase"], amber_edge: at(61_000)["phase"],
-          expiredIds: expired.expired, kept: Object.keys(expired.map),
-          next: m.nextChangeIn(map, t0 + 10_000),
+          yellow_edge: at(359_000)["phase"], red_edge: at(361_000)["phase"],
+          shortStale: m.activityPhase(map["42"], t0 + 1_000_000, 900_000),
+          macroText: m.badgeFor(map["42"], t0, undefined, true).text,
+          expiredIds: expired.expired, kept: Object.keys(expired.map).sort(),
+          due: m.dueForClose(map, t0 + 120_000, 3_600_000),
+          dueNone: m.dueForClose(map, t0, 0),
+          next: m.nextChangeIn({"42": map["42"]}, t0 + 10_000),
+          nextRed: m.nextChangeIn({"42": map["42"]}, t0 + 400_000),
           nextEmpty: m.nextChangeIn({}, t0),
-          forgotten: Object.keys(m.forgetActivity(map, 42)),
+          forgotten: Object.keys(m.forgetActivity(map, 42)).sort(),
           labels: [m.agentLabel(null), m.agentLabel({program: "a.py", pid: 3}),
                    m.agentLabel({label: "bad\\u0007label"})],
           ids: [m.normalizeTabId(true), m.normalizeTabId(0), m.normalizeTabId("12"), m.normalizeTabId(1.5)],
@@ -69,42 +78,47 @@ def test_activity_phases_badges_and_expiry() -> None:
         """,
     )
     assert out["entry"] == {
-        "tabId": 42, "at": 1_000_000, "agent": "claude", "pid": 7,
-        "method": "cdp.send", "claim": "main.py#7",
+        "tabId": 42, "at": 10_000_000, "agent": "claude", "pid": 7,
+        "method": "cdp.send", "claim": "main.py#7", "created": False,
     }
-    assert out["ignoredSame"] == 2
+    assert out["ignoredSame"] == 3
+    # A tab the agent opened stays its own whatever it does next: auto-close relies on it.
+    assert out["stickyCreated"] is True
     assert out["fresh"]["phase"] == "active"
     assert out["fresh"]["badge"] == {
-        "text": "AI", "color": "#16a34a",
+        "text": "\U0001f916", "color": "#16a34a",
         "title": "Web Search Neo — Agent claude — active now",
     }
+    assert out["macroText"] == "\U0001f527"
     assert out["recent"]["phase"] == "recent"
-    assert out["recent"]["badge"]["color"] == "#d97706"
+    assert out["recent"]["badge"]["color"] == "#ca8a04"
     assert out["recent"]["badge"]["title"].endswith("Agent claude — last action 2 min ago")
-    # Inside the green window the badge says "active now" outright; the seconds
-    # wording is what a gap just past it gets, and never a rounded "1 min ago".
     assert out["young"]["age"] == "active now" and out["young"]["phase"] == "active"
-    # The green window is the minute the user asked for: still "active now" at
-    # 59 s, amber from 61 s on, and gone when five quiet minutes are up.
+    # The owner's states, 2026-10-24: green for the minute, yellow until six minutes,
+    # red until the auto-close time (an hour by default), then gone.
     assert out["green_edge"] == "active"
     assert out["amber_edge"] == "recent"
-    assert out["gone"] == {"phase": "expired", "badge": None, "age": "last action 5 min ago"}
-    assert out["expiredIds"] == [43] and out["kept"] == ["42"]
-    # The next scheduled change is the green -> amber edge, not a 30 s flicker.
-    assert out["next"] == 50_000
+    assert out["yellow_edge"] == "recent" and out["red_edge"] == "stale"
+    assert out["red"]["phase"] == "stale" and out["red"]["badge"]["color"] == "#dc2626"
+    assert out["gone"] == {"phase": "expired", "badge": None, "age": "last action 60 min ago"}
+    assert out["shortStale"] == "expired"
+    assert out["expiredIds"] == [44] and out["kept"] == ["42", "43"]
+    # Only the tab the agent opened and left for the hour is due; never one it attached to.
+    assert out["due"] == [44] and out["dueNone"] == []
+    assert out["next"] == 50_000 and out["nextRed"] == 3_200_000
     assert out["nextEmpty"] is None
-    assert out["forgotten"] == ["43"]
+    assert out["forgotten"] == ["43", "44"]
     assert out["labels"] == ["agent", "a.py#3", "badlabel"]
     assert out["ids"] == [None, None, 12, None]
     assert out["rows"] == [
         {
             "tab_id": 42, "window_id": 3, "title": "Docs", "url": "https://d",
-            "agent": "claude", "pid": 7, "claim": "main.py#7", "phase": "recent",
+            "agent": "claude", "pid": 7, "claim": "main.py#7", "phase": "recent", "created": False,
             "age_ms": 90_000, "status_text": "1 min ago",
         },
         {
             "tab_id": 43, "window_id": None, "title": "Tab 43", "url": "",
-            "agent": "x#8", "pid": 8, "claim": None, "phase": "recent",
+            "agent": "x#8", "pid": 8, "claim": None, "phase": "recent", "created": False,
             "age_ms": 290_000, "status_text": "4 min ago",
         },
     ]
@@ -183,7 +197,7 @@ def test_a_relayed_command_badges_its_tab_and_lists_it_in_the_popup() -> None:
         const before = globalThis.__badges.length;
         globalThis.__tabUpdated(12, {status: "loading"});
         await globalThis.__sleep(20);
-        const repainted = globalThis.__badges.slice(before).some(c => c.tabId === 12 && c.text === "AI");
+        const repainted = globalThis.__badges.slice(before).some(c => c.tabId === 12 && c.text === "\\u{1F916}");
 
         globalThis.__fire("tabRemoved", 12);
         await globalThis.__sleep(20);
@@ -193,7 +207,7 @@ def test_a_relayed_command_badges_its_tab_and_lists_it_in_the_popup() -> None:
         """,
         prelude=_BADGE_WORLD,
     )
-    assert outcome["text"]["text"] == "AI"
+    assert outcome["text"]["text"] == "\U0001f916"
     assert outcome["color"]["color"] == "#16a34a"
     assert outcome["title"]["title"] == "Web Search Neo — Agent claude — active now"
     rows = outcome["listed"]["tabs"]
@@ -228,7 +242,7 @@ def test_badges_expire_back_to_the_global_badge_after_an_eviction() -> None:
         prelude=_BADGE_WORLD
         + """
         globalThis.__seedSession({agent_activity: {activity: {
-          "8": {tabId: 8, at: Date.now() - 6 * 60 * 1000, agent: "old", pid: 1, method: null, claim: null},
+          "8": {tabId: 8, at: Date.now() - 61 * 60 * 1000, agent: "old", pid: 1, method: null, claim: null},
           "9": {tabId: 9, at: Date.now() - 60 * 1000, agent: "new", pid: 2, method: null, claim: null},
         }, retired: []}});
         """,

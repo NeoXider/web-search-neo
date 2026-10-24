@@ -15,6 +15,7 @@ import re
 from typing import Any
 
 from web_search_neo.perception import text_window
+from web_search_neo.perception.find_terms import FIND_TERMS_JS
 from web_search_neo.perception.titles import settle_document_title
 
 
@@ -970,6 +971,7 @@ function wsnDice(left, right) {
 function wsnTokenMatch(query, field) {
   if (!query || !field) return false;
   if (query === field) return true;
+  if (query.length < 3 || field.length < 3) return false;  // "in" does not begin "initial"
   const queryStem = query.slice(0, Math.max(4, query.length - 2));
   if (field.startsWith(queryStem)) return true;
   const fieldStem = field.slice(0, Math.max(4, field.length - 2));
@@ -2046,7 +2048,7 @@ def element_text(
 # Semantic find
 # ---------------------------------------------------------------------------
 
-_FIND_SCRIPT = _JS_LIB + r"""
+_FIND_SCRIPT = _JS_LIB + FIND_TERMS_JS + r"""
 const query = arguments[0];
 const roleFilter = arguments[1];
 const limit = arguments[2];
@@ -2120,7 +2122,7 @@ function wsnCollect(root, offsets, out, depth) {
     }
     let matched = false;
     try {
-      matched = el.matches(WSN_CANDIDATE_SELECTOR);
+      matched = el.matches(WSN_FIND_SELECTOR);
     } catch (error) {
       matched = false;
     }
@@ -2130,6 +2132,7 @@ function wsnCollect(root, offsets, out, depth) {
 
 const normalizedQuery = wsnNorm(query);
 const queryTokens = normalizedQuery ? normalizedQuery.split(' ') : [];
+const terms = wsnFindTerms(normalizedQuery);
 const wantedRole = roleFilter ? String(roleFilter).toLowerCase() : '';
 const actionish = queryTokens.some(token => WSN_ACTION_WORDS.has(token));
 
@@ -2145,7 +2148,7 @@ let hiddenSkipped = 0;
 for (let index = 0; index < candidates.length; index += 1) {
   const el = candidates[index].el;
   const offsets = candidates[index].offsets;
-  const role = wsnRole(el);
+  const role = wsnFindRole(el, wsnRole(el));
   if (role === 'hidden') continue;
   // The outline stops at the first aria-hidden or [hidden] ancestor. Checking
   // only the element itself let a hidden copy of a real control outrank it, so
@@ -2198,7 +2201,7 @@ for (let index = 0; index < candidates.length; index += 1) {
   let matchScore = 0;
   let matchedField = '';
   for (const field of fields) {
-    const component = wsnFieldScore(normalizedQuery, queryTokens, field[2]);
+    const component = wsnFindScore(terms, normalizedQuery, queryTokens, field[2], role);
     if (component <= 0) continue;
     const weighted = component * field[1];
     if (weighted > matchScore) {
@@ -2216,6 +2219,7 @@ for (let index = 0; index < candidates.length; index += 1) {
   if (inViewport) score += 18;
   if (actionish && interactive) score += 12;
   if (wantedRole && role === wantedRole) score += 8;
+  if (terms.roles.has(role)) score += 25;
   const disabled = el.disabled === true || wsnAttr(el, 'aria-disabled') === 'true';
   if (!disabled) score += 6;
   else score -= 15;
@@ -2239,6 +2243,8 @@ for (let index = 0; index < candidates.length; index += 1) {
     visible: visible,
     occluded: occluded,
     interactive: interactive,
+    answer: interactive ? '' : wsnFactAnswer(el),
+    text: matchedField === 'text' ? ownText : '',
     frame: offsets.frame || null
   });
 }
@@ -2275,7 +2281,8 @@ if (!selected.length) {
 // second one was just as good.
 const ambiguous = !lowConfidence && qualified.length > 1
   && (qualified[0].match_score - qualified[1].match_score) < 5
-  && (qualified[0].score - qualified[1].score) < 5;
+  && (qualified[0].score - qualified[1].score) < 5
+  && !qualified[0].el.contains(qualified[1].el) && !qualified[1].el.contains(qualified[0].el);
 
 const matches = selected.map(item => {
   const match = {
@@ -2297,6 +2304,8 @@ const matches = selected.map(item => {
   // A perspective chain projects onto the page without an affine map, so the box
   // is its flat approximation; the outline says the same thing on the same key.
   if (item.approximate) match.page_rect_approximate = true;
+  if (item.answer) match.answer = item.answer;
+  if (item.text) match.text = item.text;
   return match;
 });
 
@@ -2314,7 +2323,8 @@ return {
   matches: matches,
   aria_hidden_skipped: hiddenSkipped,
   ambiguous: ambiguous,
-  low_confidence: lowConfidence
+  low_confidence: lowConfidence,
+  terms: terms.reduced || terms.roles.size ? {words: terms.tokens, role_hint: [...terms.roles]} : null
 };
 """
 
@@ -2366,6 +2376,12 @@ def find(
     ``returned`` counts the guesses handed over anyway - the one case where
     ``returned`` exceeds ``matched``. ``frames_too_deep`` counts frames nested
     past ``MAX_FRAME_DEPTH``, which no topic enters.
+
+    The query is read as a person writes it (``perception/find_terms.py``): filler
+    words are dropped, role words ("link", "button") become a role hint, and
+    ``terms`` reports both when they changed anything. Table headers and
+    definition terms are searched too; such a match carries ``answer``, the value
+    it labels ("initial release date" -> the cell beside "Initial release").
     """
     text = str(query or "").strip()
     if not text:
@@ -2396,6 +2412,7 @@ def find(
         "returned": int(raw.get("returned") or len(raw.get("matches") or [])),
         "truncated": bool(raw.get("truncated")),
         "aria_hidden_skipped": int(raw.get("aria_hidden_skipped") or 0),
+        **({"terms": raw["terms"]} if raw.get("terms") else {}),
     }
 
 

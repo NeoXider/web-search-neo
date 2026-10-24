@@ -92,12 +92,15 @@ def test_allowed_dependencies_and_own_modules(source):
 # relay to the bridge (nodes.js) and the pause gate (control.js) are their own modules.
 # 2026-10-21 (button pairing): service-worker.js raised by one line - the spread that
 # registers nodes.js's companion.pairRequest command; the notification lives in nodes.js.
+# 2026-10-24 (macro jobs in the popup): service-worker.js raised by one line - the spread that
+# registers jobs.js's companion.jobsReport command (agent-badges.js re-exports it, so the import
+# line only grew); the report, Stop, ask answers and notifications live in jobs.js.
 _RATCHET_CEILINGS = {
     "web_search_neo/browser_tools.py": 8604,
     "web_search_neo/main.py": 2822,
     "web_search_neo/page_perception.py": 2720,
     "web_search_neo/chrome_bridge.py": 2090,
-    "chrome-extension/service-worker.js": 1742,
+    "chrome-extension/service-worker.js": 1743,
     "web_search_neo/bridge_daemon.py": 1166,
     "web_search_neo/macros.py": 849,
     "web_search_neo/agent_presence.py": 817,

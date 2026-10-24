@@ -18,7 +18,7 @@ import {
   sameFrameUrl,
   trackPending,
 } from "./events.js";
-import {agentMessage, applyGlobalBadge, noteAgentCommand} from "./agent-badges.js";
+import {agentMessage, applyGlobalBadge, jobCommands, noteAgentCommand} from "./agent-badges.js";
 import {createBackgroundCapture} from "./background-capture.js";
 import {createTabFollower} from "./tab-follow.js";
 import {selfCodeHash} from "./code-hash.js";
@@ -666,6 +666,7 @@ const tabFollower = createTabFollower(chrome.tabs, chrome.storage?.session);
 const nodeRelay = createNodeRelay(() => (isLiveConnection(socket) ? socket : null));
 const commands = {
   ...nodeRelay.commands, // companion.pairRequest: another computer asks to pair (nodes.js)
+  ...jobCommands, // companion.jobsReport: a server's macro jobs; the answer carries Stop/answers (jobs.js)
   async "tabs.resolve"({tabId}) {
     return tabFollower.resolve(tabId);
   },

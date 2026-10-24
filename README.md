@@ -25,7 +25,8 @@ look, `web_action` to act — and behind them four capabilities:
 | **Perception** | An accessibility outline, readable text, semantic element lookup, the page console, and its HTTP traffic. |
 | **Isolation** | Separate Selenium profiles — isolated (the default for a new session), temporary, persistent, or attached. |
 | **Site checks** | For your own site: a passive security report graded A–F, load metrics, HAR export, and step-by-step regression tests. |
-| **Macro scripts** | Saved or inline flows with variables, conditions, loops, waits on the page or the network, sub-macros and background jobs — validated before they run. |
+| **Macro scripts** | Saved or inline flows with variables, conditions, loops, waits on the page or the network, sub-macros, parallel branches, questions to you, background jobs you can watch and stop from the popup, and schedules — validated before they run. |
+| **Games for any model** | Frame-exact game input for agents, and an RL environment (`env`) for models that output action probabilities, with a Gymnasium-style Python client. |
 | **Other computers** | The Chrome of another PC on your network, with `node="<name>"` on any call. Pair once with a button and a six-digit code; no key to copy. |
 | **You stay in charge** | Driven tabs are marked (animated favicon, ghost cursor, captions, coloured tab groups), and **Take over** in the popup pauses every agent at once. |
 
@@ -393,11 +394,16 @@ strip (with a chip saying whether this computer is shared and reachable), and th
 tabs; **Computers** — [other computers on your network](#other-computers-on-your-network):
 the **Share this computer** and **Start with Windows** switches with what each means right
 now, a pairing request from another computer with its code and **Allow** / **Deny**,
-**Scan** and **Pair**, and **Send this tab**; **Settings**. While agents work, the toolbar icon animates, the logo in the panel
-turns, each agent tab row shows a bar draining over its five-minute afterglow, and every
+**Scan** and **Pair**, and **Send this tab**; **Settings**, including **Idle AI tabs**: tabs an
+agent opened and left alone for an hour (by default) are closed, never a pinned, audible or
+watched one. The **Macros** card lists running and recent macro jobs with their progress, a
+**Stop** button, and the buttons of a job that asks you something; a background job that ends
+or asks shows a notification. While agents work, the toolbar icon animates (its badge shows
+a robot, or a wrench while a background macro job drives tabs), the logo in the panel
+turns, each agent tab row shows a bar draining over its afterglow, and every
 tab group holding a driven tab is coloured by state: green while an agent acted in the
-last minute, yellow for the afterglow, orange while you have taken over — then it gets
-its own colour back. Icon buttons carry accessible
+last minute, yellow for the next five minutes, red until an hour has passed, orange while
+you have taken over — then it gets its own colour back. Icon buttons carry accessible
 names (`aria-label`/`title`): release check, repository link, apply/reset port,
 apply/reset session limit. A version chip and a GitHub release check round off
 the top; **Settings** holds the port and session limit. Everything renders from the
@@ -1054,9 +1060,11 @@ set `WEB_SEARCH_NEO_LABEL_TABS=0` in the server's environment, to turn it off.
 
 The label says whose tab it is; three further signals say whether anything is
 happening in it. Every action marks the page it ran in: the tab's favicon gets
-a small semi-transparent slime in its corner — awake and green while an agent
-is working there, sleepy and amber for five minutes after its last action — on
-top of the site's own icon, which comes back clean afterwards (a favicon the
+a small mark in its corner — a robot for an agent, a wrench for a background
+macro job, both when both act — green while it works and for a minute after,
+yellow for the next five minutes, red until an hour has passed — on
+top of the site's own icon (it survives reloads and navigation, and a page that
+rewrites its favicon does not wipe it), which comes back clean afterwards (a favicon the
 page cannot read cross-origin is left untouched) — so a glance at the
 tab strip separates the tab being driven right now from the one abandoned an
 hour ago. In the page itself, the element the action touched flashes for a
@@ -1170,6 +1178,14 @@ Field weights, and the values `matched_field` can take: `name` 1.0, `text` — t
 element's own visible words, scored separately when an accessible name overrode
 them — 0.9, `placeholder` 0.8, `title` 0.65, `testid` 0.6, `name_id` (the `name`
 attribute and the `id`) 0.5, `role` and `value` 0.4, `href` 0.3.
+
+The query is read the way an agent writes it: filler words (`the`, `to`, `click`) are
+dropped from the words that must match while the whole query is still scored, a role word
+(`link`, `button`, `field`) becomes a role hint that lifts elements of that role, and `terms`
+says how the query was read. Table row headers and definition terms are searched too, and
+such a match carries `answer`, the value it labels: `"release date"` finds the infobox row
+**Release** and answers with the cell beside it (`1.0 / June 8, 2005; ...`). When a `title` or `aria-label` took an element's
+name, `text` shows the words on screen.
 
 Two flags sit on top of them, and they mean different things:
 
@@ -1389,10 +1405,13 @@ A macro can decide and wait, not only replay. Any step takes `when` (run only if
   {"action":"return","value":"{{find(net, method='POST').url}}"}]}]}
 ```
 
-`op=run_steps` runs inline steps without a file; `background: true` on `run` or
-`run_steps` answers at once with a `job_id` (`op=job` with `wait_seconds`, `op=jobs`,
-`op=cancel`), so a long wait no longer holds the call — or a single-call daemon — open.
-`op=validate` checks scripts too. The full language, the answer's fields and recipes are in
+`op=run_steps` runs inline steps without a file. Every script run is a job; `background:
+true` on `run` or `run_steps` answers at once with a `job_id` (`op=job` with `wait_seconds`,
+`op=jobs`, `op=cancel`), so a long wait no longer holds the call — or a single-call daemon —
+open. Jobs are saved to disk, so another agent's server lists and stops them, and you see
+them in the companion popup. `ask` pauses a job for your answer (popup or notification
+buttons, or `op=answer`), `parallel` runs branches at once, and `op=schedule` runs a macro
+every N seconds or at set times of day. `op=validate` checks scripts too. The full language, the answer's fields and recipes are in
 [docs/macro-scripts.md](docs/macro-scripts.md). A macro with none of this still replays as
 one batch, exactly as before.
 
@@ -1637,6 +1656,7 @@ Browser automation is not limited to DOM forms. The compact contract covers comm
 | `unthrottle` | When `game_probe.frame_health.throttled` is true, asks Chrome to treat the tab as focused and active and measures `raf_fps` again; says when only raising the window helps. |
 | `screenshot` `wait_frames`, `pointer` `coordinate_space="image"` | Every capture reports image size, CSS box, `device_pixel_ratio`, `scale`, `frame_id` and `changed_since_last`; `pointer` can aim directly in the last capture's pixels. |
 | `frame_selector` | Targets a cross-origin game iframe such as the one used by Yandex Games. |
+| `env` | The page as an RL environment for a model that outputs action probabilities: `define` named actions (keys to hold or tap, a click) or just `keys`, the observation (a small pixel grid, a state script), `reward` and `done`; `reset`; `step` with an action name, an index or `probs` (sampled or argmax), or in per-key mode `key_probs` / `pressed` plus `frames` (how long); [`scripts/wsn_env.py`](scripts/wsn_env.py) is a Gymnasium-style client. See [docs/playing-games.md](docs/playing-games.md#a-model-that-outputs-probabilities-env). |
 
 The verb of each action is namespaced because the dispatcher already owns
 `action`: `key_action`, `pointer_action`, `touch_action`, and `pointer_lock`'s
@@ -1920,10 +1940,12 @@ server process: a daemon inherits the environment of whichever server spawns it.
 | `WEB_SEARCH_NEO_BRIDGE_START_TIMEOUT` | How long server startup waits for that first attempt before continuing in the background, default `2` seconds. |
 | `WEB_SEARCH_NEO_LOGON_START` | `0` makes **Start with Windows** off by default; the popup's switch still wins. |
 
-One more is about the server rather than the bridge:
+A few more are about the server rather than the bridge:
 
 | Variable | Effect |
 | --- | --- |
+| `WEB_SEARCH_NEO_JOBS_DIR` | Where macro jobs write their state, default `~/.web-search-neo/macro-jobs`. Servers that should see and stop each other's jobs need the same folder. |
+| `WEB_SEARCH_NEO_SCHEDULES_FILE` | The macro schedules file, default `~/.web-search-neo/macro-schedules.json`. |
 | `WEB_SEARCH_NEO_MAX_SESSIONS` | Browser sessions one server holds at once, default `30`; any number is accepted, and `0` (or `unlimited`) removes the cap. Per process, so agents running in parallel share the allowance; the refusal at the cap names this variable. Set here it wins over the companion popup's **Parallel sessions** setting, which is where a user without access to the server's environment changes the same number. |
 
 Only use a proxy you are authorized to use. HTTP sessions use desktop browser headers, connection pooling, bounded response sizes, and conservative retry/backoff. Rendered pages use the installed Chrome's native matching User-Agent unless explicitly overridden.

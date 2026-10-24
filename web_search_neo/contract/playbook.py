@@ -239,7 +239,10 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
             "Check results where they happen: assert 'result.data.status == 200' on an http_request, expect {text: 'Saved'} on a click, retry: 2 on a flaky wait.",
             "Contain failures with try {steps, catch, finally}, or on_error: 'continue' plus a later if on last.ok.",
             "Reuse with call {name, variables}; finish with return {value}. The answer carries returned, outputs, log and a trace line per step.",
-            "Long or watching runs: run with background=true, read op='job' (wait_seconds), op='jobs', op='cancel'. Use a session_id of the job's own.",
+            "Long or watching runs: run with background=true, read op='job' (wait_seconds), op='jobs', op='cancel'. Use a session_id of the job's own. The person sees the jobs in the companion popup (Stop there too), and a background job's tabs carry a wrench badge.",
+            "Before an irreversible step, {action: ask, message, options, default, timeout_seconds, save_as} pauses for the person (popup buttons or a notification) or an agent's op='answer'.",
+            "Two tabs at once: {action: parallel, branches: [[...], [...]]}, a session_id per branch; fail_fast (default true) stops the rest at the first failure.",
+            "Repeat it on a clock: op='schedule' with name or steps and every_seconds (>= 10) or times ['09:00'], max_runs; op='schedules', op='unschedule'. Each run is a background job; an overlapping run is skipped.",
         ],
         "rules": [
             "Expressions are Python-like (and/or/not, also &&, ||, !): a.b and a[0] give null when missing; functions: len, contains, matches(text, regex), search, number, json, find(items, key=value | key='~regex'), filter, count, pluck, get, default, empty, first, last, sorted, join, split, lower, upper, now, today.",
@@ -392,6 +395,7 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
             "Fresh frames: screenshot wait_frames=N renders N frames first; frame_id and changed_since_last tell a new image from a repeat.",
             "Aiming from an image: every screenshot reports image size, css_box, device_pixel_ratio and scale; pointer coordinate_space='image' takes the image's pixels directly.",
             "FPS / gaze cameras: pointer_lock acquire, then look {dx, dy, steps, duration_ms} turns smoothly (a single big relative move is clamped by many engines); pointer_lock status reports the lock.",
+            "A policy that outputs probabilities (RL agent, JEPA-style model, classifier): env op='define' {actions: [{name, hold, tap, click}], frames_per_step, observe: {pixels: {selector, width, height, gray}, script}, reward, done}, op='reset' {url, seed}, then op='step' with act (name or index) or probs [one weight per action] (choose sample|argmax, temperature); per-key mode: define keys=[...], step key_probs [one per key] or pressed [names], frames = how long; op='close'. scripts/wsn_env.py is a Gymnasium-style client.",
         ],
         "avoid": [
             "Leaving render in step mode or keys held at the end of a task.",

@@ -18,6 +18,7 @@ export const CODE_FILES = [
   "control.js",
   "nodes.js",
   "tab-status.js",
+  "jobs.js",
   "code-hash.js",
 ];
 

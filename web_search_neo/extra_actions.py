@@ -13,7 +13,7 @@ from typing import Any, Literal
 
 from web_search_neo import audit_actions, browser_tools, captcha_actions, captcha_aid, frame_capture
 from web_search_neo import frame_health, node_actions, page_guards
-from web_search_neo import owned_parking, tab_actions
+from web_search_neo import env_actions, owned_parking, tab_actions
 from web_search_neo.sessions import parking as current_parking
 
 
@@ -227,6 +227,8 @@ ACTION_SPECS = (
      "Answer the challenge just read: boxes are [x,y,w,h] in picture pixels, clicked in order."),
 ) + audit_actions.ACTION_SPECS + tab_actions.ACTION_SPECS  # 1.20: site checks; tabs of Selenium sessions
 ACTION_SPECS += node_actions.ACTION_SPECS  # other computers on the LAN (node=)
+# 2026-10-24: a page as an RL environment for policies that output action probabilities.
+ACTION_SPECS += (("env", env_actions.browser_env, "game", "RL env: step a page by name, index or probs."),)
 
 
 def register(server: Any, facade: Any = None) -> None:
