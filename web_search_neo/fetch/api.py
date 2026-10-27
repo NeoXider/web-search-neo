@@ -5,6 +5,10 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from web_search_neo import web_client
+from web_search_neo.fetch import headers as fetch_headers
+from web_search_neo.fetch import hints as fetch_hints
+from web_search_neo.fetch import politeness
 from web_search_neo.fetch import sessions as http_sessions
 from web_search_neo.fetch import variants
 from web_search_neo.fetch.decoding import decode_response
@@ -100,6 +104,9 @@ def http_request(
     log.info("HTTP %s %s", normalized_method, redact_url(normalized_url))
     byte_budget = min(max(1_000_000, int(max_chars) * 8), 10_000_000)
     client = request if request_client is None else request_client
+    # Hardening fires only on the real client's path; injected clients (tests, plugins)
+    # must see exactly the caller's words. Named headers always win too.
+    live = client is web_client.request
     def _send(spec: dict[str, Any]) -> dict[str, Any]:
         """Send one spec through this call's client, jar and byte budget."""
         send_extra = dict(extra)
@@ -114,6 +121,11 @@ def http_request(
             send_extra["data"] = payload
         send_method = str(spec.get("method") or normalized_method)
         send_url = str(spec.get("url") or normalized_url)
+        if live:
+            if not send_extra.get("headers"):
+                send_extra["headers"] = fetch_headers.browser_headers(send_url)
+            politeness.gate(send_url)
+            politeness.note_request(send_url)
         log.info("HTTP %s %s", send_method, redact_url(send_url))
         try:
             response = client(
@@ -130,6 +142,10 @@ def http_request(
             ):
                 raise
             response = error_response
+        if live:
+            politeness.remember_retry_after(
+                send_url, politeness.retry_after_seconds(getattr(response, "headers", None))
+            )
         return _envelope(response, session_jar, session_info, before,
                          bool(show_values), save_to=save_to, overwrite=overwrite,
                          max_chars=max_chars)
@@ -185,6 +201,8 @@ def _envelope(response: Any, session_jar: Any, session_info: Any, before: list,
             **({"truncated": True} if cut_by_transport else {}),
         }
     limit = max(1, int(max_chars))
+    # A gate status is an answer, but not as a visitor yet: say so in the envelope.
+    hint = fetch_hints.hint_for_status(status, final_url)
     return {
         "success": True,
         "url": final_url,
@@ -193,4 +211,5 @@ def _envelope(response: Any, session_jar: Any, session_info: Any, before: list,
         "body": text_value[:limit], "total_chars": len(text_value),
         "truncated": len(text_value) > limit or cut_by_transport,
         "size_bytes": size_bytes,
+        **({"hint": hint.strip()} if hint else {}),
     }

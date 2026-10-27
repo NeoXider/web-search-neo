@@ -27,19 +27,34 @@ _TAB_ACTIVITY_SOURCE = r"""
   const state = {links: [], timer: 0, phaseTimer: 0, generation: 0, stopped: false, pingedAt: 0};
   window[KEY] = state;
   const phaseColor = () => (Date.now() - state.pingedAt <= ACTIVE_MS ? GREEN : AMBER);
-  const robotIcon = (color) => "data:image/svg+xml," + encodeURIComponent(
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
-    + `<circle cx="32" cy="32" r="30" fill="${color}"/>`
-    + '<circle cx="22" cy="26" r="5" fill="#fff"/><circle cx="42" cy="26" r="5" fill="#fff"/>'
-    + '<rect x="20" y="40" width="24" height="5" rx="2.5" fill="#fff"/></svg>');
+  // The mark is a dot in the corner and nothing else. This used to fall back to a full-size
+  // green face when the page declared no icon yet, which replaced the icon of every
+  // single-page app (its <link rel=icon> arrives after load) with a picture of ours.
+  const drawDot = (ctx, color) => {
+    ctx.fillStyle = color;
+    ctx.beginPath(); ctx.arc(50, 50, 15, 0, 7); ctx.fill();
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 22px sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("\u25CF", 50, 51);
+  };
+  const cornerIcon = (color) => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 64; canvas.height = 64;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return "";
+    drawDot(ctx, color);
+    return canvas.toDataURL();
+  };
   const snapshot = () => {
     try {
       state.links = Array.from(
-        document.querySelectorAll('link[rel~="icon"]:not([data-wsn-activity])')).map(el => el.href || "");
+        document.querySelectorAll('link[rel~="icon"]:not([data-wsn-activity]):not([data-wsn-presence])'))
+        .map(el => el.href || "");
     } catch (error) { state.links = []; }
   };
   const applyIcon = (href, generation) => {
-    if (state.stopped || generation !== state.generation) return;
+    if (!href || state.stopped || generation !== state.generation) return;
     try {
       const head = document.head || document.documentElement;
       if (!head) return;
@@ -48,9 +63,12 @@ _TAB_ACTIVITY_SOURCE = r"""
         link = document.createElement("link");
         link.setAttribute("rel", "icon");
         link.setAttribute("data-wsn-activity", "1");
-        head.appendChild(link);
       }
+      // Chrome shows the newest icon link, so ours goes to the end each time: a page that
+      // added its own icon after we first painted would otherwise keep hiding the mark.
+      if (link.parentNode) link.parentNode.removeChild(link);
       link.href = href;
+      head.appendChild(link);
     } catch (error) {}
   };
   const restore = () => {
@@ -70,7 +88,16 @@ _TAB_ACTIVITY_SOURCE = r"""
     try {
       snapshot();
       const first = state.links.length ? state.links[0] : "";
-      if (!first) { applyIcon(robotIcon(color), generation); return; }
+      if (!first) {
+        applyIcon(cornerIcon(color), generation);
+        // The page may simply not have drawn its icon yet: look once more, then composite
+        // the dot over it instead of leaving the bare corner mark as the tab's icon.
+        if (state.retried !== generation) {
+          state.retried = generation;
+          setTimeout(() => setBadge(generation), 3000);
+        }
+        return;
+      }
       const img = new Image();
       img.onload = () => {
         try {
@@ -79,12 +106,7 @@ _TAB_ACTIVITY_SOURCE = r"""
           const ctx = canvas.getContext("2d");
           if (!ctx) return;
           ctx.drawImage(img, 0, 0, 64, 64);
-          ctx.fillStyle = color;
-          ctx.beginPath(); ctx.arc(50, 50, 15, 0, 7); ctx.fill();
-          ctx.fillStyle = "#ffffff";
-          ctx.font = "bold 22px sans-serif";
-          ctx.textAlign = "center"; ctx.textBaseline = "middle";
-          ctx.fillText("\u25CF", 50, 51);
+          drawDot(ctx, color);
           applyIcon(canvas.toDataURL(), generation);
         } catch (error) {}
       };

@@ -114,12 +114,12 @@ def test_activity_phases_badges_and_expiry() -> None:
         {
             "tab_id": 42, "window_id": 3, "title": "Docs", "url": "https://d",
             "agent": "claude", "pid": 7, "claim": "main.py#7", "phase": "recent", "created": False,
-            "age_ms": 90_000, "status_text": "1 min ago",
+            "age_ms": 90_000, "status_text": "idle 1 min",
         },
         {
             "tab_id": 43, "window_id": None, "title": "Tab 43", "url": "",
             "agent": "x#8", "pid": 8, "claim": None, "phase": "recent", "created": False,
-            "age_ms": 290_000, "status_text": "4 min ago",
+            "age_ms": 290_000, "status_text": "idle 4 min",
         },
     ]
 

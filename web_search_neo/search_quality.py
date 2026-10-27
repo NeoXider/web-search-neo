@@ -55,3 +55,48 @@ def off_topic(query: str, results: list[dict[str, str]]) -> bool:
     """True when not one row mentions any word of the query."""
     measured = relevance(query, results)
     return measured is not None and measured[0] == 0
+
+
+# ------------------------------------------------ Cyrillic fallback
+#
+# WHY this lives here: the engines that answer reliably in Cyrillic are the ones
+# this server cannot reach (yandex is on SmartCaptcha, google is DNS-cut), and
+# the engines that do answer (brave, yahoo, bing) mix Cyrillic words up. A
+# best-effort transliteration is the cheap bridge between the two: it keeps the
+# words recognizable to an engine that indexes Latin, and it is only ever a
+# FALLBACK - an operator who can write the query in Latin or English should.
+
+CYRILLIC_RANGES = ((0x0400, 0x048F), (0x0490, 0x04FF))
+TRANSLIT_MAP = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "yo", "ж": "zh",
+    "з": "z", "и": "i", "й": "j", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o",
+    "п": "p", "р": "r", "с": "s", "т": "t", "у": "u", "ф": "f", "х": "kh", "ц": "ts",
+    "ч": "ch", "ш": "sh", "щ": "shch", "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu",
+    "я": "ya",
+}
+
+
+def has_cyrillic(text: Any) -> bool:
+    """Whether any character of ``text`` sits in the Cyrillic blocks."""
+    for char in str(text or ""):
+        if any(low <= ord(char) <= high for low, high in CYRILLIC_RANGES):
+            return True
+    return False
+
+
+def transliterate(text: Any) -> str | None:
+    """The Latin shape of a Cyrillic query; None when there is nothing to convert.
+
+    Lowercase output: engines fold case anyway, and a folded query is what the
+    cache key uses. Characters outside Cyrillic pass through untouched.
+    """
+    if not has_cyrillic(text):
+        return None
+    out = []
+    for char in str(text):
+        low = ord(char)
+        if any(block_low <= low <= block_high for block_low, block_high in CYRILLIC_RANGES):
+            out.append(TRANSLIT_MAP.get(char.lower(), char))
+        else:
+            out.append(char)
+    return "".join(out).casefold().strip() or None

@@ -618,9 +618,9 @@ function previewAgentTabs() {
     {tab_id: 101, title: "Pull request #42 - review", agent: "claude#4120", phase: "active",
      status_text: "active now", claim: "main.py#4120", url: "https://example.com/pr/42", age_ms: 4000},
     {tab_id: 102, title: "chrome://extensions", agent: "codex#5230", phase: "recent",
-     status_text: "2 min ago", claim: null, url: "chrome://extensions", age_ms: 120000},
+     status_text: "idle 2 min", claim: null, url: "chrome://extensions", age_ms: 120000},
     {tab_id: 103, title: "Quarterly report.pdf", agent: "main.py#6008", phase: "recent",
-     status_text: "4 min ago", claim: "main.py#6008", url: "file:///report.pdf", age_ms: 240000},
+     status_text: "idle 4 min", claim: "main.py#6008", url: "file:///report.pdf", age_ms: 240000},
   ];
   return {tabs: previewEnabled ? rows.slice(0, previewAgents) : [], now: Date.now()};
 }

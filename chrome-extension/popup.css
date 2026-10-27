@@ -270,9 +270,9 @@ p { margin: 0; }
 }
 .agent-meta { color: var(--muted); font-size: 11.5px; }
 .agent-row[data-phase="active"] .agent-meta { color: var(--ok); }
+/* An agent that left the tab is not an error: grey, and the text keeps its usual colour. */
 .agent-row[data-phase="stale"] .agent-dot,
-.agent-row[data-phase="stale"] .agent-life { background: var(--bad); color: var(--bad); }
-.agent-row[data-phase="stale"] .agent-meta { color: var(--bad); }
+.agent-row[data-phase="stale"] .agent-life { background: var(--muted); color: var(--muted); }
 
 /* Macro jobs: one row each, a state chip, Stop, and the ask buttons when one waits. */
 .job-row { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; align-items: center;

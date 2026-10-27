@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- **Plain fetch learned manners.** An un-headed request now dresses like the browser this server drives when the caller named no headers (sticky per host, so one session keeps one face); a politeness floor keeps requests to one host apart and honours whatever `Retry-After` the host asked for; a consent cookie a site plants on the first visit rides along on the second (per-host jars on the page-fetch path, `WEB_SEARCH_NEO_FETCH_COOKIE_JAR=0` turns it off). Cyrillic queries get one last Latin-transliteration pass when the chain found nothing on-topic, and `docs/usage-for-agents.md` now tells agents what this server can see and what it cannot.
+
+- **A tab an agent left is grey in the popup, not red.** The Agent tabs row of a tab nobody acted on for six minutes or more read like an error: red dot, red bar, red text. Its dot and bar are grey now and the text keeps its usual colour; red stays for what went wrong. Rows say how long the agent has been idle (`idle 8 min`) instead of `8 min ago`.
+- **The tab mark sits in the corner of the site's own icon again, instead of redrawing the whole icon.** Two bugs did it. The overlay set `state.hidden = false` at install and overwrote the list of parked icon links the badge kept under the same name, so on any page with a favicon the first parking threw: the mark never appeared and the page's icon was never handed back. And the older activity badge (`sessions/activity.py`) painted a full-size green face when the page declared no icon yet, which is every single-page app (ChatGPT adds its `<link rel=icon>` after load); the mark script then took that face for the site's icon and drew its dot over it. The list is `state.parked` now; the older badge only ever draws a corner dot and looks again after three seconds; the mark script ignores the older badge's link and removes it when it takes over; an icon that arrives after the first paint gets the mark over it, and a tab that outlived the upgrade has the links the broken build parked adopted and handed back instead of being left on a bare corner mark. `PRESENCE_VERSION` 16, so open pages reinstall. `tests/test_presence_favicon.py` runs the installer in Node against a fake DOM.
+
 ## 1.28.1
 
 - **The popup's Computers tab works again, and so does Update.** In 1.28.0 the bridge daemon called its claimed-tab count as a function, so the first frame from the Computers tab or the Update button ended the companion's connection: the switches stayed at "Checking..." and could not be turned on. The daemon now reads the count, and a test sends real popup frames through the daemon's companion loop.
@@ -119,7 +126,7 @@ Docs: README (slider solving, privacy note, `replay_request vary`, Update button
 
 ## 1.24.0
 
-Fuller pentest coverage with the same safety contract: no new actions, so the capabilities budget is untouched.
+Fuller site-check coverage with the same safety contract: no new actions, so the capabilities budget is untouched.
 - `secret_scan` learned `scope`: `page` (as before, browser optional) plus `site` (a bounded crawl of links and sitemap from `url`, served HTML only, `robots.txt` honoured) and `hosts` (each named origin's front page); `paths` scans your own routes too. Sections merge into one `priority[]`.
 - `active_probe` learned `scope='hosts'`: every named origin's front page gets the full probe (no site crawl - active probing multiplies requests; discover routes with a `site` crawl first, then probe them through `paths`).
 - `secret_scan` reads the agent surface it is referenced to: `llms.txt`, skills, MCP cards and API descriptions from Link headers, page text, code and traffic (never guessed) - fetched when same-scope, scanned for secrets, code never quoted.

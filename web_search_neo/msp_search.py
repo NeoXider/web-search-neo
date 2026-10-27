@@ -18,7 +18,7 @@ from urllib.parse import quote_plus
 from bs4 import BeautifulSoup
 from ddgs import DDGS
 
-from web_search_neo.search_quality import off_topic, unwrap_bing
+from web_search_neo.search_quality import has_cyrillic, off_topic, transliterate, unwrap_bing
 from web_search_neo.web_client import clamp_timeout, request
 
 
@@ -625,6 +625,18 @@ def search_web(
             started=started, off_topic_answers=off_topic_answers,
         )
 
+    if fallback and has_cyrillic(query):
+        # One more pass with the Latin shape of the query: the engines that read
+        # Cyrillic well are exactly the ones this server cannot reach.
+        latin = transliterate(query)
+        if latin and latin != query.casefold().strip():
+            answer = _transliteration_attempt(
+                candidates, cache_key, query, latin, num, engine, started, deadline,
+                errors, recoveries, empty_answers, off_topic_answers,
+            )
+            if answer is not None:
+                return answer
+
     if off_topic_rows is not None:
         # Nothing better anywhere: pass the rows on, labelled for what they are.
         return _successful_search(
@@ -664,6 +676,42 @@ def search_web(
         "errors": errors,
         "challenge_recoveries": recoveries,
     }
+
+
+def _transliteration_attempt(
+    candidates, cache_key, query, latin, num, engine, started, deadline,
+    errors, recoveries, empty_answers, off_topic_answers,
+) -> dict[str, Any] | None:
+    """Ask the chain once with the Latin shape of a Cyrillic query; None if nothing answers.
+
+    WHY only here: this fires on the tail (the chain found nothing on-topic) and
+    only when the query actually holds Cyrillic, so every Latin query keeps its
+    exact pre-change shape. The chain's own records stay as they were - this pass
+    reports only what it finds itself, under the original query.
+    """
+    for candidate in candidates:
+        if time.monotonic() + 1.0 > deadline:
+            break
+        if _cooldown_remaining(candidate):
+            continue
+        try:
+            results = _call_provider(
+                candidate, latin, num,
+                max(1.0, min(MAX_PROVIDER_ATTEMPT_SECONDS, deadline - time.monotonic())),
+            )
+        except Exception:
+            continue
+        if not results or off_topic(latin, results):
+            continue
+        answer = _successful_search(
+            cache_key, query=query, engine=engine, candidate=candidate, num=num,
+            results=results, errors=errors, recoveries=recoveries,
+            empty_answers=empty_answers, started=started, off_topic_answers=off_topic_answers,
+        )
+        answer["transliterated_query"] = latin
+        answer["note"] = f"Answered from the Latin transliteration '{latin}' of the query."
+        return answer
+    return None
 
 
 def _successful_search(

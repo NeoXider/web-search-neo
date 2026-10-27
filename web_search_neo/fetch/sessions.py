@@ -136,6 +136,45 @@ def clear_all() -> None:
     """Forget every jar (tests, process reset)."""
     with _lock:
         _entries.clear()
+        _host_entries.clear()
+
+
+# ---------------------------------------------------------------- per-host jars
+
+HOST_JAR_ENV = "WEB_SEARCH_NEO_FETCH_COOKIE_JAR"
+
+# The page-fetch path (fetch_text / fetch_page_links) keeps one jar per host, so
+# a consent cookie a site plants on the first visit rides along on the second.
+# WHY only this path: named http_session jars are an explicit opt-in, and every
+# http_request without a name must keep starting empty, as published.
+_host_entries: OrderedDict[str, _Entry] = OrderedDict()
+
+
+def host_jar_enabled() -> bool:
+    """Whether the page-fetch path keeps per-host jars; on unless turned off explicitly."""
+    return os.getenv(HOST_JAR_ENV, "1").strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def host_jar(url_or_host: str) -> SessionJar | None:
+    """The jar for one host on the page-fetch path; None when the feature is off."""
+    if not host_jar_enabled():
+        return None
+    key = str(url_or_host or "").strip().lower().split("/", 1)[0]
+    if not key:
+        return None
+    ttl = ttl_seconds()
+    now = _now()
+    with _lock:
+        for stale in [k for k, entry in _host_entries.items() if now - entry.last_used > ttl]:
+            del _host_entries[stale]
+        entry = _host_entries.get(key)
+        if entry is None:
+            while len(_host_entries) >= MAX_SESSIONS:
+                _host_entries.popitem(last=False)
+            entry = _host_entries[key] = _Entry(SessionJar(), now)
+        entry.last_used = now
+        _host_entries.move_to_end(key)
+        return entry.jar
 
 
 def _touch(key: tuple[str | None, str], jar: SessionJar) -> None:

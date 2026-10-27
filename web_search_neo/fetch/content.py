@@ -7,6 +7,11 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from bs4.element import Tag
 
+from web_search_neo import web_client
+from web_search_neo.fetch import headers as fetch_headers
+from web_search_neo.fetch import hints as fetch_hints
+from web_search_neo.fetch import politeness
+from web_search_neo.fetch import sessions as fetch_sessions
 from web_search_neo.fetch.decoding import decode_response
 from web_search_neo.fetch.safety import redact_url, write_download
 from web_search_neo.web_client import clamp_timeout
@@ -103,6 +108,52 @@ def _is_html_response(response: Any) -> bool:
     return "html" in lowered or lowered.startswith("text/")
 
 
+def _live_client(request_client: Any) -> bool:
+    """Whether this is the real client; hardening fires only for it.
+
+    WHY: injected clients (tests, plugins) must see exactly the caller's words -
+    a fake that asserts on the captured kwargs would trip over headers and jars
+    the policy added behind it.
+    """
+    return request_client is web_client.request
+
+
+def _prepare_request(url: str, extra: dict[str, Any], request_client: Any) -> None:
+    """Apply the page-fetch hardening: built headers, per-host jar, politeness.
+
+    The caller's headers always win: the builder only fires when the caller
+    named none. The jar is added when the caller sent no Cookie header of their
+    own - an explicit Cookie is exactly what they asked to send.
+    """
+    if not _live_client(request_client):
+        return
+    if "headers" not in extra:
+        extra["headers"] = fetch_headers.browser_headers(url)
+    if not any(str(k).lower() == "cookie" for k in extra.get("headers", {})):
+        jar = fetch_sessions.host_jar(fetch_headers.host_of(url))
+        if jar is not None:
+            extra["cookie_jar"] = jar
+    politeness.gate(url)
+    politeness.note_request(url)
+
+
+def _fetch_hint(url: str, html: str, text: str, status: int | None, is_html: bool = True) -> str:
+    """The appended pointer when this fetch answered like a wall; "" when it did not."""
+    if not is_html:
+        # A non-HTML body is not judged by its markup, but a gate status on it
+        # still means "you were answered, but not as a visitor yet".
+        return fetch_hints.hint_for_status(status, url) or ""
+    kind = fetch_hints.classify_body(html, text, status)
+    return fetch_hints.browser_route(url, f"the fetch was answered by a {kind}") if kind else ""
+
+
+def _record_penalty(url: str, response: Any) -> None:
+    """Honour a Retry-After the host answered with, on the live path only."""
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        politeness.remember_retry_after(url, politeness.retry_after_seconds(headers))
+
+
 def _spa_notice(url: str) -> str:
     """The pointer appended to a title-only shell instead of silent content."""
     return (
@@ -136,7 +187,12 @@ def _fetch_url_text(
     returns the same as ``{text, status, final_url, content_type, charset_used,
     total_chars, offset, returned_chars, truncated, next_offset, body_cut,
     spa_suspected}``. An SPA shell (title-only text plus an app bundle) is
-    flagged with ``[spa_suspected=true]`` and the exact browser calls.
+    flagged with ``[spa_suspected=true]`` and the exact browser calls; a consent
+    wall, a bot challenge or a gate status (401/403/429/451) adds a
+    ``[fetch_hint]`` line (a ``hint`` key in json mode) pointing at the same
+    browser route. On the live path the fetch also sends browser-shaped headers
+    when the caller named none, keeps a per-host cookie jar, and pauses to the
+    politeness floor (see fetch.headers, fetch.politeness, fetch.hints).
     """
     normalized_mode = str(mode or "text").strip().lower()
     if normalized_mode not in {"text", "html", "raw"}:
@@ -151,9 +207,22 @@ def _fetch_url_text(
         if not isinstance(headers, dict):
             raise ValueError("headers must be a {name: value} map")
         extra["headers"] = {str(k): str(v) for k, v in headers.items()}
-    response = request_client(
-        url, timeout_seconds=clamp_timeout(timeout_seconds), max_response_bytes=byte_limit, **extra
-    )
+    _prepare_request(url, extra, request_client)
+    try:
+        response = request_client(
+            url, timeout_seconds=clamp_timeout(timeout_seconds), max_response_bytes=byte_limit, **extra
+        )
+    except Exception as exc:
+        if _live_client(request_client):
+            # A gate status the client raised on is exactly what the hint is for;
+            # injected clients keep their exceptions word for word.
+            error_response = getattr(exc, "response", None)
+            if error_response is not None:
+                _record_penalty(url, error_response)
+                hint = fetch_hints.hint_for_status(getattr(error_response, "status_code", None), url)
+                if hint:
+                    exc.args = ((str(exc.args[0]) + hint) if exc.args else hint.strip(),)
+        raise
     body_cut = getattr(response, "wsn_truncated", False) is True
     final_url = str(getattr(response, "url", None) or url)
     if save_to:
@@ -176,6 +245,14 @@ def _fetch_url_text(
     limit = max(1, min(int(max_chars), 500_000))
     text = full_text[start:start + limit]
     next_offset = start + len(text) if start + len(text) < len(full_text) else None
+    # Detection ran on the whole text above (in text mode); the hint rides after
+    # the cut, like every other fetch metadata.
+    if _live_client(request_client):
+        _record_penalty(final_url, response)
+    hint = "" if spa_suspected else _fetch_hint(
+        final_url, decoded, full_text,
+        getattr(response, "status_code", None), _is_html_response(response),
+    )
     if output == "json":
         headers_in = getattr(response, "headers", None) or {}
         return {
@@ -186,6 +263,7 @@ def _fetch_url_text(
             "next_offset": next_offset, "body_cut": body_cut,
             **({"bytes_read": len(response.content or b"")} if body_cut else {}),
             "spa_suspected": spa_suspected,
+            **({"hint": hint.strip()} if hint else {}),
         }
     # Fetch metadata is appended after the cut, so max_chars never hides it.
     if next_offset is not None:
@@ -196,6 +274,8 @@ def _fetch_url_text(
                  "response were read; the page is longer than the byte budget]")
     if spa_suspected:
         text += _spa_notice(final_url)
+    if hint:
+        text += ("\n\n" + hint.strip()) if next_offset is None or body_cut or spa_suspected else hint
     return text
 
 
@@ -213,9 +293,20 @@ def _fetch_page_links(
         if not isinstance(headers, dict):
             raise ValueError("headers must be a {name: value} map")
         extra["headers"] = {str(k): str(v) for k, v in headers.items()}
-    response = request_client(
-        url, timeout_seconds=clamp_timeout(timeout_seconds), max_response_bytes=5_000_000, **extra
-    )
+    _prepare_request(url, extra, request_client)
+    try:
+        response = request_client(
+            url, timeout_seconds=clamp_timeout(timeout_seconds), max_response_bytes=5_000_000, **extra
+        )
+    except Exception as exc:
+        if _live_client(request_client):
+            error_response = getattr(exc, "response", None)
+            if error_response is not None:
+                _record_penalty(url, error_response)
+                hint = fetch_hints.hint_for_status(getattr(error_response, "status_code", None), url)
+                if hint:
+                    exc.args = ((str(exc.args[0]) + hint) if exc.args else hint.strip(),)
+        raise
     decoded, _charset = decode_response(response)
     soup = BeautifulSoup(decoded, "html.parser")
     maximum = max(1, min(int(limit), 5000))
@@ -238,4 +329,17 @@ def _fetch_page_links(
     if getattr(response, "wsn_truncated", False) is True:
         links.append(f"# body_cut=true: only the first {len(response.content or b'')} bytes of the page "
                      "were read; links further down are missing")
+    if _live_client(request_client):
+        # Detection on the page we just pulled: a wall page's links are a search
+        # result page in disguise, and the reader should know which room they are
+        # really looking at. Injected clients see the list exactly as parsed.
+        _record_penalty(url, response)
+        probe = BeautifulSoup(decoded, "html.parser")
+        for element in probe(["script", "style", "noscript", "template"]):
+            element.decompose()
+        kind = fetch_hints.classify_body(decoded, probe.get_text(separator="\n", strip=True),
+                                         getattr(response, "status_code", None))
+        if kind:
+            route = fetch_hints.browser_route(url, f"the fetch was answered by a {kind}")
+            links.append("# fetch_hint: " + " ".join(route.split()))
     return links

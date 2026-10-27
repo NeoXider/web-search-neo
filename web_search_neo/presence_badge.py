@@ -102,6 +102,18 @@ SOURCE = r"""
   state.watch = null;
   const AT_KEY = "__wsnPresenceAt";
 
+  // A page that outlived an upgrade still carries links an earlier installation parked
+  // (the one that lost them could not hand them back). Taking them over lets this one read
+  // them as the page's icon and give them back on restore.
+  (function adoptParked() {
+    try {
+      const earlier = document.querySelectorAll("link[data-wsn-rel]");
+      for (let index = 0; index < earlier.length; index += 1) {
+        if (state.parked.indexOf(earlier[index]) === -1) state.parked.push(earlier[index]);
+      }
+    } catch (error) {}
+  })();
+
   function iconLinks() {
     if (!document.querySelectorAll) return [];
     const links = [];
@@ -109,6 +121,9 @@ SOURCE = r"""
     for (let index = 0; index < all.length; index += 1) {
       const link = all[index];
       if (link === state.ownLink) continue;
+      // The older activity badge (sessions/activity.py) keeps its own icon link. Taking it
+      // for the page's icon made its picture the base our corner mark was painted over.
+      if (link.hasAttribute("data-wsn-activity")) continue;
       const rel = (link.getAttribute("rel") || "").toLowerCase();
       if (/(^|\s)(icon|shortcut icon|apple-touch-icon)(\s|$)/.test(rel)) links.push(link);
     }
@@ -119,6 +134,11 @@ SOURCE = r"""
     const links = iconLinks();
     for (let index = links.length - 1; index >= 0; index -= 1) {
       const href = links[index].href;
+      if (href) return href;
+    }
+    // Links this script already took over still name the page's icon.
+    for (let index = state.parked.length - 1; index >= 0; index -= 1) {
+      const href = state.parked[index].href;
       if (href) return href;
     }
     try {
@@ -265,16 +285,34 @@ SOURCE = r"""
 
   function applyIcon(dataUrl) {
     if (!dataUrl || !document.head) return;
+    // This script owns the favicon from here on: the older activity badge's link goes, or
+    // its picture would sit under ours and come back the moment ours is replaced.
+    try {
+      const older = document.querySelectorAll("link[data-wsn-activity]");
+      for (let index = 0; index < older.length; index += 1) {
+        if (older[index].parentNode) older[index].parentNode.removeChild(older[index]);
+      }
+    } catch (error) {}
     // Chrome honours the last icon link in the document, but a page that
     // rewrites its own favicon after us would win on the next reflow. Parking
     // the page's rel attribute makes ours the only icon link there is.
     const links = iconLinks();
+    let learned = false;
     for (let index = 0; index < links.length; index += 1) {
       const link = links[index];
       if (link.hasAttribute("data-wsn-rel")) continue;
       link.setAttribute("data-wsn-rel", link.getAttribute("rel") || "icon");
       link.setAttribute("rel", "wsn-parked-icon");
-      state.hidden.push(link);
+      state.parked.push(link);
+      learned = true;
+    }
+    // The page had no icon when the mark was first painted (a single-page app adds its link
+    // after load), so the mark went on a bare canvas and stayed the tab's whole icon. Now
+    // that the page has one, paint again over it.
+    if (learned && state.base === null) {
+      state.base = undefined;
+      state.painted = {};
+      state.rebase = true;
     }
     if (!state.ownLink) {
       state.ownLink = document.createElement("link");
@@ -288,6 +326,28 @@ SOURCE = r"""
     state.ownLink.setAttribute("href", dataUrl);
     document.head.appendChild(state.ownLink);
     watchHead();
+    if (state.rebase) {
+      state.rebase = false;
+      setTimeout(function () {
+        if (state.shown) show(state.shown.slice(state.shown.indexOf("/") + 1));
+      }, 0);
+    }
+  }
+
+  // Hands the page's own icon links back and takes our link off the page.
+  function unpark() {
+    for (let index = 0; index < state.parked.length; index += 1) {
+      const link = state.parked[index];
+      try {
+        const rel = link.getAttribute("data-wsn-rel");
+        if (rel) link.setAttribute("rel", rel);
+        link.removeAttribute("data-wsn-rel");
+      } catch (error) {}
+    }
+    state.parked = [];
+    if (state.ownLink && state.ownLink.parentNode) {
+      try { state.ownLink.parentNode.removeChild(state.ownLink); } catch (error) {}
+    }
   }
 
   // A page that writes its favicon again (unread counters, a player's state) adds
@@ -338,7 +398,7 @@ SOURCE = r"""
         // screen (Chrome fetches it without CORS), so it stays; only a page
         // with no icon at all gets the corner mark on its own.
         state.baseHref = declared || fallback;
-        settle(iconLinks().length || state.hidden.length ? false : null);
+        settle(iconLinks().length || state.parked.length ? false : null);
         return;
       }
       try {
@@ -365,7 +425,11 @@ SOURCE = r"""
     withBase(function (image) {
       // Unreadable (most sites: a cross-origin icon without CORS): the page's icon
       // stays until the server hands it over as a data URL (needBase / setBase).
-      if (image === false) return;
+      if (image === false) {
+        // A bare mark painted earlier must not stand in for an icon we cannot read.
+        unpark();
+        return;
+      }
       const dataUrl = paint(key, image);
       if (!dataUrl) {
         state.base = false;
@@ -391,18 +455,7 @@ SOURCE = r"""
     }
     state.staleUntil = 0;
     try { sessionStorage.removeItem(AT_KEY); } catch (error) {}
-    for (let index = 0; index < state.hidden.length; index += 1) {
-      const link = state.hidden[index];
-      try {
-        const rel = link.getAttribute("data-wsn-rel");
-        if (rel) link.setAttribute("rel", rel);
-        link.removeAttribute("data-wsn-rel");
-      } catch (error) {}
-    }
-    state.hidden = [];
-    if (state.ownLink && state.ownLink.parentNode) {
-      try { state.ownLink.parentNode.removeChild(state.ownLink); } catch (error) {}
-    }
+    unpark();
     state.ownLink = null;
     state.phase = null;
     state.shown = null;
