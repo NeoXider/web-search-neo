@@ -149,7 +149,7 @@ def test_the_installer_carries_this_build_s_timings():
     assert f'"flashMs": {agent_presence.FLASH_MS}' in source
     assert agent_presence.FLASH_MS <= 300
     # The badge the person in the tab strip reads (the owner, 2026-10-24): green for a
-    # minute after the last action, yellow until six minutes, red until an hour, then
+    # minute after the last action, yellow until six minutes, grey until an hour, then
     # the favicon is handed back (and the companion closes a tab the agent opened).
     assert agent_presence.ACTIVE_MS == 60_000
     assert f'"activeMs": {agent_presence.ACTIVE_MS}' in source
@@ -753,8 +753,11 @@ def test_the_badge_has_three_states_told_apart_by_more_than_colour():
     assert f'"dozeFrameMs": {presence_badge.DOZE_FRAME_MS}' in source
     assert (presence_badge.PULSE_FRAME_MS < presence_badge.BREATHE_FRAME_MS
             < presence_badge.DOZE_FRAME_MS), "working must look busier than the quiet states"
-    # Active, recent, stale: green, yellow, red - then the page's own icon.
+    # Active, recent, stale: green, yellow, grey - then the page's own icon. Not red: an
+    # agent leaving a tab is not an error (2026-10-28).
     assert "disc(context, DOT.x, DOT.y, radius, phaseColor(phase));" in source
+    assert f'"staleColor": "{presence_badge.STALE_COLOR}"' in source
+    assert presence_badge.STALE_COLOR == "#9aa0a6"
     assert 'if (phase === "stale") { show("stale"); return; }' in source
     assert "restoreIcon();" in source
     assert presence_badge.BUSY_MS < agent_presence.ACTIVE_MS < agent_presence.RECENT_MS

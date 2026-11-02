@@ -404,7 +404,7 @@ or asks shows a notification. While agents work, the toolbar icon animates (its 
 a robot, or a padlock while a background macro job drives tabs), the logo in the panel
 turns, each agent tab row shows a bar draining over its afterglow, and every
 tab group holding a driven tab is coloured by state: green while an agent acted in the
-last minute, yellow for the next five minutes, red until an hour has passed, orange while
+last minute, yellow for the next five minutes, grey until an hour has passed, orange while
 you have taken over — then it gets its own colour back. Icon buttons carry accessible
 names (`aria-label`/`title`): release check, repository link, apply/reset port,
 apply/reset session limit. A version chip and a GitHub release check round off
@@ -1063,7 +1063,7 @@ set `WEB_SEARCH_NEO_LABEL_TABS=0` in the server's environment, to turn it off.
 The label says whose tab it is; three further signals say whether anything is
 happening in it. Every action marks the page it ran in: the tab's favicon gets
 a state dot in its top-left corner — green while an agent or a macro works and
-for a minute after, yellow for the next five minutes, red until an hour has
+for a minute after, yellow for the next five minutes, grey until an hour has
 passed — and a padlock in the bottom-left corner while a background macro job
 drives it, on top of the site's own icon, which stays whole and comes back clean
 afterwards (an icon the page cannot read, on another origin without CORS, is

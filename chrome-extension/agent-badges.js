@@ -4,7 +4,7 @@
 // refuse ours - which the in-page favicon badge cannot.
 //
 // The toolbar badge is per tab: green "AI" while an agent acted on the tab in
-// the last minute, yellow until six minutes have passed, then red until the
+// the last minute, yellow until six minutes have passed, then grey until the
 // auto-close time (an hour by default): a tab the agent opened is closed then,
 // unless the popup switched auto-close off, and any other tab goes back to the
 // global ON/OFF badge. The map is mirrored into chrome.storage.session and a

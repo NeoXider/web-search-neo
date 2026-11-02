@@ -172,7 +172,7 @@ stay reachable, so local services work unchanged.
   process picked the new code up (it does not).
 - A tab an agent is driving keeps its own favicon with a state dot in the top-left corner
   (a background macro job's tab also a padlock bottom-left): green while acting and for a
-  minute after, yellow for the next five minutes, red for up to an hour; it survives
+  minute after, yellow for the next five minutes, grey for up to an hour; it survives
   reloads and navigation. A small panel in the page's bottom-left corner names the agent
   and its state, and a click opens its stats (last action, counts, an env's step and
   reward); it lets clicks through while the agent acts and is never in your screenshots. The
@@ -180,7 +180,7 @@ stay reachable, so local services work unchanged.
   tabs; never a pinned, audible or watched tab). A
   ghost cursor glides between the agent's pointer points with its name tag and a caption
   of what it does ("Click · Sign in", "Typing…"), and lands a fading ring on every press
-  (red when refused); its tab group turns green, then yellow, then red, and the toolbar icon spins
+  (red when refused); its tab group turns green, then yellow, then grey, and the toolbar icon spins
   while commands arrive. Such a tab is
   agent-held: observe it read-only
   (`page_text`/`page_outline`/`screenshot`) or open your own session — acting on it

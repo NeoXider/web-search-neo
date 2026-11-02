@@ -129,7 +129,7 @@ saveAutoClose.addEventListener("click", async () => {
     autoCloseMinutes.value = String(settings.minutes);
     messageNode.textContent = settings.enabled
       ? `Idle AI tabs close after ${settings.minutes} min.`
-      : "Idle AI tabs stay open (red after six quiet minutes).";
+      : "Idle AI tabs stay open (grey after six quiet minutes).";
   } catch (error) {
     messageNode.textContent = error.message;
   }

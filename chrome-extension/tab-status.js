@@ -5,7 +5,7 @@
 //   is doing something right now" is visible without opening anything;
 // * every tab group holding a driven tab takes the colour of its liveliest tab:
 //   green while an agent acted in the last minute, yellow until six minutes,
-//   red after that (the agent left), orange while the user has taken over; once
+//   grey after that (the agent left; not an error), orange while the user has taken over; once
 //   the tab is closed or forgotten the group gets the colour it had before. Titles are never changed: the server finds
 //   its group by title.
 //
@@ -17,7 +17,7 @@ const SPIN_LINGER_MS = 2500;
 const SPIN_STEPS = 12;
 const ICON_SIZES = [16, 32];
 const ACTIVE_ARC = "#22c55e";
-const GROUP_COLORS = {active: "green", recent: "yellow", stale: "red", paused: "orange"};
+const GROUP_COLORS = {active: "green", recent: "yellow", stale: "grey", paused: "orange"};
 const LIVELINESS = {active: 3, recent: 2, stale: 1};
 const GROUP_STORE = "agent_group_colors";
 const SYNC_DELAY_MS = 250;

@@ -9,16 +9,17 @@
 
 export const ACTIVE_MS = 60 * 1000;
 // Yellow from one minute to six after the last action (the owner, 2026-10-24: "a minute
-// without action - yellow for five minutes, then red").
+// without action - yellow for five minutes").
 export const RECENT_MS = 6 * 60 * 1000;
-// Red from then on: the agent left the tab. The mark lasts until STALE_MS - the auto-close
+// Grey from then on: the agent left the tab, which is not an error, so not red (the owner,
+// 2026-10-28). The mark lasts until STALE_MS - the auto-close
 // time, an hour unless the popup says otherwise - when a tab an agent opened is closed (if
 // auto-close is on) and any other tab drops the mark.
 export const STALE_MS = 60 * 60 * 1000;
 export const MAX_TRACKED_TABS = 200;
 export const ACTIVE_COLOR = "#16a34a";
 export const RECENT_COLOR = "#ca8a04";
-export const STALE_COLOR = "#dc2626";
+export const STALE_COLOR = "#6b7280";
 // Who is on the tab, by shape (the owner, 2026-10-24): an agent's robot, a background macro's wrench.
 export const BADGE_TEXT = "\u{1F916}";
 export const MACRO_BADGE_TEXT = "\u{1F512}";

@@ -50,7 +50,7 @@ status.setPausedLook(true);
 await settle();
 const paused = {{10: groups[10].color, 20: groups[20].color}};
 status.setPausedLook(false);
-status.syncGroups({{"3": {{tabId: 3, phase: "recent"}}}}, Date.now(), phaseOf);
+status.syncGroups({{"3": {{tabId: 3, phase: "stale"}}}}, Date.now(), phaseOf);
 await settle();
 const afterTen = {{10: groups[10].color, 20: groups[20].color}};
 status.syncGroups({{}}, Date.now(), phaseOf);
@@ -71,8 +71,9 @@ return {{working, paused, afterTen, done: {{10: groups[10].color, 20: groups[20]
     # The liveliest tab wins the group; an ungrouped tab touches nothing.
     assert out["working"] == {"10": "green", "20": "yellow"}
     assert out["paused"] == {"10": "orange", "20": "orange"}
-    # A group with no driven tab left gets its own colour back, the other keeps going.
-    assert out["afterTen"] == {"10": "purple", "20": "yellow"}
+    # A group with no driven tab left gets its own colour back; one whose agent left goes
+    # grey, not red - that is not an error.
+    assert out["afterTen"] == {"10": "purple", "20": "grey"}
     assert out["done"] == {"10": "purple", "20": "blue"}
     assert out["stored"] == {"original": {}, "applied": {}}
     assert out["writes"] == 7, "colours are written only when they change"

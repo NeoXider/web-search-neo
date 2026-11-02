@@ -12,7 +12,7 @@ and motion, not by shade alone:
   breathing - it bobs gently under a soft halo that swells and fades;
 * **recent** - quiet for more than a minute: yellow and asleep, a small "z"
   drifting up beside it, until six minutes after the last action;
-* **stale** - the agent left: a still red slime, until STALE_MS (an hour)
+* **stale** - the agent left: a still grey slime, until STALE_MS (an hour)
   after the last action, when the page's own favicon comes back. The companion
   closes a tab the agent opened at that point (its auto-close setting).
 
@@ -20,7 +20,7 @@ Who is on the tab is told by the shape (the owner, 2026-10-24): a **robot head**
 for an agent working live, a **wrench** for a background macro job
 (``presence_live.MACRO_RUN``), and the robot with a small wrench beside it when
 both acted on the tab within six minutes of each other. The colour still tells
-the time since the last action: green, yellow, red.
+the time since the last action: green, yellow, grey.
 
 The badge survives the document: each action's time is kept in sessionStorage
 (a reload or a same-site navigation picks it up at once), and the companion
@@ -66,10 +66,10 @@ HOP_LIFTS = (3.0, 7.0, 9.0, 7.0, 3.0, 0.0)
 HOP_SQUASH = 0.8
 HOP_FRAME_MS = 55
 BUSY_COLOR = "#5dff8f"
-# After the yellow minutes the slime turns red and stays until this long after
-# the last action (matches the companion's auto-close time).
+# After the yellow minutes the slime turns grey - the agent left, which is not an error -
+# and stays until this long after the last action (matches the companion's auto-close time).
 STALE_MS = 60 * 60 * 1000
-STALE_COLOR = "#e5484d"
+STALE_COLOR = "#9aa0a6"
 
 
 def config() -> dict[str, Any]:
@@ -205,7 +205,7 @@ SOURCE = r"""
   }
 
   // The state dot: green while working and for a minute after (breathing), yellow
-  // for the next minutes, red until the hour is up. `grow` is the hop of an action.
+  // for the next minutes, grey until the hour is up. `grow` is the hop of an action.
   function drawStateDot(context, phase, still, grow) {
     let radius = DOT.r * (grow || 1);
     if (phase === "active" && still !== null) radius += 0.9 * breath(still, CONFIG.breatheFrames);
@@ -489,7 +489,7 @@ SOURCE = r"""
     state.pulse = null;
     const phase = badgePhase(Date.now());
     if (!phase || phase !== state.phase) return;
-    if (phase === "stale") { show("stale"); return; }  // red is still: no timer for an idle tab
+    if (phase === "stale") { show("stale"); return; }  // grey is still: no timer for an idle tab
     const motion = motionOf(phase);
     state.frame = (state.frame + 1) % motion[0];
     show(phase + ":" + state.frame);

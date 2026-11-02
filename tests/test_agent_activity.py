@@ -58,9 +58,9 @@ def test_activity_phases_badges_and_expiry() -> None:
           entry: map["42"],
           ignoredSame: Object.keys(ignored).length,
           stickyCreated: opened["50"].created,
-          fresh: at(1_000), recent: at(150_000), red: at(400_000), gone: at(3_600_000), young: at(35_000),
+          fresh: at(1_000), recent: at(150_000), grey: at(400_000), gone: at(3_600_000), young: at(35_000),
           green_edge: at(59_000)["phase"], amber_edge: at(61_000)["phase"],
-          yellow_edge: at(359_000)["phase"], red_edge: at(361_000)["phase"],
+          yellow_edge: at(359_000)["phase"], grey_edge: at(361_000)["phase"],
           shortStale: m.activityPhase(map["42"], t0 + 1_000_000, 900_000),
           macroText: m.badgeFor(map["42"], t0, undefined, true).text,
           expiredIds: expired.expired, kept: Object.keys(expired.map).sort(),
@@ -95,11 +95,12 @@ def test_activity_phases_badges_and_expiry() -> None:
     assert out["recent"]["badge"]["title"].endswith("Agent claude — last action 2 min ago")
     assert out["young"]["age"] == "active now" and out["young"]["phase"] == "active"
     # The owner's states, 2026-10-24: green for the minute, yellow until six minutes,
-    # red until the auto-close time (an hour by default), then gone.
+    # grey until the auto-close time (an hour by default), then gone. Not red: an agent
+    # leaving a tab is not an error (2026-10-28).
     assert out["green_edge"] == "active"
     assert out["amber_edge"] == "recent"
-    assert out["yellow_edge"] == "recent" and out["red_edge"] == "stale"
-    assert out["red"]["phase"] == "stale" and out["red"]["badge"]["color"] == "#dc2626"
+    assert out["yellow_edge"] == "recent" and out["grey_edge"] == "stale"
+    assert out["grey"]["phase"] == "stale" and out["grey"]["badge"]["color"] == "#6b7280"
     assert out["gone"] == {"phase": "expired", "badge": None, "age": "last action 60 min ago"}
     assert out["shortStale"] == "expired"
     assert out["expiredIds"] == [44] and out["kept"] == ["42", "43"]
