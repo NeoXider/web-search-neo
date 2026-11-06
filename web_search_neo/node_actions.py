@@ -21,7 +21,8 @@ from typing import Any, Literal
 from mcp.server.fastmcp import Image
 
 from web_search_neo import browser_tools, plugins
-from web_search_neo.nodes import client, config, identity, overview, pairing
+from web_search_neo.fetch.safety import download_root
+from web_search_neo.nodes import client, config, files, identity, overview, pairing
 from web_search_neo.nodes.server import NodeServer
 
 LOGGER = logging.getLogger("web_search_neo.nodes")
@@ -118,8 +119,21 @@ def wants_remote(node: str | None) -> bool:
 async def forward(node: str, tool: str, arguments: dict[str, Any]) -> Any:
     """Run one ``web_action``/``web_info`` call on another computer."""
     entry = config.resolve(node)
-    result = decode(await asyncio.to_thread(client.call, entry, tool, arguments))
+    if tool == "web_action" and "actions" in arguments:
+        # A path names a file on the computer that reads it: the files an upload names go along.
+        arguments = {**arguments, "actions": await asyncio.to_thread(files.pack_uploads, arguments["actions"])}
+    try:
+        answer = await asyncio.to_thread(client.call, entry, tool, arguments, accept_files=True)
+    except client.NodeError as exc:
+        if files.UPLOAD_KEY not in str(exc):
+            raise
+        raise client.NodeError(
+            f"Node {entry.name!r} runs an older Web Search Neo that cannot take the files an upload "
+            "sends; update it (its companion popup, Update) or name a path on that computer."
+        ) from None
+    result = decode(answer)
     if isinstance(result, dict):
+        result = await asyncio.to_thread(files.unpack_files, result, download_root(), entry.name)
         result = {**result, "via_node": {"name": entry.name, "address": entry.address}}
     return result
 
@@ -160,11 +174,17 @@ def node_call(loop: asyncio.AbstractEventLoop) -> Any:
         kept = {key: arguments[key] for key in allowed if key in arguments}
         if tool == "web_action":
             _refuse_denied(kept.get("actions"))
+            if "actions" in kept:
+                kept["actions"] = files.unpack_uploads(kept["actions"], download_root())
             coroutine = _facade.web_action(**kept)
         else:
             coroutine = _facade.web_info(**kept)
         LOGGER.info("Node call %s from %s", tool, caller)
-        return encode(asyncio.run_coroutine_threadsafe(coroutine, loop).result())
+        result = asyncio.run_coroutine_threadsafe(coroutine, loop).result()
+        # What this call saved here (a screenshot, a download, save_to) goes back with the answer.
+        bundle = files.pack_files(result, download_root()) if isinstance(result, dict) else None
+        encoded = encode(result)
+        return {**encoded, files.FILES_KEY: bundle} if bundle else encoded
 
     return call
 

@@ -12,8 +12,9 @@ bookkeeping: who the nodes are (:mod:`.config`), what this machine looks like
 from the network - LAN addresses, public IP, coarse geolocation
 (:mod:`.identity`), how a request proves it knows the key (:mod:`.protocol`),
 the HTTP server and its LAN discovery responder (:mod:`.server`), the client
-side (:mod:`.client`), pairing by button instead of a copied key
-(:mod:`.pairing`), whether Windows Firewall lets the LAN in (:mod:`.firewall`),
+side (:mod:`.client`), the files a call carries each way (:mod:`.files`),
+pairing by button instead of a copied key (:mod:`.pairing`), whether Windows
+Firewall lets the LAN in (:mod:`.firewall`),
 and the combined picture the ``nodes`` topic and the popup show
 (:mod:`.overview`). The glue that hands a call to the facade lives in
 ``web_search_neo/node_actions.py``.

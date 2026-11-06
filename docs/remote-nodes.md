@@ -26,6 +26,16 @@ its files and its network — and only the answer comes back, with a `via_node` 
 naming where it ran. Images (the `screenshot` topic) travel as base64 and arrive as
 images.
 
+Files cross with the call. An `upload` step's `file_paths` that are files on the calling
+computer travel with the request; the node writes them under its download folder
+(`node-uploads/`, kept a day, since a page reads an attached file when it sends the form)
+and attaches those. A path that is not a file on the caller is taken as a path on the node,
+as before. On the way back, every file the answer names under the node's download folder -
+a `screenshot` saved to a file, what `downloads` lists, a `save_to` - is copied to the
+caller's download folder under `from-nodes/<node>/`, the node's layout kept, and the answer
+names the copy; `node_files.saved_here` pairs each copy with its `remote_path`. Up to 32 MB
+travel each way per call; a bigger file stays on the node, listed in `node_files.left_on_node`.
+
 ## See what is out there: `web_info(topic="nodes")`
 
 ```json

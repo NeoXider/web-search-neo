@@ -31,10 +31,12 @@ import time
 from typing import Any, Callable
 
 from web_search_neo.nodes import protocol
+from web_search_neo.nodes.files import FILES_KEY
 from web_search_neo.nodes.pairing import PairingDesk, PairingError
 
 LOGGER = logging.getLogger("web_search_neo.nodes.server")
-MAX_BODY_BYTES = 16 * 1024 * 1024
+# Room for the files an upload carries to this node (nodes.files.MAX_UPLOAD_BYTES, as base64).
+MAX_BODY_BYTES = 64 * 1024 * 1024
 MAX_PAIR_BODY_BYTES = 8 * 1024
 ALLOWED_TOOLS = frozenset({"web_action", "web_info"})
 _AUTH_FAILURE_DELAY = 0.25
@@ -267,6 +269,9 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send(200, {"ok": False, "error": f"{type(exc).__name__}: {exc}"}, nonce)
             return
+        if isinstance(result, dict) and FILES_KEY in result and request.get("files") is not True:
+            # An older caller would hand the files to its agent as base64; it gets the paths, as before.
+            result = {key: value for key, value in result.items() if key != FILES_KEY}
         self._send(200, {"ok": True, "result": result}, nonce)
 
     def _stop(self, nonce: str) -> None:

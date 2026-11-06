@@ -81,10 +81,17 @@ def _exchange(entry: NodeEntry, method: str, path: str, payload: Any | None,
     return decoded.get("result")
 
 
-def call(entry: NodeEntry, tool: str, arguments: dict[str, Any], timeout: float | None = None) -> Any:
-    """Run ``web_action``/``web_info`` on ``entry`` and return its result."""
-    return _exchange(entry, "POST", "/wsn/call", {"tool": tool, "arguments": arguments},
-                     call_timeout() if timeout is None else timeout)
+def call(entry: NodeEntry, tool: str, arguments: dict[str, Any], timeout: float | None = None,
+         accept_files: bool = False) -> Any:
+    """Run ``web_action``/``web_info`` on ``entry`` and return its result.
+
+    ``accept_files`` asks the node to send back the files its answer names
+    (:mod:`.files`); an older node ignores the request field.
+    """
+    payload: dict[str, Any] = {"tool": tool, "arguments": arguments}
+    if accept_files:
+        payload["files"] = True
+    return _exchange(entry, "POST", "/wsn/call", payload, call_timeout() if timeout is None else timeout)
 
 
 def info(entry: NodeEntry, timeout: float = PROBE_TIMEOUT) -> dict[str, Any]:

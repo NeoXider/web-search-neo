@@ -29,11 +29,19 @@ import json
 import logging
 import re
 import secrets
+import threading
 from typing import Any, Callable
 
 from web_search_neo import bridge_auth
 
 LOGGER = logging.getLogger("web_search_neo.bridge.daemon")
+# websockets logs every socket it opens and every plain request it turns down at INFO:
+# one line per agent call and per probe of the port. The daemon says what matters itself.
+SOCKET_LOGGER = logging.getLogger("web_search_neo.bridge.websockets")
+SOCKET_LOGGER.setLevel(logging.WARNING)
+_MAX_PROBE_SOURCES = 32
+_probe_sources: set[str] = set()
+_probe_lock = threading.Lock()
 
 HANDSHAKE_TIMEOUT = 5.0
 MIN_NONCE_CHARS = 16
@@ -59,12 +67,22 @@ def answer_plain_http(connection: Any, request: Any) -> Any:
     """``process_request`` for the bridge port: plain HTTP gets a quiet 426.
 
     Browser tabs and port probes GET the port now and then. Left to websockets,
-    each one failed the opening handshake and logged a full traceback at ERROR;
-    answered here it is one INFO line. Anything asking for an upgrade goes on to
-    the normal handshake, the Origin check included.
+    each one failed the opening handshake and logged a full traceback at ERROR,
+    and once answered here websockets still logged a line for every one of them -
+    some pages probe every few seconds. Now each source (its Origin, else its
+    User-Agent) is named once, so who it is can be found, and then left alone.
+    Anything asking for an upgrade goes on to the normal handshake, the Origin
+    check included.
     """
     if "websocket" in request.headers.get("Upgrade", "").lower():
         return None
+    source = (request.headers.get("Origin") or request.headers.get("User-Agent") or "no Origin or User-Agent")[:160]
+    with _probe_lock:
+        first = source not in _probe_sources and len(_probe_sources) < _MAX_PROBE_SOURCES
+        if first:
+            _probe_sources.add(source)
+    if first:
+        LOGGER.info("Plain HTTP on the bridge port answered 426 (from %s); more from it go unlogged", source)
     response = connection.respond(http.HTTPStatus.UPGRADE_REQUIRED, "This port speaks WebSocket only.\n")
     response.headers["Upgrade"] = "websocket"
     return response

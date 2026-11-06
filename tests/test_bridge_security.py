@@ -459,7 +459,15 @@ def test_plain_http_on_the_bridge_port_is_answered_without_a_traceback(caplog) -
                 answer += chunk
         assert answer.startswith(b"HTTP/1.1 426 ")
         assert b"Upgrade: websocket" in answer
+        # A page that probes every few seconds is named once, not logged once a probe.
+        for _ in range(3):
+            with socket.create_connection(("127.0.0.1", daemon.port), timeout=5.0) as sock:
+                sock.sendall(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://prober.test\r\n\r\n")
+                while sock.recv(4096):
+                    pass
         # A real peer still gets through the same port.
         client = _raw_client(daemon.port, "c3" * 16, pid=333)
         client.close()
     assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+    assert not [message for message in caplog.messages if message.startswith("connection rejected")]
+    assert len([message for message in caplog.messages if "https://prober.test" in message]) == 1

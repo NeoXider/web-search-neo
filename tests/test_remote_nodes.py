@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import pathlib
 import socket
 import threading
 import time
@@ -17,7 +18,7 @@ import pytest
 from mcp.server.fastmcp import Image
 
 from web_search_neo import main, node_actions, node_link
-from web_search_neo.nodes import client, config, firewall, identity, overview, pairing, protocol
+from web_search_neo.nodes import client, config, files, firewall, identity, overview, pairing, protocol
 from web_search_neo.nodes.server import NodeServer
 
 
@@ -284,6 +285,72 @@ def test_web_action_runs_on_the_named_node(facade_node):
 def test_denied_actions_are_refused_on_the_node(facade_node):
     with pytest.raises(client.NodeError, match="disabled on this node"):
         asyncio.run(main.web_action(actions=[{"action": "update_companion"}], node=facade_node))
+
+
+def test_an_upload_carries_the_callers_file_to_the_node(facade_node, tmp_path, monkeypatch):
+    # The node used to look for the caller's path on its own disk.
+    monkeypatch.setenv("WEB_SEARCH_NEO_DOWNLOAD_DIR", str(tmp_path / "downloads"))
+    local = tmp_path / "caller" / "report.pdf"
+    local.parent.mkdir()
+    local.write_bytes(b"%PDF caller bytes")
+    seen = {}
+
+    def upload_file(selector, file_paths, session_id="default", frame_selector=None):
+        seen["files"] = {pathlib.Path(path).name: pathlib.Path(path).read_bytes() for path in file_paths
+                         if pathlib.Path(path).is_file()}
+        seen["paths"] = list(file_paths)
+        return {"success": True, "files_uploaded": {selector: [pathlib.Path(p).name for p in file_paths]}}
+
+    monkeypatch.setattr(main.browser_tools, "upload_file", upload_file)
+    result = asyncio.run(main.web_action(actions=[
+        {"action": "upload", "selector": "#file", "file_paths": [str(local), "C:/only/on/the/node.txt"]},
+    ], node=facade_node))
+    assert result["results"][0]["success"] is True
+    assert seen["files"]["report.pdf"] == b"%PDF caller bytes"
+    assert files.UPLOADS_DIR in seen["paths"][0] and seen["paths"][1] == "C:/only/on/the/node.txt"
+
+
+def test_a_file_the_node_saved_comes_back_to_the_caller(facade_node, tmp_path, monkeypatch):
+    # A screenshot (or a download, or save_to) stayed on the node behind a path the caller
+    # could not open.
+    root = tmp_path / "downloads"
+    monkeypatch.setenv("WEB_SEARCH_NEO_DOWNLOAD_DIR", str(root))
+
+    def save_screenshot(session_id, mode, x, y, width, height, path, overwrite, wait_frames):
+        target = root / "screenshots" / "shot.png"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"\x89PNG node pixels")
+        return {"success": True, "path": str(target)}
+
+    monkeypatch.setattr(main.browser_tools, "save_screenshot", save_screenshot)
+    result = asyncio.run(main.web_action(actions=[{"action": "screenshot"}], node=facade_node))
+    local = pathlib.Path(result["results"][0]["data"]["path"])
+    assert files.RECEIVED_DIR in local.parts and local.read_bytes() == b"\x89PNG node pixels"
+    saved = result["node_files"]["saved_here"][0]
+    assert saved["path"] == str(local) and saved["remote_path"].endswith("shot.png")
+    assert files.FILES_KEY not in result
+
+
+def test_an_older_caller_gets_paths_not_base64(facade_node, tmp_path, monkeypatch):
+    root = tmp_path / "downloads"
+    monkeypatch.setenv("WEB_SEARCH_NEO_DOWNLOAD_DIR", str(root))
+
+    def save_screenshot(*args):
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "shot.png").write_bytes(b"png")
+        return {"success": True, "path": str(root / "shot.png")}
+
+    monkeypatch.setattr(main.browser_tools, "save_screenshot", save_screenshot)
+    answer = client.call(config.resolve(facade_node), "web_action", {"actions": [{"action": "screenshot"}]})
+    assert files.FILES_KEY not in answer and answer["results"][0]["data"]["path"] == str(root / "shot.png")
+
+
+def test_returned_files_stay_inside_the_callers_folder(tmp_path):
+    bundle = {"files": [{"remote_path": "C:/x/evil", "relative": "../../outside.txt",
+                         "data": base64.b64encode(b"x").decode()}], "too_large": []}
+    result = files.unpack_files({files.FILES_KEY: bundle, "path": "C:/x/evil"}, tmp_path, "pc")
+    written = pathlib.Path(result["path"])
+    assert written.is_relative_to(tmp_path / files.RECEIVED_DIR / "pc") and written.read_bytes() == b"x"
 
 
 def test_a_node_does_not_relay_to_further_nodes():
