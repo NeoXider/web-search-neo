@@ -37,7 +37,7 @@ from typing import Any
 import uuid
 
 from web_search_neo import bridge_auth, node_link
-from web_search_neo.bridge_claims import claim_is_own, js_number_tab_id
+from web_search_neo.bridge_claims import claim_is_own, js_number_tab_id, reload_refusal
 from web_search_neo.bridge_handshake import SOCKET_LOGGER, TOKEN_MISMATCH_REASON, answer_plain_http, authenticate_peer  # noqa: F401
 from web_search_neo.bridge_outbox import Outbox
 from web_search_neo.process_probe import process_alive
@@ -1030,8 +1030,8 @@ class BridgeDaemon:
         is read as the companion's ``Number()`` reads it and rewritten to that
         int; a claim of this client's own superseded connection moves to it.
         """
-        if method == "runtime.reload" and self._claims:  # it would detach every agent's tabs
-            return None, "The companion was not reloaded: an agent is driving a tab right now."
+        if method == "runtime.reload":  # it would detach every agent's tabs
+            return None, reload_refusal(self._claims, params)
         if not isinstance(params, dict):
             return None, None
         tab_id, bad = js_number_tab_id(params.get("tabId"))

@@ -343,8 +343,10 @@ browser that needs no companion.
 After the server is updated, the running companion keeps the code it loaded.
 The server now reloads a connected companion whose manifest version differs from
 its folder by itself (on `browser_tabs` and before `open`; both answers report it
-as `companion_refresh`), but only while no agent is driving a tab - a reload
-detaches every debugger session at once - at most once per five minutes across
+as `companion_refresh`), but only while no agent holds a tab - a reload
+detaches every debugger session at once, and a tab is held from `open` to
+`close`, idle hours included (`python main.py --update --force` is the owner's
+way past a session that never closes) - at most once per five minutes across
 all server processes, and never again for a build whose reload did not take (the
 answer then carries the manual steps). A companion that differs only in its code
 hash (same version, an edited checkout) is reported, not reloaded. When the bridge has just (re)started,
@@ -355,7 +357,7 @@ companion popup's Reconnect (Restart companion when its service worker has
 stopped) is the one action; Reload on its card at chrome://extensions is the
 fallback.
 
-The bundled companion is version 1.30.0. Chrome does not refresh an unpacked
+The bundled companion is version 1.30.1. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. That only works for

@@ -64,6 +64,21 @@ class LazyRotatingFileHandler(RotatingFileHandler):
                 return
         super().emit(record)
 
+    def doRollover(self) -> None:
+        """Rotate, or carry on in the same file when another process is in the way.
+
+        Every MCP server and the bridge daemon write this one file. When it fills
+        they all try to rotate it at once: one wins, and the rename of the others
+        fails (on Windows also while anyone else merely has the file open). That
+        printed a traceback on stderr for a record that was never in danger. The
+        record now goes into the file as it is, and a later one rotates it.
+        """
+        try:
+            super().doRollover()
+        except OSError:
+            if self.stream is None:
+                self.stream = self._open()
+
 
 def configure_server_log(name: str = "web_search_neo") -> logging.Logger:
     """Attach the per-user file handler to ``name`` once and return the logger."""

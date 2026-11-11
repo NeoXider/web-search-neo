@@ -47,8 +47,8 @@ def parts(monkeypatch):
     monkeypatch.setattr(companion_update, "update_checkout", lambda root: {
         "updated": True, "from_commit": "aaa", "to_commit": "bbb", "files_changed": 3})
     monkeypatch.setattr(client, "stop_local", lambda: stopped_nodes.append(1) or True)
-    monkeypatch.setattr(chrome_bootstrap, "_reload_companion",
-                        lambda bridge, version: reloads.append(version) or {"self_update": "done"})
+    monkeypatch.setattr(chrome_bootstrap, "_reload_companion", lambda bridge, version, force=False: (
+        reloads.append((version, force)) or {"self_update": "done"}))
     return stopped_nodes, reloads
 
 
@@ -58,7 +58,7 @@ def test_update_restarts_every_part_onto_the_pulled_files(parts, capsys):
     old, fresh = FakeBridge.made
     assert old.spawn is False, "stopping must never start a daemon first"
     assert old.calls == ["stop", "shutdown"] and fresh.calls == ["start", "shutdown"]
-    assert stopped_nodes == [1] and len(reloads) == 1
+    assert stopped_nodes == [1] and len(reloads) == 1 and reloads[0][1] is False
     out = capsys.readouterr().out
     assert "pulled aaa -> bbb, 3 file(s)" in out and "Chrome companion: reloaded" in out
 
@@ -71,6 +71,10 @@ def test_update_leaves_agents_alone_unless_forced(parts, capsys):
     assert stopped_nodes == [] and reloads == [] and len(FakeBridge.made) == 1
     assert run_modes.run(["--update", "--force"], "9.9.9") == 0
     assert stopped_nodes == [1]
+    # The reload itself is sent as forced: the agents' servers claim their tabs again as
+    # soon as the fresh daemon is up, and the daemon would refuse an ordinary reload.
+    assert [forced for _version, forced in reloads] == [True]
+    assert "2 tab(s) held by agents are cut off (--force)" in capsys.readouterr().out
 
 
 def test_update_says_when_chrome_is_not_there(parts, capsys):

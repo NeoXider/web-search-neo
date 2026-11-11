@@ -195,8 +195,10 @@ python main.py --update
 pulls the checkout and moves every long-running part onto it: it stops the node and the
 bridge daemon, starts a fresh daemon and reloads the Chrome companion, and the daemon
 starts the node again once the companion is back. A `git pull` alone leaves all three
-running the old code. It does not cut off agents driving tabs unless given `--force`;
-an MCP server already running keeps its code until its client restarts it.
+running the old code. It does not cut off agents that hold tabs unless given `--force`
+(then the companion reload is forced too, and each session holding a tab ends: its next
+call is told to open the page again); an MCP server already running keeps its code until
+its client restarts it.
 
 ## Settings
 

@@ -41,7 +41,9 @@ def update_here(arguments: list[str]) -> int:
     daemon, starts a fresh daemon, and reloads the companion onto the files; the
     daemon starts the node again when the companion is back (if sharing is on). An
     MCP server already running keeps its code until its client restarts it. Agents
-    driving tabs here are not cut off unless ``--force`` says so.
+    holding tabs here are not cut off unless ``--force`` says so; with it the reload
+    is sent as forced, because an agent's server claims its tab again the moment the
+    fresh daemon is up, and the daemon would otherwise refuse the reload after all.
     """
     from pathlib import Path
 
@@ -62,13 +64,17 @@ def update_here(arguments: list[str]) -> int:
         else:
             outcome = f"not pulled: {pulled.get('reason') or pulled.get('refused')}"
         print(f"Checkout {root}: {outcome}")
+    forced = "--force" in arguments
     current = chrome_bridge.ChromeBridge(spawn=False)
     try:
         claims = list(((current.status(2.0) or {}).get("daemon") or {}).get("claims") or [])
-        if claims and "--force" not in arguments:
+        if claims and not forced:
             print(f"{len(claims)} tab(s) are driven by agents right now; a restart would cut them "
                   "off. Run again when they are done, or add --force.")
             return 1
+        if claims:
+            print(f"{len(claims)} tab(s) held by agents are cut off (--force); each of those sessions "
+                  "ends, and its next call is told to open the page again.")
         print("LAN node: " + ("stopped" if client.stop_local() else "was not running"))
         print("Bridge daemon: " + ("stopped" if current.stop_daemon("update from the command line")
                                    else "was not running"))
@@ -81,7 +87,7 @@ def update_here(arguments: list[str]) -> int:
             print("A new bridge daemon runs, but Chrome's companion did not connect within 25 s; "
                   "open Chrome (the companion reconnects by itself).")
             return 1
-        reload = _reload_companion(fresh, expected_extension_version())
+        reload = _reload_companion(fresh, expected_extension_version(), force=forced)
         print("Chrome companion: " + ("reloaded" if reload.get("self_update") == "done"
                                       else f"not reloaded ({reload})"))
     finally:

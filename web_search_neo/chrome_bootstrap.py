@@ -96,15 +96,17 @@ def reload_steps() -> list[str]:
     ]
 
 
-def _reload_companion(bridge: Any, expected_version: str) -> dict[str, Any]:
+def _reload_companion(bridge: Any, expected_version: str, *, force: bool = False) -> dict[str, Any]:
     """Ask a connected companion to reload itself, and report whether it came back.
 
     Chrome reserves the Reload button on an unpacked card for a human, but the
     worker can re-read its own folder from disk. Builds older than 1.3.1 have no
     such command, and that is exactly the case where a person still has to click.
+    The daemon refuses the reload while agents hold tabs; ``force`` is the owner's
+    word (``--update --force``) that those sessions may be detached.
     """
     try:
-        answer = bridge.request("runtime.reload", {}, 10.0)
+        answer = bridge.request("runtime.reload", {"force": True} if force else {}, 10.0)
     except Exception as exc:
         return {"self_update": "unsupported", "self_update_error": f"{type(exc).__name__}: {exc}"}
 

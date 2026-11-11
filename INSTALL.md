@@ -2,7 +2,7 @@
 
 This guide installs the MCP server from source and connects it to LM Studio or another stdio-compatible MCP client.
 
-It describes version 1.30.0. The Python package, the server, and the bundled Chrome
+It describes version 1.30.1. The Python package, the server, and the bundled Chrome
 companion carry that same version, and the bridge only accepts a companion that speaks the
 current handshake (bridge protocol 2, since 1.15.0) — see [Updating](#updating) if an older one is already
 installed.
@@ -242,7 +242,7 @@ Earlier revisions tried to perform those clicks for you through Windows UI Autom
 code is gone. It depended on the interface language, on which window happened to have focus,
 and on a folder picker that the automation backend does not even enumerate.
 
-The bundled companion is version 1.30.0 and declares six permissions: `alarms`, `debugger`,
+The bundled companion is version 1.30.1 and declares six permissions: `alarms`, `debugger`,
 `notifications`, `storage`, `tabs`, and `tabGroups`. There are no content scripts and no `host_permissions`;
 page access comes from `debugger`, which attaches the Chrome DevTools Protocol to the tabs
 the agent drives. `alarms` exists because Chrome suspends an idle MV3 service worker after
@@ -515,8 +515,12 @@ python main.py --update
 
 pulls the checkout (fast-forward only), stops this computer's LAN node and the bridge daemon,
 starts a fresh daemon and reloads the Chrome companion onto the new files; the daemon brings
-the node back by itself. It does not cut off agents that are driving tabs unless given
-`--force`. By hand the same is:
+the node back by itself. It does not cut off agents that hold tabs unless given `--force`
+(a tab is held from an agent's `open` to its `close`, idle hours included, and the refusal
+lists who holds what). With `--force` the companion reload is forced as well, and the sessions
+holding tabs end: the next call of each is told that the companion updated itself and to open
+the page again. No tool an agent can call forces a reload; this command line is the owner's.
+By hand the same is:
 
 ```text
 git pull --ff-only
@@ -759,7 +763,7 @@ or when `setup_current_chrome` answered `self_update: "unsupported"` or `"timeou
    very directory **Load unpacked** points at, then reload the extension. Restarting the
    daemon does not help and never did after the daemon learned to re-read the token file:
    it already fetches the current secret from disk before calling anything a mismatch.
-3. Check the card's version. It must read 1.30.0 once the reload has taken. A build older
+3. Check the card's version. It must read 1.30.1 once the reload has taken. A build older
    than 1.15.0 speaks bridge protocol 1 and is refused with `Expected Web Search Neo bridge
    protocol 2; update and reload the companion`; a newer one that is merely behind still
    connects, but Chrome only picks up the new manifest on reload.

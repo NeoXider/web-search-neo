@@ -1415,7 +1415,7 @@ def test_the_daemon_refuses_a_companion_reload_while_tabs_are_claimed():
     daemon._lock = _threading.Lock()
     daemon._claims = {5: object()}
     holder, refusal = daemon._claim_check(object(), "runtime.reload", {})
-    assert holder is None and "driving a tab" in refusal
+    assert holder is None and "not reloaded" in refusal and "tab 5" in refusal
     daemon._claims = {}
     assert daemon._claim_check(object(), "runtime.reload", {}) == (None, None)
 
