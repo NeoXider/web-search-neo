@@ -6,14 +6,16 @@
 `127.0.0.1:8765` (`WEB_SEARCH_NEO_BRIDGE_PORT` may override the port). It is a detached
 `python main.py --bridge` process, normally spawned by `ChromeBridge`. It accepts the fixed
 extension origin and origin-less local Python clients, holds one extension connection and
-many MCP-client connections, routes commands/results, and owns tab claims.
+many MCP-client connections, routes commands/results, and owns tab claims. Each client is
+written to through an outbox thread of its own (`web_search_neo/bridge_outbox.py`), so one
+that stops reading cannot stall the others.
 
 The extension service worker opens `ws://127.0.0.1:<port>`. The handshake is protocol 2
 (`web_search_neo/bridge_handshake.py`, `chrome-extension/bridge-auth.js`); the raw token
 never crosses the socket:
 
 ```json
-{"type":"hello","protocol":2,"role":"extension","nonce":"<Nc>","browser":{"name":"Chrome","extension_version":"...","browser_run":"...","max_sessions":8}}
+{"type":"hello","protocol":2,"role":"extension","nonce":"<Nc>","browser":{"name":"Chrome","extension_version":"...","browser_run":"...","max_sessions":30}}
 {"type":"challenge","protocol":2,"nonce":"<Ns>","proof":"HMAC-SHA256(token, wsn-bridge-server|Nc|Ns)"}
 {"type":"auth","proof":"HMAC-SHA256(token, wsn-bridge-client|Ns|Nc)"}
 {"type":"hello_ack","protocol":2}
@@ -61,7 +63,7 @@ Native mode still starts with a transport-neutral hello so version, `browser_run
 `max_sessions` reach the broker:
 
 ```json
-{"type":"hello","protocol":3,"transport":"native","browser":{"name":"Chrome","extension_version":"...","browser_run":"...","max_sessions":8}}
+{"type":"hello","protocol":3,"transport":"native","browser":{"name":"Chrome","extension_version":"...","browser_run":"...","max_sessions":30}}
 ```
 
 The broker answers with `hello_ack`, protocol, transport, broker version, PID, and instance.

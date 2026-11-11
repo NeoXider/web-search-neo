@@ -126,8 +126,8 @@ def resolve_locator(driver: Any, locator: str, expression: str, gone: type[Excep
     if epoch and current != epoch.lower():
         raise gone(
             f"Element handle '{locator}' was not read from the document this session is "
-            "in: the page was replaced since, or the handle belongs to a frame (pass that "
-            "frame as frame_selector). Read the page again with "
+            "in: the page was replaced since, or the handle was read inside a frame (reach an "
+            "element in a frame with a CSS selector and frame_selector). Read the page again with "
             f"web_info(topic='page_outline'). {_POINTER_HINT}"
         )
     raise ValueError(

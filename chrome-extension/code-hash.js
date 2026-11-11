@@ -19,6 +19,7 @@ export const CODE_FILES = [
   "nodes.js",
   "tab-status.js",
   "jobs.js",
+  "debugger-attach.js",
   "code-hash.js",
 ];
 

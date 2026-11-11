@@ -614,14 +614,18 @@ the best score reached, and whether anything is sure. Nothing is sent.
 | Field | What it means |
 | --- | --- |
 | `challenge` | which kind this is; only `slider` on TCaptcha/Geetest is draggable here today |
-| `measurement.sure` | false means no answer should be spent, and `captcha_verify` will not spend one |
+| `measurement.sure` | false means no answer should be spent, and `captcha_answer` without `boxes` of your own will not spend one |
 | `measurement.tried_bands`, `best_band`, `boxes` | what the measurement looked at and where it landed |
 | `target_plan` | the order, boxes and strip URLs the challenge published for its own targets |
 | `sprite_match` | the reading built from that strip: per-glyph `tile_box`, `score`, `lead`, `sure`; `boxes` only when every row is sure |
 | `site_aid` result | the encrypted id blob the site publishes, its encoding, and any plaintext id |
 
-`captcha_verify {page_url, aid, boxes}` spends exactly one attempt, and only when the measurement
-was sure *and* the challenge's hash was solved; either way out is a refusal that sent nothing.
+`captcha_answer {page_url, aid, boxes}` answers the challenge that was just read, not a freshly
+drawn one. `boxes` are `[x, y, w, h]` regions in the picture's own pixels, clicked in the order
+given; without them the kept measurement is used, and only when it was sure. It spends exactly
+one attempt, and only when the challenge's hash was solved; either way out is a refusal that sent
+nothing. (`captcha_verify` is the library call `web_search_neo.captcha_actions.captcha_verify`
+with the same rule; it is not an action.)
 `captcha`'s unsolved report carries the same naming as `challenge_classification`, including
 `solver_available` and — when false — the sentence saying what would be needed.
 

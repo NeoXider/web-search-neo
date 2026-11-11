@@ -33,6 +33,25 @@ Top-level helpers extracted from the facades: `dispatch.py` is the ordered-actio
 itself as the facade, so the loop reads main's registry and validator at call time), and
 `actions/injected_scripts.py` holds the `inject_script` operations.
 
+The companion bridge is a set of top-level modules on two sides of one loopback port.
+`bridge_daemon.py` is the standalone process that owns the port, holds the single
+connection to the Chrome companion, relays commands for any number of MCP servers and
+keeps the tab-claim register (`bridge_claims.py` holds its pure rules);
+`bridge_handshake.py` and `bridge_auth.py` are the challenge-response both roles speak.
+`bridge_outbox.py` is how the daemon writes to a client: one ordered outbox per client,
+sent by a thread of its own, so a client that stopped reading stalls nobody but itself and
+one that falls 256 MB behind is disconnected. `chrome_bridge.py` is the client of that
+daemon and the WebDriver-shaped driver above it. `bridge_attach.py` is the explicit
+debugger attach a session makes as soon as its tab exists (`WSN_ATTACH_TIMEOUT`), and
+`bridge_patience.py` decides how long a built-in limit waits for a busy machine: it times
+the cheapest commands, reads the machine's CPU load when a limit runs out, and never
+extends a limit the caller chose. `page_ready.py` is the wait `open` makes for
+`document.readyState`: short polls inside the caller's `timeout_seconds`, an unanswered
+poll read as "not ready yet". In the extension, `chrome-extension/debugger-attach.js`
+attaches once per tab however many commands ask at the same moment and reports the
+timing through the `debugger.attach` command. `scripts/bridge_probe.py` times each bridge
+step on one blank background tab, which tells a broken bridge from a slow Chrome.
+
 `scripts/architecture_policy.py` is the executable dependency allowlist. The AST checker
 resolves absolute and relative imports; a leaf may not import `main` or `browser_tools`.
 Third-party dependencies are named explicitly. Do not bypass boundaries with dynamic
@@ -89,6 +108,12 @@ be copied into the MCP repository.
   is the one place that closes everything unasked, because no owner outlives it. The one
   exception is a session opened with `persist=true`: its tab is detached and parked, and
   only an explicit `reattach` that re-proves the tab's identity continues it.
+- Several MCP servers share one Chrome through one bridge daemon, and tab ownership lives
+  there: every tab a server opens or claims is registered with the daemon, a command for a
+  tab another connected client holds is refused, and a claim ends with its client's
+  connection. No client may make another wait: the daemon queues each client's frames in
+  that client's own outbox instead of writing them from the thread that reads the
+  companion, and a slow Chrome is waited for rather than reported as a broken bridge.
 - The session cap is per process and shared by every agent in it. It is a setting in three
   places, in this order: the server's own environment, then the companion popup's value
   relayed through the bridge hello, then the built-in default. The refusal at the cap names

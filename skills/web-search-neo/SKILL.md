@@ -10,9 +10,9 @@ they are meant to be used in this order.
 
 | Call | Answers |
 | --- | --- |
-| `web_info(topic="actions")` | What can I call? Every action with its summary and required parameters. `params={"group": "macro"}` narrows it to one group (`search`, `fetch`, `session`, `page`, `game`, `macro`). |
+| `web_info(topic="actions")` | What can I call? Every action with its summary and required parameters. `params={"group": "macro"}` narrows it to one group (`search`, `fetch`, `session`, `page`, `game`, `macro`, `audit`). |
 | `web_info(topic="skill")` | How do I work? The compact inspect → act → verify playbook, plus the names of its detailed sections. |
-| `web_info(topic="skill", params={"section": "<name>"})` | The full section: when it applies, the calls in order, the rules that cannot be guessed, and what to avoid. Sections are `start`, `loop`, `locators`, `forms`, `macros`, `guarded`, `parallel`, `search`, `diagnostics`, `games`, `audit`, `testing`, `computers`, `troubleshooting`. |
+| `web_info(topic="skill", params={"section": "<name>"})` | The full section: when it applies, the calls in order, the rules that cannot be guessed, and what to avoid. Sections are `start`, `loop`, `locators`, `forms`, `macros`, `macro_scripts`, `guarded`, `parallel`, `search`, `diagnostics`, `games`, `audit`, `testing`, `computers`, `troubleshooting`. |
 | `web_info(topic="action_schema", params={"action": "<name>"})` | Exactly what one action or one observation topic accepts: optional names, types, defaults. |
 
 `web_info()` with no arguments returns the whole contract at once — action index, topics,
@@ -63,8 +63,9 @@ outcome happened. After navigation or rerender, discard old selectors, refs, and
   `frame_selector`: it always counts the whole existing DOM, including rendered controls
   below the viewport. Paginate each category with `limit` plus `offset` until
   `range.<category>.next_offset` is null. Scroll only to materialize lazy/infinite content,
-  then reread from `offset=0`. Only `[contenteditable="true"]` is listed as a field, so a bare
-  `<div contenteditable>` shows up in `page_outline` and here not at all.
+  then reread from `offset=0`. Its `fields` list looks for `[contenteditable="true"]`
+  literally, so a bare `<div contenteditable>` shows up in `page_outline` and here only
+  under `category="interactive"`.
 - `console`: console output and uncaught errors with stack frames. Pages through history
   with `since_seq` and `limit`, and keeps its own place, so it never competes with
   `game_probe` for entries.
@@ -90,20 +91,24 @@ iframes; a cross-origin frame is a stub, so pass its selector as `frame_selector
 
 ## Locators
 
-Plain CSS works everywhere and stays the default. In companion `current` Chrome, it is the
-only action locator: never send `ref:` or a `>>>` piercing path to `click`, `fill`, `wait`,
-`upload`, `submit.form_selector`, or an input action. Outline refs and piercing paths are
-still useful for observation there, but they are not action locators.
+Plain CSS works everywhere and stays the default. In companion `current` Chrome, treat it
+as the only action locator: that mode has no element handles, so a `ref:` or a `>>>`
+piercing path sent to `click`, `fill`, `wait`, `upload` or `submit.form_selector` is found
+again by script, from the top document, on every call. It resolves for an element of the
+top document; a ref read inside a frame is refused, and CSS with `frame_selector` is the
+way to an element in a frame. Outline refs and piercing paths stay useful for observation
+there.
 
-In `temporary`, `persistent`, and `attach` sessions, `fill`, `upload`, `click`, `wait`, and
-`submit.form_selector` may also accept a fresh ref such as `ref:3f9a1c04b7e25d18:12` or a
-piercing path such as `#host >>> .inner`. `submit_selector` always needs plain CSS.
+In `isolated`, `temporary`, `persistent`, and `attach` sessions, `fill`, `upload`, `click`,
+`wait`, `scroll` and `submit.form_selector` also accept a fresh ref such as
+`ref:3f9a1c04b7e25d18:12` or a piercing path such as `#host >>> .inner`, and follow it into
+whichever frame holds the element. `submit_selector` always needs plain CSS.
 
 A `frame_selector` always names exactly one frame: CSS matching two is refused with the
 count, everywhere. The accepted *forms* differ. `fill`, `click`, `wait`, `submit`, `upload`,
 `render` and the `page_outline`/`page_text`/`find` topics take all three. The input actions
-— `press_keys`, `pointer`, `touch`, `game_probe`, an `input` batch's pointer entries and
-every `pointer_lock` operation — take plain CSS only: they aim by coordinate and need the
+— `press_keys`, `pointer`, `touch`, `game_probe`, `input` and every `pointer_lock`
+operation — take plain CSS only: they aim by coordinate and need the
 frame's box in the top-level page, so a ref or a `>>>` path is refused before any event. Do
 not copy the outline's `#host >>> #frame` path into `game_probe` or `input`; give those a
 CSS selector that is unique by itself.
@@ -153,7 +158,23 @@ stay reachable, so local services work unchanged.
   that opened it; the session stays on its tab. Move with `tabs {op:"switch", handle}` or
   `follow_new_tab=true` on `click`/`click_text`; `tabs` also lists and closes them.
 - Another agent may be driving the same Chrome: `attach_tab` on a tab it already holds is
-  refused with who holds it. Pick a different tab or open your own; do not retry.
+  refused with who holds it. Pick a different tab or open your own; do not retry. Any
+  number of MCP servers and sessions share one Chrome through one bridge daemon, a tab
+  each; since 1.30 an agent that hangs delays only itself, so a timeout of yours is about
+  Chrome or the page, not about the other agents.
+- On a busy machine (a build, a render, a local model on the CPU) Chrome answers late, and
+  the server waits for it on its own: a `current` session's debugger attach gets up to
+  `WSN_ATTACH_TIMEOUT` seconds (default 60), and built-in timeouts go on waiting while
+  Chrome answers slowly or the CPU is above 80 %. A limit you pass yourself is never
+  extended. If a call still ends in `timed out`: retry once - after the other work has
+  finished when the message names the CPU load; `the page did not finish loading` means a
+  larger `timeout_seconds` on `open` (the message says whether the page was still
+  `'interactive'`, i.e. fetching, or left the question unanswered, i.e. starved of CPU, and
+  `open` never waits longer than you asked); a slow script of your own means `timeout_seconds` on
+  `run_script`; `Chrome did not attach its debugger` means the user should raise
+  `WSN_ATTACH_TIMEOUT`. `python scripts/bridge_probe.py` in the server's checkout times
+  each bridge step and tells a broken bridge from a slow Chrome. A timeout is not a reason
+  to reinstall the companion, switch browsers, or assume another session is in the way.
 - Tabs open in the background and nothing steals the user's focus, so they keep working
   while you do. Hidden-tab throttling is compensated, so frames, timers and input behave.
   A session whose Chrome restarted (or whose companion self-updated) is dropped with an
@@ -246,8 +267,8 @@ was typed — disabled, readonly, no such `<option>` — still shows what it hol
 nothing could be read back, i.e. the selector matched nothing or the control is gone. The
 browser's own tidying is not a refusal: trimmed whitespace on `email`/`url`, `\r\n`, and a
 handler's case folding all count as filled, while `maxlength` truncation and a rewritten
-value still fail. Checkboxes take `1/yes/y/on/check/checked` or
-`0/no/n/off/uncheck/unchecked`. Only a `<select multiple>` takes a list, reads back as one,
+value still fail. Checkboxes take `true/1/yes/y/on/check/checked` or
+`false/0/no/n/off/uncheck/unchecked`. Only a `<select multiple>` takes a list, reads back as one,
 and has its whole selection replaced by a scalar. Date, time, range and colour controls are
 set rather than typed, so an unparseable value is refused without touching the control and
 the error names the format. `upload`, and `fill`'s `files` key, *replace* an input's
@@ -271,8 +292,8 @@ target, while cross-origin frames use their child debugger target. This prevents
 a top-level decoy input from being selected and avoids the opaque Chrome
 `Uncaught` error that otherwise occurs for a valid same-origin iframe upload.
 `fill`, `click`, `submit`, `upload` and `wait` accept `frame_selector`; `wait`'s
-`timeout_seconds` defaults to 10 and is respected as passed — ask for as long as
-the target needs. `wait` also takes `script` instead of `selector`: a JS
+`timeout_seconds` defaults to 10 and is respected as passed up to 300 s (a larger
+value is cut to that, and `timeout_note` says so). `wait` also takes `script` instead of `selector`: a JS
 expression polled atomically server-side until truthy, for SPA hydration and
 framework flags (`window.__hydrated === true`) that no selector expresses.
 `challenge_detected` means a challenge is *blocking* — a widget, or a positioned ancestor of
@@ -347,7 +368,8 @@ silently falling back.
 
 For state only the page holds — virtualised rows, framework stores — and for mutations with
 no input-shaped equivalent, use `run_script` (web_action) or the `execute_js` topic
-(web_info). Both run in the session's top document; `args` arrive as `arguments[0..n]` and a
+(web_info). Both run in the session's top document, or in the frame `frame_selector`
+names; `args` arrive as `arguments[0..n]` and a
 JSON-serialisable return value comes back as itself. Prefer `fill`/`click`/`pointer` for
 anything a user gesture should do, and never use a script where a form control read is
 enough.
@@ -366,7 +388,9 @@ writing a script for the same thing.
 
 `cookies` reads every cookie as a full object — `secure`, `httpOnly`, `sameSite` and
 `expires` included, which is what makes a site's session handling auditable rather than just
-readable — and also sets and clears them. Filter with `domain` (substring) and `name` (exact).
+readable — and also sets and clears them. Filter with `domain` (that domain and its
+subdomains, never a substring) and `name` (exact); `op=clear` needs a `domain`, or
+`confirm_clear_all=true` to wipe every cookie of the profile.
 
 `inject_script` registers code that runs *before* every document's own scripts, which is the
 only way to patch an API a page captures on load. It survives navigation for the life of the

@@ -39,6 +39,7 @@ import uuid
 from web_search_neo import bridge_auth, node_link
 from web_search_neo.bridge_claims import claim_is_own, js_number_tab_id
 from web_search_neo.bridge_handshake import SOCKET_LOGGER, TOKEN_MISMATCH_REASON, answer_plain_http, authenticate_peer  # noqa: F401
+from web_search_neo.bridge_outbox import Outbox
 from web_search_neo.process_probe import process_alive
 
 
@@ -189,7 +190,7 @@ class _Client:
     program: str = ""
     name: str = ""
     instance: str = ""  # stable across one bridge object's reconnects
-    lock: threading.Lock = field(default_factory=threading.Lock)
+    outbox: Outbox = field(default_factory=Outbox)
 
     def identity(self) -> dict[str, Any]:
         """Who is asking, as relayed to the companion for its activity badge."""
@@ -198,10 +199,9 @@ class _Client:
 
     def send(self, payload: dict[str, Any]) -> None:
         # Results, state pushes and control answers reach a client from different
-        # threads, and a websocket frame cannot be interleaved with another.
-        text = json.dumps(payload, ensure_ascii=False)
-        with self.lock:
-            self.connection.send(text)
+        # threads. Its outbox writes them in order on a thread of its own, so a client
+        # that stopped reading stalls nobody but itself (bridge_outbox.py).
+        self.outbox.put(self.connection, json.dumps(payload, ensure_ascii=False), self.label)
 
     def send_quietly(self, payload: dict[str, Any]) -> None:
         try:
@@ -947,9 +947,9 @@ class BridgeDaemon:
                 "Bridge client %s detached: %s: %s", label, type(exc).__name__, exc
             )
         finally:
-            # Every exit from the loop lands here (goodbye, dropped socket,
-            # handler exception); a claim that outlived its client could never
-            # be released, so the tab comes back to the pool on all of them.
+            # Every exit from the loop lands here (goodbye, dropped socket, handler
+            # exception); a claim that outlived its client could never be released.
+            client.outbox.close()
             with self._lock:
                 self._clients.discard(client)
                 stale = [key for key, route in self._routes.items() if route.client is client]

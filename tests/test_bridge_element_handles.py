@@ -72,6 +72,8 @@ class _TabBridge:
         params = params or {}
         if method == "tabs.create":
             return {"id": 7, "url": params.get("url", ""), "title": "", "group": params.get("group")}
+        if method == "debugger.attach":
+            return {"tab_id": params["tabId"], "attached": True, "reused": False, "total_ms": 1}
         if method == "events.subscribe":
             return {"started_at": 0, "seq": 0, "domains": params.get("domains", [])}
         if method == "cdp.send":

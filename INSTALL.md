@@ -2,7 +2,7 @@
 
 This guide installs the MCP server from source and connects it to LM Studio or another stdio-compatible MCP client.
 
-It describes version 1.29.0. The Python package, the server, and the bundled Chrome
+It describes version 1.30.0. The Python package, the server, and the bundled Chrome
 companion carry that same version, and the bridge only accepts a companion that speaks the
 current handshake (bridge protocol 2, since 1.15.0) — see [Updating](#updating) if an older one is already
 installed.
@@ -242,13 +242,15 @@ Earlier revisions tried to perform those clicks for you through Windows UI Autom
 code is gone. It depended on the interface language, on which window happened to have focus,
 and on a folder picker that the automation backend does not even enumerate.
 
-The bundled companion is version 1.29.0 and declares five permissions: `alarms`, `debugger`,
-`storage`, `tabs`, and `tabGroups`. There are no content scripts and no `host_permissions`;
+The bundled companion is version 1.30.0 and declares six permissions: `alarms`, `debugger`,
+`notifications`, `storage`, `tabs`, and `tabGroups`. There are no content scripts and no `host_permissions`;
 page access comes from `debugger`, which attaches the Chrome DevTools Protocol to the tabs
 the agent drives. `alarms` exists because Chrome suspends an idle MV3 service worker after
 about thirty seconds: the longer waits in the reconnect backoff have to be handed to
 `chrome.alarms` or they would die with the worker and leave the bridge offline until
 someone clicked the toolbar icon. Chrome shows no additional user-facing warning for it.
+`notifications` is how a pairing request from another computer, and a background macro job
+that ended or asks a question, reach you while the popup is closed.
 
 If the companion was already installed from an earlier revision, Chrome keeps running the
 old service worker until it is reloaded. From 1.3.1 the server does that for you: a
@@ -301,7 +303,10 @@ Two consequences are worth knowing before you troubleshoot anything:
   instance. Both relay through the one daemon, which also keeps them off each other's tabs:
   it registers every tab an agent opens or claims, refuses an `attach_tab` for a tab another
   agent is already driving, and frees a tab the moment that agent's connection ends, however
-  it ends.
+  it ends. Any number of servers, each with any number of sessions, share the browser this
+  way, and since 1.30 none of them waits on another: the daemon writes to each client from
+  an outbox thread of that client's own, so one that hangs (a stopped debugger, a suspended
+  process) delays only itself, and one more than 256 MB behind is disconnected.
 
 You can drive it directly from the clone:
 
@@ -367,7 +372,7 @@ identity, so the server cannot tell two agents apart. It can say it is happening
 with `shared_session_warning` appears on `browser_status` and on `open` when this very session
 is one of them. Give each agent its own `session_id` and they get a tab each. The session cap
 is per process too, so parallel agents share it — raise it with `WEB_SEARCH_NEO_MAX_SESSIONS`
-if four is not enough for the number of agents you run.
+if the default of 30 is not enough for the number of agents you run.
 
 ### The shared bridge secret
 
@@ -554,11 +559,23 @@ Two cases still need the human:
 Confirm with `web_info(topic="browser_status")` that `current_chrome.connected` is `true`
 before continuing.
 
+### Migrating to 1.30: a slow Chrome is waited for, and agents do not wait on each other
+
+Nothing to change in your calls. One new environment variable, `WSN_ATTACH_TIMEOUT`
+(default 60 s), bounds the debugger attach of a `current`-mode session; the other waits
+adjust themselves, as described under
+[`open` fails with `cdp.send timed out` on a busy machine](#open-fails-with-cdpsend-timed-out-on-a-busy-machine).
+A companion older than 1.30 keeps working - the server sends it a warm-up script in place
+of the new `debugger.attach` command - but only a reloaded one attaches once per tab and
+hands a blank tab back at once. The bridge daemon of an older revision is replaced by the
+first 1.30 server that meets it, as after any update, and with the new daemon one client
+that hangs no longer holds back the others sharing the browser.
+
 ### Migrating to 1.27: a captcha is named before anything is spent
 
 Nothing to change in your existing calls, and no new environment variable. Two habits are worth changing:
 
-- Before calling anything that answers a captcha, call `captcha_challenge {page_url}` (with `aid=` when the site does not publish its own id, or `site_aid=true` to read the id document the site publishes). It says which vendor and which kind of challenge this is, and whether this machine can measure it. An image-select grid - "click the tiles showing X" - is not a slider, and dragging one was the fastest way to burn its single attempt. `captcha_verify` refuses an unsure measurement or an unsolved hash on its own, so nothing is wasted even if you forget.
+- Before calling anything that answers a captcha, call `captcha_challenge {page_url}` (with `aid=` when the site does not publish its own id, or `site_aid=true` to read the id document the site publishes). It says which vendor and which kind of challenge this is, and whether this machine can measure it. An image-select grid - "click the tiles showing X" - is not a slider, and dragging one was the fastest way to burn its single attempt. The action that spends an answer, `captcha_answer` (since 1.28; `captcha_verify` is the library call behind the same rule, not an action), refuses an unsure measurement of its own or an unsolved hash, so nothing is wasted even if you forget.
 - Run `auto_fix {dry_run: true}` before `auto_fix`. It reports what the page asked for without touching it, and `undo: true` takes a consent click back when the guess was wrong.
 
 `api_report` answers gained two fields that change what a 403 means: every entry in `error_meanings[]` now carries `rejected_by` (`edge` or `application`), and `probe_journal` lists, per host, the `{id}` path templates this host already answered and what each status meant there. Both come from traffic already captured - the audit still sends no probe requests.
@@ -605,12 +622,27 @@ Set these for the MCP server process before it starts.
 | `WEB_SEARCH_NEO_BROWSER_USER_AGENT` | Override the User-Agent of rendered sessions. |
 | `WEB_SEARCH_NEO_PROFILE_ROOT` | Root directory for `persistent` Chrome profiles. |
 | `WEB_SEARCH_NEO_MAX_SESSIONS` | How many browser sessions one server holds at once, default `30`; any number is accepted, and `0` (or `unlimited`) removes the cap. The cap is per process and parallel agents share it, so raise it when several agents each need a page of their own. |
+| `WEB_SEARCH_NEO_SESSION_IDLE_TTL` | Seconds a session may sit unused before it is reaped when the cap is reached, default `1800`. |
+| `WEB_SEARCH_NEO_PARKED_SESSION_TTL` | Seconds a `persist=true` session stays re-attachable while parked, default `86400` (24 hours), at least `60`. |
+| `WEB_SEARCH_NEO_HTTP_SESSION_TTL` | Idle lifetime of an `http_session` cookie jar, default `1800` seconds, at least `60`. |
+| `WEB_SEARCH_NEO_FETCH_COOKIE_JAR` | `0` stops plain page fetches from keeping a per-host cookie jar between calls. |
+| `WEB_SEARCH_NEO_FETCH_MIN_INTERVAL` | Seconds kept between two plain fetches to the same public host, default `1.2`; `0` turns the pause off. |
+| `WEB_SEARCH_NEO_AGENT_PRESENCE` | `0` turns off the marks on a driven tab (favicon dot, flash, panel, ghost cursor) everywhere; it wins over the popup's **Agent presence** switch. |
+| `WEB_SEARCH_NEO_LABEL_TABS` | `0` stops `current`-mode tabs from getting the `[agent_label] ` title prefix. |
+| `WEB_SEARCH_NEO_POINTER_GLIDE` | `0` makes clicks and hovers jump to their target instead of gliding to it. |
+| `WEB_SEARCH_NEO_PROJECT_ROOT` | The project whose `.web-search-neo/macros/` every macro call uses when it passes no `project_root`. |
+| `WEB_SEARCH_NEO_MACRO_ROOT` | Where the per-user macro store lives; a named project wins over it. |
+| `WEB_SEARCH_NEO_JOBS_DIR` | Where macro jobs write their state, default `~/.web-search-neo/macro-jobs`. |
+| `WEB_SEARCH_NEO_SCHEDULES_FILE` | The macro schedules file, default `~/.web-search-neo/macro-schedules.json`. |
 | `WEB_SEARCH_NEO_DEBUGGER_ADDRESS` | Default DevTools address for `attach` mode. |
 | `WEB_SEARCH_NEO_BRIDGE_PORT` | Loopback port of the companion bridge, default `8765`. Shared by the daemon and every MCP server; set the companion's own port in its popup under Settings. |
 | `WEB_SEARCH_NEO_BRIDGE_IDLE_SECONDS` | How long the bridge daemon stays up with neither a companion nor a client attached, default `900`. `0` disables the timer. |
 | `WEB_SEARCH_NEO_BRIDGE_AUTOSPAWN` | `0`, `false`, or `no` stops a server from starting a daemon; it then works only if one is already running. |
 | `WEB_SEARCH_NEO_BRIDGE_CONNECT_TIMEOUT` | How long a server keeps trying to reach a daemon, including one it just started, default `12` seconds. |
 | `WEB_SEARCH_NEO_BRIDGE_START_TIMEOUT` | How long startup waits for that first attempt before it continues in the background, default `2` seconds. |
+| `WSN_ATTACH_TIMEOUT` | Seconds a `current`-mode session waits for Chrome to attach its debugger to the session's tab, default `60`, clamped to `5`-`600`. Raise it when a busy machine makes the attach itself run out; see [Troubleshooting](#open-fails-with-cdpsend-timed-out-on-a-busy-machine). |
+| `WSN_TAB_CREATE_TIMEOUT` | Seconds a `current`-mode session waits for the companion to create its tab, default `60`. |
+| `WSN_FORBID_CURRENT_PROFILE` | `1`, `true`, `yes` or `on`: no session may drive your own Chrome. `profile_mode="current"` is downgraded to `temporary` (the answer's `profile_mode` says so) and `auto` resolves to `temporary`. Meant for benchmarks and batch jobs. |
 | `WEB_SEARCH_NEO_LOGON_START` | `0` makes the popup's **Start with Windows** off by default; a choice made in the popup still wins. |
 | `WEB_SEARCH_NEO_NODE_SHARE` | `0` makes **Share this computer** off by default. The other `WEB_SEARCH_NEO_NODE_*` settings are in [docs/remote-nodes.md](docs/remote-nodes.md). |
 | `WEB_SEARCH_NEO_ALLOW_PLAIN_HTTP` | Accept unencrypted `http://` to public hosts. |
@@ -628,7 +660,9 @@ Set these for the MCP server process before it starts.
 The `WEB_SEARCH_NEO_BRIDGE_*` variables reach the daemon as well: a spawned one inherits the
 environment of the server that started it, and one you run yourself with
 `python main.py --bridge` reads them from that shell. A daemon that is already running keeps
-the values it started with, so stop it with `--bridge --stop` after changing them.
+the values it started with, so stop it with `--bridge --stop` after changing them. The two
+`WSN_*_TIMEOUT` variables are read by the MCP server, not by the daemon: restarting the
+server (or toggling it in the client) is what applies them.
 
 `WEB_SEARCH_NEO_ALLOW_PLAIN_HTTP` accepts `1`, `true`, `yes`, or `on`. Without it, plain
 `http://` to a public host is refused for both page fetches and browser `open`, and each
@@ -667,7 +701,7 @@ enabled at `chrome://extensions`, that the toolbar badge shows `ON`, and that
 `current_chrome.daemon.linked` is `true` — that last one separates "the server cannot reach
 the bridge" from "the bridge cannot reach Chrome". If port 8765 is occupied by something
 that is not our daemon, stop that process, or set the same free `WEB_SEARCH_NEO_BRIDGE_PORT`
-for the MCP and the extension source before loading it. To take the bridge under your own
+for the MCP and under **Settings → Bridge port** in the companion's popup. To take the bridge under your own
 control while you reproduce the problem, stop the running one and start it yourself, then
 follow `%LOCALAPPDATA%\WebSearchNeo\bridge-daemon.log` — that is where it writes, foreground
 or not:
@@ -725,9 +759,10 @@ or when `setup_current_chrome` answered `self_update: "unsupported"` or `"timeou
    very directory **Load unpacked** points at, then reload the extension. Restarting the
    daemon does not help and never did after the daemon learned to re-read the token file:
    it already fetches the current secret from disk before calling anything a mismatch.
-3. Check the card's version. It must read 1.29.0; anything older speaks bridge protocol 1
-   and is refused with `Expected Web Search Neo bridge protocol 2; update and reload the
-   companion`, and Chrome only picks up the new manifest on reload.
+3. Check the card's version. It must read 1.30.0 once the reload has taken. A build older
+   than 1.15.0 speaks bridge protocol 1 and is refused with `Expected Web Search Neo bridge
+   protocol 2; update and reload the companion`; a newer one that is merely behind still
+   connects, but Chrome only picks up the new manifest on reload.
 4. `%LOCALAPPDATA%\WebSearchNeo\bridge-daemon.log` records the bridge's side: `Rejected a
    bridge extension that did not prove it knows the companion token` or `A bridge peer left
    during the challenge (token mismatch?)` confirms that something did reach the port but
@@ -735,7 +770,66 @@ or when `setup_current_chrome` answered `self_update: "unsupported"` or `"timeou
 
 The companion keeps retrying a refused handshake on its own — starting at about ten seconds
 and slowing to at most two minutes — so once the cause is fixed it reconnects without help.
-Clicking the toolbar icon resets that schedule and retries immediately.
+The popup's **Reconnect** button resets that schedule and retries immediately.
+
+### `open` fails with `cdp.send timed out` on a busy machine
+
+The symptom: in `profile_mode="current"` an `open`, or the first command after it, fails
+with `Chrome bridge command 'cdp.send' timed out` while something else has the CPU - a
+build, a render, a game engine, a local model. The cause is Chrome answering slowly, not a
+broken bridge and not another session holding it up: with the CPU at 100 % Chrome was
+measured taking 10 s to call a new blank tab "complete" and 12.7 s to attach its debugger,
+ten times what an idle machine needs.
+
+What the server does about it on its own since 1.30:
+
+- It attaches the debugger as a step of its own, as soon as the session's tab exists, and
+  waits for that one step up to `WSN_ATTACH_TIMEOUT` seconds (default 60, clamped to
+  5-600). If the attach never answers, the tab it opened for the session is closed and the
+  error reads `Chrome did not attach its debugger to tab N within 60 s` and names the
+  setting.
+- It lets its built-in timeouts wait for a busy machine. The bridge times its cheapest
+  commands, and while the slowest of the last three minutes is 3 s or more, every built-in
+  limit starts at four times that, up to 120 s. When a built-in limit still runs out, the
+  CPU time the whole machine used during that wait is read: above 80 % the wait goes on one
+  more limit at a time, up to four in all, and a timeout after that names the CPU load. A
+  limit you chose yourself (`timeout_seconds` of `run_script`, an explicit CDP timeout) is
+  never extended.
+- `open` waits for the page until its own `timeout_seconds` and no longer. It polls
+  `document.readyState` with short polls (five seconds at most, never longer than the time
+  left); a poll the busy page left unanswered counts as "not ready yet", not as a failed
+  `open`, and the error at the end says whether the page was still `'interactive'` or
+  `'loading'`, or left the question unanswered.
+
+To see whether the bridge is broken or Chrome is merely slow, run the probe from the clone
+(it needs the companion connected and touches no other tab):
+
+```text
+python scripts/bridge_probe.py
+```
+
+It opens one blank background tab in the agent group and prints one line per step with the
+seconds it took: `tabs.list`, `tabs.create`, `debugger.attach` (with the attach and setup
+times the companion measured), `first script`, `second script`, `events.subscribe`,
+`tabs.remove`. On an idle machine every line is well under a second and the last line is
+`Every step answered quickly: the bridge is healthy.` A step of five seconds or more, or a
+failed one, is listed after `Slow or failed:` and the exit code is 1: the bridge works and
+Chrome is slow. `The companion is not connected` (exit code 2) is the other problem - see
+[Current Chrome companion cannot connect](#current-chrome-companion-cannot-connect). A
+line saying the companion is older than 1.30 means it still works, through a warm-up
+script, but only a reloaded one attaches once per tab.
+
+What is left for you:
+
+- Retry once. When the message says the wait was extended because the CPU was busy, retry
+  after the other work has finished.
+- `the page did not finish loading within N s`: pass a larger `timeout_seconds` to `open`
+  (the default is 20). `document.readyState was still 'interactive'` means the page was
+  still fetching something and more time is the whole answer; `the page left the question
+  unanswered` means the page itself got no CPU, so retry when the machine is less busy.
+- A script of your own that needs longer: pass `timeout_seconds` to `run_script`.
+- `Chrome did not attach its debugger ... within 60 s`: raise `WSN_ATTACH_TIMEOUT` in the
+  MCP server's environment and restart the server.
 
 ### Starting fresh after a reboot
 

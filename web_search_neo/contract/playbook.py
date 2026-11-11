@@ -143,7 +143,7 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
             "Use a ref: handle or an 'a >>> b' piercing path only for observation, or for actions in temporary/persistent/attach sessions.",
         ],
         "rules": [
-            "In current Chrome (the default) every action locator is plain CSS. click, fill, wait, upload, submit.form_selector and the input actions refuse ref: and >>> there.",
+            "In current Chrome give every action a plain CSS locator. A ref: or >>> sent to click, fill, wait, upload or submit.form_selector is found again by script in the top document only: one read inside a frame is refused, so reach a frame with CSS and frame_selector.",
             "frame_selector always names exactly one frame; ambiguous CSS is refused with the count. Coordinate actions (press_keys, pointer, touch, input, game_probe, pointer_lock) take plain CSS for it and nothing else.",
             "A ref carries the document epoch it came from. Pass it back exactly as returned; after navigation it resolves to nothing on purpose.",
             "Repeated visible text is not identity. Compare an exact href, control value, or stable attribute from a fresh page_elements read.",
@@ -520,8 +520,8 @@ _SKILL_SECTIONS: dict[str, dict[str, Any]] = {
             },
             {
                 "symptom": "A locator is refused in current Chrome.",
-                "cause": "ref: and >>> are observation-only in the user's own Chrome.",
-                "fix": "Give the action a plain CSS selector.",
+                "cause": "A ref: or >>> resolves only in the top document of the user's own Chrome; one read inside a frame is refused.",
+                "fix": "Give the action a plain CSS selector, with frame_selector for an element inside a frame.",
             },
             {
                 "symptom": "macro 'x' does not exist, but it was just saved.",

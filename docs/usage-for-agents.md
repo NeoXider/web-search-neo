@@ -20,8 +20,9 @@ instead. Written from live sessions, not from hope.
 - A plain fetch sends browser-like headers **only when the caller named none**;
   a caller who named headers gets exactly those. The pick is sticky per host so
   one session keeps one face.
-- Politeness: a small fixed floor keeps requests to one host apart and honours
-  whatever `Retry-After` the host asked for. Private and loopback hosts skip the
+- Politeness: a small fixed floor (1.2 s by default; `WEB_SEARCH_NEO_FETCH_MIN_INTERVAL`
+  sets it, `0` turns it off) keeps requests to one host apart and honours
+  whatever `Retry-After` the host asked for, up to 30 s. Private and loopback hosts skip the
   gate. A host that sees a hop every hundred milliseconds answers the tenth with
   a 429 - the pause is cheaper than the challenge.
 - Consent cookies planted on the first visit ride along on the second: the
@@ -40,8 +41,18 @@ instead. Written from live sessions, not from hope.
 Drive a real Chrome window when a site wants a browser: open and close tabs,
 click, type, fill and submit forms, upload files, scroll, screenshot, read
 console and network traffic, HAR export, perf report, test runs. Captcha is
-detected and reported; the solver interface is pluggable and **off by default**.
+detected and reported; the plain-fetch solver interface is pluggable and **off by
+default** (`WEB_SEARCH_NEO_FETCH_SOLVER` names a registered one).
 
+- A new session without `profile_mode` opens an isolated headless browser; ask
+  for `profile_mode="current"` when the task needs the user's own Chrome.
+- Several agents and sessions share that Chrome through one bridge daemon, a tab
+  each, and an agent that hangs delays only itself.
+- On a busy machine Chrome answers late and the server waits for it on its own
+  (the debugger attach up to `WSN_ATTACH_TIMEOUT`, default 60 s; built-in
+  timeouts while Chrome answers slowly or the CPU is above 80 %). If a call still
+  times out: retry once, raise `timeout_seconds` on `open` for a heavy page, and
+  time the bridge with `python scripts/bridge_probe.py` before calling it broken.
 - A banner appears on driven tabs when the profile is not isolated; run isolated
   modes when the banner would be seen by someone.
 - Sessions are per profile; keep the one you were given, name new ones, and park

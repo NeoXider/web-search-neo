@@ -43,7 +43,10 @@ _MAX_PROBE_SOURCES = 32
 _probe_sources: set[str] = set()
 _probe_lock = threading.Lock()
 
-HANDSHAKE_TIMEOUT = 5.0
+# How long either side waits for the other's next handshake frame. Five seconds was not enough on a
+# machine pegged by other work: a client that had only just started was still importing when the
+# daemon gave up on its hello, so every first connection failed and only the retry got through.
+HANDSHAKE_TIMEOUT = 20.0
 MIN_NONCE_CHARS = 16
 MAX_NONCE_CHARS = 256
 TOKEN_MISMATCH_REASON = "Companion token mismatch; reload the extension on chrome://extensions"

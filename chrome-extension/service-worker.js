@@ -25,6 +25,7 @@ import {selfCodeHash} from "./code-hash.js";
 import {PROTOCOL_VERSION, advanceHandshake, bytesToHex, loadBridgeToken, newNonce} from "./bridge-auth.js";
 import {controlMessage, pauseState, refuseWhilePaused} from "./control.js";
 import {createNodeRelay} from "./nodes.js";
+import {createDebuggerAttacher} from "./debugger-attach.js";
 
 export {loadBridgeToken, parseBridgeToken} from "./bridge-auth.js";
 
@@ -352,77 +353,13 @@ async function sendSafe(tabId, method, params = {}) {
   }
 }
 
-async function ensureDebugger(tabId) {
-  await restoreState();
-  bufferFor(tabId);
-  if (attachedTabs.has(tabId)) {
-    try {
-      // chrome.storage.session outlives an MV3 worker. Usually Chrome keeps the
-      // debugger attachment too, but it can drop just that attachment (a tab
-      // crash, an extension reload, or the old MCP session letting go) while
-      // the stored Set still says it is present. Trusting the shelf then makes
-      // every later command fail with "Debugger is not attached" and, because
-      // this early return never repairs it, the tab stays unusable forever.
-      await chrome.debugger.sendCommand({tabId}, "Runtime.enable");
-      return;
-    } catch (error) {
-      console.warn(`bridge: forgot a stale debugger attachment for tab ${tabId}`, error);
-      // Preserve already-recorded events, but make capture and child sessions
-      // earn their state again after the fresh debugger attachment below.
-      forgetTab(tabId, false);
-    }
-  }
-  try {
-    await chrome.debugger.attach({tabId}, DEBUGGER_VERSION);
-  } catch (error) {
-    // Chrome refuses a second attach both when the debugger already on the tab
-    // is this worker's own - the ordinary case after an eviction, since Chrome
-    // keeps the attachment that the worker forgot - and when it belongs to
-    // somebody else: a DevTools window, another extension. The message does not
-    // reliably tell those apart, so this does not try to. The setup below is
-    // what decides: a session that is ours answers it, and one that is not
-    // throws, leaving the tab unattached rather than recorded as ready.
-    if (!/already attached/i.test(String(error?.message || error))) throw error;
-  }
-  try {
-    await chrome.debugger.sendCommand({tabId}, "Runtime.enable");
-    await sendSafe(tabId, "Page.enable");
-    await sendSafe(tabId, "Log.enable");
-    await sendSafe(tabId, "Target.setAutoAttach", {
-      autoAttach: true,
-      waitForDebuggerOnStart: false,
-      flatten: true,
-    });
-    // Without this a tab that was never in front is barely controllable, which
-    // measurement rather than theory established: Input.dispatchKeyEvent and
-    // dispatchMouseEvent return success and are then dropped on the floor, no
-    // event reaches the page at all; requestAnimationFrame never fires; and
-    // setTimeout is clamped to one second, then to sixty after a minute or so
-    // hidden. With focus emulation on, the same hidden tab measured 49 fps and
-    // 4.5 ms timers - foreground numbers - and input arrives.
-    //
-    // The cost is that the page is told it is focused and visible when it is
-    // not, so a script watching visibilitychange sees a tab that never hides.
-    // For a page an agent is driving that is closer to the truth than the
-    // alternative: something is looking at it, and it should behave as if. The
-    // setting belongs to this debugger session and dies with it, so the tab goes
-    // back to ordinary background behaviour the moment the session detaches.
-    await sendSafe(tabId, "Emulation.setFocusEmulationEnabled", {enabled: true});
-  } catch (error) {
-    // Nothing here is optional: a tab that skipped this is the one that accepts
-    // keystrokes and drops them. So it is not recorded, the half-open session is
-    // let go, and the next call attaches again - which is what recovers a tab
-    // whose DevTools window the user has meanwhile closed.
-    await chrome.debugger.detach({tabId}).catch(() => {});
-    throw new Error(
-      `Chrome would not let the companion drive tab ${tabId}: ` +
-        `${error?.message || error}. Something else is debugging that tab - close its ` +
-        "DevTools window (or the other extension using it) and try again.",
-    );
-  }
-  attachedTabs.add(tabId);
-  persistState();
-}
+// Attach once per tab however many commands ask at once, and say how long it took
+// (debugger-attach.js). Everything below goes through this one function.
+const debuggerAttacher = createDebuggerAttacher({
+  chromeApi: () => chrome, version: DEBUGGER_VERSION, attachedTabs, restoreState, bufferFor,
+  forgetTab, persistState, sendSafe,
+});
+const ensureDebugger = tabId => debuggerAttacher.ensure(tabId);
 
 // Every DevTools method the server sends through "cdp.send", and nothing else. This narrows
 // the protocol surface, not the power: Runtime.evaluate, Input.*, cookies and Fetch still let an
@@ -712,7 +649,10 @@ const commands = {
       tab = await chrome.tabs.create({url, active: wanted});
     }
     await ensureGroup(tab.id, group);
-    return serializeTab(await waitForTab(tab.id, 10000), await groupMap());
+    // A blank tab has nothing to load and the server navigates it next, so it is not
+    // worth the ten seconds a busy Chrome can take to call it "complete".
+    const patience = url === "about:blank" ? 1500 : 10000;
+    return serializeTab(await waitForTab(tab.id, patience), await groupMap());
   },
 
   // Navigating says nothing about who should be looking at the tab, so it no
@@ -884,6 +824,12 @@ const commands = {
       size: row?.size ?? body.length,
       body: body.slice(0, BODY_LIMIT),
     };
+  },
+
+  // Attach ahead of the first real command: the server gives this one slow step its
+  // own generous timeout instead of spending the short one of whatever it runs next.
+  async "debugger.attach"({tabId}) {
+    return ensureDebugger(Number(tabId));
   },
 
   async "debugger.detach"({tabId}) {

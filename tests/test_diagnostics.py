@@ -890,6 +890,8 @@ class _FakeCompanionBridge:
             return self._tab()
         if method in {"tabs.get", "tabs.activate"}:
             return self._tab()
+        if method == "debugger.attach":
+            return {"tab_id": params["tabId"], "attached": True, "reused": False, "total_ms": 1}
         if method == "tabs.navigate":
             self.url = params["url"]
             self.page_requests(self.url, "https://example.test/boot.js")

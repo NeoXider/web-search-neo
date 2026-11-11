@@ -30,6 +30,8 @@ from selenium.common.exceptions import NoSuchElementException, TimeoutException,
 from web_search_neo import bridge_auth
 from web_search_neo import bridge_daemon
 from web_search_neo import bridge_handshake
+from web_search_neo.bridge_attach import attach_debugger
+from web_search_neo.bridge_patience import Patience, patient
 from web_search_neo.cdp import element_handles
 from web_search_neo.bridge_daemon import (
     CHROME_EXTENSION_ID,
@@ -288,6 +290,7 @@ class ChromeBridge:
         )
         self._state_lock = threading.RLock()
         self._send_lock = threading.Lock()
+        self.patience = Patience()  # how long to wait for a busy Chrome (bridge_patience.py)
         self._pending: dict[str, _PendingRequest] = {}
         # Old tab id -> the id Chrome replaced it with, as the companion reported.
         self._followed: dict[int, int] = {}
@@ -1021,7 +1024,7 @@ class ChromeBridge:
                 'which needs no extension, or send {"action": '
                 '"setup_current_chrome"}, which returns the steps to install it.'
             )
-        request_id = uuid.uuid4().hex
+        request_id, started = uuid.uuid4().hex, self.patience.clock()
         with self._state_lock:
             connection = self._daemon
             pending = _PendingRequest(event=threading.Event(), connection=connection)
@@ -1032,12 +1035,7 @@ class ChromeBridge:
             raise ChromeBridgeUnavailable("Chrome companion extension disconnected")
         try:
             payload = json.dumps(
-                {
-                    "type": "command",
-                    "id": request_id,
-                    "method": method,
-                    "params": params or {},
-                },
+                {"type": "command", "id": request_id, "method": method, "params": params or {}},
                 ensure_ascii=False,
             )
             try:
@@ -1049,8 +1047,7 @@ class ChromeBridge:
                 raise ChromeBridgeUnavailable(
                     f"The bridge daemon link dropped while sending '{method}': {exc}"
                 ) from exc
-            if not pending.event.wait(max(0.1, timeout)):
-                raise TimeoutError(f"Chrome bridge command '{method}' timed out")
+            self.patience.wait(pending.event, method, timeout, started)  # raises TimeoutError
             if pending.error:
                 if pending.transport_failure:
                     raise ChromeBridgeUnavailable(pending.error)
@@ -1443,7 +1440,7 @@ class _BridgeSwitchTo:
         resolved = self.driver.bridge.request(
             "frames.resolve",
             {"tabId": self.driver.tab_id, "selector": frame.selector},
-            timeout=10.0,
+            timeout=patient(self.driver.bridge, 10.0),
         )
         self.driver._frame_session_id = resolved.get("sessionId")
         self.driver._same_origin_frame_selector = (
@@ -1493,11 +1490,9 @@ class ChromeBridgeDriver:
         # whether an empty result means "quiet page" or "nothing was recorded".
         self.events_subscribed = False
         if tab_id is None:
-            # 10 s was enough on an idle machine; with the CPU pegged by other work
-            # (Unity/CUDA builds, 30.09.2026) the extension answers late, the
-            # request times out, and the tab it already made is left behind as an
-            # orphan about:blank - which slows the next attempt even more. A longer
-            # wait costs nothing when the answer is fast.
+            # With the CPU pegged by other work (Unity/CUDA builds, 30.09.2026) the
+            # extension answers late; a timed-out request leaves an orphan about:blank
+            # behind. A longer wait costs nothing when the answer is fast.
             tab = self.bridge.request(
                 "tabs.create",
                 {"url": "about:blank", "group": self.tab_group, "active": self.foreground},
@@ -1514,6 +1509,7 @@ class ChromeBridgeDriver:
                 )
         self.tab_id = int(tab["id"])
         self.actual_tab_group = tab.get("group")
+        self.attach_timing = attach_debugger(self.bridge, self.tab_id, created=tab_id is None)
         self._start_capture()
 
     def _start_capture(self) -> None:
@@ -1533,7 +1529,7 @@ class ChromeBridgeDriver:
         a bridge hiccup here costs history rather than the whole session.
         """
         try:
-            self.subscribe_events(["console", "network"])
+            self.subscribe_events(["console", "network"], timeout=patient(self.bridge, 10.0))
         except Exception as exc:
             LOGGER.warning(
                 "Capturing events on tab %s failed: %s: %s",
@@ -1559,6 +1555,10 @@ class ChromeBridgeDriver:
 
     def set_script_timeout(self, seconds: float) -> None:
         self._script_timeout = max(1.0, float(seconds))
+
+    def _command_timeout(self, extra: float = 0.0) -> float:
+        # 15 s is the built-in default and may grow on a busy machine; another value is a caller's own limit.
+        return patient(self.bridge, 15.0 + extra) if self._script_timeout == 15.0 else self._script_timeout + extra
 
     def activate_tab(self) -> dict[str, Any]:
         """Put this tab in front and raise its window - the only call that may.
@@ -1645,7 +1645,7 @@ class ChromeBridgeDriver:
                     "userGesture": True,
                 },
             },
-            timeout=timeout or self._script_timeout,
+            timeout=timeout or self._command_timeout(),
         )
         if response.get("exceptionDetails"):
             details = response["exceptionDetails"] or {}
@@ -1680,10 +1680,7 @@ class ChromeBridgeDriver:
 
     def execute_async_script(self, script: str, *args: Any) -> Any:
         try:
-            result = self._evaluate(
-                self._wrap_script(script, args, True),
-                timeout=self._script_timeout + 1.0,
-            )
+            result = self._evaluate(self._wrap_script(script, args, True), timeout=self._command_timeout(1.0))
         except TimeoutError as exc:
             raise TimeoutException(str(exc)) from exc
         return result.get("value")
@@ -1699,7 +1696,7 @@ class ChromeBridgeDriver:
         # overrides both: an awaited promise may wait on real user action (a human
         # solving a captcha), which 15 s of default patience would fail early.
         timeout = min(max(float(timeout), 1.0), 600.0) if timeout is not None else (
-            SCREENSHOT_TIMEOUT if command == "Page.captureScreenshot" else self._script_timeout
+            SCREENSHOT_TIMEOUT if command == "Page.captureScreenshot" else self._command_timeout()
         )
         try:
             return self.bridge.request(

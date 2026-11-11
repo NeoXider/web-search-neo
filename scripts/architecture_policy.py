@@ -28,7 +28,8 @@ LEGACY_MAX_LINES = {
     # Lowered 8604 -> 8516 (2026-10-21): the presence plumbing moved to presence_live.py
     # and the eased pointer approach to pointer_motion.py / actions/pointer_path.py; the
     # freed room also carries the session cap's "unlimited" parsing.
-    "web_search_neo/browser_tools.py": 8516,
+    # Lowered 8516 -> 8513 (1.30): the page-ready wait moved to page_ready.py.
+    "web_search_neo/browser_tools.py": 8513,
     # Raised 2680 -> 2706 (2026-10-13) for the update_companion action and its tool:
     # the pull, the refusal rules and the reload all live in companion_update.py, so
     # this file only carries the call and what it says it refuses.
@@ -51,7 +52,9 @@ LEGACY_MAX_LINES = {
     # Raised 2070 -> 2075 (2026-10-13, from upstream 96427c0): a tab create on a busy
     # machine answered late and left an orphan about:blank behind, so the wait is now
     # configurable. Came in with the rebase; the ratchet follows the file.
-    "web_search_neo/chrome_bridge.py": 2075,
+    # Lowered 2075 -> 2072 (1.30): the attach and the waiting live in bridge_attach.py
+    # and bridge_patience.py.
+    "web_search_neo/chrome_bridge.py": 2072,
     # Raised 1734 -> 1738 (2026-10-13) for the popup Update button's message: it
     # reuses the reload command the daemon already had, so this is one branch.
     # Raised 1738 -> 1741 (2026-10-21) for the popup's Computers tab and Take over: one
@@ -61,7 +64,9 @@ LEGACY_MAX_LINES = {
     # nodes.js's companion.pairRequest command; the notification lives in nodes.js.
     # Raised 1742 -> 1743 (2026-10-24, macro jobs in the popup): the one spread that registers
     # jobs.js's companion.jobsReport command; the jobs, Stop and ask answers live in jobs.js.
-    "chrome-extension/service-worker.js": 1743,
+    # Lowered 1743 -> 1689 (2026-11-11, 1.30): the debugger attach lives in debugger-attach.js,
+    # where it runs once per tab however many commands ask at once.
+    "chrome-extension/service-worker.js": 1689,
     # Lowered 1163 -> 1162 (2026-10-21): the popup's nodes frames are answered by
     # node_link.py; the one-line hello_ack freed the room for that branch and for
     # the one call that starts this computer's node when the companion connects.

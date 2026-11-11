@@ -3170,6 +3170,8 @@ class _FakeBridge:
             if "document.querySelector" in expression:
                 return {"result": {"type": "boolean", "value": True}}
             return {"result": {"type": "undefined"}}
+        if method == "debugger.attach":
+            return {"tab_id": params["tabId"], "attached": True, "reused": False, "total_ms": 1}
         if method == "debugger.detach":
             return {"detached": True}
         if method == "tabs.remove":
@@ -3272,7 +3274,8 @@ def test_driver_claims_an_existing_tab_without_raising_it() -> None:
     bridge = _FakeBridge()
     driver = ChromeBridgeDriver(bridge=bridge, tab_id=41, tab_group="AI")
     assert driver.actual_tab_group == "Existing"
-    assert [method for method, _ in bridge.calls] == ["tabs.get", "events.subscribe"]
+    # 1.30: the debugger is attached as its own step, before anything is asked of the tab
+    assert [method for method, _ in bridge.calls] == ["tabs.get", "debugger.attach", "events.subscribe"]
     assert all(method != "tabs.create" for method, _ in bridge.calls)
 
 

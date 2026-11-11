@@ -127,7 +127,7 @@ empty.
 | Form | Example | Accepted by | Lifetime |
 | --- | --- | --- | --- |
 | CSS selector | `#full-name`, `input[name='full_name']` | Everything, everywhere, including companion `current` mode. | As long as the markup keeps that shape. |
-| Ref handle | `ref:1cffa5bd10c7e703:4` | `fill` (fields and files), `upload`, `click`, `wait`, and `submit`'s `form_selector`. | Only in the document it was read from, and only while the element is attached. |
+| Ref handle | `ref:1cffa5bd10c7e703:4` | `fill` (fields and files), `upload`, `click`, `wait`, `scroll`, `submit`'s `form_selector`, and the `element_text` topic. | Only in the document it was read from, and only while the element is attached. |
 | Piercing path | `#host >>> #inner` | Same list as ref handles. | As long as each step resolves. |
 
 The ref handle's first field is the **document epoch**, also reported as
@@ -144,17 +144,21 @@ that frame's rather than the page's. An epoch that differs from the outline's
 the resolver finds the frame that issued it and enters it.
 
 The piercing path separator is a space-padded ` >>> `. Each step enters the
-element's open shadow root, or its document when the element is a same-origin
-iframe, and any number of steps can be chained. A CSS selector that merely
+element's shadow root — an open one, or a closed one the session saw being
+attached — or its document when the element is a same-origin iframe, and any
+number of steps can be chained. A CSS selector that merely
 contains ` >>> ` inside quotes or brackets — `div[data-op='a >>> b']` — is still
 treated as plain CSS.
 
-Two constraints worth knowing before you build a plan on refs:
+Three things worth knowing before you build a plan on refs:
 
-- refs and piercing paths need a live element handle, so they resolve in the
-  Selenium-backed modes (`temporary`, `persistent`, `attach`). In companion
-  `current` mode they are refused with an explicit message, and CSS stays the
-  way to address elements;
+- in the Selenium-backed modes (`isolated`, `temporary`, `persistent`, `attach`)
+  a ref or a piercing path is followed into whichever frame holds its element.
+  Companion `current` mode has no element handles: there the locator is resolved
+  by script on every call, from the top document, so a ref minted inside a frame
+  is refused with an explicit message — address an element in a frame with CSS
+  and `frame_selector` instead. Plain CSS is the form that works the same in
+  every mode;
 - `submit_selector` always expects plain CSS;
 - `frame_selector` takes all three forms on every action in this document —
   `fill`, `click`, `wait`, `submit`, `upload` — and on `page_outline`, `page_text`
@@ -219,11 +223,11 @@ What each control type does:
 | Control | Value to send |
 | --- | --- |
 | Text input, textarea | The string. The field is cleared first, then typed into, so listeners see real input events. |
-| `contenteditable` region | The string, addressed by the editable element itself. The outline reports it as `role: textbox` however the attribute is written, but `page_elements` looks for `[contenteditable="true"]` literally — so a bare `<div contenteditable>` is a field there and appears in no `page_elements` listing. Find those through `page_outline` or `find`. |
+| `contenteditable` region | The string, addressed by the editable element itself. The outline reports it as `role: textbox` however the attribute is written, but the `fields` list of `page_elements` looks for `[contenteditable="true"]` literally — so a bare `<div contenteditable>` is a field in the outline and is missing from that list; only `category="interactive"` reports it. Find those through `page_outline` or `find`. |
 | Checkbox | `true`/`false`, or `"1"`, `"true"`, `"yes"`, `"on"`, `"checked"` for the checked state. The element is clicked only if its state actually has to change. |
 | Radio | `true` selects it. `false` on an already-selected radio is refused with "A selected radio cannot be unchecked directly; select another radio in its group" — that is a real HTML constraint, not a limitation of the tool. |
 | `<select>` | The option `value`; if no option carries it, the visible text is tried. Both `"support"` and `"Support request"` select the same option in the fixture. |
-| `<select multiple>` | A list of values, `["a", "c"]`, and it is the only control that takes one — a list anywhere else is refused with "this control takes one". It reads back as a list too. A scalar is legal and *replaces* the whole selection rather than adding to it, so `"b"` after `["a","c"]` leaves exactly `["b"]`. One `change` fires for the write, not one per option. |
+| `<select multiple>` | A list of values, `["a", "c"]`, and it is the only control that takes several — a list on any other kind of control is refused with "this control takes one", and more than one value on a plain `<select>` with "holds one option at a time". It reads back as a list too. A scalar is legal and *replaces* the whole selection rather than adding to it, so `"b"` after `["a","c"]` leaves exactly `["b"]`. One `change` fires for the write, not one per option. |
 | Date, time, datetime-local, month, week, range, colour | The string, in the control's own format. These are set directly rather than typed, because typing into them depends on the browser's locale. The value is rehearsed on a throwaway input first, so an unparseable one is refused **without touching the control** — it used to leave a valid-looking wrong date, or drop a slider to its midpoint — and the error names the format: `A date control takes YYYY-MM-DD, for example 2024-01-15`. |
 | File input | Not through `fields`. Use the `files` key or the `upload` action; sending a path in `fields` returns `Use the files argument for file inputs`. |
 
@@ -250,8 +254,9 @@ reports exactly what happened:
   "success": false,
   "filled": ["#full-name", "#message", "#category", "#urgent"],
   "field_values": {
-    "#full-name": "Ada Lovelace", "#message": "Please confirm the details above",
-    "#category": "support", "#urgent": true
+    "#full-name": "A. Requester", "#message": "Please confirm the details above",
+    "#category": "support", "#urgent": true,
+    "#missing-field": null, "#locked": ""
   },
   "files_uploaded": {},
   "errors": {
@@ -299,7 +304,7 @@ failed; `field_values` says what each one holds now.
 
 ```json
 {
-  "field_values": {"#full-name": "Ada Lovelace", "#locked": "", "#missing-field": null},
+  "field_values": {"#full-name": "A. Requester", "#locked": "", "#missing-field": null},
   "errors": {
     "#locked": "ValueError: The control is disabled, so nothing can be written to it",
     "#missing-field": "NoSuchElementException: no such element: ..."
@@ -307,14 +312,16 @@ failed; `field_values` says what each one holds now.
 }
 ```
 
-Checkbox and radio values are a documented vocabulary: `1`, `yes`, `y`, `on`,
-`check`, `checked` tick the box; `0`, `no`, `n`, `off`, `uncheck`, `unchecked`
-and the empty string clear it. Anything else raises and lists both sets — it used
-to mean *uncheck* and report success, which included the word `"check"` itself.
+Checkbox and radio values are a documented vocabulary: `1`, `true`, `yes`, `y`,
+`on`, `check`, `checked` tick the box; `0`, `false`, `no`, `n`, `off`, `uncheck`,
+`unchecked` and the empty string clear it. Any other string raises and lists both
+sets — it used to mean *uncheck* and report success, which included the word
+`"check"` itself.
 
 ### `fill` leaves nothing focused
 
-Every control `fill` writes is blurred straight afterwards. That is not tidiness:
+By default every control `fill` writes is blurred straight afterwards
+(`blur_after=false` leaves focus in the last one). That is not tidiness:
 a `change` event fires on focus loss, so without the blur the *last* field of a
 fill is the one field whose `change` handler never runs — and on a form that
 validates or computes on `change`, that is the field the page is still waiting
@@ -326,8 +333,9 @@ The cost is that focus ends on `document.body`. Three things follow:
   usually what you want;
 - a `press_keys(["ENTER"])` sent afterwards goes to the body, not to the field
   you just filled, so a form you meant to submit by keyboard silently does
-  nothing. Pass `target_selector` — or `focus_mode="click"` — to put focus back
-  first, or use `submit`, which does not depend on focus at all;
+  nothing. Pass `target_selector` — with `focus_mode="click"` when the field
+  needs a real click to take focus — to put focus back first, or use `submit`,
+  which does not depend on focus at all;
 - a control refused before anything was typed is never blurred, because the code
   never got that far, and neither are `files` entries.
 
@@ -436,7 +444,10 @@ same as one resting on both.
 its result in a tab this session does not own, so the `url` and `title` in the
 same response are still *this* page's — unchanged, and easy to misread as a
 submit that went nowhere. The evidence sentence says so outright. To read the
-result, list tabs and attach to the new one.
+result, move to the new tab: in the Selenium-backed modes the answer lists it
+under `new_tabs` and `tabs` with `op: "switch"` takes the session there; in
+companion `current` mode, find it with `browser_tabs` and claim it with
+`attach_tab`.
 
 For proof the server accepted it, read the result page:
 
@@ -500,8 +511,12 @@ that the browser itself did not raise:
 Web components are ordinary form fields hidden behind a shadow boundary.
 `page_outline` and `find` walk **open** shadow roots automatically and report
 the fields inside them with normal refs, so most of the time nothing special is
-needed. Closed shadow roots cannot be entered by anyone; the outline counts them
-in `closed_shadow_roots` so you know the picture is incomplete.
+needed. A closed shadow root is walked the same way when the session saw it
+being attached: every `attachShadow` call is recorded from the moment the
+session takes the page, and the outline counts those roots in
+`closed_shadow_roots`. A closed root that already existed when a tab was claimed
+with `attach_tab` was recorded by nobody: it cannot be entered and is not
+counted.
 
 To address such a field by structure rather than by ref, use a piercing path:
 
@@ -530,8 +545,9 @@ so a rotated frame makes it larger than the element. A cross-origin frame appear
 
 `frame_selector` is available on `page_outline`, `page_text` and `find`, and now
 on `fill`, `click`, `submit`, `upload` and `wait` too, so a form inside a frame
-can be driven by name rather than only through a ref. It takes plain CSS, or the
-`#host >>> #inner` path the outline reports for a nested frame; plain CSS that
+can be driven by name rather than only through a ref. It takes plain CSS, a ref
+handle, or the `#host >>> #inner` path the outline reports for a nested frame;
+plain CSS that
 matches more than one element is refused with the count rather than reading
 whichever came first. A ref handle or a piercing path already carries its own
 document, so passing one *and* a `frame_selector` is refused instead of letting
@@ -548,8 +564,10 @@ evaluation error when the intended same-origin input is valid.
 Every page summary carries `challenge_detected`, `challenge_type`,
 `challenge_evidence`, `captcha_widgets` and `captcha_scan_incomplete`. A page
 summary is what `open`, `fill`,
-`click`, `submit` and `upload` return, and among the observation topics only
-`page_elements` builds one. `page_outline`, `page_text` and `find` describe
+`click`, `submit` and `upload` return, and among the topics that read a page's
+content only `page_elements` builds one (`execute_js`, `game_probe` and
+`browser_status` carry one too, but none of them is how a form is read).
+`page_outline`, `page_text` and `find` describe
 structure and text and answer nothing about challenges — so a checklist that says
 "read the page and look at `challenge_detected`" has to mean `page_elements` or
 the result of the action you just sent.
@@ -558,8 +576,9 @@ The question those first three answer is "is a challenge *in the way*", not "doe
 this page contain a captcha". An article with an hCaptcha in its comment form is
 readable, and used to come back `challenge_detected: true` with
 `manual_action_required: true`; a chat widget carrying a `data-sitekey` was
-treated as a captcha outright. Both now appear in `captcha_widgets` — captchas
-seen, blocking or not — while `challenge_detected` stays `false`. It goes `true`
+treated as a captcha outright. The first now appears in `captcha_widgets` —
+captchas seen, blocking or not — while `challenge_detected` stays `false`; the
+second is no longer counted at all. It goes `true`
 when a widget covers the page's centre, when the page is a sparse interstitial, or
 when the wording says so.
 
@@ -575,8 +594,8 @@ interstitial still reads as blocking.
 `captcha_widgets` is a short list, not an inventory: the scan stops after three
 widgets, and each entry is the CSS selector that matched plus where it matched —
 `div.g-recaptcha (in a frame)`, `iframe[src*="challenges.cloudflare.com"]`,
-`… (in shadow DOM)`. It is a selector you can point `page_outline` at, not a
-description of what the widget is.
+`… (in shadow DOM)`. It is the selector that matched, not a description of what
+the widget is.
 
 `captcha_scan_incomplete: true` means the walk stopped before it ran out of page,
 so an empty `captcha_widgets` is not proof there is no captcha — it is "I did not
@@ -592,9 +611,9 @@ being missed entirely. A shadow tree is painted in its host's layer, so a captch
 inside an open shadow root is measured as standing over the page exactly as far as
 its host does — a full-page shadow overlay is blocking, which the old hit test
 structurally could not see. The widgets recognised are reCAPTCHA, hCaptcha, Cloudflare
-Turnstile, Yandex SmartCaptcha, PerimeterX, DataDome and AWS WAF, at least 20x20
-pixels; a bare `data-sitekey` counts only when the element itself or a nested
-frame says captcha.
+Turnstile, Yandex SmartCaptcha, PerimeterX, DataDome, AWS WAF, Tencent TCaptcha
+and Geetest, at least 20x20 pixels; a bare `data-sitekey` counts only when the
+element itself or a nested frame says captcha.
 
 When it is `true`, stop automating. Retrying a click is both useless and rude to
 the site. In a visible session, hand control to the user:
@@ -613,7 +632,8 @@ This polls the page while a human solves the challenge and returns `resolved`,
 `timed_out`, `challenge_seen`, and `waited_seconds`, keeping the session open
 either way. It carries the page summary too, `captcha_scan_incomplete` included,
 so the same caution applies to its verdict. The timeout honours `timeout_seconds`
-as passed (it defaults to 180).
+as passed up to 300 s — a larger value is cut to that and `timeout_note` says so
+(it defaults to 180).
 
 Nothing clears a challenge on its own. The `captcha` action can send a widget's
 sitekey to a paid, third-party solving service, but only when asked: `mode='solve'`,
@@ -680,10 +700,12 @@ Both buffers are armed when the session takes its tab, before the first
 navigation, so the submit you are diagnosing is in them and nothing has to be
 replayed to see it. The exception is `attach_tab`: a claimed tab is recorded from
 the claim onwards, and a submit that happened before you claimed it was recorded
-by nobody — reload and repeat it to observe a full cycle. Each stream keeps up to
-500 entries and reports how many older records were `dropped`; in companion
-`current` mode, where the buffers live inside the extension, a 512 KB budget
-shared between console and network evicts as well. On a page that fires hundreds
+by nobody — reload and repeat it to observe a full cycle. The network journal
+keeps the newest 500 finished requests (`dropped` counts the rest) and the
+console history the newest 2,000 entries (`history_dropped`); in companion
+`current` mode, where the buffers live inside the extension, each stream holds
+500 entries between reads and a 512 KB budget shared between console and network
+evicts as well. On a page that fires hundreds
 of requests, read `network` promptly, because eviction is oldest-first and takes
 the page load with it.
 
@@ -699,7 +721,7 @@ the page load with it.
 7. If it failed: `network` with `only_errors`, then `network_body`, then
    `console`.
 8. If `challenge_detected` is true — on the result of the action you just sent, or
-   on `page_elements`, the one topic that reports it: `wait_challenge`, never a
-   retry loop.
+   on `page_elements`, the one page-reading topic that reports it:
+   `wait_challenge`, never a retry loop.
 9. After any navigation or step change: read `page_outline` again and treat old
    refs as stale, whatever `dom_epoch` says.

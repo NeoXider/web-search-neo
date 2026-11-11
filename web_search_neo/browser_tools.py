@@ -65,7 +65,7 @@ from web_search_neo import frame_health as _frame_health
 from web_search_neo.sessions import roster as _roster
 from web_search_neo import page_guards as _page_guards
 from web_search_neo import script_results as _script_results
-from web_search_neo import key_table
+from web_search_neo import key_table, page_ready
 from web_search_neo import page_perception
 from web_search_neo.web_client import validate_http_url
 from web_search_neo.fetch import variants as fetch_variants
@@ -1572,10 +1572,7 @@ def _get_session(session_id: str) -> BrowserSession:
 
 
 def _wait_until_ready(driver: webdriver.Chrome, timeout_seconds: float) -> None:
-    timeout = max(1.0, float(timeout_seconds))
-    WebDriverWait(driver, timeout).until(
-        lambda current: current.execute_script("return document.readyState") == "complete"
-    )
+    page_ready.wait_until_ready(driver, timeout_seconds)  # short polls within the caller's time
 
 
 def _set_viewport(driver: Any, width: int, height: int) -> None:

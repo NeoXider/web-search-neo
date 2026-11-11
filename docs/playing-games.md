@@ -19,6 +19,7 @@ README](../README.md#canvas-and-webgl-games). Everything here is expressed as
 - [Why a tapped key stays down for a whole frame](#why-a-tapped-key-stays-down-for-a-whole-frame)
 - [Auto-repeat for held keys](#auto-repeat-for-held-keys)
 - [Games inside an iframe](#games-inside-an-iframe)
+- [Typing text into a canvas game](#typing-text-into-a-canvas-game)
 - [Pointer lock and first-person controls](#pointer-lock-and-first-person-controls)
 - [Touch games](#touch-games)
 - [Watching what happens](#watching-what-happens)
@@ -79,9 +80,11 @@ with the wall clock after a run.
 
 The MCP `render` action also accepts `frame_delta_ms` (0.1-1000 ms),
 `freeze_time`, and `gate_timers` if the defaults do not suit a particular
-engine. One knob stays Python-only: `web_search_neo.browser_tools.set_render_control(...,
-key_repeat=False)` turns off [key auto-repeat](#auto-repeat-for-held-keys); the
-MCP action always leaves it on.
+engine. Two knobs stay Python-only, on
+`web_search_neo.browser_tools.set_render_control(...)`: `key_repeat=False` turns
+off [key auto-repeat](#auto-repeat-for-held-keys), which the MCP action always
+leaves on, and `deterministic=True` (step mode only) also pauses Chrome's own
+clock between released frames, which the MCP action never does.
 
 ## A full playthrough
 
@@ -113,9 +116,10 @@ clear it, and the finish is at x 520.
 ```
 
 `profile_mode="temporary"` with `headless=true` gives a clean, reproducible
-window. Drop both to play in the user's visible Chrome instead — that is the
-default. Loopback addresses stay reachable over plain HTTP; a public host would
-have to be `https://`.
+window. Drop both and a new session still opens a clean headless browser of its
+own — `isolated`, the default since 1.20. To play in the user's visible Chrome
+instead, pass `profile_mode="current"`. Loopback addresses stay reachable over
+plain HTTP; a public host would have to be `https://`.
 
 ### 2. Look at what you opened
 
@@ -435,8 +439,8 @@ painted bounding rect.
 
 One thing this map does not accept is a piercing path. `frame_selector` on
 `render`, `wait`, `click`, `fill` and the reading topics takes CSS, a `ref:`
-handle or `#host >>> #frame`. On the input actions — `input`'s pointer entries,
-`press_keys`, `pointer`, `touch`, `game_probe` and `pointer_lock` — it is plain
+handle or `#host >>> #frame`. On the input actions — `input`, `press_keys`,
+`pointer`, `touch`, `game_probe` and `pointer_lock` — it is plain
 CSS and nothing else, refused before the first event rather than part way through
 a batch, because the map needs the frame's box in the top document and neither
 other form gives one. An ambiguous CSS selector is refused there too, with the
@@ -468,8 +472,7 @@ Type into a canvas one key per character instead:
 
 Every character becomes its own keydown/keypress/keyup carrying the character,
 so Cyrillic and other non-Latin text arrives unchanged; an upper-case Latin
-letter is pressed under Shift, `
-` is Enter and `	` is Tab. When the focused
+letter is pressed under Shift, `\n` is Enter and `\t` is Tab. When the focused
 element is a `<canvas>`, `type_text` switches to keys by itself and says so in
 `mode_used`. `press_keys` with one character per key is the same mechanism for a
 few keys at a time. Give the canvas focus first (a click on it, or

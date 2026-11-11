@@ -16,7 +16,7 @@
 </p>
 
 Web Search Neo is an MCP server that gives a model two tools — `web_info` to
-look, `web_action` to act — and behind them four capabilities:
+look, `web_action` to act — and behind them nine capabilities:
 
 | Capability | What it is |
 | --- | --- |
@@ -42,7 +42,7 @@ where another finds hits is tried last and named in `unreliable_engines`.
 - [Deep dives: playing games](docs/playing-games.md) · [complex forms](docs/complex-forms.md)
 - [Extending Web Search Neo](docs/extending.md) — plugin actions, observation topics, and search providers
 - [Why Web Search Neo](#why-web-search-neo) — the capability table
-- [Connect your already-open Chrome](#connect-your-already-open-chrome) · [The bridge daemon](#the-bridge-daemon) · [Bridge authentication](#bridge-authentication)
+- [Connect your already-open Chrome](#connect-your-already-open-chrome) · [The bridge daemon](#the-bridge-daemon) · [A busy machine](#a-busy-machine) · [Bridge authentication](#bridge-authentication)
 - [**Other computers on your network**](#other-computers-on-your-network) — `node=` runs a call in another PC's Chrome; IP and location of each · [the long version](docs/remote-nodes.md)
 - [Search behavior](#search-behavior) · [HTTP requests without a browser](#http-requests-without-a-browser) · [CAPTCHA and challenge modes](#captcha-and-challenge-modes)
 - [Current Chrome automation](#current-chrome-automation) · [Chrome profile modes](#chrome-profile-modes)
@@ -154,8 +154,8 @@ Ranked matches for a plain-language query when a CSS selector would be a guess.
 {"actions":[{"action":"click","selector":"a[href*='iana.org']","session_id":"demo"}]}
 ```
 
-Clicks it. `click` and `wait` also accept a `ref:` handle or a piercing path in
-the Selenium-backed profile modes.
+Clicks it. `click` and `wait` also accept a `ref:` handle or a piercing path
+(see [Locators](#locators) for what each profile mode resolves).
 
 ### 3. Fill in a form and submit it
 
@@ -280,7 +280,7 @@ limits, and worked examples. `web_info(topic="action_schema", params={"action":
 | Your current Chrome on request | With `profile_mode="current"` tabs open in the `🟢 AI` tab group of the Chrome you already use, so existing logins remain available while automation stays in the background unless `show` is explicitly requested. A new session without a mode opens isolated. |
 | Reusable authorization | List and claim existing tabs, use the current signed-in Chrome, a persistent MCP-owned profile, or a DevTools attach window. |
 | Authenticated companion | Server and extension prove knowledge of a machine-local secret to each other before a single command crosses the loopback bridge. |
-| One bridge, many clients | The companion port belongs to a standalone bridge process, not to whichever agent happens to be running, so Claude Code and LM Studio can drive the same Chrome at the same time and the badge stays `ON` between calls. |
+| One bridge, many clients | The companion port belongs to a standalone bridge process, not to whichever agent happens to be running, so Claude Code and LM Studio can drive the same Chrome at the same time and the badge stays `ON` between calls. Each client is answered through an outbox of its own, so one that hangs delays nobody else. |
 | Two-tool MCP surface | Models see only `web_info` and `web_action`; detailed action schemas are discovered only when needed. |
 | Self-describing contract | `web_info()` with no arguments returns the actions, recipes, pitfalls, limits, and examples, so an external skill file is optional. |
 | Semantic page reading | `page_outline`, `page_text`, `element_text`, and `find` return roles, accessible names, states, boxes, and `ref:<epoch>:N` handles across open Shadow DOM and same-origin iframes — and `element_text` hands over the whole content of one element, overflow-clipped tails included. |
@@ -355,7 +355,7 @@ companion popup's Reconnect (Restart companion when its service worker has
 stopped) is the one action; Reload on its card at chrome://extensions is the
 fallback.
 
-The bundled companion is version 1.29.0. Chrome does not refresh an unpacked
+The bundled companion is version 1.30.0. Chrome does not refresh an unpacked
 extension by itself, but from 1.3.1 the server does it instead: the worker
 understands a `runtime.reload` command, and `setup_current_chrome` sends it
 whenever the connected build is older than the bundled one. That only works for
@@ -374,7 +374,7 @@ authenticate:
 - the bridge daemon records the rejection in `%LOCALAPPDATA%\WebSearchNeo\bridge-daemon.log`, not in `msp_server.log`;
 - a 1.3.0 worker also prints the close code and reason in its own service-worker console; an older one does not, so on a stale install the badge and that daemon log are the signal.
 
-The bridge accepts only the fixed bundled extension ID, binds only to loopback, and never reads Chrome profile files, cookies, or saved passwords directly. The extension uses Chrome's standard [tabs](https://developer.chrome.com/docs/extensions/reference/api/tabs), [tab groups](https://developer.chrome.com/docs/extensions/reference/api/tabGroups), and [debugger](https://developer.chrome.com/docs/extensions/reference/api/debugger) APIs, plus `storage` for its own session state and [alarms](https://developer.chrome.com/docs/extensions/reference/api/alarms) for the long waits in its reconnect backoff, with the permissions shown by Chrome.
+The bridge accepts only the fixed bundled extension ID, binds only to loopback, and never reads Chrome profile files, cookies, or saved passwords directly. The extension uses Chrome's standard [tabs](https://developer.chrome.com/docs/extensions/reference/api/tabs), [tab groups](https://developer.chrome.com/docs/extensions/reference/api/tabGroups), and [debugger](https://developer.chrome.com/docs/extensions/reference/api/debugger) APIs, plus `storage` for its own session state, [alarms](https://developer.chrome.com/docs/extensions/reference/api/alarms) for the long waits in its reconnect backoff, and `notifications` for pairing requests and macro jobs, with the permissions shown by Chrome.
 
 A badge reading `OFF` means this companion is not connected and authenticated, which is usually — but not only — because nothing is listening on the bridge port: no daemon has been started since the machine booted, the last one exited after its idle window, or it was stopped with `--bridge --stop`. That is the normal state of a machine on which no MCP server has run yet, not a fault — but it is no longer the state between two agent calls, which is what it was when the port lived inside the MCP server. The badge also reads `OFF` in two cases where the port is very much held: when the daemon refused this companion's token, and when a companion in a second Chrome profile authenticated later and displaced it. So `OFF` is not by itself a reason to start a daemon — read `web_info(topic="browser_status")` and `bridge-daemon.log` before concluding the port is free. While nothing listens, the worker retries with an exponential backoff — about 1.5 seconds after the first failure, doubling to a ceiling of one minute, and dropping back to the floor the moment a handshake verifies. Chrome suspends an idle service worker after roughly thirty seconds, which is why the longer waits are `chrome.alarms` rather than timers: a timer that long would die with the worker. Chrome also logs every refused attempt as an extension error of ours and an extension cannot suppress that, so a red **Errors** button on the card of an idle machine is expected; before 1.3.1 the worker retried every two seconds and could fill that page with hundreds of identical `ERR_CONNECTION_REFUSED` lines. Starting the browser or reloading the extension resets the schedule, and the popup's **Reconnect** button retries immediately.
 
@@ -456,7 +456,10 @@ Three things follow, and they are why the listener moved out:
   reconnected on its own backoff schedule whenever a server appeared.
 - **Two MCP clients can share one Chrome.** Claude Code and LM Studio can now run
   at the same time; the second server to start used to fail to bind the port with
-  `OSError: [Errno 10048]` and silently lose `profile_mode: "current"`.
+  `OSError: [Errno 10048]` and silently lose `profile_mode: "current"`. Since 1.30
+  each of them is also answered through an outbox of its own, so a client that
+  hangs cannot hold back the answers of the others - see
+  [Working in the same Chrome as the user](#working-in-the-same-chrome-as-the-user).
 - **The first call after a quiet stretch is not spent waiting.** A freshly started
   server no longer has to sit out whatever reconnect delay the extension had
   climbed to.
@@ -576,6 +579,71 @@ could sit next to the version of a daemon that had already exited.
 `current_chrome.connected` still means what it always did — the companion itself
 is attached — and a `daemon.linked: true` with `connected: false` is exactly the
 case of a running bridge with Chrome closed.
+
+### A busy machine
+
+A Chrome that shares the CPU with a build, a render or a local model answers late,
+and a late answer used to read as a broken bridge: `open` in `current` mode failed
+with `cdp.send timed out` although nothing was wrong. Measured with the CPU at
+100 %, Chrome took 10 s to call a new blank tab "complete" and 12.7 s to attach
+its debugger, a tenth of that on an idle machine. Since 1.30 the server allows for
+it on its own:
+
+- **The debugger attach is its own step.** A session attaches as soon as its tab
+  exists - a new tab or one claimed with `attach_tab` - and waits for that one
+  step up to `WSN_ATTACH_TIMEOUT` seconds (default 60, clamped to 5-600). Every
+  later command keeps its usual timeout against a tab that is already attached. If
+  the attach never answers, the tab opened for the session is closed rather than
+  left behind as a blank orphan, and the error says Chrome is slow and names the
+  setting. The companion attaches once per tab however many commands ask at the
+  same moment and reports how long it took; a companion older than 1.30 does not
+  know the `debugger.attach` command and is sent a trivial script with the same
+  patience instead, so the fix works before the companion is reloaded.
+- **Built-in timeouts wait for a busy machine.** Two measurements decide how long
+  a limit the server chose for itself lasts. The bridge times its cheapest
+  commands (`debugger.attach`, `tabs.get`, `tabs.list`, `tabs.activate`,
+  `events.subscribe` - none runs page code or waits for a load) and keeps the
+  answers for three minutes: while the slowest of them is 3 s or more, every
+  built-in limit of the driver starts at four times that, up to 120 s. And when
+  a built-in limit runs out, the CPU time the whole machine used during that
+  very wait is read: above 80 % the answer is late rather than lost, so the wait
+  goes on one more limit at a time, up to four in all, and a timeout after that
+  names the CPU load. On an idle machine nothing changes - a page stuck in an
+  endless loop uses one core and still fails at its usual limit.
+- **A limit the caller chose is never extended.** `timeout_seconds` of
+  `run_script`, an explicit CDP timeout and `WSN_ATTACH_TIMEOUT` itself are kept
+  to the second.
+- **`open` waits out a page that is still loading, and no longer than you said.**
+  It polls `document.readyState` until `timeout_seconds` (default 20) with short
+  polls - five seconds at most, never longer than the time that is left. A poll
+  the busy page left unanswered means "not ready yet" instead of ending the whole
+  `open`, and the wait ends at the caller's `timeout_seconds` however slow each
+  poll is.
+- **Timeouts say what happened.** A bridge command that got no answer reports how
+  long it waited and that a busy Chrome is slow rather than broken - with the CPU
+  load when the wait was extended for it. A page that did not finish loading says
+  so, names `timeout_seconds`, and says which of two things it saw:
+  `document.readyState was still 'interactive'` (or `'loading'`) is a page still
+  fetching something, `the page left the question unanswered` is a page starved
+  of CPU.
+
+What is left for the caller: retry once (when the message names the CPU load,
+after the other work has finished), raise `timeout_seconds` on `open` for a heavy
+page, and raise `WSN_ATTACH_TIMEOUT` in the server's environment when the attach
+itself runs out. To tell a broken bridge from a slow Chrome, time the bridge
+directly:
+
+```powershell
+python scripts/bridge_probe.py
+```
+
+It opens one blank background tab in the agent group, attaches, runs two trivial
+scripts, subscribes to the console and closes the tab, printing how long each step
+took. Every line well under a second is a healthy bridge; a step that took five
+seconds or more, or failed, is named at the end with the reminder that the machine
+is busy. It needs the companion connected and touches no other tab. The
+troubleshooting entry is in
+[INSTALL.md](INSTALL.md#open-fails-with-cdpsend-timed-out-on-a-busy-machine).
 
 ### Bridge authentication
 
@@ -747,7 +815,7 @@ The same drag is used without being asked, where a captcha is what stands betwee
 
 ### A challenge you cannot see yet — name it first
 
-A slider is the easy half. The other shape these vendors serve is a grid of pictures — "click the tiles that show X" — and until now this tool had no way to even say it was looking at one. `captcha_challenge {page_url}` reads the challenge through Tencent's own protocol: `cap_union_prehandle` answers only as JSONP GET carrying the page's Referer/Origin (the same address refuses a POST with 403, which is why third-party solvers stall on it), and its answer carries the challenge kind (`slider`, `word_click`, `icon_click`, `image_select`, `checkbox`), the instruction text, the grid size, the subcapclass and the hash-of-the-attempt config. It then measures the served picture against a shape built from that instruction and reports which colour bands were tried, the best score it reached, and whether anything is sure — with no answer sent when it is not. `site_aid=true` reads the id document the site publishes for itself (`GET /web/v1/captcha/aid-encrypted` on the origin its widget bundle calls; a console host is followed to its `api.` twin, because an SPA answers every unknown path with its own index.html) and returns the encrypted blob, its encoding, and the plaintext id when one is published. `captcha_verify` spends one attempt only for a challenge measured sure *and* whose hash was solved; otherwise it refuses, and no request is wasted. `captcha`'s unsolved report now carries `challenge_classification`: vendor, challenge, the evidence it came from, whether this machine can measure that pair today, and — when it cannot — the sentence naming what is missing instead of pretending.
+A slider is the easy half. The other shape these vendors serve is a grid of pictures — "click the tiles that show X" — and until now this tool had no way to even say it was looking at one. `captcha_challenge {page_url}` reads the challenge through Tencent's own protocol: `cap_union_prehandle` answers only as JSONP GET carrying the page's Referer/Origin (the same address refuses a POST with 403, which is why third-party solvers stall on it), and its answer carries the challenge kind (`slider`, `word_click`, `icon_click`, `image_select`, `checkbox`), the instruction text, the grid size, the subcapclass and the hash-of-the-attempt config. It then measures the served picture against a shape built from that instruction and reports which colour bands were tried, the best score it reached, and whether anything is sure — with no answer sent when it is not. `site_aid=true` reads the id document the site publishes for itself (`GET /web/v1/captcha/aid-encrypted` on the origin its widget bundle calls; a console host is followed to its `api.` twin, because an SPA answers every unknown path with its own index.html) and returns the encrypted blob, its encoding, and the plaintext id when one is published. `captcha_answer {page_url, aid?, boxes?}` answers the challenge that was just read, not a freshly drawn one: `boxes` are `[x, y, w, h]` regions in the picture's own pixels, clicked in the order given, and without them it answers only when its own measurement was sure. Either way one attempt is spent only for a challenge whose hash was solved; otherwise it refuses, and no request is wasted (the same rule as the library call `web_search_neo.captcha_actions.captcha_verify`, which is not an action). `captcha`'s unsolved report now carries `challenge_classification`: vendor, challenge, the evidence it came from, whether this machine can measure that pair today, and — when it cannot — the sentence naming what is missing instead of pretending.
 
 The reading of that grid puzzle is a library call, not a click: `web_search_neo.captcha_solvers.match_glyph_shapes(picture_png, strip_box, picture_box)` takes the widget's own target row and its picture, extracts every glyph and shape as a dark-ink component, and scores pairs by **two-sided chamfer distance swept over small rotations** - filled-mask overlap was measured useless on real pictographs (every building scored ~0.42), while the stroke itself separates them. Each row comes back ranked with `sure` true only when the best score is inside `SCORE_CEILING` and leads the runner-up by `MIN_LEAD`; a confusable pair says unsure rather than guessing, because one wrong click spends the vendor's attempt. Nothing here clicks or chooses an order: act on `all_sure` rows only.
 
@@ -763,14 +831,15 @@ The same rule decides whether a step is tried again. An observing step (`wait`, 
 
 ## Current Chrome automation
 
-Yes — the agent can work in your normal already-open Chrome while you watch it. New pages go into a visible tab group named `🟢 AI` by default — the mascot is there so agent tabs are obvious in a crowded window, and the companion colours the group purple when it is the one creating it:
+Yes — the agent can work in your normal already-open Chrome while you watch it. Ask for it with `profile_mode: "current"` (a new session without a mode opens isolated since 1.20). New pages go into a visible tab group named `🟢 AI` by default — the mascot is there so agent tabs are obvious in a crowded window, and the companion colours the group purple when it is the one creating it:
 
 ```json
 {
   "actions": [{
     "action": "open",
     "url": "https://example.com",
-    "session_id": "demo"
+    "session_id": "demo",
+    "profile_mode": "current"
   }]
 }
 ```
@@ -1016,6 +1085,21 @@ a tab. A client that reconnects re-asserts its claims, and gives up any it lost.
 When there is no daemon to ask, nothing is guarding the browser and the claim is
 skipped rather than failing closed.
 
+So the shape is one bridge daemon, one companion, and any number of MCP servers
+behind it, each holding any number of sessions - a tab each, kept apart by those
+claims. Since 1.30 nobody in that picture waits on anybody else. The daemon used
+to answer every server from the one thread that reads the companion's socket, and
+a websocket write blocks when the peer does not read: a single client that hung -
+a stopped debugger, a suspended process - held that thread, and the commands of
+every other agent sharing the browser timed out for a reason that had nothing to
+do with them. Each client now has an outbox written by a thread of its own, in
+order, so a slow client delays only itself, and one more than 256 MB behind is
+disconnected instead of being buffered without bound. The first connection of a
+freshly started server no longer fails under load either: both sides wait twenty
+seconds for the other's handshake frame, where five was too short for a client
+still importing. A Chrome that is merely slow is a separate case, handled in
+[A busy machine](#a-busy-machine).
+
 That register is also readable, which it had to become: a refusal arrives after an
 agent has already chosen a tab, and the list it chose from said nothing. Every
 client is told who else is on the bridge — `browser_status` reports
@@ -1148,7 +1232,7 @@ The `headless` argument cannot hide or reveal a Chrome process that is already r
 
 ## Reading a page
 
-Four observation topics describe an open session, from semantic structure down to raw selectors:
+Five observation topics describe an open session, from semantic structure down to raw selectors:
 
 | Topic | Returns |
 | --- | --- |
@@ -1156,13 +1240,13 @@ Four observation topics describe an open session, from semantic structure down t
 | `page_text` | The rendered text, with headings, list items, and table cells preserved. `mode="full"` is the whole `<body>`, same-origin frames and open dialogs included; `mode="main"` narrows to the main-content sub-tree and drops navigation, header, footer, aside, and form chrome. `max_chars=20000`, `include_links=false`. |
 | `element_text` | The whole content of one element — not a clipped slice of the page. `selector` takes CSS, a fresh `ref:<epoch>:N`, or an `a >>> b` piercing path. `full_text=true` reads `textContent`, which no rendering filter may drop, so the tail of a scrolled-out code block or a collapsed panel is returned whole. `mode="text"|"html"|"outer"|"both"` returns the rendered text, `innerHTML`, `outerHTML`, or all three; `max_chars` clips at a paragraph boundary and says so with `truncated`. |
 | `find` | Ranked matches for a plain-language `query` such as `"submit request"`, each with a `ref`, role, name, box, a `match_score` (query against the element alone) and the ranking `score` that adds context. `limit=5`, capped at 25; `visible_only=true` by default, so a control the page has not revealed yet is not a candidate; `role` filters rather than nudges. `low_confidence` means nothing on the page answers the query — the closest few still come back, as the guesses they are — and `ambiguous` means the top two matched *and* ranked equally, so document order picked the winner. `candidates`/`scored`/`matched`/`returned`, `truncated` and `aria_hidden_skipped` account for what was examined, cut, and skipped as hidden from assistive technology. |
-| `page_elements` | The flat lists of links, forms, fields with `<select>` options, and buttons, addressed by CSS selector — or by a piercing path when they live in an open shadow root or a same-origin frame, or by an empty string when nothing addresses them uniquely, which is the honest answer and not a bug to work around. It covers the whole existing DOM, not only the viewport, so a rendered button below the fold is returned before any scroll. Each entry carries `visible` and, when it is not, a `hidden_reason`; visible entries come first. `limit` is capped at 1,000 per category; continue with `offset` and `range.<category>.next_offset` until it is `null`. `found`, `returned`, `truncated`, and `collector_truncated` account for the result and the 20,000-element safety cap. `limit` counts controls; `max_chars` (default 18,000) bounds the answer itself, because 200 controls of a large directory page came to 83,616 characters — more than a small model could receive. When the budget bites, `budget_truncated` is `true`, `budget_note` says how much was dropped, and `range.<category>.next_offset` is restated to point at the first entry that was not sent. `page_outline` and `find` take the same `max_chars`; `page_text` and `element_text` already had one. Lazy, infinite, and virtualized controls do not exist until the page creates them: `scroll`, wait, then reread from `offset=0`. Alone among the four it takes no `frame_selector`: it always walks the whole page, open shadow roots, and same-origin frames. |
+| `page_elements` | The flat lists of links, forms, fields with `<select>` options, and buttons, addressed by CSS selector — or by a piercing path when they live in an open shadow root or a same-origin frame, or by an empty string when nothing addresses them uniquely, which is the honest answer and not a bug to work around. It covers the whole existing DOM, not only the viewport, so a rendered button below the fold is returned before any scroll. Each entry carries `visible` and, when it is not, a `hidden_reason`; visible entries come first. `limit` is capped at 1,000 per category; continue with `offset` and `range.<category>.next_offset` until it is `null`. `found`, `returned`, `truncated`, and `collector_truncated` account for the result and the 20,000-element safety cap. `limit` counts controls; `max_chars` (default 18,000) bounds the answer itself, because 200 controls of a large directory page came to 83,616 characters — more than a small model could receive. When the budget bites, `budget_truncated` is `true`, `budget_note` says how much was dropped, and `range.<category>.next_offset` is restated to point at the first entry that was not sent. `page_outline` and `find` take the same `max_chars`; `page_text` and `element_text` already had one. Lazy, infinite, and virtualized controls do not exist until the page creates them: `scroll`, wait, then reread from `offset=0`. Alone among the five it takes no `frame_selector`: it always walks the whole page, open shadow roots, and same-origin frames. |
 
 ```json
 {"topic":"page_outline","params":{"session_id":"demo","output":"json","limit":80}}
 ```
 
-The outline and `find` walk open shadow roots and same-origin iframes, including nested ones, and map every box into top-document coordinates so a reported `center` can be clicked or pointed at directly. A frame is mapped through the full transform of itself and its ancestors — `transform`, the individual `rotate`/`scale`/`translate` properties, and CSS `zoom` — because a frame scaled to fit its container is ordinary on a checkout page, and translating by its origin alone put the reported centre tens of pixels from the control. `center` is the point to aim at; `page_rect` is the smallest rectangle containing the mapped corners, which for a rotated frame is larger than the element itself and is not something to click. A chain that is not affine — a 3D `perspective` — can only be approximated flat, and those nodes say so with `page_rect_approximate` rather than presenting the guess as an ordinary number. A cross-origin frame appears as one node with `same_origin: false`; read it by passing its selector as `frame_selector`. Closed shadow roots are counted in `closed_shadow_roots` rather than entered. A node inside a frame reports the `frame` path that reaches it, verified to match exactly one element and written as a `#host >>> #inner` piercing path when the frame is itself nested or inside a shadow root; a frame with no such path is marked `frame_addressable: false` instead of being given a selector that would land in the wrong one.
+The outline and `find` walk open shadow roots and same-origin iframes, including nested ones, and map every box into top-document coordinates so a reported `center` can be clicked or pointed at directly. A frame is mapped through the full transform of itself and its ancestors — `transform`, the individual `rotate`/`scale`/`translate` properties, and CSS `zoom` — because a frame scaled to fit its container is ordinary on a checkout page, and translating by its origin alone put the reported centre tens of pixels from the control. `center` is the point to aim at; `page_rect` is the smallest rectangle containing the mapped corners, which for a rotated frame is larger than the element itself and is not something to click. A chain that is not affine — a 3D `perspective` — can only be approximated flat, and those nodes say so with `page_rect_approximate` rather than presenting the guess as an ordinary number. A cross-origin frame appears as one node with `same_origin: false`; read it by passing its selector as `frame_selector`. A closed shadow root is walked like an open one when the session saw it being attached - every `attachShadow` call is recorded from the moment the session takes the page - and those roots are counted in `closed_shadow_roots`; one that already existed when a tab was claimed with `attach_tab` cannot be entered and is not counted. A node inside a frame reports the `frame` path that reaches it, verified to match exactly one element and written as a `#host >>> #inner` piercing path when the frame is itself nested or inside a shadow root; a frame with no such path is marked `frame_addressable: false` instead of being given a selector that would land in the wrong one.
 
 `page_text` never answers with a blank page, and never hands a fragment over as if it were the page:
 
@@ -1229,7 +1313,7 @@ offer is how an agent ends up pressing *Cancel* when it meant *Submit order*.
 | --- | --- | --- |
 | CSS selector | `input[name='q']` | Unchanged, and still the only form accepted everywhere. |
 | Ref handle | `ref:3f9a1c04b7e25d18:12` | Issued by `page_outline` and `find`. The first field is the document epoch — 16 hex characters, also reported separately as `dom_epoch`; the second is the element number. |
-| Piercing path | `#host >>> .inner` | The separator is a space-padded ` >>> `. Each step enters the element's open shadow root, or its document when the element is a same-origin iframe. Any number of segments may be chained. |
+| Piercing path | `#host >>> .inner` | The separator is a space-padded ` >>> `. Each step enters the element's shadow root - an open one, or a closed one the session saw being attached - or its document when the element is a same-origin iframe. Any number of segments may be chained. |
 
 Ref handles carry the document they were read from — which, for a node inside an iframe, is that frame and not the top page:
 
@@ -1239,14 +1323,17 @@ Ref handles carry the document they were read from — which, for a node inside 
 - a bare `ref:N` without an epoch is refused outright, with an error that says to read `page_outline` again: it carries no document identity, and answering it from whatever document happens to be loaded is the very mistake the epoch exists to prevent.
 
 Ref handles and piercing paths are accepted by `fill` (both its field and its file keys),
-`upload`, `click`, `wait`, and the `form_selector` of `submit`. `click` and `wait` took
+`upload`, `click`, `wait`, `scroll`, the `form_selector` of `submit`, and the `element_text`
+topic. `click` and `wait` took
 plain CSS only until 1.3.0, which made the natural `find` → `click` sequence fail with
 `InvalidSelectorException`; they now poll the resolved handle for the requested
 `present`/`visible`/`clickable` state. The `submit_selector` still expects a plain CSS
-selector. Both non-CSS forms need a live element handle, so they
-resolve in the Selenium-backed modes (`temporary`, `persistent`, `attach`); in companion
-`current` mode they are refused with an explicit message and CSS selectors remain the way
-to address elements.
+selector. In the Selenium-backed modes (`isolated`, `temporary`, `persistent`, `attach`)
+a ref or a piercing path is followed into whichever frame holds its element. Companion
+`current` mode has no element handles: there the locator is resolved by script on every
+call, from the top document, so a ref minted inside a frame is refused with an explicit
+message - address an element in a frame with CSS and `frame_selector` instead. Plain CSS
+is the form that works the same in every mode.
 
 A CSS selector that contains ` >>> ` inside quotes or brackets — `div[data-op='a >>> b']`
 — is no longer mistaken for a piercing path; the separator is only recognised outside
@@ -1262,8 +1349,8 @@ What differs is which *forms* are accepted. `render` and the reading topics —
 `#host >>> #frame` path the outline reports for it, as can `fill`, `click`, `wait`, `submit`
 and `upload`.
 
-The input actions take plain CSS and nothing else: `press_keys`, `pointer`, `touch`, the
-pointer entries of an `input` batch, `pointer_lock`, and `game_probe`. They aim by
+The input actions take plain CSS and nothing else: `press_keys`, `pointer`, `touch`,
+`input` (its key entries as well as its pointer entries), `pointer_lock`, and `game_probe`. They aim by
 coordinate, which needs the frame's own box measured in the top-level page, and neither a
 `ref:` handle nor a piercing path yields one. Both are refused before a single event is sent
 — not half-way through a batch, which is what an `input` mixing keys and pointer entries
@@ -1314,7 +1401,7 @@ Capture is armed when the session takes its tab, not when a topic is first read.
 
 `attach_tab` is necessarily different. Capture starts at the claim, and whatever the tab did before it was claimed was recorded by nobody and cannot be recovered — reload the claimed page if you need its load traffic.
 
-Each stream keeps up to 500 entries and reports how many older records were `dropped`. Two further ceilings belong to companion `current` mode alone, because there the buffers live inside the extension: a 512 KB budget shared between console and network, and in-flight requests capped at 1000. Those limits bite on a chatty page: one that fires 700 requests keeps the newest 500 and reports a little over 200 `dropped` — a few more than the arithmetic, because the shared byte budget evicts as well — and eviction is oldest-first, so the very first navigation is the first thing to go. Read `network` before the page has had time to bury it. An empty list next to a non-zero `dropped` means "evicted", not "quiet".
+The network journal keeps the newest 500 finished requests and reports how many older records were `dropped`; the console history keeps the newest 2,000 entries (`history_dropped`). Further ceilings belong to companion `current` mode alone, because there the buffers live inside the extension: each stream holds 500 entries between reads, a 512 KB budget is shared between console and network, and in-flight requests are capped at 1000. Those limits bite on a chatty page: one that fires 700 requests keeps the newest 500 and reports a little over 200 `dropped` — a few more than the arithmetic, because the shared byte budget evicts as well — and eviction is oldest-first, so the very first navigation is the first thing to go. Read `network` before the page has had time to bury it. An empty list next to a non-zero `dropped` means "evicted", not "quiet".
 
 Both topics work in companion `current` mode and in the Selenium-backed modes; the Selenium path reads Chrome's browser and performance logs instead of the extension's buffer, so field coverage is close but not identical. It caps in-flight requests at 500 and keeps no byte budget. Its performance log is switched on when the session starts, and its page console hook is registered with `Page.addScriptToEvaluateOnNewDocument` before the session navigates anywhere, so it runs ahead of each document's own first script and the first page's boot output is covered too. That hook used to be installed the first time the `console` topic was read, which lost exactly those lines and made a reload the price of seeing them.
 
@@ -1343,11 +1430,11 @@ choice, submit exactly once, then prove the outcome with fresh DOM/text.
 - `upload` says how the file got in: `attach_method: "set_file_input_files"` (Chrome read the path itself) or `"streamed"` with `stream_reason`. In your own Chrome, if Chrome refuses access to the file (a bare "Not allowed"), the server reads the file and hands its bytes to the page and reports `attach_method: streamed`; the page then sees synthetic `input`/`change` events (`isTrusted=false`). Chrome gives the same "Not allowed" when the companion's "Allow access to file URLs" is off and, apparently, when an administrator forbids file access - the two cannot be told apart. A refusal whose text names a policy is returned as an error.
 - `fetch_links` returns a list of URLs; when the `limit` or the byte budget cut it, the last line starts with `# ` (`# truncated=true: …`, `# body_cut=true: …`) and is never a URL.
 - `submit` runs native validation first and reports `validation_passed` with the offending field ids, then `submit_triggered` from the fired `submit` event or from the document being replaced — including a reload of the same URL, which a check on url and title alone reported as a failed submit. `submit_default_prevented` marks the SPA case where a handler cancelled the navigation on purpose. `submit_evidence` states in a sentence what the verdict rests on, and `new_tab_opened` warns that a `target="_blank"` result landed in a tab this session does not own — so the `url` and `title` beside it are still this page's, not the answer you are looking for.
-- A checkbox takes `1`/`yes`/`y`/`on`/`check`/`checked` or `0`/`no`/`n`/`off`/`uncheck`/`unchecked`/`""` and refuses anything else, a `<select>` takes an option `value` or its visible text, and a file input must go through `files`/`upload`.
-- Every control `fill` writes is blurred afterwards, because that is the only way the last field of a fill ever fires its `change` event. Three consequences follow and the third bites: focus ends on `document.body`, an autocomplete list the fill opened is dismissed, and a following `press_keys(["ENTER"])` goes to the body rather than the field — pass `target_selector`, or `focus_mode="click"`, when you mean to submit by keyboard. The `files` entries are the exception: nothing is typed into them, so nothing is blurred.
+- A checkbox takes `true`/`1`/`yes`/`y`/`on`/`check`/`checked` or `false`/`0`/`no`/`n`/`off`/`uncheck`/`unchecked`/`""` and refuses any other string, a `<select>` takes an option `value` or its visible text, and a file input must go through `files`/`upload`.
+- Every control `fill` writes is blurred afterwards by default (`blur_after=false` leaves focus in the last one), because that is the only way the last field of a fill ever fires its `change` event. Three consequences follow and the third bites: focus ends on `document.body`, an autocomplete list the fill opened is dismissed, and a following `press_keys(["ENTER"])` goes to the body rather than the field — pass `target_selector`, with `focus_mode="click"` when the field needs a real click to take focus, when you mean to submit by keyboard. The `files` entries are the exception: nothing is typed into them, so nothing is blurred.
 - `fill`, `click`, `submit`, `upload` and `wait` take `frame_selector`, so a form inside an iframe is addressable by name and not only through a ref.
 - File inputs honor that frame context too: same-origin uploads are resolved inside the selected frame in the tab target, while cross-origin uploads use the child debugger target. A top-level matching input is never chosen as a decoy, and valid same-origin uploads no longer surface Chrome's opaque `Uncaught` evaluation error.
-- `wait` takes `present`, `visible`, or `clickable`, and honours its `timeout_seconds` as passed (it defaults to 10). A timeout names the seconds actually waited in its message, so you can ask for as long as the target needs and read back what really happened.
+- `wait` takes `present`, `visible`, or `clickable`, and honours its `timeout_seconds` as passed up to 300 s - a larger value is cut to that and `timeout_note` says so (it defaults to 10). A timeout names the seconds actually waited in its message, so you can ask for as long as the target needs within that ceiling and read back what really happened.
 - After any navigation or step change, read `page_outline` again: old ref handles are stale by definition. `dom_epoch` only tests one direction of that. A different epoch proves your refs are dead; the same epoch proves nothing, because the epoch belongs to the document and a wizard step that swaps its own markup in place keeps it while every ref it issued goes with the old nodes. A ref read inside a frame carries that frame's epoch rather than the page's, so a mismatch there is normal and not staleness at all.
 
 For an application, payment, message, deletion, or other consequential terminal
@@ -1734,9 +1821,11 @@ While the gate is engaged — in `throttled` as well as in `step` — page time 
 - page time never runs backwards. Stepping carries the clock *ahead* of wall time — sixty frames released back to back advance it by a second in barely a moment — and returning to `normal` keeps that gap instead of dropping it. Handing the native clock back used to lose the whole gain at once, measured at −5.9 s, which a game reads as a negative frame delta. A session that has stepped keeps the clock wrapper for the rest of its life, since only the wrapper can go on applying the offset; one that never stepped gets the untouched native clock back.
 
 `render` also accepts `frame_delta_ms`, `freeze_time`, and `gate_timers` when an
-engine needs something other than those defaults. One knob stays Python-only:
-`browser_tools.set_render_control(..., key_repeat=False)` disables the auto-repeat
-that keeps a held key alive for games which latch input on `keydown`.
+engine needs something other than those defaults. Two knobs stay Python-only, on
+`browser_tools.set_render_control(...)`: `key_repeat=False` disables the auto-repeat
+that keeps a held key alive for games which latch input on `keydown`, and
+`deterministic=True` (step mode only) also pauses Chrome's own clock between
+released frames.
 
 One `input` action can hold one key, release another, tap two more, turn the wheel, and move the pointer by a delta before releasing exactly one frame. A tapped key is pressed together with the rest of the batch, stays down for the whole released frame, and is lifted afterwards, so an engine that polls key state once per frame — Phaser, Godot, a hand-written canvas loop — actually observes the press. In `step` mode the game never observes a partially applied intermediate input state. Outside step mode the actions are still serialized, but the page continues rendering normally.
 
@@ -1839,7 +1928,7 @@ small local models: inspect → act → verify, schema discovery before guessing
 optional parameters, element pagination and lazy-page scrolling, the three
 screenshot modes, safe visual-coordinate clicks, current-Chrome CSS-only action
 locators, exact href/value matching, and a one-shot final-submit guard. It is
-about 6.5 KB and can be fetched once at the start of an automation task.
+about 6 KB and can be fetched once at the start of an automation task.
 
 It also names its detailed sections, which are the part a small model needs when
 a specific operation starts rather than at the beginning of the session. Each is opened
@@ -1854,6 +1943,7 @@ that are not guessable, and the mistakes to avoid.
 | `locators` | CSS, refs, piercing paths, and which action accepts which. |
 | `forms` | Filling, choice widgets, uploads, the one-shot terminal submit. |
 | `macros` | Project files, placeholders, validate, preview, replay. |
+| `macro_scripts` | Logic in a macro: conditions, loops, waits, background jobs. |
 | `guarded` | The two-phase path for an action that cannot be taken twice. |
 | `parallel` | Session discipline for subagents sharing one server. |
 | `search` | Search and fetch without a browser. |
@@ -1935,7 +2025,7 @@ MCP client's configuration is the way to give a model a project's macros without
 to spell a path on every call. `WEB_SEARCH_NEO_MACRO_ROOT` still points the per-user store
 somewhere specific, and a named project wins over it.
 
-The [bridge daemon](#the-bridge-daemon) has five switches of its own. Set them for the MCP
+The [bridge daemon](#the-bridge-daemon) has six switches of its own. Set them for the MCP
 server process: a daemon inherits the environment of whichever server spawns it.
 
 | Variable | Effect |
@@ -1947,10 +2037,13 @@ server process: a daemon inherits the environment of whichever server spawns it.
 | `WEB_SEARCH_NEO_BRIDGE_START_TIMEOUT` | How long server startup waits for that first attempt before continuing in the background, default `2` seconds. |
 | `WEB_SEARCH_NEO_LOGON_START` | `0` makes **Start with Windows** off by default; the popup's switch still wins. |
 
-A few more are about the server rather than the bridge:
+A few more are read by the server itself, not by the daemon:
 
 | Variable | Effect |
 | --- | --- |
+| `WSN_ATTACH_TIMEOUT` | Seconds a `current`-mode session waits for Chrome to attach its debugger to the session's tab, default `60`, clamped to `5`-`600`. Raise it on a machine whose CPU is busy with other work; see [A busy machine](#a-busy-machine). |
+| `WSN_TAB_CREATE_TIMEOUT` | Seconds a `current`-mode session waits for the companion to create its tab, default `60`. |
+| `WSN_FORBID_CURRENT_PROFILE` | `1`, `true`, `yes` or `on`: no session may drive the user's own Chrome. `profile_mode="current"` is downgraded to `temporary` (the answer's `profile_mode` says so) and `auto` resolves to `temporary`. For benchmarks and batch jobs. |
 | `WEB_SEARCH_NEO_JOBS_DIR` | Where macro jobs write their state, default `~/.web-search-neo/macro-jobs`. Servers that should see and stop each other's jobs need the same folder. |
 | `WEB_SEARCH_NEO_SCHEDULES_FILE` | The macro schedules file, default `~/.web-search-neo/macro-schedules.json`. |
 | `WEB_SEARCH_NEO_MAX_SESSIONS` | Browser sessions one server holds at once, default `30`; any number is accepted, and `0` (or `unlimited`) removes the cap. Per process, so agents running in parallel share the allowance; the refusal at the cap names this variable. Set here it wins over the companion popup's **Parallel sessions** setting, which is where a user without access to the server's environment changes the same number. |
@@ -1973,7 +2066,7 @@ python -m pytest
 python -m pytest --cov=. --cov-report=term-missing
 ```
 
-The deterministic suite is 2203 tests, grouped by what they protect:
+The deterministic suite is 2682 tests, grouped by what they protect:
 
 | Area | Covered |
 | --- | --- |
@@ -1983,8 +2076,8 @@ The deterministic suite is 2203 tests, grouped by what they protect:
 | Perception | The accessibility outline including open shadow roots and same-origin frames, refs minted in the document that owns them and resolved back into it, selectors verified unique before they are handed over, page text extraction with its non-empty `main` fallback, its link budget and its account of what it left out, and `find` separating how well a query matched from how a result ranks. |
 | Locators | The three forms and their escaping, refs that refuse to resolve in another document or after their element was removed, valid CSS that merely contains ` >>> `. |
 | Diagnostics | The companion's console and network buffers with their ring-buffer eviction, capture armed at open so the very first navigation is reported, a claimed tab recorded only from the claim, and a subscription that failed at open repaired on the next read. |
-| Companion bridge | The handshake — a client without the token, a hello without a nonce, a newer companion evicting an older one, and WebCrypto HMAC agreeing with the Python signature — origin checks, tab grouping, and confirmation-gated Chrome setup that publishes the token before touching Chrome. |
-| Bridge daemon | Two MCP servers with commands in flight at once, two servers starting together converging on one daemon, a client never mistaken for the browser, an in-flight command failing instead of hanging when the daemon dies, a daemon of the same version left alone while an outdated one is replaced, a *newer* daemon used rather than evicted by the server it outranks, versions ranked component by component so `1.3.10` outranks `1.3.9`, two checkouts on one port settling on the newer daemon, a second outdated replacement reported instead of looped over — with the reported `daemon.version` being the one the error names — a conflict that clears itself once the other side stops, a daemon of another bridge protocol refused by name, the idle exit once neither browser nor client is left, `--bridge --stop` against a running daemon and against none, each client seeing how many agents share the bridge and which tabs they hold, a departure taken off that list, a tab list that marks what another agent is already driving, a handshake that still gets its acknowledgement while the bridge is broadcasting, and a stop request that waits for its own answer rather than the next frame. |
+| Companion bridge | The handshake — a client without the token, a hello without a nonce, a newer companion evicting an older one, and WebCrypto HMAC agreeing with the Python signature — origin checks, tab grouping, and confirmation-gated Chrome setup that publishes the token before touching Chrome. Under load: commands arriving together sharing one debugger attach, an attach that waits as long as a busy machine needs and closes the tab it was opened for when it never answers, an older companion warmed up with a trivial script instead, built-in timeouts that stretch only while Chrome answers slowly, a built-in limit that goes on waiting while the machine's CPU is busy and names the load when the answer still does not come, a caller's limit kept as given, a readiness poll left unanswered that is not a failed `open`, and a wait for the page that ends when the caller said however slow each poll is. |
+| Bridge daemon | Two MCP servers with commands in flight at once, two servers starting together converging on one daemon, a client never mistaken for the browser, an in-flight command failing instead of hanging when the daemon dies, a daemon of the same version left alone while an outdated one is replaced, a *newer* daemon used rather than evicted by the server it outranks, versions ranked component by component so `1.3.10` outranks `1.3.9`, two checkouts on one port settling on the newer daemon, a second outdated replacement reported instead of looped over — with the reported `daemon.version` being the one the error names — a conflict that clears itself once the other side stops, a daemon of another bridge protocol refused by name, the idle exit once neither browser nor client is left, `--bridge --stop` against a running daemon and against none, each client seeing how many agents share the bridge and which tabs they hold, a departure taken off that list, a tab list that marks what another agent is already driving, a handshake that still gets its acknowledgement while the bridge is broadcasting, and a stop request that waits for its own answer rather than the next frame, a client that stopped reading not blocking the sender, frames reaching a client in the order they were queued, and a client too far behind disconnected rather than buffered forever. |
 | Forms | Multipart upload, form filling, native validation, values read back off the control so a refused write is not a success, exact PNG viewport size, a guarded terminal click that counts its matches in the page and so works in the user's own Chrome as well as a Selenium one, and guarded refusals that name the ledger they refuse from. |
 | Challenges | A captcha that blocks told apart from one merely present on the page, and the providers a top-level query walked past — DataDome, AWS WAF, a challenge one frame down, and one in a shadow root. |
 | Games and input | Canvas probing, normal/throttled/step rendering, atomic mixed input, held modifiers across a batch, gate and held-input reset on navigation, coordinates that follow a frame's CSS transforms, key spellings that release each other, and a virtual clock whose intervals keep their period. |
@@ -2009,7 +2102,7 @@ It reports the eager tool-schema size and the median and p95 latency of both MCP
 ## Safety notes
 
 - Visible or attached sessions may contain authenticated accounts. The MCP client can act with the permissions of those accounts.
-- The companion declares five permissions: `alarms`, `debugger`, `storage`, `tabs`, and `tabGroups`. It ships no content scripts and asks for no `host_permissions`, but `debugger` is the broad one: it lets the extension attach the Chrome DevTools Protocol to a tab and from there read and modify that page, its console, and its network traffic. Chrome shows a "started debugging this browser" banner whenever it is attached. `alarms` is the narrow one — it only wakes a suspended service worker to retry the bridge, and Chrome shows no extra warning for it. Install the companion only from this repository.
+- The companion declares six permissions: `alarms`, `debugger`, `notifications`, `storage`, `tabs`, and `tabGroups`. It ships no content scripts and asks for no `host_permissions`, but `debugger` is the broad one: it lets the extension attach the Chrome DevTools Protocol to a tab and from there read and modify that page, its console, and its network traffic. Chrome shows a "started debugging this browser" banner whenever it is attached. `alarms` is the narrow one — it only wakes a suspended service worker to retry the bridge, and Chrome shows no extra warning for it. `notifications` shows a pairing request from another computer and a background macro job that ended or asks a question. Install the companion only from this repository.
 - The loopback bridge is authenticated in both directions with an HMAC challenge-response over fresh nonces: the daemon proves it holds the machine-local token first, and the extension or MCP server answers only after checking that proof, so the token itself never crosses the socket (since 1.15.0). Until 1.3.0 the port accepted any local client that spoke the protocol, and the extension trusted whatever answered on it.
 - That secret is a file readable by the user account that owns it, so it does not defend against a malicious process already running as you: such a process can read the token and impersonate either side. It removes the race in which any local program that binds `127.0.0.1:8765` before the server inherits DevTools access to every signed-in tab. Chrome Native Messaging, which needs no listening port at all, is the actual fix and is tracked in [TODO.md](TODO.md).
 - The port is now held by a [daemon](#the-bridge-daemon) that outlives each agent call, so it is reachable for as long as Chrome keeps the companion attached rather than only while an agent runs. The authentication is unchanged and same-user processes were never excluded by it, but the window in which one could use the token is wider. Stop the daemon with `python main.py --bridge --stop`, or let its idle exit close the port fifteen minutes after the last companion and client are gone.
